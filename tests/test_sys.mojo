@@ -16,6 +16,7 @@ from net._sys import (
     F_GETFD,
     SOCK_STREAM,
     _OwnedFD,
+    _recv,
     _send,
     _socket,
     _wait_readable,
@@ -75,6 +76,9 @@ def test_move_transfers_descriptor() raises:
     var raw = source.raw()
     var moved = source^
     assert_equal(moved.raw(), raw)
+    var flags = _test_fcntl(c_int(moved.raw()), c_int(F_GETFD), c_int(0))
+    assert_true(flags >= 0)
+    assert_true(moved.is_valid())
 
 
 def test_take_invalidates_source() raises:
@@ -115,6 +119,10 @@ def test_sent_byte_makes_peer_readable() raises:
             _Deadline.from_timeout(Timeout.seconds(1)),
         )
     )
+    var received = Array[Byte, 1](fill=0)
+    assert_equal(_recv(pair.second.raw(), Span(received)), 1)
+    assert_equal(received[0], Byte(42))
+    assert_true(pair.first.is_valid())
 
 
 def test_poll_timeout_uses_remaining_deadline() raises:

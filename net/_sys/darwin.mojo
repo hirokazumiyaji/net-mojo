@@ -3,8 +3,8 @@ comptime AF_INET6: Int32 = 30
 comptime AF_UNIX: Int32 = 1
 comptime SOCK_STREAM: Int32 = 1
 comptime SOCK_DGRAM: Int32 = 2
-comptime SOCK_NONBLOCK: Int32 = 0x20000000
-comptime SOCK_CLOEXEC: Int32 = 0x10000000
+comptime SOCK_NONBLOCK: Int32 = 0
+comptime SOCK_CLOEXEC: Int32 = 0
 comptime SOL_SOCKET: Int32 = 0xFFFF
 comptime SO_ERROR: Int32 = 0x1007
 comptime SO_NOSIGPIPE: Int32 = 0x1022
@@ -27,13 +27,6 @@ comptime F_GETFL: Int32 = 3
 comptime F_SETFL: Int32 = 4
 comptime FD_CLOEXEC: Int32 = 1
 comptime O_NONBLOCK: Int32 = 0x4
-
-
-@fieldwise_init
-struct _PollFD:
-    var fd: Int32
-    var events: Int16
-    var revents: Int16
 
 
 @fieldwise_init
@@ -89,13 +82,3 @@ struct _MsgHdr:
     var control: Optional[Pointer[Byte, MutUntrackedOrigin]]
     var control_length: UInt32
     var flags: Int32
-
-
-struct _DarwinABI:
-    comptime PollFD = _PollFD
-    comptime SockaddrIn = _SockaddrIn
-    comptime SockaddrIn6 = _SockaddrIn6
-    comptime SockaddrUn = _SockaddrUn
-    comptime AddrInfo = _AddrInfo
-    comptime IOVec = _IOVec
-    comptime MsgHdr = _MsgHdr

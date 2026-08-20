@@ -30,13 +30,6 @@ comptime O_NONBLOCK: Int32 = 0x800
 
 
 @fieldwise_init
-struct _PollFD:
-    var fd: Int32
-    var events: Int16
-    var revents: Int16
-
-
-@fieldwise_init
 struct _SockaddrIn:
     var family: UInt16
     var port: UInt16
@@ -86,13 +79,3 @@ struct _MsgHdr:
     var control: Optional[Pointer[Byte, MutUntrackedOrigin]]
     var control_length: UInt
     var flags: Int32
-
-
-struct _LinuxABI:
-    comptime PollFD = _PollFD
-    comptime SockaddrIn = _SockaddrIn
-    comptime SockaddrIn6 = _SockaddrIn6
-    comptime SockaddrUn = _SockaddrUn
-    comptime AddrInfo = _AddrInfo
-    comptime IOVec = _IOVec
-    comptime MsgHdr = _MsgHdr
