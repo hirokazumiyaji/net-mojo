@@ -17,10 +17,21 @@ struct AddressFamily(Copyable, Equatable, Hashable, Writable):
         writer.write(self.value)
 
 
-@fieldwise_init
 struct IPAddress(Copyable, Equatable, Hashable, Writable):
     var _family: AddressFamily
     var _bytes: Array[Byte, 16]
+
+    def __init__(out self, byte0: Byte, byte1: Byte, byte2: Byte, byte3: Byte):
+        self._family = AddressFamily.ipv4()
+        self._bytes = Array[Byte, 16](fill=0)
+        self._bytes[0] = byte0
+        self._bytes[1] = byte1
+        self._bytes[2] = byte2
+        self._bytes[3] = byte3
+
+    def __init__(out self, var bytes: Array[Byte, 16]):
+        self._family = AddressFamily.ipv6()
+        self._bytes = bytes^
 
     @staticmethod
     def parse(value: StringSlice) raises NetError -> Self:
@@ -196,16 +207,11 @@ def _parse_ipv6(value: StringSlice) raises NetError -> IPAddress:
 def _from_ipv4_bytes(
     byte0: Byte, byte1: Byte, byte2: Byte, byte3: Byte
 ) -> IPAddress:
-    var bytes = Array[Byte, 16](fill=0)
-    bytes[0] = byte0
-    bytes[1] = byte1
-    bytes[2] = byte2
-    bytes[3] = byte3
-    return IPAddress(_family=AddressFamily.ipv4(), _bytes=bytes^)
+    return IPAddress(byte0, byte1, byte2, byte3)
 
 
 def _from_ipv6_bytes(var bytes: Array[Byte, 16]) -> IPAddress:
-    return IPAddress(_family=AddressFamily.ipv6(), _bytes=bytes^)
+    return IPAddress(bytes^)
 
 
 def _write_hextet[W: Writer](value: UInt16, mut writer: W):

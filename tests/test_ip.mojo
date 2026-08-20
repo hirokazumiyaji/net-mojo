@@ -21,6 +21,13 @@ def test_canonical_formatting() raises:
     assert_equal(String(IPAddress.parse("::ffff:192.0.2.1")), "::ffff:c000:201")
 
 
+def test_single_zero_hextet_is_not_compressed() raises:
+    assert_equal(
+        String(IPAddress.parse("2001:db8:0:1:1:1:1:1")),
+        "2001:db8:0:1:1:1:1:1",
+    )
+
+
 def test_address_family_is_part_of_equality() raises:
     assert_true(IPAddress.parse("127.0.0.1").is_ipv4())
     assert_true(IPAddress.parse("::1").is_ipv6())
@@ -100,6 +107,20 @@ def test_rejects_malformed_addresses() raises:
         _ = IPAddress.parse("1.2.3.4 ")
     with assert_raises():
         _ = IPAddress.parse("1.2.3.4\0")
+
+
+def test_rejects_zero_width_compression() raises:
+    with assert_raises():
+        _ = IPAddress.parse("1:2:3:4:5:6:7:8::")
+    with assert_raises():
+        _ = IPAddress.parse("::1:2:3:4:5:6:7:8")
+
+
+def test_rejects_ipv4_tail_before_end() raises:
+    with assert_raises():
+        _ = IPAddress.parse("::ffff:192.0.2.1:1")
+    with assert_raises():
+        _ = IPAddress.parse("1:2:3:4:5:6:192.0.2.1:1")
 
 
 def test_parse_format_round_trips_preserve_value_and_hash() raises:
