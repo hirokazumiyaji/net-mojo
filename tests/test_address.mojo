@@ -70,6 +70,26 @@ def test_socket_address_accepts_port_and_scope_boundaries() raises:
     assert_equal(ipv6.port, UInt16.MAX)
 
 
+def test_socket_address_rejects_ports_longer_than_five_digits() raises:
+    with assert_raises():
+        _ = SocketAddress.parse("127.0.0.1:000000")
+
+
+def test_socket_address_rejects_bracketed_ipv4() raises:
+    with assert_raises():
+        _ = SocketAddress.parse("[127.0.0.1]:80")
+
+
+def test_socket_address_rejects_scoped_ipv4() raises:
+    with assert_raises():
+        _ = SocketAddress.parse("127.0.0.1%3:80")
+
+
+def test_socket_address_rejects_hostnames() raises:
+    with assert_raises():
+        _ = SocketAddress.parse("example.com:80")
+
+
 def test_listen_host_port_allows_an_empty_host() raises:
     var host, port = _split_host_port(":0", True)
     assert_equal(host, "")
