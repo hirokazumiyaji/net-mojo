@@ -181,6 +181,22 @@ struct _RawSocketAddress(Movable):
         return Pointer(to=self).unsafe_bitcast[Byte]()
 
 
+struct _RawDatagramReceive(Movable):
+    var count: Int
+    var source: _RawSocketAddress
+    var truncated: Bool
+
+    def __init__(
+        out self,
+        count: Int,
+        var source: _RawSocketAddress,
+        truncated: Bool,
+    ):
+        self.count = count
+        self.source = source^
+        self.truncated = truncated
+
+
 @fieldwise_init
 struct _PollFD:
     var fd: Int32
@@ -209,6 +225,7 @@ def _verify_abi_layouts():
     ), "invalid raw socket address storage"
     comptime assert size_of[_SockaddrIn]() == 16, "invalid sockaddr_in ABI"
     comptime assert size_of[_SockaddrIn6]() == 28, "invalid sockaddr_in6 ABI"
+    comptime assert size_of[_IOVec]() == 16, "invalid iovec ABI"
     comptime if _DARWIN:
         comptime assert (
             size_of[_SockaddrUn]() == 106
@@ -429,6 +446,117 @@ def _send[
         var error_number = _last_errno()
         raise _system_error("send", error_number)
     return Int(result)
+
+
+def _send_to[
+    origin: ImmOrigin
+](
+    fd: Int32,
+    buffer: Span[Byte, origin],
+    mut address: _RawSocketAddress,
+) raises NetError -> Int:
+    _verify_abi_layouts()
+    var flags: Int32 = 0
+    comptime if _LINUX:
+        flags = MSG_NOSIGNAL
+    var result = external_call["sendto", c_ssize_t](
+        c_int(fd),
+        buffer.unsafe_ptr(),
+        c_size_t(len(buffer)),
+        c_int(flags),
+        address.unsafe_ptr(),
+        c_uint(address.length),
+    )
+    if result == -1:
+        var error_number = _last_errno()
+        raise _system_error("sendto", error_number)
+    return Int(result)
+
+
+def _recv_from[
+    origin: MutOrigin
+](
+    fd: Int32, buffer: Span[mut=True, Byte, origin]
+) raises NetError -> _RawDatagramReceive:
+    _verify_abi_layouts()
+    var source = _RawSocketAddress()
+    var source_pointer = Pointer[Byte, MutUntrackedOrigin](
+        unsafe_from_address=Int(source.unsafe_ptr())
+    )
+    var buffer_pointer = Pointer[Byte, MutUntrackedOrigin](
+        unsafe_from_address=Int(buffer.unsafe_ptr())
+    )
+    var received: Int
+    var source_length: UInt32
+    var message_flags: Int32
+
+    comptime if _DARWIN:
+        var vector = darwin._IOVec(
+            base=buffer_pointer, length=UInt(len(buffer))
+        )
+        var vector_pointer = Pointer[darwin._IOVec, MutUntrackedOrigin](
+            unsafe_from_address=Int(Pointer(to=vector))
+        )
+        var message = darwin._MsgHdr(
+            name=source_pointer,
+            name_length=128,
+            vectors=vector_pointer,
+            vector_count=1,
+            control=None,
+            control_length=0,
+            flags=0,
+        )
+        var result = external_call["recvmsg", c_ssize_t](
+            c_int(fd), Pointer(to=message), c_int(0)
+        )
+        # The ABI erases origins, so keep the iovec storage live through recvmsg.
+        _ = vector.length
+        if result == -1:
+            var error_number = _last_errno()
+            raise _system_error("recvmsg", error_number)
+        received = Int(result)
+        source_length = message.name_length
+        message_flags = message.flags
+    else:
+        var vector = linux._IOVec(base=buffer_pointer, length=UInt(len(buffer)))
+        var vector_pointer = Pointer[linux._IOVec, MutUntrackedOrigin](
+            unsafe_from_address=Int(Pointer(to=vector))
+        )
+        var message = linux._MsgHdr(
+            name=source_pointer,
+            name_length=128,
+            vectors=vector_pointer,
+            vector_count=1,
+            control=None,
+            control_length=0,
+            flags=0,
+        )
+        var result = external_call["recvmsg", c_ssize_t](
+            c_int(fd), Pointer(to=message), c_int(0)
+        )
+        # The ABI erases origins, so keep the iovec storage live through recvmsg.
+        _ = vector.length
+        if result == -1:
+            var error_number = _last_errno()
+            raise _system_error("recvmsg", error_number)
+        received = Int(result)
+        source_length = message.name_length
+        message_flags = message.flags
+
+    if source_length > 128:
+        raise NetError(
+            NetErrorKind.invalid_state(),
+            "recvmsg",
+            None,
+            "socket address is too large",
+        )
+    source.length = source_length
+    var count = received if received <= len(buffer) else len(buffer)
+    return _RawDatagramReceive(
+        count=count,
+        source=source^,
+        truncated=(message_flags & MSG_TRUNC) != 0,
+    )
 
 
 def _set_socket_option_int(
