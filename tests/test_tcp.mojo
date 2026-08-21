@@ -1,9 +1,11 @@
 from std.testing import assert_equal, assert_true, TestSuite
 
 from net import Timeout, dial_tcp, listen_tcp
-from net.error import NetErrorKind
+from net.error import NetError, NetErrorKind
 from net._sys import IPPROTO_IPV6, IPV6_V6ONLY
 from net._sys.common import _get_socket_option_int
+from net.tcp import _WriteAllStep, _write_all_loop
+from net.timeout import _Deadline
 
 
 def _assert_bytes_equal[
@@ -164,6 +166,62 @@ def test_listen_rejects_invalid_backlog() raises:
         assert_equal(error.kind, NetErrorKind.invalid_argument())
         return
     raise Error("listen accepted an invalid backlog")
+
+
+def test_listen_rejects_backlog_above_int32() raises:
+    try:
+        _ = listen_tcp("127.0.0.1:0", backlog=Int(Int32.MAX) + 1)
+    except error:
+        assert_equal(error.kind, NetErrorKind.invalid_argument())
+        return
+    raise Error("listen accepted an oversized backlog")
+
+
+def test_zero_length_read_and_write_return_zero() raises:
+    var listener = listen_tcp("127.0.0.1:0")
+    var client = dial_tcp(String(listener.local_address()))
+    var server = listener.accept(Timeout.seconds(1))
+    var empty = Array[Byte, 0](fill=0)
+    assert_equal(client.write(Span(empty), Timeout.nanoseconds(0)), 0)
+    assert_equal(server.read(Span(empty), Timeout.nanoseconds(0)), 0)
+    assert_true(client.local_address().port != 0)
+
+
+@fieldwise_init
+struct _PartialWriteStep(Copyable, _WriteAllStep):
+    var calls: Int
+    var expected_offset: Int
+    var offsets_are_correct: Bool
+    var deadline_is_shared: Bool
+    var expected_expiration: Optional[Int]
+
+    def write(
+        mut self, offset: Int, remaining: Int, deadline: _Deadline
+    ) raises NetError -> Int:
+        if offset != self.expected_offset:
+            self.offsets_are_correct = False
+        if deadline._expires_at != self.expected_expiration:
+            self.deadline_is_shared = False
+        self.calls += 1
+        var written = 3 if remaining > 3 else remaining
+        self.expected_offset += written
+        return written
+
+
+def test_write_all_advances_partial_progress_with_one_deadline() raises:
+    var deadline = _Deadline.from_timeout(Timeout.seconds(1))
+    var write_step = _PartialWriteStep(
+        calls=0,
+        expected_offset=0,
+        offsets_are_correct=True,
+        deadline_is_shared=True,
+        expected_expiration=deadline._expires_at,
+    )
+    _write_all_loop(10, deadline, write_step)
+    assert_equal(write_step.calls, 4)
+    assert_equal(write_step.expected_offset, 10)
+    assert_true(write_step.offsets_are_correct)
+    assert_true(write_step.deadline_is_shared)
 
 
 def main() raises:

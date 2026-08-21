@@ -44,7 +44,9 @@ comptime SOL_SOCKET: Int32 = (
     darwin.SOL_SOCKET if _DARWIN else linux.SOL_SOCKET
 )
 comptime SO_ERROR: Int32 = darwin.SO_ERROR if _DARWIN else linux.SO_ERROR
-comptime SO_REUSEADDR: Int32 = 0x0004 if _DARWIN else 2
+comptime SO_REUSEADDR: Int32 = (
+    darwin.SO_REUSEADDR if _DARWIN else linux.SO_REUSEADDR
+)
 comptime SO_NOSIGPIPE: Int32 = (
     darwin.SO_NOSIGPIPE if _DARWIN else linux.SO_NOSIGPIPE
 )
@@ -64,7 +66,9 @@ comptime EAGAIN: Int32 = darwin.EAGAIN if _DARWIN else linux.EAGAIN
 comptime EWOULDBLOCK: Int32 = (
     darwin.EWOULDBLOCK if _DARWIN else linux.EWOULDBLOCK
 )
-comptime EAFNOSUPPORT: Int32 = 47 if _DARWIN else 97
+comptime EAFNOSUPPORT: Int32 = (
+    darwin.EAFNOSUPPORT if _DARWIN else linux.EAFNOSUPPORT
+)
 comptime EINPROGRESS: Int32 = (
     darwin.EINPROGRESS if _DARWIN else linux.EINPROGRESS
 )

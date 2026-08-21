@@ -130,6 +130,48 @@ def _write_with_deadline[
             raise _timeout_error("write")
 
 
+trait _WriteAllStep:
+    def write(
+        mut self, offset: Int, remaining: Int, deadline: _Deadline
+    ) raises NetError -> Int:
+        ...
+
+
+struct _SocketWriteStep[origin: ImmOrigin](Movable, _WriteAllStep):
+    var fd: Int32
+    var buffer: Span[Byte, Self.origin]
+
+    def __init__(out self, fd: Int32, buffer: Span[Byte, Self.origin]):
+        self.fd = fd
+        self.buffer = buffer
+
+    def write(
+        mut self, offset: Int, remaining: Int, deadline: _Deadline
+    ) raises NetError -> Int:
+        return _write_with_deadline(
+            self.fd,
+            self.buffer[offset : offset + remaining],
+            deadline,
+        )
+
+
+def _write_all_loop[
+    WriteStep: _WriteAllStep
+](length: Int, deadline: _Deadline, mut write_step: WriteStep) raises NetError:
+    var offset = 0
+    while offset < length:
+        var remaining = length - offset
+        var written = write_step.write(offset, remaining, deadline)
+        if written <= 0 or written > remaining:
+            raise NetError(
+                NetErrorKind.invalid_state(),
+                "write",
+                None,
+                "write reported invalid progress",
+            )
+        offset += written
+
+
 struct TCPConn(Movable):
     var _fd: _OwnedFD
 
@@ -167,9 +209,8 @@ struct TCPConn(Movable):
     ) raises NetError:
         var deadline = _Deadline.from_optional(timeout)
         var fd = self._fd.raw()
-        var offset = 0
-        while offset < len(buffer):
-            offset += _write_with_deadline(fd, buffer[offset:], deadline)
+        var write_step = _SocketWriteStep(fd, buffer)
+        _write_all_loop(len(buffer), deadline, write_step)
 
     def local_address(self) raises NetError -> SocketAddress:
         var raw = _socket_name(self._fd.raw(), False)
@@ -248,8 +289,7 @@ def dial_tcp(
         raise _invalid_tcp_address()
     var addresses = resolve_socket_addresses(address, SOCK_STREAM)
     var deadline = _Deadline.from_optional(timeout)
-    var last_error = _invalid_tcp_address()
-    var had_error = False
+    var last_error: Optional[NetError] = None
 
     for candidate in addresses:
         try:
@@ -267,18 +307,18 @@ def dial_tcp(
             if error.kind == NetErrorKind.timeout():
                 raise error^
             last_error = error.copy()
-            had_error = True
             if deadline.expired():
                 raise _timeout_error("connect")
-    if had_error:
-        if _unsupported_family(last_error):
+    if last_error:
+        var final_error = last_error.value().copy()
+        if _unsupported_family(final_error):
             raise NetError(
                 NetErrorKind.unsupported(),
                 "dial tcp",
-                last_error.errno,
+                final_error.errno,
                 "address family is unsupported",
             )
-        raise last_error^
+        raise final_error^
     raise _invalid_tcp_address()
 
 
@@ -288,8 +328,7 @@ def listen_tcp(
     if backlog < 1 or backlog > Int(Int32.MAX):
         raise _invalid_backlog()
     var addresses = _listen_addresses(address)
-    var last_error = _invalid_tcp_address()
-    var had_error = False
+    var last_error: Optional[NetError] = None
 
     for candidate in addresses:
         try:
@@ -316,14 +355,14 @@ def listen_tcp(
             return TCPListener(fd^)
         except error:
             last_error = error.copy()
-            had_error = True
-    if had_error:
-        if _unsupported_family(last_error):
+    if last_error:
+        var final_error = last_error.value().copy()
+        if _unsupported_family(final_error):
             raise NetError(
                 NetErrorKind.unsupported(),
                 "listen tcp",
-                last_error.errno,
+                final_error.errno,
                 "address family is unsupported",
             )
-        raise last_error^
+        raise final_error^
     raise _invalid_tcp_address()
