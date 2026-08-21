@@ -27,6 +27,8 @@ comptime F_GETFL: Int32 = 3
 comptime F_SETFL: Int32 = 4
 comptime FD_CLOEXEC: Int32 = 1
 comptime O_NONBLOCK: Int32 = 0x4
+comptime AI_NUMERICSERV: Int32 = 0x1000
+comptime IF_NAMESIZE: Int = 16
 
 
 @fieldwise_init

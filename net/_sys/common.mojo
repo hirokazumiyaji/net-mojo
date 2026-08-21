@@ -80,6 +80,99 @@ comptime FD_CLOEXEC: Int32 = (
 comptime O_NONBLOCK: Int32 = (
     darwin.O_NONBLOCK if _DARWIN else linux.O_NONBLOCK
 )
+comptime AI_NUMERICSERV: Int32 = (
+    darwin.AI_NUMERICSERV if _DARWIN else linux.AI_NUMERICSERV
+)
+comptime IF_NAMESIZE: Int = (
+    darwin.IF_NAMESIZE if _DARWIN else linux.IF_NAMESIZE
+)
+
+
+struct _ResolverHints(Movable):
+    var _storage: Array[UInt64, 6]
+
+    def __init__(out self, socket_type: Int32):
+        _verify_abi_layouts()
+        self._storage = Array[UInt64, 6](fill=0)
+        var destination = Pointer(to=self).unsafe_bitcast[Byte]()
+        comptime if _DARWIN:
+            var hints = darwin._AddrInfo(
+                flags=AI_NUMERICSERV,
+                family=0,
+                socket_type=socket_type,
+                protocol=0,
+                address_length=0,
+                canonical_name=None,
+                address=None,
+                next=None,
+            )
+            var source = Pointer(to=hints).unsafe_bitcast[Byte]()
+            for i in range(48):
+                destination[unsafe_offset=i] = source[unsafe_offset=i]
+        else:
+            var hints = linux._AddrInfo(
+                flags=AI_NUMERICSERV,
+                family=0,
+                socket_type=socket_type,
+                protocol=0,
+                address_length=0,
+                address=None,
+                canonical_name=None,
+                next=None,
+            )
+            var source = Pointer(to=hints).unsafe_bitcast[Byte]()
+            for i in range(48):
+                destination[unsafe_offset=i] = source[unsafe_offset=i]
+
+    def unsafe_ptr(mut self) -> Pointer[Byte, origin_of(self)]:
+        return Pointer(to=self).unsafe_bitcast[Byte]()
+
+
+def _addrinfo_family(address: Pointer[Byte, MutUntrackedOrigin]) -> Int32:
+    comptime if _DARWIN:
+        return address.unsafe_bitcast[darwin._AddrInfo]()[].family
+    else:
+        return address.unsafe_bitcast[linux._AddrInfo]()[].family
+
+
+def _addrinfo_address_length(
+    address: Pointer[Byte, MutUntrackedOrigin],
+) -> UInt32:
+    comptime if _DARWIN:
+        return address.unsafe_bitcast[darwin._AddrInfo]()[].address_length
+    else:
+        return address.unsafe_bitcast[linux._AddrInfo]()[].address_length
+
+
+def _addrinfo_address(
+    address: Pointer[Byte, MutUntrackedOrigin],
+) -> Optional[Pointer[Byte, MutUntrackedOrigin]]:
+    comptime if _DARWIN:
+        return address.unsafe_bitcast[darwin._AddrInfo]()[].address
+    else:
+        return address.unsafe_bitcast[linux._AddrInfo]()[].address
+
+
+def _addrinfo_next(
+    address: Pointer[Byte, MutUntrackedOrigin],
+) -> Optional[Pointer[Byte, MutUntrackedOrigin]]:
+    comptime if _DARWIN:
+        return address.unsafe_bitcast[darwin._AddrInfo]()[].next
+    else:
+        return address.unsafe_bitcast[linux._AddrInfo]()[].next
+
+
+struct _RawSocketAddress(Movable):
+    var _storage: Array[UInt64, 16]
+    var length: UInt32
+
+    def __init__(out self):
+        _verify_abi_layouts()
+        self._storage = Array[UInt64, 16](fill=0)
+        self.length = 0
+
+    def unsafe_ptr(mut self) -> Pointer[Byte, origin_of(self)]:
+        return Pointer(to=self).unsafe_bitcast[Byte]()
 
 
 @fieldwise_init
@@ -96,6 +189,18 @@ def _verify_abi_layouts():
         _LINUX and CompilationTarget.is_x86() and is_64bit()
     ), "net supports only macOS arm64 and Linux x86_64"
     comptime assert size_of[_PollFD]() == 8, "invalid pollfd ABI"
+    comptime assert (
+        size_of[darwin._AddrInfo]() == 48
+    ), "invalid Darwin addrinfo ABI"
+    comptime assert (
+        size_of[linux._AddrInfo]() == 48
+    ), "invalid Linux addrinfo ABI"
+    comptime assert (
+        size_of[_ResolverHints]() == 48
+    ), "invalid resolver hints storage"
+    comptime assert (
+        size_of[_RawSocketAddress]() >= 128
+    ), "invalid raw socket address storage"
     comptime assert size_of[_SockaddrIn]() == 16, "invalid sockaddr_in ABI"
     comptime assert size_of[_SockaddrIn6]() == 28, "invalid sockaddr_in6 ABI"
     comptime if _DARWIN:
