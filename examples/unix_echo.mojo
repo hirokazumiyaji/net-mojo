@@ -1,9 +1,9 @@
-from std.ffi import c_int, external_call
+from std.ffi import c_int, external_call, get_errno
 from std.tempfile import gettempdir
 from std.testing import assert_equal
 from std.time import perf_counter_ns
 
-from net import Timeout, dial_unix, listen_unix
+from net import Timeout, UnixConn, dial_unix, listen_unix
 
 
 def _socket_path() raises -> String:
@@ -22,14 +22,37 @@ def _unlink(path: StringSlice):
     _ = external_call["unlink", c_int](c_path.unsafe_ptr())
 
 
+def _unlink_checked(path: StringSlice) raises:
+    var owned_path = String(path)
+    var c_path = owned_path.as_c_string_slice()
+    if external_call["unlink", c_int](c_path.unsafe_ptr()) != 0:
+        var error_number = get_errno().value
+        raise Error(
+            String(t"failed to remove Unix socket path (errno {error_number})")
+        )
+
+
 struct _PathCleanup(Movable):
     var path: String
+    var armed: Bool
 
-    def __init__(out self, path: StringSlice):
+    def __init__(out self):
+        self.path = String()
+        self.armed = False
+
+    def arm(mut self, path: StringSlice):
         self.path = String(path)
+        self.armed = True
+
+    def remove(mut self) raises:
+        if not self.armed:
+            raise Error("Unix socket path cleanup is not armed")
+        self.armed = False
+        _unlink_checked(self.path)
 
     def __deinit__(deinit self):
-        _unlink(self.path)
+        if self.armed:
+            _unlink(self.path)
 
 
 def _assert_payload[
@@ -43,11 +66,26 @@ def _assert_payload[
         assert_equal(received[i], expected[i])
 
 
+def _read_exact[
+    origin: MutOrigin
+](
+    connection: UnixConn,
+    buffer: Span[mut=True, Byte, origin],
+    timeout: Timeout,
+) raises:
+    var offset = 0
+    while offset < len(buffer):
+        var count = connection.read(buffer[offset:], timeout.copy())
+        if count == 0:
+            raise Error("Unix stream ended before the payload was complete")
+        offset += count
+
+
 def main() raises:
     var path = _socket_path()
-    _unlink(path)
-    var cleanup = _PathCleanup(path)
+    var cleanup = _PathCleanup()
     var listener = listen_unix(path)
+    cleanup.arm(path)
     var client = dial_unix(path, Timeout.seconds(1))
     var server = listener.accept(Timeout.seconds(1))
     var payload: Array[Byte, 9] = [
@@ -64,21 +102,16 @@ def main() raises:
 
     client.write_all(Span(payload), Timeout.seconds(1))
     var server_buffer = Array[Byte, 9](fill=0)
-    assert_equal(
-        server.read(Span(server_buffer), Timeout.seconds(1)), len(payload)
-    )
+    _read_exact(server, Span(server_buffer), Timeout.seconds(1))
     _assert_payload(Span(server_buffer), Span(payload))
 
     server.write_all(Span(server_buffer), Timeout.seconds(1))
     var client_buffer = Array[Byte, 9](fill=0)
-    assert_equal(
-        client.read(Span(client_buffer), Timeout.seconds(1)), len(payload)
-    )
+    _read_exact(client, Span(client_buffer), Timeout.seconds(1))
     _assert_payload(Span(client_buffer), Span(payload))
 
     client.close()
     server.close()
     listener.close()
-    _unlink(path)
-    _ = cleanup.path
+    cleanup.remove()
     print("Unix echo succeeded")
