@@ -14,7 +14,8 @@ from net.address import (
     _split_host_port,
 )
 from net.error import NetErrorKind
-from net._sys import SOCK_STREAM
+from net._sys import AF_INET, AF_INET6, SOCK_STREAM
+from net._sys.common import _RawSocketAddress
 
 
 def test_socket_address_parses_numeric_ipv4_and_formats_it() raises:
@@ -125,11 +126,134 @@ def test_raw_socket_addresses_round_trip() raises:
     _assert_raw_round_trip("[fe80::1%3]:9")
 
 
+def test_encoded_ipv4_sockaddr_has_platform_abi_bytes() raises:
+    var raw = _socket_address_to_raw(SocketAddress.parse("192.0.2.1:4660"))
+    var length = raw.length
+    var pointer = raw.unsafe_ptr()
+    assert_equal(length, UInt32(16))
+    comptime if CompilationTarget.is_macos():
+        assert_equal(pointer[unsafe_offset=0], Byte(16))
+        assert_equal(pointer[unsafe_offset=1], Byte(AF_INET))
+    else:
+        assert_equal(pointer[unsafe_offset=0], Byte(AF_INET))
+        assert_equal(pointer[unsafe_offset=1], Byte(0))
+    assert_equal(pointer[unsafe_offset=2], Byte(0x12))
+    assert_equal(pointer[unsafe_offset=3], Byte(0x34))
+    assert_equal(pointer[unsafe_offset=4], Byte(192))
+    assert_equal(pointer[unsafe_offset=5], Byte(0))
+    assert_equal(pointer[unsafe_offset=6], Byte(2))
+    assert_equal(pointer[unsafe_offset=7], Byte(1))
+    assert_equal(raw.length, length)
+
+
+def test_encoded_ipv6_sockaddr_has_platform_abi_bytes() raises:
+    var raw = _socket_address_to_raw(
+        SocketAddress.parse("[2001:db8::1%16909060]:43981")
+    )
+    var length = raw.length
+    var expected = IPAddress.parse("2001:db8::1")
+    var address_bytes = expected.as_bytes()
+    var pointer = raw.unsafe_ptr()
+    assert_equal(length, UInt32(28))
+    comptime if CompilationTarget.is_macos():
+        assert_equal(pointer[unsafe_offset=0], Byte(28))
+        assert_equal(pointer[unsafe_offset=1], Byte(AF_INET6))
+    else:
+        assert_equal(pointer[unsafe_offset=0], Byte(AF_INET6))
+        assert_equal(pointer[unsafe_offset=1], Byte(0))
+    assert_equal(pointer[unsafe_offset=2], Byte(0xAB))
+    assert_equal(pointer[unsafe_offset=3], Byte(0xCD))
+    for i in range(16):
+        assert_equal(pointer[unsafe_offset=8 + i], address_bytes[i])
+    assert_equal(pointer[unsafe_offset=24], Byte(0x04))
+    assert_equal(pointer[unsafe_offset=25], Byte(0x03))
+    assert_equal(pointer[unsafe_offset=26], Byte(0x02))
+    assert_equal(pointer[unsafe_offset=27], Byte(0x01))
+    assert_equal(raw.length, length)
+
+
+def _write_test_family(
+    mut raw: _RawSocketAddress, length: UInt32, family: Int32
+):
+    raw.length = length
+    var pointer = raw.unsafe_ptr()
+    comptime if CompilationTarget.is_macos():
+        pointer[unsafe_offset=0] = Byte(length)
+        pointer[unsafe_offset=1] = Byte(family)
+    else:
+        pointer[unsafe_offset=0] = Byte(UInt32(family) & 0xFF)
+        pointer[unsafe_offset=1] = Byte((UInt32(family) >> 8) & 0xFF)
+
+
+def test_handcrafted_sockaddr_bytes_decode() raises:
+    var ipv4 = _RawSocketAddress()
+    _write_test_family(ipv4, 16, AF_INET)
+    var ipv4_pointer = ipv4.unsafe_ptr()
+    ipv4_pointer[unsafe_offset=2] = 0x1F
+    ipv4_pointer[unsafe_offset=3] = 0x90
+    ipv4_pointer[unsafe_offset=4] = 203
+    ipv4_pointer[unsafe_offset=5] = 0
+    ipv4_pointer[unsafe_offset=6] = 113
+    ipv4_pointer[unsafe_offset=7] = 7
+    var decoded_ipv4 = _socket_address_from_raw(ipv4_pointer, 16)
+    assert_equal(decoded_ipv4, SocketAddress.parse("203.0.113.7:8080"))
+    assert_equal(ipv4.length, UInt32(16))
+
+    var ipv6 = _RawSocketAddress()
+    _write_test_family(ipv6, 28, AF_INET6)
+    var ipv6_pointer = ipv6.unsafe_ptr()
+    ipv6_pointer[unsafe_offset=2] = 0x01
+    ipv6_pointer[unsafe_offset=3] = 0xBB
+    var expected_ip = IPAddress.parse("2001:db8::1")
+    var expected_bytes = expected_ip.as_bytes()
+    for i in range(16):
+        ipv6_pointer[unsafe_offset=8 + i] = expected_bytes[i]
+    ipv6_pointer[unsafe_offset=24] = 0x04
+    ipv6_pointer[unsafe_offset=25] = 0x03
+    ipv6_pointer[unsafe_offset=26] = 0x02
+    ipv6_pointer[unsafe_offset=27] = 0x01
+    var decoded_ipv6 = _socket_address_from_raw(ipv6_pointer, 28)
+    assert_equal(
+        decoded_ipv6,
+        SocketAddress.parse("[2001:db8::1%16909060]:443"),
+    )
+    assert_equal(ipv6.length, UInt32(28))
+
+
 def test_raw_socket_address_rejects_invalid_length() raises:
     var raw = _socket_address_to_raw(SocketAddress.parse("127.0.0.1:0"))
     var pointer = raw.unsafe_ptr()
     with assert_raises():
         _ = _socket_address_from_raw(pointer, UInt32(15))
+
+
+def test_raw_socket_address_rejects_family_and_length_mismatch() raises:
+    var raw = _RawSocketAddress()
+    _write_test_family(raw, 28, AF_INET)
+    var pointer = raw.unsafe_ptr()
+    with assert_raises():
+        _ = _socket_address_from_raw(pointer, 28)
+    assert_equal(raw.length, UInt32(28))
+
+
+def test_raw_socket_address_rejects_unknown_family() raises:
+    var raw = _RawSocketAddress()
+    _write_test_family(raw, 16, 99)
+    var pointer = raw.unsafe_ptr()
+    with assert_raises():
+        _ = _socket_address_from_raw(pointer, 16)
+    assert_equal(raw.length, UInt32(16))
+
+
+def test_darwin_raw_socket_address_rejects_sa_len_mismatch() raises:
+    comptime if CompilationTarget.is_macos():
+        var raw = _socket_address_to_raw(SocketAddress.parse("127.0.0.1:80"))
+        var length = raw.length
+        var pointer = raw.unsafe_ptr()
+        pointer[unsafe_offset=0] = 28
+        with assert_raises():
+            _ = _socket_address_from_raw(pointer, length)
+        assert_equal(raw.length, length)
 
 
 def test_localhost_resolution_is_bounded_and_preserves_port() raises:
@@ -139,6 +263,21 @@ def test_localhost_resolution_is_bounded_and_preserves_port() raises:
     for address in addresses:
         assert_true(address.ip.is_ipv4() or address.ip.is_ipv6())
         assert_equal(address.port, UInt16(80))
+
+
+def _assert_invalid_resolution(value: StringSlice) raises:
+    try:
+        _ = resolve_socket_addresses(value, SOCK_STREAM)
+    except error:
+        assert_equal(error.kind, NetErrorKind.invalid_address())
+        return
+    raise Error("expected invalid socket address")
+
+
+def test_resolution_rejects_port_and_nul_before_ffi() raises:
+    _assert_invalid_resolution("localhost:65536")
+    _assert_invalid_resolution("local\0host:80")
+    _assert_invalid_resolution("localhost:8\0")
 
 
 def test_numeric_resolution_preserves_exact_value_without_lookup() raises:
