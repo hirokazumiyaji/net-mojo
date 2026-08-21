@@ -1,6 +1,8 @@
 from std.testing import assert_equal, assert_false, assert_true, TestSuite
 
 from net import Timeout, dial_udp, listen_udp
+from net._sys import IPPROTO_IPV6, IPV6_V6ONLY
+from net._sys.common import _get_socket_option_int
 from net.error import NetErrorKind
 
 
@@ -166,6 +168,7 @@ def test_dial_rejects_port_zero() raises:
 
 
 def test_ipv6_loopback_when_available() raises:
+    var v6only: Int
     var sent_count: Int
     var received_count: Int
     var was_truncated: Bool
@@ -174,6 +177,11 @@ def test_ipv6_loopback_when_available() raises:
     var second_byte: Byte
     try:
         var receiver = listen_udp("[::1]:0")
+        v6only = Int(
+            _get_socket_option_int(
+                receiver._fd.raw(), IPPROTO_IPV6, IPV6_V6ONLY
+            )
+        )
         var sender = listen_udp("[::1]:0")
         var payload: Array[Byte, 2] = [81, 82]
         sent_count = sender.send_to(Span(payload), receiver.local_address())
@@ -188,6 +196,7 @@ def test_ipv6_loopback_when_available() raises:
         if error.kind == NetErrorKind.unsupported():
             return
         raise error^
+    assert_equal(v6only, 1)
     assert_equal(sent_count, 2)
     assert_equal(received_count, 2)
     assert_false(was_truncated)
