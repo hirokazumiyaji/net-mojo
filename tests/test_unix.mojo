@@ -306,5 +306,20 @@ def test_unix_second_close_reports_closed() raises:
     raise Error("UnixListener second close unexpectedly succeeded")
 
 
+def test_zero_timeout_allows_immediate_unix_connect() raises:
+    var path = _unique_path("zero-timeout")
+    _unlink(path)
+    var cleanup = _PathCleanup(path)
+    var listener = listen_unix(path)
+    var client = dial_unix(path, Timeout.nanoseconds(0))
+    var server = listener.accept(Timeout.seconds(1))
+    assert_true(_exists(path))
+    client.close()
+    server.close()
+    listener.close()
+    _unlink(path)
+    _ = cleanup.path
+
+
 def main() raises:
     TestSuite.discover_tests[__functions_in_module()]().run()

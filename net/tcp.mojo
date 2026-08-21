@@ -13,6 +13,7 @@ from net._sys.common import (
     _CONNECT_RETRY,
     _accept_status,
     _bind,
+    _connect_attempt_allowed,
     _connect_disposition,
     _connect_status,
     _is_interrupted,
@@ -287,11 +288,13 @@ def dial_tcp(
     var addresses = resolve_socket_addresses(address, SOCK_STREAM)
     var deadline = _Deadline.from_optional(timeout)
     var last_error: Optional[NetError] = None
+    var has_attempted = False
 
     for candidate in addresses:
         while True:
-            if deadline.expired():
+            if not _connect_attempt_allowed(has_attempted, deadline):
                 raise _timeout_error("connect")
+            has_attempted = True
             try:
                 var domain = AF_INET6 if candidate.ip.is_ipv6() else AF_INET
                 var fd = _socket(domain, SOCK_STREAM, 0)

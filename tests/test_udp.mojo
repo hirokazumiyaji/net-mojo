@@ -167,6 +167,14 @@ def test_dial_rejects_port_zero() raises:
     raise Error("dial_udp accepted port zero")
 
 
+def test_zero_timeout_allows_immediate_udp_connect() raises:
+    var server = listen_udp("127.0.0.1:0")
+    var server_address = server.local_address()
+    var client = dial_udp(String(server_address), Timeout.nanoseconds(0))
+    assert_equal(client.remote_address(), server_address)
+    assert_true(server.local_address().port != 0)
+
+
 def test_ipv6_loopback_when_available() raises:
     var v6only: Int
     var sent_count: Int

@@ -375,6 +375,10 @@ def _connect_disposition(error_number: Int32) -> Int32:
     return _CONNECT_FAILED
 
 
+def _connect_attempt_allowed(has_attempted: Bool, deadline: _Deadline) -> Bool:
+    return not has_attempted or not deadline.expired()
+
+
 def _close(fd: Int32) raises NetError:
     _verify_abi_layouts()
     var result = external_call["close", c_int](c_int(fd))

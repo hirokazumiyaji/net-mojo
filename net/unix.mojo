@@ -7,6 +7,7 @@ from net._sys.common import (
     _CONNECT_RETRY,
     _accept_status,
     _bind,
+    _connect_attempt_allowed,
     _connect_disposition,
     _connect_status,
     _is_interrupted,
@@ -135,9 +136,11 @@ def dial_unix(
 ) raises NetError -> UnixConn:
     var address = UnixAddress.parse(path)
     var deadline = _Deadline.from_optional(timeout)
+    var has_attempted = False
     while True:
-        if deadline.expired():
+        if not _connect_attempt_allowed(has_attempted, deadline):
             raise _timeout_error("connect")
+        has_attempted = True
         var fd = _socket(AF_UNIX, SOCK_STREAM, 0)
         var raw = _unix_address_to_raw(address.path)
         var status = _connect_status(fd.raw(), raw)

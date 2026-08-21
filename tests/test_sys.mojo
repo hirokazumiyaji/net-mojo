@@ -33,6 +33,7 @@ from net._sys.common import (
     _CONNECT_RETRY,
     _CONNECT_SUCCEEDED,
     _accept_status,
+    _connect_attempt_allowed,
     _connect_disposition,
     _recv_from_status,
     _recv_status,
@@ -157,6 +158,12 @@ def test_connect_disposition_keeps_interruption_distinct_from_pending() raises:
     assert_equal(_connect_disposition(EINPROGRESS), _CONNECT_PENDING)
     assert_equal(_connect_disposition(EINTR), _CONNECT_RETRY)
     assert_equal(_connect_disposition(1), _CONNECT_FAILED)
+
+
+def test_connect_attempt_allows_only_the_first_expired_attempt() raises:
+    var deadline = _Deadline.from_timeout(Timeout.nanoseconds(0))
+    assert_true(_connect_attempt_allowed(False, deadline))
+    assert_false(_connect_attempt_allowed(True, deadline))
 
 
 def test_nonblocking_recv_returns_errno_status_without_throwing() raises:
