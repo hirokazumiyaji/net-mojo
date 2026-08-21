@@ -2,9 +2,15 @@ from net._sys.common import (
     AF_UNIX,
     SOCK_STREAM,
     _OwnedFD,
-    _accept,
+    _CONNECT_FAILED,
+    _CONNECT_PENDING,
+    _CONNECT_RETRY,
+    _accept_status,
     _bind,
-    _connect,
+    _connect_disposition,
+    _connect_status,
+    _is_interrupted,
+    _is_would_block,
     _listen,
     _socket,
     _socket_error,
@@ -18,10 +24,8 @@ from net._sys.common import (
 from .error import NetError, NetErrorKind
 from .tcp import (
     _SocketWriteStep,
-    _interrupted,
     _read_with_deadline,
     _timeout_error,
-    _would_block,
     _write_all_loop,
     _write_with_deadline,
 )
@@ -94,16 +98,22 @@ struct UnixListener(Movable):
         var deadline = _Deadline.from_optional(timeout)
         var fd = self._fd.raw()
         while True:
-            try:
-                var accepted = _accept(fd)
-                return UnixConn(accepted^)
-            except error:
-                if _interrupted(error):
-                    if deadline.expired():
-                        raise _timeout_error("accept")
-                    continue
-                if not _would_block(error):
-                    raise error^
+            var status = _accept_status(fd)
+            if status.invalid_state:
+                raise NetError(
+                    NetErrorKind.invalid_state(),
+                    "accept",
+                    None,
+                    "accepted descriptor configuration failed",
+                )
+            if status.error_number == 0:
+                return UnixConn(status.take_fd())
+            if _is_interrupted(status.error_number):
+                if deadline.expired():
+                    raise _timeout_error("accept")
+                continue
+            if not _is_would_block(status.error_number):
+                raise _system_error("accept", status.error_number)
             if not _wait_readable(fd, deadline):
                 raise _timeout_error("accept")
 
@@ -125,15 +135,24 @@ def dial_unix(
 ) raises NetError -> UnixConn:
     var address = UnixAddress.parse(path)
     var deadline = _Deadline.from_optional(timeout)
-    var fd = _socket(AF_UNIX, SOCK_STREAM, 0)
-    var raw = _unix_address_to_raw(address.path)
-    if not _connect(fd.raw(), raw):
-        if not _wait_writable(fd.raw(), deadline):
+    while True:
+        if deadline.expired():
             raise _timeout_error("connect")
-        var error_number = _socket_error(fd.raw())
-        if error_number != 0:
-            raise _system_error("connect", error_number)
-    return UnixConn(fd^)
+        var fd = _socket(AF_UNIX, SOCK_STREAM, 0)
+        var raw = _unix_address_to_raw(address.path)
+        var status = _connect_status(fd.raw(), raw)
+        var disposition = _connect_disposition(status.error_number)
+        if disposition == _CONNECT_RETRY:
+            continue
+        if disposition == _CONNECT_FAILED:
+            raise _system_error("connect", status.error_number)
+        if disposition == _CONNECT_PENDING:
+            if not _wait_writable(fd.raw(), deadline):
+                raise _timeout_error("connect")
+            var error_number = _socket_error(fd.raw())
+            if error_number != 0:
+                raise _system_error("connect", error_number)
+        return UnixConn(fd^)
 
 
 def listen_unix(

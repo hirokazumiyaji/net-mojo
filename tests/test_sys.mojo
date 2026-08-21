@@ -8,10 +8,15 @@ from std.testing import (
 )
 
 from net.error import NetErrorKind
+from net import listen_tcp, listen_udp
 from net.timeout import Timeout, _Deadline
 from net._sys import (
     AF_INET,
     AF_UNIX,
+    EAGAIN,
+    EINPROGRESS,
+    EINTR,
+    EWOULDBLOCK,
     FD_CLOEXEC,
     F_GETFD,
     SOCK_STREAM,
@@ -21,6 +26,17 @@ from net._sys import (
     _socket,
     _wait_readable,
     _wait_writable,
+)
+from net._sys.common import (
+    _CONNECT_FAILED,
+    _CONNECT_PENDING,
+    _CONNECT_RETRY,
+    _CONNECT_SUCCEEDED,
+    _accept_status,
+    _connect_disposition,
+    _recv_from_status,
+    _recv_status,
+    _set_nonblocking_cloexec,
 )
 
 
@@ -48,7 +64,10 @@ def _test_socket_pair() raises -> _TestSocketPair:
     )
     if result != 0:
         raise Error("socketpair failed")
-    return _TestSocketPair(first=_OwnedFD(raw[0]), second=_OwnedFD(raw[1]))
+    var pair = _TestSocketPair(first=_OwnedFD(raw[0]), second=_OwnedFD(raw[1]))
+    _set_nonblocking_cloexec(pair.first.raw())
+    _set_nonblocking_cloexec(pair.second.raw())
+    return pair^
 
 
 def test_descriptor_lifecycle_and_readiness() raises:
@@ -131,6 +150,45 @@ def test_poll_timeout_uses_remaining_deadline() raises:
     assert_false(_wait_readable(pair.first.raw(), deadline))
     assert_true(deadline.remaining_milliseconds() <= 1)
     assert_true(pair.second.is_valid())
+
+
+def test_connect_disposition_keeps_interruption_distinct_from_pending() raises:
+    assert_equal(_connect_disposition(0), _CONNECT_SUCCEEDED)
+    assert_equal(_connect_disposition(EINPROGRESS), _CONNECT_PENDING)
+    assert_equal(_connect_disposition(EINTR), _CONNECT_RETRY)
+    assert_equal(_connect_disposition(1), _CONNECT_FAILED)
+
+
+def test_nonblocking_recv_returns_errno_status_without_throwing() raises:
+    var pair = _test_socket_pair()
+    var buffer = Array[Byte, 1](fill=0)
+    var status = _recv_status(pair.first.raw(), Span(buffer))
+    assert_true(pair.first.is_valid())
+    assert_equal(status.value, -1)
+    assert_true(
+        status.error_number == EAGAIN or status.error_number == EWOULDBLOCK
+    )
+
+
+def test_nonblocking_accept_returns_errno_status_without_throwing() raises:
+    var listener = listen_tcp("127.0.0.1:0")
+    var status = _accept_status(listener._fd.raw())
+    assert_true(listener._fd.is_valid())
+    assert_false(status.fd.is_valid())
+    assert_true(
+        status.error_number == EAGAIN or status.error_number == EWOULDBLOCK
+    )
+
+
+def test_nonblocking_recvmsg_returns_errno_status_without_throwing() raises:
+    var socket = listen_udp("127.0.0.1:0")
+    var buffer = Array[Byte, 1](fill=0)
+    var status = _recv_from_status(socket._fd.raw(), Span(buffer))
+    assert_true(socket._fd.is_valid())
+    assert_equal(status.count, -1)
+    assert_true(
+        status.error_number == EAGAIN or status.error_number == EWOULDBLOCK
+    )
 
 
 def main() raises:

@@ -2,21 +2,24 @@ from net._sys.common import (
     AF_INET,
     AF_INET6,
     EAFNOSUPPORT,
-    EAGAIN,
-    EINTR,
-    EWOULDBLOCK,
     IPPROTO_IPV6,
     IPV6_V6ONLY,
     SOCK_STREAM,
     SOL_SOCKET,
     SO_REUSEADDR,
     _OwnedFD,
-    _accept,
+    _CONNECT_FAILED,
+    _CONNECT_PENDING,
+    _CONNECT_RETRY,
+    _accept_status,
     _bind,
-    _connect,
+    _connect_disposition,
+    _connect_status,
+    _is_interrupted,
+    _is_would_block,
     _listen,
-    _recv,
-    _send,
+    _recv_status,
+    _send_status,
     _set_socket_option_int,
     _shutdown,
     _socket,
@@ -63,17 +66,6 @@ def _invalid_backlog() -> NetError:
     )
 
 
-def _would_block(error: NetError) -> Bool:
-    if not error.errno:
-        return False
-    var error_number = Int32(error.errno.value())
-    return error_number == EAGAIN or error_number == EWOULDBLOCK
-
-
-def _interrupted(error: NetError) -> Bool:
-    return error.errno and Int32(error.errno.value()) == EINTR
-
-
 def _unsupported_family(error: NetError) -> Bool:
     return error.errno and Int32(error.errno.value()) == EAFNOSUPPORT
 
@@ -88,15 +80,15 @@ def _read_with_deadline[
     if len(buffer) == 0:
         return 0
     while True:
-        try:
-            return _recv(fd, buffer)
-        except error:
-            if _interrupted(error):
-                if deadline.expired():
-                    raise _timeout_error("read")
-                continue
-            if not _would_block(error):
-                raise error^
+        var status = _recv_status(fd, buffer)
+        if status.error_number == 0:
+            return status.value
+        if _is_interrupted(status.error_number):
+            if deadline.expired():
+                raise _timeout_error("read")
+            continue
+        if not _is_would_block(status.error_number):
+            raise _system_error("recv", status.error_number)
         if not _wait_readable(fd, deadline):
             raise _timeout_error("read")
 
@@ -109,23 +101,22 @@ def _write_with_deadline[
     if len(buffer) == 0:
         return 0
     while True:
-        try:
-            var written = _send(fd, buffer)
-            if written == 0:
+        var status = _send_status(fd, buffer)
+        if status.error_number == 0:
+            if status.value == 0:
                 raise NetError(
                     NetErrorKind.invalid_state(),
                     "write",
                     None,
                     "non-empty write made no progress",
                 )
-            return written
-        except error:
-            if _interrupted(error):
-                if deadline.expired():
-                    raise _timeout_error("write")
-                continue
-            if not _would_block(error):
-                raise error^
+            return status.value
+        if _is_interrupted(status.error_number):
+            if deadline.expired():
+                raise _timeout_error("write")
+            continue
+        if not _is_would_block(status.error_number):
+            raise _system_error("send", status.error_number)
         if not _wait_writable(fd, deadline):
             raise _timeout_error("write")
 
@@ -243,16 +234,22 @@ struct TCPListener(Movable):
         var deadline = _Deadline.from_optional(timeout)
         var fd = self._fd.raw()
         while True:
-            try:
-                var accepted = _accept(fd)
-                return TCPConn(accepted^)
-            except error:
-                if _interrupted(error):
-                    if deadline.expired():
-                        raise _timeout_error("accept")
-                    continue
-                if not _would_block(error):
-                    raise error^
+            var status = _accept_status(fd)
+            if status.invalid_state:
+                raise NetError(
+                    NetErrorKind.invalid_state(),
+                    "accept",
+                    None,
+                    "accepted descriptor configuration failed",
+                )
+            if status.error_number == 0:
+                return TCPConn(status.take_fd())
+            if _is_interrupted(status.error_number):
+                if deadline.expired():
+                    raise _timeout_error("accept")
+                continue
+            if not _is_would_block(status.error_number):
+                raise _system_error("accept", status.error_number)
             if not _wait_readable(fd, deadline):
                 raise _timeout_error("accept")
 
@@ -292,23 +289,33 @@ def dial_tcp(
     var last_error: Optional[NetError] = None
 
     for candidate in addresses:
-        try:
-            var domain = AF_INET6 if candidate.ip.is_ipv6() else AF_INET
-            var fd = _socket(domain, SOCK_STREAM, 0)
-            var raw = _socket_address_to_raw(candidate)
-            if not _connect(fd.raw(), raw):
-                if not _wait_writable(fd.raw(), deadline):
-                    raise _timeout_error("connect")
-                var error_number = _socket_error(fd.raw())
-                if error_number != 0:
-                    raise _system_error("connect", error_number)
-            return TCPConn(fd^)
-        except error:
-            if error.kind == NetErrorKind.timeout():
-                raise error^
-            last_error = error.copy()
+        while True:
             if deadline.expired():
                 raise _timeout_error("connect")
+            try:
+                var domain = AF_INET6 if candidate.ip.is_ipv6() else AF_INET
+                var fd = _socket(domain, SOCK_STREAM, 0)
+                var raw = _socket_address_to_raw(candidate)
+                var status = _connect_status(fd.raw(), raw)
+                var disposition = _connect_disposition(status.error_number)
+                if disposition == _CONNECT_RETRY:
+                    continue
+                if disposition == _CONNECT_FAILED:
+                    raise _system_error("connect", status.error_number)
+                if disposition == _CONNECT_PENDING:
+                    if not _wait_writable(fd.raw(), deadline):
+                        raise _timeout_error("connect")
+                    var error_number = _socket_error(fd.raw())
+                    if error_number != 0:
+                        raise _system_error("connect", error_number)
+                return TCPConn(fd^)
+            except error:
+                if error.kind == NetErrorKind.timeout():
+                    raise error^
+                last_error = error.copy()
+                if deadline.expired():
+                    raise _timeout_error("connect")
+                break
     if last_error:
         var final_error = last_error.value().copy()
         if _unsupported_family(final_error):

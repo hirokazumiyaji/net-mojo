@@ -251,6 +251,53 @@ struct _RawDatagramReceive(Movable):
 
 
 @fieldwise_init
+struct _SyscallStatus(Copyable, Movable):
+    var value: Int
+    var error_number: Int32
+
+
+struct _RawDatagramReceiveStatus(Movable):
+    var count: Int
+    var source: _RawSocketAddress
+    var truncated: Bool
+    var error_number: Int32
+    var address_too_large: Bool
+
+    def __init__(
+        out self,
+        count: Int,
+        var source: _RawSocketAddress,
+        truncated: Bool,
+        error_number: Int32,
+        address_too_large: Bool = False,
+    ):
+        self.count = count
+        self.source = source^
+        self.truncated = truncated
+        self.error_number = error_number
+        self.address_too_large = address_too_large
+
+
+struct _AcceptStatus(Movable):
+    var fd: _OwnedFD
+    var error_number: Int32
+    var invalid_state: Bool
+
+    def __init__(
+        out self,
+        var fd: _OwnedFD,
+        error_number: Int32,
+        invalid_state: Bool = False,
+    ):
+        self.fd = fd^
+        self.error_number = error_number
+        self.invalid_state = invalid_state
+
+    def take_fd(mut self) -> _OwnedFD:
+        return _OwnedFD(self.fd._take())
+
+
+@fieldwise_init
 struct _PollFD:
     var fd: Int32
     var events: Int16
@@ -302,6 +349,30 @@ def _system_error(operation: String, error_number: Int32) -> NetError:
 
 def _last_errno() -> Int32:
     return get_errno().value
+
+
+def _is_interrupted(error_number: Int32) -> Bool:
+    return error_number == EINTR
+
+
+def _is_would_block(error_number: Int32) -> Bool:
+    return error_number == EAGAIN or error_number == EWOULDBLOCK
+
+
+comptime _CONNECT_SUCCEEDED: Int32 = 0
+comptime _CONNECT_PENDING: Int32 = 1
+comptime _CONNECT_RETRY: Int32 = 2
+comptime _CONNECT_FAILED: Int32 = 3
+
+
+def _connect_disposition(error_number: Int32) -> Int32:
+    if error_number == 0:
+        return _CONNECT_SUCCEEDED
+    if error_number == EINPROGRESS:
+        return _CONNECT_PENDING
+    if error_number == EINTR:
+        return _CONNECT_RETRY
+    return _CONNECT_FAILED
 
 
 def _close(fd: Int32) raises NetError:
@@ -357,56 +428,40 @@ def _fcntl[*types: Intable](fd: c_int, command: c_int, *args: *types) -> c_int:
     )
 
 
-def _fcntl_get(
-    fd: Int32, command: Int32, operation: String
-) raises NetError -> Int32:
-    var result = _fcntl(c_int(fd), c_int(command), c_int(0))
-    if result == -1:
-        var error_number = _last_errno()
-        raise _system_error(operation, error_number)
-    return result
-
-
-def _fcntl_set(
-    fd: Int32, command: Int32, value: Int32, operation: String
-) raises NetError:
-    var result = _fcntl(c_int(fd), c_int(command), c_int(value))
-    if result == -1:
-        var error_number = _last_errno()
-        raise _system_error(operation, error_number)
-
-
-def _set_nonblocking_cloexec(fd: Int32) raises NetError:
-    var status = _fcntl_get(fd, F_GETFL, "fcntl(F_GETFL)")
+def _nonblocking_cloexec_status(fd: Int32) -> _SyscallStatus:
+    var status = _fcntl(c_int(fd), c_int(F_GETFL), c_int(0))
+    if status == -1:
+        return _SyscallStatus(value=-1, error_number=_last_errno())
     if (status & O_NONBLOCK) == 0:
-        _fcntl_set(fd, F_SETFL, status | O_NONBLOCK, "fcntl(F_SETFL)")
-        status = _fcntl_get(fd, F_GETFL, "fcntl(F_GETFL)")
-        if (status & O_NONBLOCK) == 0:
-            raise NetError(
-                NetErrorKind.invalid_state(),
-                "fcntl(F_SETFL)",
-                None,
-                "descriptor is blocking",
-            )
-    var descriptor = _fcntl_get(fd, F_GETFD, "fcntl(F_GETFD)")
-    if (descriptor & FD_CLOEXEC) == 0:
-        _fcntl_set(
-            fd,
-            F_SETFD,
-            descriptor | FD_CLOEXEC,
-            "fcntl(F_SETFD)",
+        var set_status = _fcntl(
+            c_int(fd), c_int(F_SETFL), c_int(status | O_NONBLOCK)
         )
-        descriptor = _fcntl_get(fd, F_GETFD, "fcntl(F_GETFD)")
+        if set_status == -1:
+            return _SyscallStatus(value=-1, error_number=_last_errno())
+        status = _fcntl(c_int(fd), c_int(F_GETFL), c_int(0))
+        if status == -1:
+            return _SyscallStatus(value=-1, error_number=_last_errno())
+        if (status & O_NONBLOCK) == 0:
+            return _SyscallStatus(value=-2, error_number=0)
+
+    var descriptor = _fcntl(c_int(fd), c_int(F_GETFD), c_int(0))
+    if descriptor == -1:
+        return _SyscallStatus(value=-1, error_number=_last_errno())
+    if (descriptor & FD_CLOEXEC) == 0:
+        var set_descriptor = _fcntl(
+            c_int(fd), c_int(F_SETFD), c_int(descriptor | FD_CLOEXEC)
+        )
+        if set_descriptor == -1:
+            return _SyscallStatus(value=-1, error_number=_last_errno())
+        descriptor = _fcntl(c_int(fd), c_int(F_GETFD), c_int(0))
+        if descriptor == -1:
+            return _SyscallStatus(value=-1, error_number=_last_errno())
         if (descriptor & FD_CLOEXEC) == 0:
-            raise NetError(
-                NetErrorKind.invalid_state(),
-                "fcntl(F_SETFD)",
-                None,
-                "close-on-exec is not set",
-            )
+            return _SyscallStatus(value=-2, error_number=0)
+    return _SyscallStatus(value=0, error_number=0)
 
 
-def _set_no_sigpipe(fd: Int32) raises NetError:
+def _no_sigpipe_status(fd: Int32) -> _SyscallStatus:
     comptime if _DARWIN:
         var enabled: Int32 = 1
         var result = external_call["setsockopt", c_int](
@@ -417,8 +472,27 @@ def _set_no_sigpipe(fd: Int32) raises NetError:
             c_uint(size_of[Int32]()),
         )
         if result == -1:
-            var error_number = _last_errno()
-            raise _system_error("setsockopt(SO_NOSIGPIPE)", error_number)
+            return _SyscallStatus(value=-1, error_number=_last_errno())
+    return _SyscallStatus(value=0, error_number=0)
+
+
+def _set_nonblocking_cloexec(fd: Int32) raises NetError:
+    var status = _nonblocking_cloexec_status(fd)
+    if status.value == -2:
+        raise NetError(
+            NetErrorKind.invalid_state(),
+            "fcntl",
+            None,
+            "descriptor configuration failed",
+        )
+    if status.error_number != 0:
+        raise _system_error("fcntl", status.error_number)
+
+
+def _set_no_sigpipe(fd: Int32) raises NetError:
+    var status = _no_sigpipe_status(fd)
+    if status.error_number != 0:
+        raise _system_error("setsockopt(SO_NOSIGPIPE)", status.error_number)
 
 
 def _socket(
@@ -442,7 +516,19 @@ def _socket(
     return result^
 
 
-def _accept(fd: Int32, stream: Bool = True) raises NetError -> _OwnedFD:
+def _accepted_fd_configuration_status(
+    fd: Int32, stream: Bool
+) -> _SyscallStatus:
+    var status = _nonblocking_cloexec_status(fd)
+    if status.value != 0:
+        return status^
+    comptime if _DARWIN:
+        if stream:
+            return _no_sigpipe_status(fd)
+    return status^
+
+
+def _accept_status(fd: Int32, stream: Bool = True) -> _AcceptStatus:
     _verify_abi_layouts()
     var raw: Int32
     comptime if _LINUX:
@@ -460,31 +546,58 @@ def _accept(fd: Int32, stream: Bool = True) raises NetError -> _OwnedFD:
         )
     if raw == -1:
         var error_number = _last_errno()
-        raise _system_error("accept", error_number)
+        return _AcceptStatus(_OwnedFD(-1), error_number)
     var result = _OwnedFD(raw)
     comptime if _DARWIN:
-        _set_nonblocking_cloexec(result.raw())
-        if stream:
-            _set_no_sigpipe(result.raw())
-    return result^
+        var configuration = _accepted_fd_configuration_status(raw, stream)
+        if configuration.value != 0:
+            return _AcceptStatus(
+                result^,
+                configuration.error_number,
+                invalid_state=configuration.value == -2,
+            )
+    return _AcceptStatus(result^, 0)
 
 
-def _recv[
+def _accept(fd: Int32, stream: Bool = True) raises NetError -> _OwnedFD:
+    var status = _accept_status(fd, stream)
+    if status.invalid_state:
+        raise NetError(
+            NetErrorKind.invalid_state(),
+            "accept",
+            None,
+            "accepted descriptor configuration failed",
+        )
+    if status.error_number != 0:
+        raise _system_error("accept", status.error_number)
+    return status.take_fd()
+
+
+def _recv_status[
     origin: MutOrigin
-](fd: Int32, buffer: Span[mut=True, Byte, origin]) raises NetError -> Int:
+](fd: Int32, buffer: Span[mut=True, Byte, origin]) -> _SyscallStatus:
     _verify_abi_layouts()
     var result = external_call["recv", c_ssize_t](
         c_int(fd), buffer.unsafe_ptr(), c_size_t(len(buffer)), c_int(0)
     )
     if result == -1:
         var error_number = _last_errno()
-        raise _system_error("recv", error_number)
-    return Int(result)
+        return _SyscallStatus(value=-1, error_number=error_number)
+    return _SyscallStatus(value=Int(result), error_number=0)
 
 
-def _send[
+def _recv[
+    origin: MutOrigin
+](fd: Int32, buffer: Span[mut=True, Byte, origin]) raises NetError -> Int:
+    var status = _recv_status(fd, buffer)
+    if status.error_number != 0:
+        raise _system_error("recv", status.error_number)
+    return status.value
+
+
+def _send_status[
     origin: ImmOrigin
-](fd: Int32, buffer: Span[Byte, origin]) raises NetError -> Int:
+](fd: Int32, buffer: Span[Byte, origin]) -> _SyscallStatus:
     _verify_abi_layouts()
     var flags: Int32 = 0
     comptime if _LINUX:
@@ -497,17 +610,26 @@ def _send[
     )
     if result == -1:
         var error_number = _last_errno()
-        raise _system_error("send", error_number)
-    return Int(result)
+        return _SyscallStatus(value=-1, error_number=error_number)
+    return _SyscallStatus(value=Int(result), error_number=0)
 
 
-def _send_to[
+def _send[
+    origin: ImmOrigin
+](fd: Int32, buffer: Span[Byte, origin]) raises NetError -> Int:
+    var status = _send_status(fd, buffer)
+    if status.error_number != 0:
+        raise _system_error("send", status.error_number)
+    return status.value
+
+
+def _send_to_status[
     origin: ImmOrigin
 ](
     fd: Int32,
     buffer: Span[Byte, origin],
     mut address: _RawSocketAddress,
-) raises NetError -> Int:
+) -> _SyscallStatus:
     _verify_abi_layouts()
     var flags: Int32 = 0
     comptime if _LINUX:
@@ -522,15 +644,26 @@ def _send_to[
     )
     if result == -1:
         var error_number = _last_errno()
-        raise _system_error("sendto", error_number)
-    return Int(result)
+        return _SyscallStatus(value=-1, error_number=error_number)
+    return _SyscallStatus(value=Int(result), error_number=0)
 
 
-def _recv_from[
-    origin: MutOrigin
+def _send_to[
+    origin: ImmOrigin
 ](
-    fd: Int32, buffer: Span[mut=True, Byte, origin]
-) raises NetError -> _RawDatagramReceive:
+    fd: Int32,
+    buffer: Span[Byte, origin],
+    mut address: _RawSocketAddress,
+) raises NetError -> Int:
+    var status = _send_to_status(fd, buffer, address)
+    if status.error_number != 0:
+        raise _system_error("sendto", status.error_number)
+    return status.value
+
+
+def _recv_from_status[
+    origin: MutOrigin
+](fd: Int32, buffer: Span[mut=True, Byte, origin]) -> _RawDatagramReceiveStatus:
     _verify_abi_layouts()
     var source = _RawSocketAddress()
     var source_pointer = Pointer[Byte, MutUntrackedOrigin](
@@ -562,11 +695,18 @@ def _recv_from[
         var result = external_call["recvmsg", c_ssize_t](
             c_int(fd), Pointer(to=message), c_int(0)
         )
+        var error_number: Int32 = 0
+        if result == -1:
+            error_number = _last_errno()
         # The ABI erases origins, so keep the iovec storage live through recvmsg.
         _ = vector.length
         if result == -1:
-            var error_number = _last_errno()
-            raise _system_error("recvmsg", error_number)
+            return _RawDatagramReceiveStatus(
+                count=-1,
+                source=source^,
+                truncated=False,
+                error_number=error_number,
+            )
         received = Int(result)
         source_length = message.name_length
         message_flags = message.flags
@@ -587,28 +727,59 @@ def _recv_from[
         var result = external_call["recvmsg", c_ssize_t](
             c_int(fd), Pointer(to=message), c_int(0)
         )
+        var error_number: Int32 = 0
+        if result == -1:
+            error_number = _last_errno()
         # The ABI erases origins, so keep the iovec storage live through recvmsg.
         _ = vector.length
         if result == -1:
-            var error_number = _last_errno()
-            raise _system_error("recvmsg", error_number)
+            return _RawDatagramReceiveStatus(
+                count=-1,
+                source=source^,
+                truncated=False,
+                error_number=error_number,
+            )
         received = Int(result)
         source_length = message.name_length
         message_flags = message.flags
 
     if source_length > 128:
+        return _RawDatagramReceiveStatus(
+            count=-1,
+            source=source^,
+            truncated=False,
+            error_number=0,
+            address_too_large=True,
+        )
+    source.length = source_length
+    var count = received if received <= len(buffer) else len(buffer)
+    return _RawDatagramReceiveStatus(
+        count=count,
+        source=source^,
+        truncated=(message_flags & MSG_TRUNC) != 0,
+        error_number=0,
+    )
+
+
+def _recv_from[
+    origin: MutOrigin
+](
+    fd: Int32, buffer: Span[mut=True, Byte, origin]
+) raises NetError -> _RawDatagramReceive:
+    var status = _recv_from_status(fd, buffer)
+    if status.error_number != 0:
+        raise _system_error("recvmsg", status.error_number)
+    if status.address_too_large:
         raise NetError(
             NetErrorKind.invalid_state(),
             "recvmsg",
             None,
             "socket address is too large",
         )
-    source.length = source_length
-    var count = received if received <= len(buffer) else len(buffer)
     return _RawDatagramReceive(
-        count=count,
-        source=source^,
-        truncated=(message_flags & MSG_TRUNC) != 0,
+        count=status.count,
+        source=status.source^,
+        truncated=status.truncated,
     )
 
 
@@ -677,17 +848,27 @@ def _listen(fd: Int32, backlog: Int32) raises NetError:
         raise _system_error("listen", error_number)
 
 
-def _connect(fd: Int32, mut address: _RawSocketAddress) raises NetError -> Bool:
+def _connect_status(
+    fd: Int32, mut address: _RawSocketAddress
+) -> _SyscallStatus:
     _verify_abi_layouts()
     var result = external_call["connect", c_int](
         c_int(fd), address.unsafe_ptr(), c_uint(address.length)
     )
     if result == 0:
-        return True
+        return _SyscallStatus(value=0, error_number=0)
     var error_number = _last_errno()
-    if error_number == EINPROGRESS or error_number == EINTR:
+    return _SyscallStatus(value=-1, error_number=error_number)
+
+
+def _connect(fd: Int32, mut address: _RawSocketAddress) raises NetError -> Bool:
+    var status = _connect_status(fd, address)
+    var disposition = _connect_disposition(status.error_number)
+    if disposition == _CONNECT_SUCCEEDED:
+        return True
+    if disposition == _CONNECT_PENDING:
         return False
-    raise _system_error("connect", error_number)
+    raise _system_error("connect", status.error_number)
 
 
 def _socket_error(fd: Int32) raises NetError -> Int32:
