@@ -1,0 +1,52 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: Test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+          - macos-14
+          - ubuntu-24.04
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      - name: Install pixi
+        uses: prefix-dev/setup-pixi@f00437f565399d418b0acc85936d12c1fb668347
+        with:
+          frozen: true
+      - name: Format Mojo sources
+        run: pixi run mojo format net tests examples benchmarks
+      - name: Verify formatting
+        run: git diff --exit-code
+      - name: Test core
+        run: pixi run mojo run --Werror -I . tests/test_core.mojo
+      - name: Test IP addresses
+        run: pixi run mojo run --Werror -I . tests/test_ip.mojo
+      - name: Test socket addresses
+        run: pixi run mojo run --Werror -I . tests/test_address.mojo
+      - name: Test system bindings
+        run: pixi run mojo run --Werror -I . tests/test_sys.mojo
+      - name: Test TCP
+        run: pixi run mojo run --Werror -I . tests/test_tcp.mojo
+      - name: Test UDP
+        run: pixi run mojo run --Werror -I . tests/test_udp.mojo
+      - name: Test Unix sockets
+        run: pixi run mojo run --Werror -I . tests/test_unix.mojo
+      - name: Sanitize system bindings
+        run: pixi run mojo run --sanitize address -I . tests/test_sys.mojo
+      - name: Sanitize TCP
+        run: pixi run mojo run --sanitize address -I . tests/test_tcp.mojo
+      - name: Sanitize UDP
+        run: pixi run mojo run --sanitize address -I . tests/test_udp.mojo
+      - name: Sanitize Unix sockets
+        run: pixi run mojo run --sanitize address -I . tests/test_unix.mojo
