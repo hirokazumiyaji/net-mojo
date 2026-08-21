@@ -44,6 +44,7 @@ comptime SOL_SOCKET: Int32 = (
     darwin.SOL_SOCKET if _DARWIN else linux.SOL_SOCKET
 )
 comptime SO_ERROR: Int32 = darwin.SO_ERROR if _DARWIN else linux.SO_ERROR
+comptime SO_REUSEADDR: Int32 = 0x0004 if _DARWIN else 2
 comptime SO_NOSIGPIPE: Int32 = (
     darwin.SO_NOSIGPIPE if _DARWIN else linux.SO_NOSIGPIPE
 )
@@ -63,6 +64,7 @@ comptime EAGAIN: Int32 = darwin.EAGAIN if _DARWIN else linux.EAGAIN
 comptime EWOULDBLOCK: Int32 = (
     darwin.EWOULDBLOCK if _DARWIN else linux.EWOULDBLOCK
 )
+comptime EAFNOSUPPORT: Int32 = 47 if _DARWIN else 97
 comptime EINPROGRESS: Int32 = (
     darwin.EINPROGRESS if _DARWIN else linux.EINPROGRESS
 )
@@ -423,6 +425,139 @@ def _send[
         var error_number = _last_errno()
         raise _system_error("send", error_number)
     return Int(result)
+
+
+def _set_socket_option_int(
+    fd: Int32,
+    level: Int32,
+    option: Int32,
+    value: Int32,
+    operation: String,
+) raises NetError:
+    _verify_abi_layouts()
+    var stored_value = value
+    var result = external_call["setsockopt", c_int](
+        c_int(fd),
+        c_int(level),
+        c_int(option),
+        Pointer(to=stored_value),
+        c_uint(size_of[Int32]()),
+    )
+    if result == -1:
+        var error_number = _last_errno()
+        raise _system_error(operation, error_number)
+
+
+def _get_socket_option_int(
+    fd: Int32, level: Int32, option: Int32
+) raises NetError -> Int32:
+    _verify_abi_layouts()
+    var value: Int32 = 0
+    var length = UInt32(size_of[Int32]())
+    var result = external_call["getsockopt", c_int](
+        c_int(fd),
+        c_int(level),
+        c_int(option),
+        Pointer(to=value),
+        Pointer(to=length),
+    )
+    if result == -1:
+        var error_number = _last_errno()
+        raise _system_error("getsockopt", error_number)
+    if length != UInt32(size_of[Int32]()):
+        raise NetError(
+            NetErrorKind.invalid_state(),
+            "getsockopt",
+            None,
+            "invalid socket option length",
+        )
+    return value
+
+
+def _bind(fd: Int32, mut address: _RawSocketAddress) raises NetError:
+    _verify_abi_layouts()
+    var result = external_call["bind", c_int](
+        c_int(fd), address.unsafe_ptr(), c_uint(address.length)
+    )
+    if result == -1:
+        var error_number = _last_errno()
+        raise _system_error("bind", error_number)
+
+
+def _listen(fd: Int32, backlog: Int32) raises NetError:
+    _verify_abi_layouts()
+    var result = external_call["listen", c_int](c_int(fd), c_int(backlog))
+    if result == -1:
+        var error_number = _last_errno()
+        raise _system_error("listen", error_number)
+
+
+def _connect(fd: Int32, mut address: _RawSocketAddress) raises NetError -> Bool:
+    _verify_abi_layouts()
+    var result = external_call["connect", c_int](
+        c_int(fd), address.unsafe_ptr(), c_uint(address.length)
+    )
+    if result == 0:
+        return True
+    var error_number = _last_errno()
+    if error_number == EINPROGRESS or error_number == EINTR:
+        return False
+    raise _system_error("connect", error_number)
+
+
+def _socket_error(fd: Int32) raises NetError -> Int32:
+    return _get_socket_option_int(fd, SOL_SOCKET, SO_ERROR)
+
+
+def _socket_name(fd: Int32, peer: Bool) raises NetError -> _RawSocketAddress:
+    _verify_abi_layouts()
+    var address = _RawSocketAddress()
+    var length = UInt32(128)
+    var result: Int32
+    if peer:
+        result = external_call["getpeername", c_int](
+            c_int(fd), address.unsafe_ptr(), Pointer(to=length)
+        )
+    else:
+        result = external_call["getsockname", c_int](
+            c_int(fd), address.unsafe_ptr(), Pointer(to=length)
+        )
+    if result == -1:
+        var error_number = _last_errno()
+        raise _system_error(
+            "getpeername" if peer else "getsockname", error_number
+        )
+    if length > 128:
+        raise NetError(
+            NetErrorKind.invalid_state(),
+            "getpeername" if peer else "getsockname",
+            None,
+            "socket address is too large",
+        )
+    address.length = length
+    return address^
+
+
+def _shutdown(fd: Int32, read_side: Bool, write_side: Bool) raises NetError:
+    _verify_abi_layouts()
+    if not read_side and not write_side:
+        raise NetError(
+            NetErrorKind.invalid_argument(),
+            "shutdown",
+            None,
+            "no shutdown direction selected",
+        )
+    var direction: Int32
+    if read_side and write_side:
+        direction = 2
+    elif read_side:
+        direction = 0
+    else:
+        direction = 1
+    var result = external_call["shutdown", c_int](c_int(fd), c_int(direction))
+    if result == -1:
+        var error_number = _last_errno()
+        raise _system_error("shutdown", error_number)
 
 
 def _wait(
