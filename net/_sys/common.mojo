@@ -92,6 +92,7 @@ comptime AI_NUMERICSERV: Int32 = (
 comptime IF_NAMESIZE: Int = (
     darwin.IF_NAMESIZE if _DARWIN else linux.IF_NAMESIZE
 )
+comptime UNIX_PATH_MAX: Int = 103 if _DARWIN else 107
 
 
 struct _ResolverHints(Movable):
@@ -179,6 +180,58 @@ struct _RawSocketAddress(Movable):
 
     def unsafe_ptr(mut self) -> Pointer[Byte, origin_of(self)]:
         return Pointer(to=self).unsafe_bitcast[Byte]()
+
+
+def _invalid_unix_path() -> NetError:
+    return NetError(
+        NetErrorKind.invalid_address(),
+        "unix address",
+        None,
+        "invalid Unix socket path",
+    )
+
+
+def _validate_unix_path(value: StringSlice) raises NetError:
+    _verify_abi_layouts()
+    var bytes = value.as_bytes()
+    if len(bytes) == 0 or len(bytes) > UNIX_PATH_MAX:
+        raise _invalid_unix_path()
+    for byte in bytes:
+        if byte == 0:
+            raise _invalid_unix_path()
+
+
+def _unix_address_to_raw(
+    value: StringSlice,
+) raises NetError -> _RawSocketAddress:
+    _validate_unix_path(value)
+    var input = value.as_bytes()
+    var length = 2 + len(input) + 1
+    var raw = _RawSocketAddress()
+
+    comptime if _DARWIN:
+        var path = Array[Byte, 104](fill=0)
+        for i in range(len(input)):
+            path[i] = input[i]
+        var address = darwin._SockaddrUn(
+            length=UInt8(length), family=UInt8(AF_UNIX), path=path^
+        )
+        var source = Pointer(to=address).unsafe_bitcast[Byte]()
+        var destination = raw.unsafe_ptr()
+        for i in range(length):
+            destination[unsafe_offset=i] = source[unsafe_offset=i]
+    else:
+        var path = Array[Byte, 108](fill=0)
+        for i in range(len(input)):
+            path[i] = input[i]
+        var address = linux._SockaddrUn(family=UInt16(AF_UNIX), path=path^)
+        var source = Pointer(to=address).unsafe_bitcast[Byte]()
+        var destination = raw.unsafe_ptr()
+        for i in range(length):
+            destination[unsafe_offset=i] = source[unsafe_offset=i]
+
+    raw.length = UInt32(length)
+    return raw^
 
 
 struct _RawDatagramReceive(Movable):

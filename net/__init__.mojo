@@ -9,3 +9,4 @@ from .address import (
 )
 from .tcp import TCPConn, TCPListener, dial_tcp, listen_tcp
 from .udp import UDPConn, UDPReceiveResult, dial_udp, listen_udp
+from .unix import UnixAddress, UnixConn, UnixListener, dial_unix, listen_unix
