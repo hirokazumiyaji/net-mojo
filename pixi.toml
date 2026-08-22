@@ -1,0 +1,32 @@
+[workspace]
+channels = ["https://conda.modular.com/max", "conda-forge"]
+name = "net-mojo"
+platforms = ["osx-arm64", "linux-64"]
+version = "0.1.0"
+
+[tasks]
+format = "mojo format net tests examples benchmarks"
+test-core = "mojo run --Werror -I . tests/test_core.mojo"
+test-ip = "mojo run --Werror -I . tests/test_ip.mojo"
+test-address = "mojo run --Werror -I . tests/test_address.mojo"
+test-sys = "mojo run --Werror -I . tests/test_sys.mojo"
+test-tcp = "mojo run --Werror -I . tests/test_tcp.mojo"
+test-udp = "mojo run --Werror -I . tests/test_udp.mojo"
+test-unix = "mojo run --Werror -I . tests/test_unix.mojo"
+test = { depends-on = [
+  "test-core",
+  "test-ip",
+  "test-address",
+  "test-sys",
+  "test-tcp",
+  "test-udp",
+  "test-unix",
+] }
+example-tcp = "mojo run --Werror -I . examples/tcp_echo.mojo"
+example-udp = "mojo run --Werror -I . examples/udp_echo.mojo"
+example-unix = "mojo run --Werror -I . examples/unix_echo.mojo"
+benchmark-ip = "mojo run --Werror -I . benchmarks/ip_parse.mojo"
+benchmark-loopback = "mojo run --Werror -I . benchmarks/loopback_io.mojo"
+
+[dependencies]
+mojo = ">=1.0.0,<2"
