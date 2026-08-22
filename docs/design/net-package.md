@@ -2,7 +2,7 @@
 
 This document records the design rationale behind the `net` package: the goals it
 serves, the constraints it accepts, and the reasons behind each significant
-decision. It complements the usage-oriented [README](../../README.md).
+decision. Usage instructions are out of scope here.
 
 ## Goals
 
