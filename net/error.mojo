@@ -35,7 +35,24 @@ struct NetErrorKind(Copyable, Equatable, Hashable, Writable):
         return Self(value=7)
 
     def write_to[W: Writer](self, mut writer: W):
-        writer.write(self.value)
+        if self == Self.invalid_address():
+            writer.write("invalid_address")
+        elif self == Self.invalid_argument():
+            writer.write("invalid_argument")
+        elif self == Self.resolution_failed():
+            writer.write("resolution_failed")
+        elif self == Self.system_error():
+            writer.write("system_error")
+        elif self == Self.timeout():
+            writer.write("timeout")
+        elif self == Self.closed():
+            writer.write("closed")
+        elif self == Self.invalid_state():
+            writer.write("invalid_state")
+        elif self == Self.unsupported():
+            writer.write("unsupported")
+        else:
+            writer.write("unknown")
 
 
 struct NetError(Copyable, Movable, Writable):

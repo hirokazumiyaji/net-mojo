@@ -66,7 +66,7 @@ pixi run mojo run --Werror -I . examples/udp_echo.mojo
 pixi run mojo run --Werror -I . examples/unix_echo.mojo
 ```
 
-Run focused tests with `pixi run mojo run --Werror -I . tests/test_tcp.mojo` and the analogous `test_core`, `test_ip`, `test_address`, `test_sys`, `test_udp`, and `test_unix` files.
+Run the whole test suite with `pixi run test`, or a focused module with `pixi run test-tcp` and the analogous `test-core`, `test-ip`, `test-address`, `test-sys`, `test-udp`, and `test-unix` tasks.
 Run benchmarks with `pixi run mojo run --Werror -I . benchmarks/ip_parse.mojo` and `benchmarks/loopback_io.mojo`.
 Benchmarks report measurements and do not define pass or fail thresholds.
 
@@ -89,7 +89,7 @@ runtime 依存は Mojo の `std` と文書化した libc/POSIX ABI だけです�
 Windows、32-bit ABI、表にない target は対象外です。
 
 環境は `pixi install --frozen` で構築します。
-各 test は `pixi run mojo run --Werror -I . tests/test_tcp.mojo` のように実行します。
+test は全体を `pixi run test`、個別を `pixi run test-tcp` のように実行します。
 examples は loopback だけを使い、benchmarks は閾値を持たない測定プログラムです。
 
 hostname は OS の同期 `getaddrinfo` で解決されます。

@@ -246,35 +246,7 @@ def _parse_numeric_socket_address(
     value: StringSlice,
 ) raises NetError -> SocketAddress:
     var host, port = split_host_port(value)
-    var input = host.as_bytes()
-    var address_text = String("")
-    var scope_id = UInt32(0)
-    var scope_separator = -1
-
-    for i in range(len(input)):
-        var byte = input[i]
-        if byte == Byte(ord("%")):
-            if scope_separator >= 0:
-                raise _invalid_socket_address()
-            scope_separator = i
-        elif scope_separator < 0:
-            address_text += host[byte=i]
-        else:
-            if byte < Byte(ord("0")) or byte > Byte(ord("9")):
-                raise _invalid_socket_address()
-            var digit = UInt32(byte - Byte(ord("0")))
-            if scope_id > (UInt32.MAX - digit) // 10:
-                raise _invalid_socket_address()
-            scope_id = scope_id * 10 + digit
-
-    if scope_separator < 0:
-        address_text = host^
-    elif (
-        scope_separator == 0
-        or scope_separator == len(input) - 1
-        or scope_id == 0
-    ):
-        raise _invalid_socket_address()
+    var address_text, scope_id = _split_host_zone(host)
 
     var ip = IPAddress.parse(address_text)
     var original = value.as_bytes()
@@ -283,7 +255,7 @@ def _parse_numeric_socket_address(
             raise _invalid_socket_address()
     elif ip.is_ipv6():
         raise _invalid_socket_address()
-    if scope_separator >= 0 and not ip.is_ipv6():
+    if scope_id != 0 and not ip.is_ipv6():
         raise _invalid_socket_address()
     return SocketAddress(ip=ip.copy(), port=port, scope_id=scope_id)
 
@@ -345,7 +317,7 @@ def _format_zone(scope_id: UInt32) -> String:
     return String(from_utf8_lossy=bytes[0:length])
 
 
-def _split_resolution_zone(
+def _split_host_zone(
     host: StringSlice,
 ) raises NetError -> Tuple[String, UInt32]:
     var input = host.as_bytes()
@@ -390,7 +362,7 @@ def resolve_socket_addresses(
     value: StringSlice, socket_type: Int32
 ) raises NetError -> List[SocketAddress]:
     var host, port = split_host_port(value)
-    var address_text, scope_id = _split_resolution_zone(host)
+    var address_text, scope_id = _split_host_zone(host)
 
     try:
         var ip = IPAddress.parse(address_text)

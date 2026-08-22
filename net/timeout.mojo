@@ -53,6 +53,11 @@ struct _Deadline(Copyable):
             return Self.from_timeout(timeout.value())
         return Self(_expires_at=None)
 
+    def is_indefinite(self) -> Bool:
+        if self._expires_at:
+            return False
+        return True
+
     def expired(self) -> Bool:
         if self._expires_at:
             return perf_counter_ns() >= self._expires_at.value()

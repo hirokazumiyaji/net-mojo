@@ -63,7 +63,7 @@ def test_socket_address_rejects_invalid_dial_host_port_grammar() raises:
     with assert_raises():
         _ = SocketAddress.parse(":0")
     with assert_raises():
-        _ = SocketAddress.parse("[fe80::1%loopback]:443")
+        _ = SocketAddress.parse("[fe80::1%net-mojo-no-such-interface]:443")
     with assert_raises():
         _ = SocketAddress.parse("[fe80::1%0]:443")
     with assert_raises():
@@ -316,6 +316,16 @@ def test_interface_zone_lookup_and_reverse_formatting() raises:
         ip=IPAddress.parse("fe80::1"), port=9, scope_id=scope_id
     )
     assert_equal(String(address), String(t"[fe80::1%{loopback}]:9"))
+
+
+def test_socket_address_parses_named_interface_zones() raises:
+    var loopback = _platform_loopback_name()
+    var scope_id = _resolve_zone(loopback)
+    var address = SocketAddress.parse(String(t"[fe80::1%{loopback}]:443"))
+    assert_equal(address.scope_id, scope_id)
+    assert_equal(address.ip, IPAddress.parse("fe80::1"))
+    assert_equal(address.port, UInt16(443))
+    assert_equal(SocketAddress.parse(String(address)), address)
 
 
 def test_interface_zone_rejects_unknown_and_nul_names() raises:

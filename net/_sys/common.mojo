@@ -938,10 +938,12 @@ def _wait(
     while True:
         if deadline.expired():
             return False
-        var remaining = deadline.remaining_milliseconds()
-        var timeout = Int32.MAX
-        if remaining < Int(Int32.MAX):
-            timeout = Int32(remaining)
+        var timeout = Int32(-1)
+        if not deadline.is_indefinite():
+            var remaining = deadline.remaining_milliseconds()
+            timeout = Int32.MAX
+            if remaining < Int(Int32.MAX):
+                timeout = Int32(remaining)
         var result: Int32
         comptime if _DARWIN:
             result = external_call["poll", c_int](
