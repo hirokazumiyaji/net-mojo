@@ -1,8 +1,11 @@
 from std.testing import assert_equal, assert_false, assert_true, TestSuite
 
 from net import Timeout, dial_udp, listen_udp
-from net._sys import IPPROTO_IPV6, IPV6_V6ONLY
-from net._sys.common import _get_socket_option_int
+from net._sys.common import (
+    IPPROTO_IPV6,
+    IPV6_V6ONLY,
+    _get_socket_option_int,
+)
 from net.error import NetErrorKind
 
 

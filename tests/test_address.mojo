@@ -14,8 +14,12 @@ from net.address import (
     _split_host_port,
 )
 from net.error import NetErrorKind
-from net._sys import AF_INET, AF_INET6, SOCK_STREAM
-from net._sys.common import _RawSocketAddress
+from net._sys.common import (
+    AF_INET,
+    AF_INET6,
+    SOCK_STREAM,
+    _RawSocketAddress,
+)
 
 
 def test_socket_address_parses_numeric_ipv4_and_formats_it() raises:

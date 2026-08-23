@@ -10,7 +10,7 @@ from std.testing import (
 from net.error import NetErrorKind
 from net import listen_tcp, listen_udp
 from net.timeout import Timeout, _Deadline
-from net._sys import (
+from net._sys.common import (
     AF_INET,
     AF_UNIX,
     EAGAIN,
@@ -20,24 +20,22 @@ from net._sys import (
     FD_CLOEXEC,
     F_GETFD,
     SOCK_STREAM,
-    _OwnedFD,
-    _recv,
-    _send,
-    _socket,
-    _wait_readable,
-    _wait_writable,
-)
-from net._sys.common import (
     _CONNECT_FAILED,
     _CONNECT_PENDING,
     _CONNECT_RETRY,
     _CONNECT_SUCCEEDED,
+    _OwnedFD,
     _accept_status,
     _connect_attempt_allowed,
     _connect_disposition,
     _recv_from_status,
     _recv_status,
+    _recv,
+    _send,
     _set_nonblocking_cloexec,
+    _socket,
+    _wait_readable,
+    _wait_writable,
 )
 
 
