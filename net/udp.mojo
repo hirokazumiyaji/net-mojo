@@ -16,8 +16,6 @@ from net._sys.common import (
     _is_interrupted,
     _is_would_block,
     _recv_from_status,
-    _recv_status,
-    _send_status,
     _send_to_status,
     _set_socket_option_int,
     _socket,
@@ -27,6 +25,7 @@ from net._sys.common import (
     _wait_readable,
     _wait_writable,
 )
+from ._stream import _read_with_deadline, _timeout_error, _write_with_deadline
 from .address import (
     SocketAddress,
     _socket_address_from_raw,
@@ -45,12 +44,6 @@ struct UDPReceiveResult(Copyable, Movable, Writable):
     var count: Int
     var source: SocketAddress
     var truncated: Bool
-
-
-def _udp_timeout(operation: String) -> NetError:
-    return NetError(
-        NetErrorKind.timeout(), operation, None, "operation timed out"
-    )
 
 
 def _invalid_udp_address() -> NetError:
@@ -75,53 +68,6 @@ def _udp_unsupported_family(error: NetError) -> Bool:
     return error.errno and Int32(error.errno.value()) == EAFNOSUPPORT
 
 
-def _udp_read[
-    origin: MutOrigin
-](
-    fd: Int32,
-    buffer: Span[mut=True, Byte, origin],
-    deadline: _Deadline,
-) raises NetError -> Int:
-    while True:
-        var status = _recv_status(fd, buffer)
-        if status.error_number == 0:
-            return status.value
-        if _is_interrupted(status.error_number):
-            if deadline.expired():
-                raise _udp_timeout("read")
-            continue
-        if not _is_would_block(status.error_number):
-            raise _system_error("recv", status.error_number)
-        if not _wait_readable(fd, deadline):
-            raise _udp_timeout("read")
-
-
-def _udp_write[
-    origin: ImmOrigin
-](
-    fd: Int32, buffer: Span[Byte, origin], deadline: _Deadline
-) raises NetError -> Int:
-    while True:
-        var status = _send_status(fd, buffer)
-        if status.error_number == 0:
-            if status.value != len(buffer):
-                raise NetError(
-                    NetErrorKind.invalid_state(),
-                    "write",
-                    None,
-                    "datagram write was partial",
-                )
-            return status.value
-        if _is_interrupted(status.error_number):
-            if deadline.expired():
-                raise _udp_timeout("write")
-            continue
-        if not _is_would_block(status.error_number):
-            raise _system_error("send", status.error_number)
-        if not _wait_writable(fd, deadline):
-            raise _udp_timeout("write")
-
-
 struct UDPConn(Movable):
     var _fd: _OwnedFD
     var _connected: Bool
@@ -140,7 +86,7 @@ struct UDPConn(Movable):
         if not self._connected:
             raise _invalid_udp_mode("read")
         var deadline = _Deadline.from_optional(timeout)
-        return _udp_read(self._fd.raw(), buffer, deadline)
+        return _read_with_deadline(self._fd.raw(), buffer, deadline)
 
     def write[
         origin: ImmOrigin
@@ -152,7 +98,15 @@ struct UDPConn(Movable):
         if not self._connected:
             raise _invalid_udp_mode("write")
         var deadline = _Deadline.from_optional(timeout)
-        return _udp_write(self._fd.raw(), buffer, deadline)
+        var written = _write_with_deadline(self._fd.raw(), buffer, deadline)
+        if written != len(buffer):
+            raise NetError(
+                NetErrorKind.invalid_state(),
+                "write",
+                None,
+                "datagram write was partial",
+            )
+        return written
 
     def recv_from[
         origin: MutOrigin
@@ -186,12 +140,12 @@ struct UDPConn(Movable):
                 )
             if _is_interrupted(received.error_number):
                 if deadline.expired():
-                    raise _udp_timeout("recv_from")
+                    raise _timeout_error("recv_from")
                 continue
             if not _is_would_block(received.error_number):
                 raise _system_error("recvmsg", received.error_number)
             if not _wait_readable(fd, deadline):
-                raise _udp_timeout("recv_from")
+                raise _timeout_error("recv_from")
 
     def send_to[
         origin: ImmOrigin
@@ -219,12 +173,12 @@ struct UDPConn(Movable):
                 return status.value
             if _is_interrupted(status.error_number):
                 if deadline.expired():
-                    raise _udp_timeout("send_to")
+                    raise _timeout_error("send_to")
                 continue
             if not _is_would_block(status.error_number):
                 raise _system_error("sendto", status.error_number)
             if not _wait_writable(fd, deadline):
-                raise _udp_timeout("send_to")
+                raise _timeout_error("send_to")
 
     def local_address(self) raises NetError -> SocketAddress:
         var raw = _socket_name(self._fd.raw(), False)
@@ -272,7 +226,7 @@ def dial_udp(
     for candidate in addresses:
         while True:
             if not _connect_attempt_allowed(has_attempted, deadline):
-                raise _udp_timeout("connect")
+                raise _timeout_error("connect")
             has_attempted = True
             try:
                 var domain = AF_INET6 if candidate.ip.is_ipv6() else AF_INET
@@ -286,7 +240,7 @@ def dial_udp(
                     raise _system_error("connect", status.error_number)
                 if disposition == _CONNECT_PENDING:
                     if not _wait_writable(fd.raw(), deadline):
-                        raise _udp_timeout("connect")
+                        raise _timeout_error("connect")
                     var error_number = _socket_error(fd.raw())
                     if error_number != 0:
                         raise _system_error("connect", error_number)
@@ -296,7 +250,7 @@ def dial_udp(
                     raise error^
                 last_error = error.copy()
                 if deadline.expired():
-                    raise _udp_timeout("connect")
+                    raise _timeout_error("connect")
                 break
     if last_error:
         var final_error = last_error.value().copy()

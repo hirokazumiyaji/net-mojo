@@ -7,7 +7,7 @@ from net._sys.common import (
     IPV6_V6ONLY,
     _get_socket_option_int,
 )
-from net.tcp import _WriteAllStep, _write_all_loop
+from net._stream import _WriteAllStep, _write_all_loop
 from net.timeout import _Deadline
 
 

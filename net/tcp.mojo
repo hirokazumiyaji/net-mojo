@@ -11,24 +11,26 @@ from net._sys.common import (
     _CONNECT_FAILED,
     _CONNECT_PENDING,
     _CONNECT_RETRY,
-    _accept_status,
     _bind,
     _connect_attempt_allowed,
     _connect_disposition,
     _connect_status,
-    _is_interrupted,
-    _is_would_block,
     _listen,
-    _recv_status,
-    _send_status,
     _set_socket_option_int,
     _shutdown,
     _socket,
     _socket_error,
     _socket_name,
     _system_error,
-    _wait_readable,
     _wait_writable,
+)
+from ._stream import (
+    _SocketWriteStep,
+    _accept_stream,
+    _read_with_deadline,
+    _timeout_error,
+    _write_all_loop,
+    _write_with_deadline,
 )
 from .address import (
     SocketAddress,
@@ -41,12 +43,6 @@ from .address import (
 from .error import NetError, NetErrorKind
 from .ip import IPAddress
 from .timeout import Timeout, _Deadline
-
-
-def _timeout_error(operation: String) -> NetError:
-    return NetError(
-        NetErrorKind.timeout(), operation, None, "operation timed out"
-    )
 
 
 def _invalid_tcp_address() -> NetError:
@@ -69,99 +65,6 @@ def _invalid_backlog() -> NetError:
 
 def _unsupported_family(error: NetError) -> Bool:
     return error.errno and Int32(error.errno.value()) == EAFNOSUPPORT
-
-
-def _read_with_deadline[
-    origin: MutOrigin
-](
-    fd: Int32,
-    buffer: Span[mut=True, Byte, origin],
-    deadline: _Deadline,
-) raises NetError -> Int:
-    if len(buffer) == 0:
-        return 0
-    while True:
-        var status = _recv_status(fd, buffer)
-        if status.error_number == 0:
-            return status.value
-        if _is_interrupted(status.error_number):
-            if deadline.expired():
-                raise _timeout_error("read")
-            continue
-        if not _is_would_block(status.error_number):
-            raise _system_error("recv", status.error_number)
-        if not _wait_readable(fd, deadline):
-            raise _timeout_error("read")
-
-
-def _write_with_deadline[
-    origin: ImmOrigin
-](
-    fd: Int32, buffer: Span[Byte, origin], deadline: _Deadline
-) raises NetError -> Int:
-    if len(buffer) == 0:
-        return 0
-    while True:
-        var status = _send_status(fd, buffer)
-        if status.error_number == 0:
-            if status.value == 0:
-                raise NetError(
-                    NetErrorKind.invalid_state(),
-                    "write",
-                    None,
-                    "non-empty write made no progress",
-                )
-            return status.value
-        if _is_interrupted(status.error_number):
-            if deadline.expired():
-                raise _timeout_error("write")
-            continue
-        if not _is_would_block(status.error_number):
-            raise _system_error("send", status.error_number)
-        if not _wait_writable(fd, deadline):
-            raise _timeout_error("write")
-
-
-trait _WriteAllStep:
-    def write(
-        mut self, offset: Int, remaining: Int, deadline: _Deadline
-    ) raises NetError -> Int:
-        ...
-
-
-struct _SocketWriteStep[origin: ImmOrigin](Movable, _WriteAllStep):
-    var fd: Int32
-    var buffer: Span[Byte, Self.origin]
-
-    def __init__(out self, fd: Int32, buffer: Span[Byte, Self.origin]):
-        self.fd = fd
-        self.buffer = buffer
-
-    def write(
-        mut self, offset: Int, remaining: Int, deadline: _Deadline
-    ) raises NetError -> Int:
-        return _write_with_deadline(
-            self.fd,
-            self.buffer[offset : offset + remaining],
-            deadline,
-        )
-
-
-def _write_all_loop[
-    WriteStep: _WriteAllStep
-](length: Int, deadline: _Deadline, mut write_step: WriteStep) raises NetError:
-    var offset = 0
-    while offset < length:
-        var remaining = length - offset
-        var written = write_step.write(offset, remaining, deadline)
-        if written <= 0 or written > remaining:
-            raise NetError(
-                NetErrorKind.invalid_state(),
-                "write",
-                None,
-                "write reported invalid progress",
-            )
-        offset += written
 
 
 struct TCPConn(Movable):
@@ -233,26 +136,7 @@ struct TCPListener(Movable):
         self, timeout: Optional[Timeout] = None
     ) raises NetError -> TCPConn:
         var deadline = _Deadline.from_optional(timeout)
-        var fd = self._fd.raw()
-        while True:
-            var status = _accept_status(fd)
-            if status.invalid_state:
-                raise NetError(
-                    NetErrorKind.invalid_state(),
-                    "accept",
-                    None,
-                    "accepted descriptor configuration failed",
-                )
-            if status.error_number == 0:
-                return TCPConn(status.take_fd())
-            if _is_interrupted(status.error_number):
-                if deadline.expired():
-                    raise _timeout_error("accept")
-                continue
-            if not _is_would_block(status.error_number):
-                raise _system_error("accept", status.error_number)
-            if not _wait_readable(fd, deadline):
-                raise _timeout_error("accept")
+        return TCPConn(_accept_stream(self._fd.raw(), deadline))
 
     def local_address(self) raises NetError -> SocketAddress:
         var raw = _socket_name(self._fd.raw(), False)
