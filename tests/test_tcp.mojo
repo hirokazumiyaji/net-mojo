@@ -2,8 +2,11 @@ from std.testing import assert_equal, assert_true, TestSuite
 
 from net import Timeout, dial_tcp, listen_tcp
 from net.error import NetError, NetErrorKind
-from net._sys import IPPROTO_IPV6, IPV6_V6ONLY
-from net._sys.common import _get_socket_option_int
+from net._sys.common import (
+    IPPROTO_IPV6,
+    IPV6_V6ONLY,
+    _get_socket_option_int,
+)
 from net.tcp import _WriteAllStep, _write_all_loop
 from net.timeout import _Deadline
 

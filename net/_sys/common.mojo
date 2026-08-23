@@ -234,22 +234,6 @@ def _unix_address_to_raw(
     return raw^
 
 
-struct _RawDatagramReceive(Movable):
-    var count: Int
-    var source: _RawSocketAddress
-    var truncated: Bool
-
-    def __init__(
-        out self,
-        count: Int,
-        var source: _RawSocketAddress,
-        truncated: Bool,
-    ):
-        self.count = count
-        self.source = source^
-        self.truncated = truncated
-
-
 @fieldwise_init
 struct _SyscallStatus(Copyable, Movable):
     var value: Int
@@ -563,20 +547,6 @@ def _accept_status(fd: Int32, stream: Bool = True) -> _AcceptStatus:
     return _AcceptStatus(result^, 0)
 
 
-def _accept(fd: Int32, stream: Bool = True) raises NetError -> _OwnedFD:
-    var status = _accept_status(fd, stream)
-    if status.invalid_state:
-        raise NetError(
-            NetErrorKind.invalid_state(),
-            "accept",
-            None,
-            "accepted descriptor configuration failed",
-        )
-    if status.error_number != 0:
-        raise _system_error("accept", status.error_number)
-    return status.take_fd()
-
-
 def _recv_status[
     origin: MutOrigin
 ](fd: Int32, buffer: Span[mut=True, Byte, origin]) -> _SyscallStatus:
@@ -650,19 +620,6 @@ def _send_to_status[
         var error_number = _last_errno()
         return _SyscallStatus(value=-1, error_number=error_number)
     return _SyscallStatus(value=Int(result), error_number=0)
-
-
-def _send_to[
-    origin: ImmOrigin
-](
-    fd: Int32,
-    buffer: Span[Byte, origin],
-    mut address: _RawSocketAddress,
-) raises NetError -> Int:
-    var status = _send_to_status(fd, buffer, address)
-    if status.error_number != 0:
-        raise _system_error("sendto", status.error_number)
-    return status.value
 
 
 def _recv_from_status[
@@ -765,28 +722,6 @@ def _recv_from_status[
     )
 
 
-def _recv_from[
-    origin: MutOrigin
-](
-    fd: Int32, buffer: Span[mut=True, Byte, origin]
-) raises NetError -> _RawDatagramReceive:
-    var status = _recv_from_status(fd, buffer)
-    if status.error_number != 0:
-        raise _system_error("recvmsg", status.error_number)
-    if status.address_too_large:
-        raise NetError(
-            NetErrorKind.invalid_state(),
-            "recvmsg",
-            None,
-            "socket address is too large",
-        )
-    return _RawDatagramReceive(
-        count=status.count,
-        source=status.source^,
-        truncated=status.truncated,
-    )
-
-
 def _set_socket_option_int(
     fd: Int32,
     level: Int32,
@@ -863,16 +798,6 @@ def _connect_status(
         return _SyscallStatus(value=0, error_number=0)
     var error_number = _last_errno()
     return _SyscallStatus(value=-1, error_number=error_number)
-
-
-def _connect(fd: Int32, mut address: _RawSocketAddress) raises NetError -> Bool:
-    var status = _connect_status(fd, address)
-    var disposition = _connect_disposition(status.error_number)
-    if disposition == _CONNECT_SUCCEEDED:
-        return True
-    if disposition == _CONNECT_PENDING:
-        return False
-    raise _system_error("connect", status.error_number)
 
 
 def _socket_error(fd: Int32) raises NetError -> Int32:
