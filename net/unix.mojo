@@ -5,31 +5,28 @@ from net._sys.common import (
     _CONNECT_FAILED,
     _CONNECT_PENDING,
     _CONNECT_RETRY,
-    _accept_status,
     _bind,
     _connect_attempt_allowed,
     _connect_disposition,
     _connect_status,
-    _is_interrupted,
-    _is_would_block,
     _listen,
     _socket,
     _socket_error,
     _system_error,
     _unix_address_to_raw,
     _validate_unix_path,
-    _wait_readable,
     _wait_writable,
 )
 
-from .error import NetError, NetErrorKind
-from .tcp import (
+from ._stream import (
     _SocketWriteStep,
+    _accept_stream,
     _read_with_deadline,
     _timeout_error,
     _write_all_loop,
     _write_with_deadline,
 )
+from .error import NetError, NetErrorKind
 from .timeout import Timeout, _Deadline
 
 
@@ -97,26 +94,7 @@ struct UnixListener(Movable):
         self, timeout: Optional[Timeout] = None
     ) raises NetError -> UnixConn:
         var deadline = _Deadline.from_optional(timeout)
-        var fd = self._fd.raw()
-        while True:
-            var status = _accept_status(fd)
-            if status.invalid_state:
-                raise NetError(
-                    NetErrorKind.invalid_state(),
-                    "accept",
-                    None,
-                    "accepted descriptor configuration failed",
-                )
-            if status.error_number == 0:
-                return UnixConn(status.take_fd())
-            if _is_interrupted(status.error_number):
-                if deadline.expired():
-                    raise _timeout_error("accept")
-                continue
-            if not _is_would_block(status.error_number):
-                raise _system_error("accept", status.error_number)
-            if not _wait_readable(fd, deadline):
-                raise _timeout_error("accept")
+        return UnixConn(_accept_stream(self._fd.raw(), deadline))
 
     def close(mut self) raises NetError:
         self._fd.close()
