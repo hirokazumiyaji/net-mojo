@@ -419,3 +419,19 @@ def resolve_socket_addresses(
     if len(addresses) == 0:
         raise _resolution_error(status)
     return addresses^
+
+
+def _listen_addresses(
+    value: StringSlice, socket_type: Int32
+) raises NetError -> List[SocketAddress]:
+    var host, port = _split_host_port(value, True)
+    if host.byte_length() != 0:
+        return resolve_socket_addresses(value, socket_type)
+    var addresses = List[SocketAddress]()
+    addresses.append(
+        SocketAddress(ip=IPAddress.parse("::"), port=port, scope_id=0)
+    )
+    addresses.append(
+        SocketAddress(ip=IPAddress.parse("0.0.0.0"), port=port, scope_id=0)
+    )
+    return addresses^

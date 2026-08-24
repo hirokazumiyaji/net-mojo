@@ -2,31 +2,21 @@ from net._sys.common import (
     AF_UNIX,
     SOCK_STREAM,
     _OwnedFD,
-    _CONNECT_FAILED,
-    _CONNECT_PENDING,
-    _CONNECT_RETRY,
-    _bind,
-    _connect_attempt_allowed,
-    _connect_disposition,
-    _connect_status,
+    _connect_candidate,
+    _create_bound_socket,
     _listen,
-    _socket,
-    _socket_error,
-    _system_error,
     _unix_address_to_raw,
     _validate_unix_path,
-    _wait_writable,
 )
 
 from ._stream import (
     _SocketWriteStep,
     _accept_stream,
     _read_with_deadline,
-    _timeout_error,
     _write_all_loop,
     _write_with_deadline,
 )
-from .error import NetError, NetErrorKind
+from .error import NetError, _invalid_backlog_error
 from .timeout import Timeout, _Deadline
 
 
@@ -100,50 +90,25 @@ struct UnixListener(Movable):
         self._fd.close()
 
 
-def _invalid_unix_backlog() -> NetError:
-    return NetError(
-        NetErrorKind.invalid_argument(),
-        "listen unix",
-        None,
-        "backlog is out of range",
-    )
-
-
 def dial_unix(
     path: StringSlice, timeout: Optional[Timeout] = None
 ) raises NetError -> UnixConn:
     var address = UnixAddress.parse(path)
     var deadline = _Deadline.from_optional(timeout)
     var has_attempted = False
-    while True:
-        if not _connect_attempt_allowed(has_attempted, deadline):
-            raise _timeout_error("connect")
-        has_attempted = True
-        var fd = _socket(AF_UNIX, SOCK_STREAM, 0)
-        var raw = _unix_address_to_raw(address.path)
-        var status = _connect_status(fd.raw(), raw)
-        var disposition = _connect_disposition(status.error_number)
-        if disposition == _CONNECT_RETRY:
-            continue
-        if disposition == _CONNECT_FAILED:
-            raise _system_error("connect", status.error_number)
-        if disposition == _CONNECT_PENDING:
-            if not _wait_writable(fd.raw(), deadline):
-                raise _timeout_error("connect")
-            var error_number = _socket_error(fd.raw())
-            if error_number != 0:
-                raise _system_error("connect", error_number)
-        return UnixConn(fd^)
+    var raw = _unix_address_to_raw(address.path)
+    return UnixConn(
+        _connect_candidate(AF_UNIX, SOCK_STREAM, raw, has_attempted, deadline)
+    )
 
 
 def listen_unix(
     path: StringSlice, backlog: Int = 128
 ) raises NetError -> UnixListener:
     if backlog < 1 or backlog > Int(Int32.MAX):
-        raise _invalid_unix_backlog()
+        raise _invalid_backlog_error("listen unix")
     var address = UnixAddress.parse(path)
-    var fd = _socket(AF_UNIX, SOCK_STREAM, 0)
     var raw = _unix_address_to_raw(address.path)
-    _bind(fd.raw(), raw)
+    var fd = _create_bound_socket(AF_UNIX, SOCK_STREAM, raw, False, False)
     _listen(fd.raw(), Int32(backlog))
     return UnixListener(fd^)

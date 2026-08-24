@@ -80,3 +80,22 @@ struct NetError(Copyable, Movable, Writable):
         writer.write(self.operation)
         writer.write(": ")
         writer.write(self.message)
+
+
+def _timeout_error(operation: String) -> NetError:
+    return NetError(
+        NetErrorKind.timeout(), operation, None, "operation timed out"
+    )
+
+
+def _invalid_address_error(operation: String, message: String) -> NetError:
+    return NetError(NetErrorKind.invalid_address(), operation, None, message)
+
+
+def _invalid_backlog_error(operation: String) -> NetError:
+    return NetError(
+        NetErrorKind.invalid_argument(),
+        operation,
+        None,
+        "backlog is out of range",
+    )

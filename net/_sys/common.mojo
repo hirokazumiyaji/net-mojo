@@ -12,7 +12,7 @@ from std.sys.info import is_64bit
 
 import net._sys.darwin as darwin
 import net._sys.linux as linux
-from net.error import NetError, NetErrorKind
+from net.error import NetError, NetErrorKind, _timeout_error
 from net.timeout import _Deadline
 
 
@@ -331,6 +331,26 @@ def _system_error(operation: String, error_number: Int32) -> NetError:
     )
 
 
+def _unsupported_family(error: NetError) -> Bool:
+    return error.errno and Int32(error.errno.value()) == EAFNOSUPPORT
+
+
+def _final_error(
+    last_error: Optional[NetError], operation: String, fallback: NetError
+) -> NetError:
+    if last_error:
+        var final_error = last_error.value().copy()
+        if _unsupported_family(final_error):
+            return NetError(
+                NetErrorKind.unsupported(),
+                operation,
+                final_error.errno,
+                "address family is unsupported",
+            )
+        return final_error^
+    return fallback.copy()
+
+
 def _last_errno() -> Int32:
     return get_errno().value
 
@@ -361,6 +381,33 @@ def _connect_disposition(error_number: Int32) -> Int32:
 
 def _connect_attempt_allowed(has_attempted: Bool, deadline: _Deadline) -> Bool:
     return not has_attempted or not deadline.expired()
+
+
+def _connect_candidate(
+    domain: Int32,
+    socket_type: Int32,
+    mut address: _RawSocketAddress,
+    mut has_attempted: Bool,
+    deadline: _Deadline,
+) raises NetError -> _OwnedFD:
+    while True:
+        if not _connect_attempt_allowed(has_attempted, deadline):
+            raise _timeout_error("connect")
+        has_attempted = True
+        var fd = _socket(domain, socket_type, 0)
+        var status = _connect_status(fd.raw(), address)
+        var disposition = _connect_disposition(status.error_number)
+        if disposition == _CONNECT_RETRY:
+            continue
+        if disposition == _CONNECT_FAILED:
+            raise _system_error("connect", status.error_number)
+        if disposition == _CONNECT_PENDING:
+            if not _wait_writable(fd.raw(), deadline):
+                raise _timeout_error("connect")
+            var error_number = _socket_error(fd.raw())
+            if error_number != 0:
+                raise _system_error("connect", error_number)
+        return fd^
 
 
 def _close(fd: Int32) raises NetError:
@@ -785,6 +832,34 @@ def _listen(fd: Int32, backlog: Int32) raises NetError:
     if result == -1:
         var error_number = _last_errno()
         raise _system_error("listen", error_number)
+
+
+def _create_bound_socket(
+    domain: Int32,
+    socket_type: Int32,
+    mut address: _RawSocketAddress,
+    reuse_address: Bool,
+    ipv6_only: Bool,
+) raises NetError -> _OwnedFD:
+    var fd = _socket(domain, socket_type, 0)
+    if reuse_address:
+        _set_socket_option_int(
+            fd.raw(),
+            SOL_SOCKET,
+            SO_REUSEADDR,
+            1,
+            "setsockopt(SO_REUSEADDR)",
+        )
+    if ipv6_only:
+        _set_socket_option_int(
+            fd.raw(),
+            IPPROTO_IPV6,
+            IPV6_V6ONLY,
+            1,
+            "setsockopt(IPV6_V6ONLY)",
+        )
+    _bind(fd.raw(), address)
+    return fd^
 
 
 def _connect_status(
