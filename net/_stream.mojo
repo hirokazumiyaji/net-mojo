@@ -9,14 +9,8 @@ from net._sys.common import (
     _wait_readable,
     _wait_writable,
 )
-from .error import NetError, NetErrorKind
+from .error import NetError, NetErrorKind, _timeout_error
 from .timeout import _Deadline
-
-
-def _timeout_error(operation: String) -> NetError:
-    return NetError(
-        NetErrorKind.timeout(), operation, None, "operation timed out"
-    )
 
 
 def _read_with_deadline[

@@ -1,70 +1,38 @@
 from net._sys.common import (
     AF_INET,
     AF_INET6,
-    EAFNOSUPPORT,
-    IPPROTO_IPV6,
-    IPV6_V6ONLY,
     SOCK_STREAM,
-    SOL_SOCKET,
-    SO_REUSEADDR,
     _OwnedFD,
-    _CONNECT_FAILED,
-    _CONNECT_PENDING,
-    _CONNECT_RETRY,
-    _bind,
-    _connect_attempt_allowed,
-    _connect_disposition,
-    _connect_status,
+    _connect_candidate,
+    _create_bound_socket,
     _listen,
-    _set_socket_option_int,
+    _final_error,
     _shutdown,
-    _socket,
-    _socket_error,
     _socket_name,
-    _system_error,
-    _wait_writable,
 )
 from ._stream import (
     _SocketWriteStep,
     _accept_stream,
     _read_with_deadline,
-    _timeout_error,
     _write_all_loop,
     _write_with_deadline,
 )
 from .address import (
     SocketAddress,
+    _listen_addresses,
     _socket_address_from_raw,
     _socket_address_to_raw,
-    _split_host_port,
     resolve_socket_addresses,
     split_host_port,
 )
-from .error import NetError, NetErrorKind
-from .ip import IPAddress
+from .error import (
+    NetError,
+    NetErrorKind,
+    _invalid_address_error,
+    _invalid_backlog_error,
+    _timeout_error,
+)
 from .timeout import Timeout, _Deadline
-
-
-def _invalid_tcp_address() -> NetError:
-    return NetError(
-        NetErrorKind.invalid_address(),
-        "dial tcp",
-        None,
-        "invalid TCP address",
-    )
-
-
-def _invalid_backlog() -> NetError:
-    return NetError(
-        NetErrorKind.invalid_argument(),
-        "listen tcp",
-        None,
-        "backlog is out of range",
-    )
-
-
-def _unsupported_family(error: NetError) -> Bool:
-    return error.errno and Int32(error.errno.value()) == EAFNOSUPPORT
 
 
 struct TCPConn(Movable):
@@ -147,116 +115,63 @@ struct TCPListener(Movable):
         self._fd.close()
 
 
-def _listen_addresses(
-    value: StringSlice,
-) raises NetError -> List[SocketAddress]:
-    var host, port = _split_host_port(value, True)
-    if host.byte_length() != 0:
-        return resolve_socket_addresses(value, SOCK_STREAM)
-    var addresses = List[SocketAddress]()
-    addresses.append(
-        SocketAddress(ip=IPAddress.parse("::"), port=port, scope_id=0)
-    )
-    addresses.append(
-        SocketAddress(ip=IPAddress.parse("0.0.0.0"), port=port, scope_id=0)
-    )
-    return addresses^
-
-
 def dial_tcp(
     address: StringSlice, timeout: Optional[Timeout] = None
 ) raises NetError -> TCPConn:
     var _, port = split_host_port(address)
     if port == 0:
-        raise _invalid_tcp_address()
+        raise _invalid_address_error("dial tcp", "invalid TCP address")
     var addresses = resolve_socket_addresses(address, SOCK_STREAM)
     var deadline = _Deadline.from_optional(timeout)
     var last_error: Optional[NetError] = None
     var has_attempted = False
 
     for candidate in addresses:
-        while True:
-            if not _connect_attempt_allowed(has_attempted, deadline):
-                raise _timeout_error("connect")
-            has_attempted = True
-            try:
-                var domain = AF_INET6 if candidate.ip.is_ipv6() else AF_INET
-                var fd = _socket(domain, SOCK_STREAM, 0)
-                var raw = _socket_address_to_raw(candidate)
-                var status = _connect_status(fd.raw(), raw)
-                var disposition = _connect_disposition(status.error_number)
-                if disposition == _CONNECT_RETRY:
-                    continue
-                if disposition == _CONNECT_FAILED:
-                    raise _system_error("connect", status.error_number)
-                if disposition == _CONNECT_PENDING:
-                    if not _wait_writable(fd.raw(), deadline):
-                        raise _timeout_error("connect")
-                    var error_number = _socket_error(fd.raw())
-                    if error_number != 0:
-                        raise _system_error("connect", error_number)
-                return TCPConn(fd^)
-            except error:
-                if error.kind == NetErrorKind.timeout():
-                    raise error^
-                last_error = error.copy()
-                if deadline.expired():
-                    raise _timeout_error("connect")
-                break
-    if last_error:
-        var final_error = last_error.value().copy()
-        if _unsupported_family(final_error):
-            raise NetError(
-                NetErrorKind.unsupported(),
-                "dial tcp",
-                final_error.errno,
-                "address family is unsupported",
+        try:
+            var domain = AF_INET6 if candidate.ip.is_ipv6() else AF_INET
+            var raw = _socket_address_to_raw(candidate)
+            return TCPConn(
+                _connect_candidate(
+                    domain, SOCK_STREAM, raw, has_attempted, deadline
+                )
             )
-        raise final_error^
-    raise _invalid_tcp_address()
+        except error:
+            if error.kind == NetErrorKind.timeout():
+                raise error^
+            last_error = error.copy()
+            if deadline.expired():
+                raise _timeout_error("connect")
+    raise _final_error(
+        last_error,
+        "dial tcp",
+        _invalid_address_error("dial tcp", "invalid TCP address"),
+    )
 
 
 def listen_tcp(
     address: StringSlice, backlog: Int = 128
 ) raises NetError -> TCPListener:
     if backlog < 1 or backlog > Int(Int32.MAX):
-        raise _invalid_backlog()
-    var addresses = _listen_addresses(address)
+        raise _invalid_backlog_error("listen tcp")
+    var addresses = _listen_addresses(address, SOCK_STREAM)
     var last_error: Optional[NetError] = None
 
     for candidate in addresses:
         try:
-            var domain = AF_INET6 if candidate.ip.is_ipv6() else AF_INET
-            var fd = _socket(domain, SOCK_STREAM, 0)
-            _set_socket_option_int(
-                fd.raw(),
-                SOL_SOCKET,
-                SO_REUSEADDR,
-                1,
-                "setsockopt(SO_REUSEADDR)",
-            )
-            if candidate.ip.is_ipv6():
-                _set_socket_option_int(
-                    fd.raw(),
-                    IPPROTO_IPV6,
-                    IPV6_V6ONLY,
-                    1,
-                    "setsockopt(IPV6_V6ONLY)",
-                )
             var raw = _socket_address_to_raw(candidate)
-            _bind(fd.raw(), raw)
+            var fd = _create_bound_socket(
+                AF_INET6 if candidate.ip.is_ipv6() else AF_INET,
+                SOCK_STREAM,
+                raw,
+                True,
+                candidate.ip.is_ipv6(),
+            )
             _listen(fd.raw(), Int32(backlog))
             return TCPListener(fd^)
         except error:
             last_error = error.copy()
-    if last_error:
-        var final_error = last_error.value().copy()
-        if _unsupported_family(final_error):
-            raise NetError(
-                NetErrorKind.unsupported(),
-                "listen tcp",
-                final_error.errno,
-                "address family is unsupported",
-            )
-        raise final_error^
-    raise _invalid_tcp_address()
+    raise _final_error(
+        last_error,
+        "listen tcp",
+        _invalid_address_error("dial tcp", "invalid TCP address"),
+    )
