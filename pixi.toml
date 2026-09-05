@@ -13,6 +13,10 @@ test-sys = "mojo run --Werror -I . tests/test_sys.mojo"
 test-tcp = "mojo run --Werror -I . tests/test_tcp.mojo"
 test-udp = "mojo run --Werror -I . tests/test_udp.mojo"
 test-unix = "mojo run --Werror -I . tests/test_unix.mojo"
+sanitize-sys = "mojo run --sanitize address -I . tests/test_sys.mojo"
+sanitize-tcp = "mojo run --sanitize address -I . tests/test_tcp.mojo"
+sanitize-udp = "mojo run --sanitize address -I . tests/test_udp.mojo"
+sanitize-unix = "mojo run --sanitize address -I . tests/test_unix.mojo"
 test = { depends-on = [
   "test-core",
   "test-ip",

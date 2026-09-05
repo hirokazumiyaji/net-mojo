@@ -172,7 +172,7 @@ def _split_host_port(
         raise _invalid_socket_address()
 
     var bracketed = input[0] == Byte(ord("["))
-    var host = String("")
+    var host_bytes = List[Byte]()
     var bracket_closed = False
     var separator_found = False
     var port_value = UInt32(0)
@@ -190,7 +190,7 @@ def _split_host_port(
                 if byte == Byte(ord("]")):
                     bracket_closed = True
                 else:
-                    host += value[byte=i]
+                    host_bytes.append(byte)
                 continue
             if not separator_found:
                 if byte != Byte(ord(":")):
@@ -206,16 +206,17 @@ def _split_host_port(
             elif byte == Byte(ord("[")) or byte == Byte(ord("]")):
                 raise _invalid_socket_address()
             else:
-                host += value[byte=i]
+                host_bytes.append(byte)
             continue
         _parse_port_digit(byte, port_value, port_digits)
 
+    var host = String(from_utf8_lossy=Span(host_bytes))
     if bracketed:
-        if not bracket_closed or not separator_found or host.byte_length() == 0:
+        if not bracket_closed or not separator_found or len(host_bytes) == 0:
             raise _invalid_socket_address()
     elif not separator_found:
         raise _invalid_socket_address()
-    if host.byte_length() == 0 and not allow_empty_host:
+    if len(host_bytes) == 0 and not allow_empty_host:
         raise _invalid_socket_address()
     if port_digits == 0:
         raise _invalid_socket_address()
@@ -331,12 +332,8 @@ def _split_host_zone(
     if separator == 0 or separator == len(input) - 1:
         raise _invalid_socket_address()
 
-    var address = String("")
-    var zone = String("")
-    for i in range(separator):
-        address += host[byte=i]
-    for i in range(separator + 1, len(input)):
-        zone += host[byte=i]
+    var address = String(from_utf8_lossy=input[0:separator])
+    var zone = String(from_utf8_lossy=input[separator + 1 : len(input)])
     var scope_id = _resolve_zone(zone)
     return address^, scope_id
 

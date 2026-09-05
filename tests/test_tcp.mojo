@@ -9,16 +9,7 @@ from net._sys.common import (
 )
 from net._stream import _WriteAllStep, _write_all_loop
 from net.timeout import _Deadline
-
-
-def _assert_bytes_equal[
-    left_origin: MutOrigin, right_origin: ImmOrigin
-](
-    left: Span[mut=True, Byte, left_origin], right: Span[Byte, right_origin]
-) raises:
-    assert_equal(len(left), len(right))
-    for i in range(len(left)):
-        assert_equal(left[i], right[i])
+from tests.support import _assert_bytes_equal
 
 
 def test_ipv4_loopback_round_trip_and_eof() raises:

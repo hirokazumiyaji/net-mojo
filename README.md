@@ -26,7 +26,7 @@ pixi install --frozen
 Run a Mojo program with the repository on the import path:
 
 ```bash
-pixi run mojo run --Werror -I . examples/tcp_echo.mojo
+pixi run example-tcp
 ```
 
 ## Public API
@@ -61,13 +61,13 @@ Callers must remove a path after closing all descriptors.
 Examples are loopback-only and self-check their payloads:
 
 ```bash
-pixi run mojo run --Werror -I . examples/tcp_echo.mojo
-pixi run mojo run --Werror -I . examples/udp_echo.mojo
-pixi run mojo run --Werror -I . examples/unix_echo.mojo
+pixi run example-tcp
+pixi run example-udp
+pixi run example-unix
 ```
 
 Run the whole test suite with `pixi run test`, or a focused module with `pixi run test-tcp` and the analogous `test-core`, `test-ip`, `test-address`, `test-sys`, `test-udp`, and `test-unix` tasks.
-Run benchmarks with `pixi run mojo run --Werror -I . benchmarks/ip_parse.mojo` and `benchmarks/loopback_io.mojo`.
+Run benchmarks with `pixi run benchmark-ip` and `pixi run benchmark-loopback`.
 Benchmarks report measurements and do not define pass or fail thresholds.
 
 ## Development and CI

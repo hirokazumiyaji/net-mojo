@@ -29,24 +29,24 @@ jobs:
       - name: Verify formatting
         run: git diff --exit-code
       - name: Test core
-        run: pixi run mojo run --Werror -I . tests/test_core.mojo
+        run: pixi run test-core
       - name: Test IP addresses
-        run: pixi run mojo run --Werror -I . tests/test_ip.mojo
+        run: pixi run test-ip
       - name: Test socket addresses
-        run: pixi run mojo run --Werror -I . tests/test_address.mojo
+        run: pixi run test-address
       - name: Test system bindings
-        run: pixi run mojo run --Werror -I . tests/test_sys.mojo
+        run: pixi run test-sys
       - name: Test TCP
-        run: pixi run mojo run --Werror -I . tests/test_tcp.mojo
+        run: pixi run test-tcp
       - name: Test UDP
-        run: pixi run mojo run --Werror -I . tests/test_udp.mojo
+        run: pixi run test-udp
       - name: Test Unix sockets
-        run: pixi run mojo run --Werror -I . tests/test_unix.mojo
+        run: pixi run test-unix
       - name: Sanitize system bindings
-        run: pixi run mojo run --sanitize address -I . tests/test_sys.mojo
+        run: pixi run sanitize-sys
       - name: Sanitize TCP
-        run: pixi run mojo run --sanitize address -I . tests/test_tcp.mojo
+        run: pixi run sanitize-tcp
       - name: Sanitize UDP
-        run: pixi run mojo run --sanitize address -I . tests/test_udp.mojo
+        run: pixi run sanitize-udp
       - name: Sanitize Unix sockets
-        run: pixi run mojo run --sanitize address -I . tests/test_unix.mojo
+        run: pixi run sanitize-unix

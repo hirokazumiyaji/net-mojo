@@ -7,16 +7,7 @@ from net._sys.common import (
     _get_socket_option_int,
 )
 from net.error import NetErrorKind
-
-
-def _assert_payload[
-    left_origin: MutOrigin, right_origin: ImmOrigin
-](
-    left: Span[mut=True, Byte, left_origin], right: Span[Byte, right_origin]
-) raises:
-    assert_equal(len(left), len(right))
-    for i in range(len(left)):
-        assert_equal(left[i], right[i])
+from tests.support import _assert_bytes_equal
 
 
 def _assert_invalid_state(error_kind: NetErrorKind) raises:
@@ -39,7 +30,7 @@ def test_unconnected_ipv4_preserves_payload_and_source() raises:
     assert_equal(result.count, 4)
     assert_equal(result.source, sender.local_address())
     assert_false(result.truncated)
-    _assert_payload(Span(received), Span(payload))
+    _assert_bytes_equal(Span(received), Span(payload))
 
 
 def test_empty_datagram_is_success() raises:
@@ -83,7 +74,7 @@ def test_connected_ipv4_read_and_write() raises:
         Span(received_request), Timeout.seconds(1)
     )
     assert_equal(request_result.count, 3)
-    _assert_payload(Span(received_request), Span(request))
+    _assert_bytes_equal(Span(received_request), Span(request))
 
     var response: Array[Byte, 2] = [42, 43]
     assert_equal(
@@ -94,7 +85,7 @@ def test_connected_ipv4_read_and_write() raises:
     )
     var received_response = Array[Byte, 2](fill=0)
     assert_equal(client.read(Span(received_response), Timeout.seconds(1)), 2)
-    _assert_payload(Span(received_response), Span(response))
+    _assert_bytes_equal(Span(received_response), Span(response))
     assert_equal(client.remote_address(), server.local_address())
 
 

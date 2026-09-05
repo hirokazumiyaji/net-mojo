@@ -7,6 +7,7 @@ from std.time import perf_counter_ns
 from net import Timeout, UnixAddress, dial_unix, listen_unix
 from net.error import NetErrorKind
 from net._sys.common import AF_UNIX, UNIX_PATH_MAX, _unix_address_to_raw
+from tests.support import _assert_bytes_equal
 
 
 def _unique_path(suffix: StringSlice) raises -> String:
@@ -40,21 +41,11 @@ struct _PathCleanup(Movable):
         _unlink(self.path)
 
 
-def _assert_bytes_equal[
-    left_origin: MutOrigin, right_origin: ImmOrigin
-](
-    left: Span[mut=True, Byte, left_origin], right: Span[Byte, right_origin]
-) raises:
-    assert_equal(len(left), len(right))
-    for i in range(len(left)):
-        assert_equal(left[i], right[i])
-
-
 def _repeated_ascii(length: Int) -> String:
-    var result = String("")
+    var bytes = List[Byte]()
     for _ in range(length):
-        result += "a"
-    return result^
+        bytes.append(Byte(ord("a")))
+    return String(from_utf8_lossy=Span(bytes))
 
 
 def _assert_invalid_path(path: StringSlice) raises:
