@@ -41,10 +41,13 @@ primitives, so an ABI change is confined to one directory.
 `net/_sys/darwin.mojo` and `net/_sys/linux.mojo` hold the constants and struct
 layouts that differ between the two targets (`AF_INET6`, `SOCK_CLOEXEC`, errno
 values, `sockaddr` prefix layout, `MSG_*` flags). `net/_sys/common.mojo` selects
-between them at compile time and calls `_verify_abi_layouts()` on every entry
-path. That helper is a `comptime assert` bundle: it rejects unsupported targets
-and pins the size of each FFI struct, so an ABI drift fails the build instead of
-corrupting memory at runtime.
+between them at compile time. ABI safety is enforced by `_verify_abi_layouts()`,
+a `comptime assert` bundle invoked from the three ABI-storage constructors
+(`_OwnedFD`, `_RawSocketAddress`, `_ResolverHints`): it rejects unsupported
+targets and pins the size of each FFI struct, so an ABI drift fails the build
+instead of corrupting memory at runtime. Every FFI path constructs at least
+one of these three types, so an unsupported target still fails to build
+without repeating the check on every entry path.
 
 ## Descriptor ownership
 
