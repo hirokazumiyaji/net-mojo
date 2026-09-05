@@ -101,35 +101,21 @@ struct _ResolverHints(Movable):
     def __init__(out self, socket_type: Int32):
         _verify_abi_layouts()
         self._storage = Array[UInt64, 6](fill=0)
+        # Both addrinfo layouts share the first five fields
+        # (flags/family/socket_type/protocol/address_length) and the
+        # remaining pointer fields are all None, so field order differences
+        # (address vs canonical_name) do not matter. Write the two nonzero
+        # fields directly instead of building a platform struct + 48B copy.
         var destination = Pointer(to=self).unsafe_bitcast[Byte]()
-        comptime if _DARWIN:
-            var hints = darwin._AddrInfo(
-                flags=AI_NUMERICSERV,
-                family=0,
-                socket_type=socket_type,
-                protocol=0,
-                address_length=0,
-                canonical_name=None,
-                address=None,
-                next=None,
-            )
-            var source = Pointer(to=hints).unsafe_bitcast[Byte]()
-            for i in range(48):
-                destination[unsafe_offset=i] = source[unsafe_offset=i]
-        else:
-            var hints = linux._AddrInfo(
-                flags=AI_NUMERICSERV,
-                family=0,
-                socket_type=socket_type,
-                protocol=0,
-                address_length=0,
-                address=None,
-                canonical_name=None,
-                next=None,
-            )
-            var source = Pointer(to=hints).unsafe_bitcast[Byte]()
-            for i in range(48):
-                destination[unsafe_offset=i] = source[unsafe_offset=i]
+        var flags = AI_NUMERICSERV
+        destination[unsafe_offset=0] = Byte(flags & 0xFF)
+        destination[unsafe_offset=1] = Byte((flags >> 8) & 0xFF)
+        destination[unsafe_offset=2] = Byte((flags >> 16) & 0xFF)
+        destination[unsafe_offset=3] = Byte((flags >> 24) & 0xFF)
+        destination[unsafe_offset=8] = Byte(socket_type & 0xFF)
+        destination[unsafe_offset=9] = Byte((socket_type >> 8) & 0xFF)
+        destination[unsafe_offset=10] = Byte((socket_type >> 16) & 0xFF)
+        destination[unsafe_offset=11] = Byte((socket_type >> 24) & 0xFF)
 
     def unsafe_ptr(mut self) -> Pointer[Byte, origin_of(self)]:
         return Pointer(to=self).unsafe_bitcast[Byte]()
@@ -680,10 +666,16 @@ def _recv_from_status[
     var buffer_pointer = Pointer[Byte, MutUntrackedOrigin](
         unsafe_from_address=Int(buffer.unsafe_ptr())
     )
-    var received: Int
-    var source_length: UInt32
-    var message_flags: Int32
+    var received: Int = -1
+    var source_length: UInt32 = 0
+    var message_flags: Int32 = 0
+    var error_number: Int32 = 0
+    var failed = False
 
+    # Mojo 1.0 cannot use the comptime _IOVec/_MsgHdr aliases as nominal
+    # types for construction (see #5 discussion), so only the msghdr/iovec
+    # construction stays branched. The recvmsg call shape and all error /
+    # tail handling are shared via outer locals.
     comptime if _DARWIN:
         var vector = darwin._IOVec(
             base=buffer_pointer, length=UInt(len(buffer))
@@ -703,21 +695,15 @@ def _recv_from_status[
         var result = external_call["recvmsg", c_ssize_t](
             c_int(fd), Pointer(to=message), c_int(0)
         )
-        var error_number: Int32 = 0
         if result == -1:
             error_number = _last_errno()
-        # The ABI erases origins, so keep the iovec storage live through recvmsg.
-        _ = vector.length
-        if result == -1:
-            return _RawDatagramReceiveStatus(
-                count=-1,
-                source=source^,
-                truncated=False,
-                error_number=error_number,
-            )
-        received = Int(result)
-        source_length = message.name_length
-        message_flags = message.flags
+            failed = True
+        else:
+            # The ABI erases origins, so keep the iovec storage live.
+            _ = vector.length
+            received = Int(result)
+            source_length = message.name_length
+            message_flags = message.flags
     else:
         var vector = linux._IOVec(base=buffer_pointer, length=UInt(len(buffer)))
         var vector_pointer = Pointer[linux._IOVec, MutUntrackedOrigin](
@@ -735,21 +721,23 @@ def _recv_from_status[
         var result = external_call["recvmsg", c_ssize_t](
             c_int(fd), Pointer(to=message), c_int(0)
         )
-        var error_number: Int32 = 0
         if result == -1:
             error_number = _last_errno()
-        # The ABI erases origins, so keep the iovec storage live through recvmsg.
-        _ = vector.length
-        if result == -1:
-            return _RawDatagramReceiveStatus(
-                count=-1,
-                source=source^,
-                truncated=False,
-                error_number=error_number,
-            )
-        received = Int(result)
-        source_length = message.name_length
-        message_flags = message.flags
+            failed = True
+        else:
+            # The ABI erases origins, so keep the iovec storage live.
+            _ = vector.length
+            received = Int(result)
+            source_length = message.name_length
+            message_flags = message.flags
+
+    if failed:
+        return _RawDatagramReceiveStatus(
+            count=-1,
+            source=source^,
+            truncated=False,
+            error_number=error_number,
+        )
 
     if source_length > 128:
         return _RawDatagramReceiveStatus(
