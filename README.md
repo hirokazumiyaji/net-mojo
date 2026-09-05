@@ -72,7 +72,7 @@ Benchmarks report measurements and do not define pass or fail thresholds.
 
 ## Development and CI
 
-Format source with `pixi run mojo format net tests examples benchmarks`.
+Format source with `pixi run format`.
 CI runs the complete warning-clean suite on both supported runners and keeps separate AddressSanitizer steps.
 Mojo 1.0.0 marks foundational standard APIs unstable, so CI uses `--Werror` without `--warn-on-unstable-apis`.
 The local macOS arm64 toolchain may fail to resolve `___asan_*` runtime symbols before sanitizer tests start.

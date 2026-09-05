@@ -25,7 +25,7 @@ jobs:
         with:
           frozen: true
       - name: Format Mojo sources
-        run: pixi run mojo format net tests examples benchmarks
+        run: pixi run format
       - name: Verify formatting
         run: git diff --exit-code
       - name: Test core
