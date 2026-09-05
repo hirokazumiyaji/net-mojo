@@ -178,7 +178,6 @@ def _invalid_unix_path() -> NetError:
 
 
 def _validate_unix_path(value: StringSlice) raises NetError:
-    _verify_abi_layouts()
     var bytes = value.as_bytes()
     if len(bytes) == 0 or len(bytes) > UNIX_PATH_MAX:
         raise _invalid_unix_path()
@@ -397,7 +396,6 @@ def _connect_candidate(
 
 
 def _close(fd: Int32) raises NetError:
-    _verify_abi_layouts()
     var result = external_call["close", c_int](c_int(fd))
     if result == -1:
         var error_number = _last_errno()
@@ -519,7 +517,6 @@ def _set_no_sigpipe(fd: Int32) raises NetError:
 def _socket(
     domain: Int32, socket_type: Int32, protocol: Int32
 ) raises NetError -> _OwnedFD:
-    _verify_abi_layouts()
     var actual_type = socket_type
     comptime if _LINUX:
         actual_type |= SOCK_NONBLOCK | SOCK_CLOEXEC
@@ -550,7 +547,6 @@ def _accepted_fd_configuration_status(
 
 
 def _accept_status(fd: Int32, stream: Bool = True) -> _AcceptStatus:
-    _verify_abi_layouts()
     var raw: Int32
     comptime if _LINUX:
         raw = external_call["accept4", c_int](
@@ -583,7 +579,6 @@ def _accept_status(fd: Int32, stream: Bool = True) -> _AcceptStatus:
 def _recv_status[
     origin: MutOrigin
 ](fd: Int32, buffer: Span[mut=True, Byte, origin]) -> _SyscallStatus:
-    _verify_abi_layouts()
     var result = external_call["recv", c_ssize_t](
         c_int(fd), buffer.unsafe_ptr(), c_size_t(len(buffer)), c_int(0)
     )
@@ -605,7 +600,6 @@ def _recv[
 def _send_status[
     origin: ImmOrigin
 ](fd: Int32, buffer: Span[Byte, origin]) -> _SyscallStatus:
-    _verify_abi_layouts()
     var flags: Int32 = 0
     comptime if _LINUX:
         flags = MSG_NOSIGNAL
@@ -637,7 +631,6 @@ def _send_to_status[
     buffer: Span[Byte, origin],
     mut address: _RawSocketAddress,
 ) -> _SyscallStatus:
-    _verify_abi_layouts()
     var flags: Int32 = 0
     comptime if _LINUX:
         flags = MSG_NOSIGNAL
@@ -658,7 +651,6 @@ def _send_to_status[
 def _recv_from_status[
     origin: MutOrigin
 ](fd: Int32, buffer: Span[mut=True, Byte, origin]) -> _RawDatagramReceiveStatus:
-    _verify_abi_layouts()
     var source = _RawSocketAddress()
     var source_pointer = Pointer[Byte, MutUntrackedOrigin](
         unsafe_from_address=Int(source.unsafe_ptr())
@@ -764,7 +756,6 @@ def _set_socket_option_int(
     value: Int32,
     operation: String,
 ) raises NetError:
-    _verify_abi_layouts()
     var stored_value = value
     var result = external_call["setsockopt", c_int](
         c_int(fd),
@@ -781,7 +772,6 @@ def _set_socket_option_int(
 def _get_socket_option_int(
     fd: Int32, level: Int32, option: Int32
 ) raises NetError -> Int32:
-    _verify_abi_layouts()
     var value: Int32 = 0
     var length = UInt32(size_of[Int32]())
     var result = external_call["getsockopt", c_int](
@@ -805,7 +795,6 @@ def _get_socket_option_int(
 
 
 def _bind(fd: Int32, mut address: _RawSocketAddress) raises NetError:
-    _verify_abi_layouts()
     var result = external_call["bind", c_int](
         c_int(fd), address.unsafe_ptr(), c_uint(address.length)
     )
@@ -815,7 +804,6 @@ def _bind(fd: Int32, mut address: _RawSocketAddress) raises NetError:
 
 
 def _listen(fd: Int32, backlog: Int32) raises NetError:
-    _verify_abi_layouts()
     var result = external_call["listen", c_int](c_int(fd), c_int(backlog))
     if result == -1:
         var error_number = _last_errno()
@@ -853,7 +841,6 @@ def _create_bound_socket(
 def _connect_status(
     fd: Int32, mut address: _RawSocketAddress
 ) -> _SyscallStatus:
-    _verify_abi_layouts()
     var result = external_call["connect", c_int](
         c_int(fd), address.unsafe_ptr(), c_uint(address.length)
     )
@@ -868,7 +855,6 @@ def _socket_error(fd: Int32) raises NetError -> Int32:
 
 
 def _socket_name(fd: Int32, peer: Bool) raises NetError -> _RawSocketAddress:
-    _verify_abi_layouts()
     var address = _RawSocketAddress()
     var length = UInt32(128)
     var result: Int32
@@ -897,7 +883,6 @@ def _socket_name(fd: Int32, peer: Bool) raises NetError -> _RawSocketAddress:
 
 
 def _shutdown(fd: Int32, read_side: Bool, write_side: Bool) raises NetError:
-    _verify_abi_layouts()
     if not read_side and not write_side:
         raise NetError(
             NetErrorKind.invalid_argument(),
@@ -921,7 +906,6 @@ def _shutdown(fd: Int32, read_side: Bool, write_side: Bool) raises NetError:
 def _wait(
     fd: Int32, events: Int16, deadline: _Deadline
 ) raises NetError -> Bool:
-    _verify_abi_layouts()
     var descriptor = _PollFD(fd=fd, events=events, revents=0)
     while True:
         if deadline.expired():
