@@ -46,10 +46,10 @@ struct IPAddress(Copyable, Equatable, Hashable, Writable):
         return _parse_ipv4(value)
 
     def is_ipv4(self) -> Bool:
-        return self._family == AddressFamily.ipv4()
+        return self._family.value == 4
 
     def is_ipv6(self) -> Bool:
-        return self._family == AddressFamily.ipv6()
+        return self._family.value == 6
 
     def as_bytes(self) -> Span[Byte, origin_of(self._bytes)]:
         return Span(self._bytes)

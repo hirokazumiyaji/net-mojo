@@ -317,7 +317,7 @@ def _system_error(operation: String, error_number: Int32) -> NetError:
 
 
 def _unsupported_family(error: NetError) -> Bool:
-    return error.errno and Int32(error.errno.value()) == EAFNOSUPPORT
+    return error.has_errno(EAFNOSUPPORT)
 
 
 def _final_error(

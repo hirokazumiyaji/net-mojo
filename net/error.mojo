@@ -76,6 +76,11 @@ struct NetError(Copyable, Movable, Writable):
     def is_timeout(self) -> Bool:
         return self.kind == NetErrorKind.timeout()
 
+    def has_errno(self, value: Int32) -> Bool:
+        if not self.errno:
+            return False
+        return Int32(self.errno.value()) == value
+
     def write_to[W: Writer](self, mut writer: W):
         writer.write(self.operation)
         writer.write(": ")
