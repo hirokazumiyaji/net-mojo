@@ -344,5 +344,28 @@ def test_unknown_scope_formats_as_decimal_fallback() raises:
     assert_equal(String(address), "[fe80::1%4294967295]:9")
 
 
+def test_resolution_failure_reports_gai_status_not_errno() raises:
+    # An invalid socket type fails inside getaddrinfo before any lookup,
+    # so this exercises the EAI path without touching the network.
+    try:
+        _ = resolve_socket_addresses("localhost:80", Int32(-1))
+    except error:
+        assert_equal(error.kind, NetErrorKind.resolution_failed())
+        if error.errno:
+            raise Error("resolution status leaked into errno")
+        var status = 0
+        var has_status = False
+        if error.resolver_status:
+            status = error.resolver_status.value()
+            has_status = True
+        assert_true(has_status)
+        assert_true(status != 0)
+        assert_true(error.message.byte_length() > 0)
+        var rendered = String(error)
+        assert_true(rendered.byte_length() > error.message.byte_length())
+        return
+    raise Error("resolution unexpectedly succeeded")
+
+
 def main() raises:
     TestSuite.discover_tests[__functions_in_module()]().run()

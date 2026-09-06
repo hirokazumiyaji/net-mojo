@@ -87,11 +87,18 @@ deadline instead of surfacing to the caller.
 ## Errors
 
 `NetError` carries a `NetErrorKind`, the failing operation, an optional errno,
-and a message. The kind is a small value struct rather than an enum so that it
+a message, and an optional resolver status. The kind is a small value struct rather than an enum so that it
 stays `Copyable`/`Hashable` and can be compared without pattern matching, and it
 formats as its name (`timeout`, `invalid_address`, ...) so log output and test
 failures are readable. `errno` is preserved rather than being flattened into the
-message, which lets callers branch on the raw system error when they need to.
+message, which lets callers branch on the raw system error when they need to
+(`has_errno`, e.g. for `EAFNOSUPPORT` fallback). System-call failures render
+the libc `strerror` text as the message and append the number at display time
+(`connect: Connection refused (errno 61)`), so production logs identify the
+cause without extra lookups. Name-resolution failures keep the `getaddrinfo`
+`EAI_*` code in the separate `resolver_status` field — never in `errno`, which
+is reserved for real errnos — with the `gai_strerror` text as the message
+(`resolve socket address: ... (resolver status N)`).
 
 ## Addresses
 

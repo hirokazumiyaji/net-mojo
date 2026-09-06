@@ -5,6 +5,7 @@ from std.testing import (
     assert_true,
     TestSuite,
 )
+from net import Timeout, dial_tcp, listen_tcp
 from net.error import NetError, NetErrorKind
 from net.timeout import Timeout, _Deadline
 
@@ -43,6 +44,30 @@ def test_timed_deadline_is_not_indefinite() raises:
 def test_timeout_conversion_overflow() raises:
     with assert_raises():
         _ = Timeout.seconds(UInt64.MAX)
+
+
+def test_system_error_reports_strerror_and_errno() raises:
+    var listener = listen_tcp("127.0.0.1:0")
+    var address = String(listener.local_address())
+    listener.close()
+    try:
+        _ = dial_tcp(address, Timeout.seconds(1))
+    except error:
+        assert_equal(error.kind, NetErrorKind.system_error())
+        var errno_value = -1
+        if error.errno:
+            errno_value = error.errno.value()
+        assert_true(errno_value > 0)
+        assert_true(error.has_errno(Int32(errno_value)))
+        if error.resolver_status:
+            raise Error("system error leaked a resolver status")
+        assert_equal(error.message, "Connection refused")
+        var expected = String(
+            t"connect: Connection refused (errno {errno_value})"
+        )
+        assert_equal(String(error), expected)
+        return
+    raise Error("connection unexpectedly succeeded")
 
 
 def main() raises:

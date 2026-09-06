@@ -60,6 +60,7 @@ struct NetError(Copyable, Movable, Writable):
     var operation: String
     var errno: Optional[Int]
     var message: String
+    var resolver_status: Optional[Int]
 
     def __init__(
         out self,
@@ -67,11 +68,13 @@ struct NetError(Copyable, Movable, Writable):
         operation: String,
         errno: Optional[Int],
         message: String,
+        resolver_status: Optional[Int] = None,
     ):
         self.kind = kind.copy()
         self.operation = String(operation)
-        self.errno = errno
+        self.errno = errno.copy()
         self.message = String(message)
+        self.resolver_status = resolver_status.copy()
 
     def is_timeout(self) -> Bool:
         return self.kind == NetErrorKind.timeout()
@@ -85,6 +88,14 @@ struct NetError(Copyable, Movable, Writable):
         writer.write(self.operation)
         writer.write(": ")
         writer.write(self.message)
+        if self.errno:
+            writer.write(" (errno ")
+            writer.write(self.errno.value())
+            writer.write(")")
+        elif self.resolver_status:
+            writer.write(" (resolver status ")
+            writer.write(self.resolver_status.value())
+            writer.write(")")
 
 
 def _timeout_error(operation: String) -> NetError:
