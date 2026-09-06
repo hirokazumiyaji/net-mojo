@@ -45,11 +45,12 @@ from net import (
 Numeric addresses use `192.0.2.1`, `2001:db8::1`, and `[2001:db8::1]:443` forms.
 IPv6 zones use `[fe80::1%en0]:443` or `[fe80::1%3]:443`.
 Hostnames are resolved by synchronous OS `getaddrinfo`; resolver time is outside the connect timeout.
-The resolver preserves OS candidate order and processes at most 64 candidates.
+The resolver preserves OS candidate order and scans at most the first 64 `addrinfo` entries (skipped families included).
 
 Each operation converts its relative timeout to one absolute deadline.
 `None` means no deadline, while zero means do not wait after the first immediate attempt.
 TCP and Unix stream reads may be partial, and `write_all` loops until all bytes are written or an error occurs.
+A `read` returning `0` means the peer shut down its write side (EOF), except on an empty buffer, which also returns `0`.
 `dial_udp` returns connected mode for `read` and `write`; `listen_udp` returns unconnected mode for `recv_from` and `send_to`.
 Connections and listeners own their descriptors through move-only types.
 
