@@ -963,10 +963,13 @@ def _poll_multiple(
     returns 0 immediately. The poll is always attempted at least once, so
     an expired deadline still reports what is already ready instead of
     sleeping. `EINTR` restarts the wait against the same deadline instead
-    of surfacing to the caller.
+    of surfacing to the caller. `revents` is cleared up front so a caller
+    never observes state left over from a previous wait.
     """
     if len(entries) == 0:
         return 0
+    for i in range(len(entries)):
+        entries[i].revents = 0
     while True:
         var timeout = _poll_timeout_ms(deadline)
         var result: Int32

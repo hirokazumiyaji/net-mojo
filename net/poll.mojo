@@ -54,6 +54,9 @@ struct Poller(Movable, Sized):
         self._entries.append(_PollFD(fd=fd, events=interests, revents=0))
 
     def remove(mut self, index: Int):
+        """Removes a registration. Entries after `index` shift forward,
+        so index-to-socket mappings held by the caller must be updated
+        the same way."""
         _ = self._entries.pop(index)
 
     def clear(mut self):
@@ -87,7 +90,9 @@ struct Poller(Movable, Sized):
         if len(self._entries) == 0:
             return 0
         var deadline = _Deadline.from_optional(timeout)
-        _ = _poll_multiple(self._entries, deadline)
+        var polled = _poll_multiple(self._entries, deadline)
+        if polled == 0:
+            return 0
         var ready = 0
         for i in range(len(self._entries)):
             if self.is_readable(i) or self.is_writable(i):
