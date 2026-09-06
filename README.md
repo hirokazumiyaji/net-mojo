@@ -76,6 +76,7 @@ A `read` returning `0` means the peer shut down its write side (EOF), except on 
 `dial_udp` returns connected mode for `read` and `write`; `listen_udp` returns unconnected mode for `recv_from` and `send_to`.
 Connections and listeners own their descriptors through move-only types.
 One thread can serve many connections: register each socket's `raw_fd()` with `Poller`, call `wait`, then use `try_read` / `try_write` / `try_accept` on the ready indices. A would-block `try_*` call reports `timeout` instead of waiting.
+To release a thread blocked in `read`, call `shutdown` from another thread (only the raw fd number crosses threads; exactly one owner closes).
 TCP connections default to `TCP_NODELAY=1` (Go parity); tune with
 `set_no_delay`, `set_keep_alive`, `set_keep_alive_period`,
 `set_read_buffer`, `set_write_buffer`, and `set_linger`.
@@ -104,7 +105,7 @@ CI runs the complete warning-clean suite on both supported runners and keeps sep
 Mojo 1.0.0 marks foundational standard APIs unstable, so CI uses `--Werror` without `--warn-on-unstable-apis`.
 The local macOS arm64 toolchain may fail to resolve `___asan_*` runtime symbols before sanitizer tests start.
 
-The initial release excludes asynchronous I/O, cancellation, a custom DNS client, TLS, raw IP and multicast APIs, Linux abstract Unix sockets, Unix datagram sockets, Happy Eyeballs, Windows, and 32-bit ABIs.
+The initial release excludes asynchronous I/O, a custom DNS client, TLS, raw IP and multicast APIs, Linux abstract Unix sockets, Unix datagram sockets, Happy Eyeballs, Windows, and 32-bit ABIs.
 
 ## 日本語
 

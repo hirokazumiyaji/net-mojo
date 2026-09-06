@@ -680,5 +680,60 @@ def test_real_signal_eintr_retries_to_deadline() raises:
     listener.close()
 
 
+@fieldwise_init
+struct _CancelCtx(Copyable, Movable):
+    var fd: Int
+    var result: Int
+    var deadline: _Deadline
+
+
+def _cancel_reader_entry(
+    arg: Pointer[Byte, MutUntrackedOrigin],
+) -> Pointer[Byte, MutUntrackedOrigin]:
+    var cp = arg.unsafe_bitcast[_CancelCtx]()
+    var buf = Array[Byte, 64](fill=0)
+    try:
+        cp[].result = _read_with_deadline(
+            Int32(cp[].fd), Span(buf), cp[].deadline.copy()
+        )
+    except e:
+        cp[].result = -99
+    return arg
+
+
+def test_shutdown_from_main_releases_blocked_reader() raises:
+    var listener = listen_tcp("127.0.0.1:0")
+    var listening = listener.local_address()
+    var client = dial_tcp(String(listening), Timeout.seconds(1))
+    var server = listener.accept(Timeout.seconds(1))
+    # The helper thread blocks in read with no data coming. shutdown
+    # from this thread must release it promptly with EOF, proving the
+    # cancellation path of #19 without threads owning connections:
+    # only the raw fd number crosses the thread boundary.
+    var ctx = _CancelCtx(
+        Int(server._fd.raw()),
+        -999,
+        _Deadline.from_timeout(Timeout.seconds(5)),
+    )
+    var handle: UInt64 = 0
+    var rc = external_call["pthread_create", c_int](
+        Pointer(to=handle),
+        Optional[Pointer[Byte, MutUntrackedOrigin]](None),
+        _cancel_reader_entry,
+        Pointer(to=ctx).unsafe_bitcast[Byte](),
+    )
+    assert_equal(Int(rc), 0)
+    sleep(0.3)
+    var start = Int(perf_counter_ns())
+    client.shutdown(False, True)
+    _join_thread(handle)
+    var waited_ms = (Int(perf_counter_ns()) - start) // 1_000_000
+    assert_equal(ctx.result, 0)
+    assert_true(waited_ms < 2000)
+    client.close()
+    server.close()
+    listener.close()
+
+
 def main() raises:
     TestSuite.discover_tests[__functions_in_module()]().run()

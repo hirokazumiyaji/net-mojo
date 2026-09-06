@@ -16,7 +16,7 @@ decision. Usage instructions are out of scope here.
 
 ## Non-goals for the initial release
 
-Asynchronous I/O, cancellation, a custom DNS client, TLS, raw IP and multicast
+Asynchronous I/O, a custom DNS client, TLS, raw IP and multicast
 APIs, Linux abstract Unix sockets, Unix datagram sockets, Happy Eyeballs,
 Windows, and 32-bit ABIs are all out of scope. Each of them either requires a
 runtime the package does not want to own (async, TLS) or an ABI surface that
@@ -195,10 +195,18 @@ may be closed while `wait` still watches its number, and a recycled number
 can then report readiness for the wrong socket. Hold every registered
 socket in a live binding or close it explicitly.
 
-Thread-based cancellation (calling `shutdown` from another thread to break
-a blocking `read`) and async I/O remain future work: thread sharing of
-sockets is unexercised on the supported matrix, so `cancellation` stays a
-non-goal until the threading story is proven out.
+Threads and cancellation build on the same borrow rule. Connection and
+listener objects are single-owner and are never shared across threads:
+the toolchain provides no `Send`-style marker, so the premise is
+documented instead of typed — hand out plain fd numbers (`Int32` from
+`raw_fd()`) and keep exactly one owner that closes. `shutdown()` takes a
+non-mutating `self` and maps to a single syscall, so calling it from
+another thread while `read` blocks elsewhere is sound; the blocked read
+returns promptly (EOF or an error) instead of waiting out its deadline.
+`close()` keeps exclusive (`mut`) access: never race a close against
+in-flight I/O on the same descriptor. `Poller` itself is single-threaded
+state; drive it from one thread. Async I/O remains future work pending
+language support.
 
 ## Testing
 
