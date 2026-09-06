@@ -141,5 +141,13 @@ def test_parse_format_round_trips_preserve_value_and_hash() raises:
         assert_equal(hash(first), hash(second))
 
 
+def test_unspecified_detection() raises:
+    assert_true(IPAddress.parse("0.0.0.0").is_unspecified())
+    assert_true(IPAddress.parse("::").is_unspecified())
+    assert_false(IPAddress.parse("127.0.0.1").is_unspecified())
+    assert_false(IPAddress.parse("::1").is_unspecified())
+    assert_false(IPAddress.parse("2001:db8::1").is_unspecified())
+
+
 def main() raises:
     TestSuite.discover_tests[__functions_in_module()]().run()

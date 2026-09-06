@@ -46,6 +46,7 @@ Numeric addresses use `192.0.2.1`, `2001:db8::1`, and `[2001:db8::1]:443` forms.
 IPv6 zones use `[fe80::1%en0]:443` or `[fe80::1%3]:443`.
 Hostnames are resolved by synchronous OS `getaddrinfo`; resolver time is outside the connect timeout.
 The resolver preserves OS candidate order and processes at most 64 candidates.
+A wildcard host (`:port`, `[::]:port`) listens dual-stack (`IPV6_V6ONLY=0`) so IPv4 clients can connect; pass `ipv6_only=True` to restrict to IPv6 (Go `tcp6` equivalent). If IPv6 is unavailable, wildcard falls back to `0.0.0.0`.
 
 Each operation converts its relative timeout to one absolute deadline.
 `None` means no deadline, while zero means do not wait after the first immediate attempt.
