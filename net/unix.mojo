@@ -2,16 +2,19 @@ from net._sys.common import (
     AF_UNIX,
     SOCK_STREAM,
     _OwnedFD,
+    _RawSocketAddress,
     _connect_candidate,
     _create_bound_socket,
     _default_listen_backlog,
     _listen,
+    _shutdown,
+    _socket_name,
+    _unix_address_from_raw,
     _unix_address_to_raw,
     _validate_unix_path,
 )
 
 from ._stream import (
-    _SocketWriteStep,
     _accept_stream,
     _read_with_deadline,
     _try_accept,
@@ -20,7 +23,7 @@ from ._stream import (
     _write_all_loop,
     _write_with_deadline,
 )
-from .error import NetError, _invalid_backlog_error
+from .error import NetError, NetErrorKind, _invalid_backlog_error
 from .timeout import Timeout, _Deadline
 
 
@@ -35,6 +38,21 @@ struct UnixAddress(Copyable, Equatable, Hashable, Movable, Writable):
 
     def write_to[W: Writer](self, mut writer: W):
         writer.write(self.path)
+
+
+def _unix_address_from_bound(
+    var raw: _RawSocketAddress, operation: String
+) raises NetError -> UnixAddress:
+    var length = raw.length
+    var path = _unix_address_from_raw(raw.unsafe_ptr(), length)
+    if path.byte_length() == 0:
+        raise NetError(
+            NetErrorKind.invalid_address(),
+            operation,
+            None,
+            "socket has no bound path",
+        )
+    return UnixAddress(path=path^)
 
 
 struct UnixConn(Movable):
@@ -71,8 +89,22 @@ struct UnixConn(Movable):
         timeout: Optional[Timeout] = None,
     ) raises NetError:
         var deadline = _Deadline.from_optional(timeout)
-        var write_step = _SocketWriteStep(self._fd.raw(), buffer)
-        _write_all_loop(len(buffer), deadline, write_step)
+        _write_all_loop(self._fd.raw(), buffer, deadline)
+
+    def local_address(self) raises NetError -> UnixAddress:
+        return _unix_address_from_bound(
+            _socket_name(self._fd.raw(), False), "local address"
+        )
+
+    def remote_address(self) raises NetError -> UnixAddress:
+        return _unix_address_from_bound(
+            _socket_name(self._fd.raw(), True), "remote address"
+        )
+
+    def shutdown(
+        self, read_side: Bool = True, write_side: Bool = True
+    ) raises NetError:
+        _shutdown(self._fd.raw(), read_side, write_side)
 
     def try_read[
         origin: MutOrigin
@@ -120,6 +152,11 @@ struct UnixListener(Movable):
         """
         return self._fd.raw()
 
+    def local_address(self) raises NetError -> UnixAddress:
+        return _unix_address_from_bound(
+            _socket_name(self._fd.raw(), False), "local address"
+        )
+
     def close(mut self) raises NetError:
         self._fd.close()
 
@@ -129,10 +166,12 @@ def dial_unix(
 ) raises NetError -> UnixConn:
     var address = UnixAddress.parse(path)
     var deadline = _Deadline.from_optional(timeout)
-    var has_attempted = False
+    # Single candidate: the flag only satisfies _connect_candidate's
+    # cross-candidate deadline tracking and is never read back here.
+    var _has_attempted = False
     var raw = _unix_address_to_raw(address.path)
     return UnixConn(
-        _connect_candidate(AF_UNIX, SOCK_STREAM, raw, has_attempted, deadline)
+        _connect_candidate(AF_UNIX, SOCK_STREAM, raw, _has_attempted, deadline)
     )
 
 

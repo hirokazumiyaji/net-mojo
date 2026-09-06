@@ -129,38 +129,16 @@ def _try_accept(fd: Int32) raises NetError -> _OwnedFD:
         raise _system_error("accept", status.error_number)
 
 
-trait _WriteAllStep:
-    def write(
-        mut self, offset: Int, remaining: Int, deadline: _Deadline
-    ) raises NetError -> Int:
-        ...
-
-
-struct _SocketWriteStep[origin: ImmOrigin](Movable, _WriteAllStep):
-    var fd: Int32
-    var buffer: Span[Byte, Self.origin]
-
-    def __init__(out self, fd: Int32, buffer: Span[Byte, Self.origin]):
-        self.fd = fd
-        self.buffer = buffer
-
-    def write(
-        mut self, offset: Int, remaining: Int, deadline: _Deadline
-    ) raises NetError -> Int:
-        return _write_with_deadline(
-            self.fd,
-            self.buffer[offset : offset + remaining],
-            deadline,
-        )
-
-
 def _write_all_loop[
-    WriteStep: _WriteAllStep
-](length: Int, deadline: _Deadline, mut write_step: WriteStep) raises NetError:
+    origin: ImmOrigin
+](fd: Int32, buffer: Span[Byte, origin], deadline: _Deadline) raises NetError:
     var offset = 0
+    var length = len(buffer)
     while offset < length:
         var remaining = length - offset
-        var written = write_step.write(offset, remaining, deadline)
+        var written = _write_with_deadline(
+            fd, buffer[offset : offset + remaining], deadline
+        )
         if written <= 0 or written > remaining:
             raise NetError(
                 NetErrorKind.invalid_state(),

@@ -69,9 +69,6 @@ comptime TCP_KEEPINTVL: Int32 = (
 comptime TCP_KEEPCNT: Int32 = (
     darwin.TCP_KEEPCNT if _DARWIN else linux.TCP_KEEPCNT
 )
-comptime SO_NOSIGPIPE: Int32 = (
-    darwin.SO_NOSIGPIPE if _DARWIN else linux.SO_NOSIGPIPE
-)
 comptime SOMAXCONN: Int32 = (darwin.SOMAXCONN if _DARWIN else linux.SOMAXCONN)
 comptime IPPROTO_IPV6: Int32 = (
     darwin.IPPROTO_IPV6 if _DARWIN else linux.IPPROTO_IPV6
@@ -123,6 +120,7 @@ comptime IF_NAMESIZE: Int = (
     darwin.IF_NAMESIZE if _DARWIN else linux.IF_NAMESIZE
 )
 comptime UNIX_PATH_MAX: Int = 103 if _DARWIN else 107
+comptime _SOCKADDR_CAPACITY: Int = 128
 
 
 struct _ResolverHints(Movable):
@@ -262,6 +260,34 @@ def _unix_address_to_raw(
     return raw^
 
 
+def _unix_address_from_raw[
+    origin: MutOrigin
+](raw: Pointer[Byte, origin], length: UInt32) raises NetError -> String:
+    var path_offset = 2
+    var path_max = UNIX_PATH_MAX
+    comptime if _DARWIN:
+        if length < 2 or length > UInt32(2 + path_max):
+            raise _invalid_unix_path()
+        if UInt16(raw[unsafe_offset=1]) != UInt16(AF_UNIX):
+            raise _invalid_unix_path()
+    else:
+        if length < 2 or length > UInt32(2 + path_max):
+            raise _invalid_unix_path()
+        var family = UInt16(raw[unsafe_offset=0]) | (
+            UInt16(raw[unsafe_offset=1]) << 8
+        )
+        if family != UInt16(AF_UNIX):
+            raise _invalid_unix_path()
+    var path_length = Int(length) - path_offset
+    var bytes = List[Byte]()
+    for i in range(path_length):
+        var byte = raw[unsafe_offset=path_offset + i]
+        if byte == 0:
+            break
+        bytes.append(byte)
+    return String(from_utf8_lossy=Span(bytes))
+
+
 @fieldwise_init
 struct _SyscallStatus(Copyable, Movable):
     var value: Int
@@ -343,7 +369,7 @@ def _verify_abi_layouts():
         size_of[_ResolverHints]() == 48
     ), "invalid resolver hints storage"
     comptime assert (
-        size_of[_RawSocketAddress]() >= 128
+        size_of[_RawSocketAddress]() >= _SOCKADDR_CAPACITY
     ), "invalid raw socket address storage"
     comptime assert size_of[_SockaddrIn]() == 16, "invalid sockaddr_in ABI"
     comptime assert size_of[_SockaddrIn6]() == 28, "invalid sockaddr_in6 ABI"
@@ -429,17 +455,17 @@ def _is_would_block(error_number: Int32) -> Bool:
 
 comptime _CONNECT_SUCCEEDED: Int32 = 0
 comptime _CONNECT_PENDING: Int32 = 1
-comptime _CONNECT_RETRY: Int32 = 2
-comptime _CONNECT_FAILED: Int32 = 3
+comptime _CONNECT_FAILED: Int32 = 2
 
 
 def _connect_disposition(error_number: Int32) -> Int32:
     if error_number == 0:
         return _CONNECT_SUCCEEDED
-    if error_number == EINPROGRESS:
+    # A non-blocking connect interrupted by a signal keeps going in the
+    # kernel, exactly like EINPROGRESS: wait it out on the same socket
+    # instead of opening a second one.
+    if error_number == EINPROGRESS or error_number == EINTR:
         return _CONNECT_PENDING
-    if error_number == EINTR:
-        return _CONNECT_RETRY
     return _CONNECT_FAILED
 
 
@@ -461,8 +487,6 @@ def _connect_candidate(
         var fd = _socket(domain, socket_type, 0)
         var status = _connect_status(fd.raw(), address)
         var disposition = _connect_disposition(status.error_number)
-        if disposition == _CONNECT_RETRY:
-            continue
         if disposition == _CONNECT_FAILED:
             raise _system_error("connect", status.error_number)
         if disposition == _CONNECT_PENDING:
@@ -553,7 +577,7 @@ def _no_sigpipe_status(fd: Int32) -> _SyscallStatus:
         var result = external_call["setsockopt", c_int](
             c_int(fd),
             c_int(SOL_SOCKET),
-            c_int(SO_NOSIGPIPE),
+            c_int(darwin.SO_NOSIGPIPE),
             Pointer(to=enabled),
             c_uint(size_of[Int32]()),
         )
@@ -596,24 +620,21 @@ def _socket(
     return result^
 
 
-def _accepted_fd_configuration_status(
-    fd: Int32, stream: Bool
-) -> _SyscallStatus:
+def _accepted_fd_configuration_status(fd: Int32) -> _SyscallStatus:
     var status = _nonblocking_cloexec_status(fd)
     if status.value != 0:
         return status^
     comptime if _DARWIN:
-        if stream:
-            return _no_sigpipe_status(fd)
+        return _no_sigpipe_status(fd)
     return status^
 
 
-def _accept_status(fd: Int32, stream: Bool = True) -> _AcceptStatus:
+def _accept_status(fd: Int32) -> _AcceptStatus:
     # The peer address rides along for free: accept fills the buffer as
     # part of the same syscall, so accept_with_address needs no extra
     # getpeername round trip.
     var peer = _RawSocketAddress()
-    var peer_length = UInt32(128)
+    var peer_length = UInt32(_SOCKADDR_CAPACITY)
     var raw: Int32
     comptime if _LINUX:
         raw = external_call["accept4", c_int](
@@ -631,7 +652,7 @@ def _accept_status(fd: Int32, stream: Bool = True) -> _AcceptStatus:
     if raw == -1:
         var error_number = _last_errno()
         return _AcceptStatus(_OwnedFD(-1), peer^, error_number)
-    if peer_length > 128:
+    if peer_length > UInt32(_SOCKADDR_CAPACITY):
         return _AcceptStatus(
             _OwnedFD(raw),
             peer^,
@@ -641,9 +662,8 @@ def _accept_status(fd: Int32, stream: Bool = True) -> _AcceptStatus:
     peer.length = peer_length
     var result = _OwnedFD(raw)
     comptime if _DARWIN:
-        # Linux configures flags atomically via accept4 above.
-        var configuration = _accepted_fd_configuration_status(raw, stream)
-        if configuration.error_number != 0:
+        var configuration = _accepted_fd_configuration_status(raw)
+        if configuration.value != 0:
             return _AcceptStatus(result^, peer^, configuration.error_number)
     return _AcceptStatus(result^, peer^, 0)
 
@@ -658,15 +678,6 @@ def _recv_status[
         var error_number = _last_errno()
         return _SyscallStatus(value=-1, error_number=error_number)
     return _SyscallStatus(value=Int(result), error_number=0)
-
-
-def _recv[
-    origin: MutOrigin
-](fd: Int32, buffer: Span[mut=True, Byte, origin]) raises NetError -> Int:
-    var status = _recv_status(fd, buffer)
-    if status.error_number != 0:
-        raise _system_error("recv", status.error_number)
-    return status.value
 
 
 def _send_status[
@@ -685,15 +696,6 @@ def _send_status[
         var error_number = _last_errno()
         return _SyscallStatus(value=-1, error_number=error_number)
     return _SyscallStatus(value=Int(result), error_number=0)
-
-
-def _send[
-    origin: ImmOrigin
-](fd: Int32, buffer: Span[Byte, origin]) raises NetError -> Int:
-    var status = _send_status(fd, buffer)
-    if status.error_number != 0:
-        raise _system_error("send", status.error_number)
-    return status.value
 
 
 def _send_to_status[
@@ -749,7 +751,7 @@ def _recv_from_status[
         )
         var message = darwin._MsgHdr(
             name=source_pointer,
-            name_length=128,
+            name_length=UInt32(_SOCKADDR_CAPACITY),
             vectors=vector_pointer,
             vector_count=1,
             control=None,
@@ -775,7 +777,7 @@ def _recv_from_status[
         )
         var message = linux._MsgHdr(
             name=source_pointer,
-            name_length=128,
+            name_length=UInt32(_SOCKADDR_CAPACITY),
             vectors=vector_pointer,
             vector_count=1,
             control=None,
@@ -803,7 +805,7 @@ def _recv_from_status[
             error_number=error_number,
         )
 
-    if source_length > 128:
+    if source_length > UInt32(_SOCKADDR_CAPACITY):
         return _RawDatagramReceiveStatus(
             count=-1,
             source=source^,
@@ -973,7 +975,7 @@ def _socket_error(fd: Int32) raises NetError -> Int32:
 
 def _socket_name(fd: Int32, peer: Bool) raises NetError -> _RawSocketAddress:
     var address = _RawSocketAddress()
-    var length = UInt32(128)
+    var length = UInt32(_SOCKADDR_CAPACITY)
     var result: Int32
     if peer:
         result = external_call["getpeername", c_int](
@@ -988,7 +990,7 @@ def _socket_name(fd: Int32, peer: Bool) raises NetError -> _RawSocketAddress:
         raise _system_error(
             "getpeername" if peer else "getsockname", error_number
         )
-    if length > 128:
+    if length > UInt32(_SOCKADDR_CAPACITY):
         raise NetError(
             NetErrorKind.invalid_state(),
             "getpeername" if peer else "getsockname",

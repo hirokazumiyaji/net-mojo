@@ -22,7 +22,6 @@ from net._sys.common import (
     _socket_name,
 )
 from ._stream import (
-    _SocketWriteStep,
     _accept_stream,
     _accept_stream_pair,
     _read_with_deadline,
@@ -35,10 +34,10 @@ from ._stream import (
 from .address import (
     SocketAddress,
     _listen_addresses,
+    _resolve_parsed,
     _socket_address_from_raw,
     _socket_address_to_raw,
     _v6only_for_listen,
-    resolve_socket_addresses,
     split_host_port,
 )
 from .error import (
@@ -117,8 +116,7 @@ struct TCPConn(Movable):
     ) raises NetError:
         var deadline = _Deadline.from_optional(timeout)
         var fd = self._fd.raw()
-        var write_step = _SocketWriteStep(fd, buffer)
-        _write_all_loop(len(buffer), deadline, write_step)
+        _write_all_loop(fd, buffer, deadline)
 
     def try_read[
         origin: MutOrigin
@@ -347,10 +345,10 @@ def _dial_tcp_candidates(
 def dial_tcp(
     address: StringSlice, timeout: Optional[Timeout] = None
 ) raises NetError -> TCPConn:
-    var _, port = split_host_port(address)
+    var host, port = split_host_port(address)
     if port == 0:
         raise _invalid_address_error("dial tcp", "invalid TCP address")
-    var addresses = resolve_socket_addresses(address, SOCK_STREAM)
+    var addresses = _resolve_parsed(host^, port, SOCK_STREAM)
     var deadline = _Deadline.from_optional(timeout)
     return _dial_tcp_candidates(addresses^, deadline)
 
@@ -389,5 +387,5 @@ def listen_tcp(
     raise _final_error(
         last_error,
         "listen tcp",
-        _invalid_address_error("dial tcp", "invalid TCP address"),
+        _invalid_address_error("listen tcp", "invalid TCP address"),
     )

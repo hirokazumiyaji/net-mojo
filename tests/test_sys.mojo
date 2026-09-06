@@ -2,7 +2,6 @@ from std.ffi import c_int, external_call
 from std.testing import (
     assert_equal,
     assert_false,
-    assert_raises,
     assert_true,
     TestSuite,
 )
@@ -22,7 +21,6 @@ from net._sys.common import (
     SOCK_STREAM,
     _CONNECT_FAILED,
     _CONNECT_PENDING,
-    _CONNECT_RETRY,
     _CONNECT_SUCCEEDED,
     _OwnedFD,
     _accept_status,
@@ -32,8 +30,7 @@ from net._sys.common import (
     _parse_backlog_limit,
     _recv_from_status,
     _recv_status,
-    _recv,
-    _send,
+    _send_status,
     _set_nonblocking_cloexec,
     _socket,
     _wait_readable,
@@ -132,7 +129,9 @@ def test_socket_sets_close_on_exec() raises:
 def test_sent_byte_makes_peer_readable() raises:
     var pair = _test_socket_pair()
     var payload = Array[Byte, 1](fill=42)
-    assert_equal(_send(pair.first.raw(), Span(payload)), 1)
+    var send_status = _send_status(pair.first.raw(), Span(payload))
+    assert_equal(send_status.error_number, 0)
+    assert_equal(send_status.value, 1)
     assert_true(
         _wait_readable(
             pair.second.raw(),
@@ -140,7 +139,9 @@ def test_sent_byte_makes_peer_readable() raises:
         )
     )
     var received = Array[Byte, 1](fill=0)
-    assert_equal(_recv(pair.second.raw(), Span(received)), 1)
+    var recv_status = _recv_status(pair.second.raw(), Span(received))
+    assert_equal(recv_status.error_number, 0)
+    assert_equal(recv_status.value, 1)
     assert_equal(received[0], Byte(42))
     assert_true(pair.first.is_valid())
 
@@ -153,10 +154,10 @@ def test_poll_timeout_uses_remaining_deadline() raises:
     assert_true(pair.second.is_valid())
 
 
-def test_connect_disposition_keeps_interruption_distinct_from_pending() raises:
+def test_connect_disposition_retries_interruption_on_the_same_socket() raises:
     assert_equal(_connect_disposition(0), _CONNECT_SUCCEEDED)
     assert_equal(_connect_disposition(EINPROGRESS), _CONNECT_PENDING)
-    assert_equal(_connect_disposition(EINTR), _CONNECT_RETRY)
+    assert_equal(_connect_disposition(EINTR), _CONNECT_PENDING)
     assert_equal(_connect_disposition(1), _CONNECT_FAILED)
 
 
