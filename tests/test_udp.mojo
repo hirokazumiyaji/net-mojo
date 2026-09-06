@@ -2,6 +2,7 @@ from std.testing import assert_equal, assert_false, assert_true, TestSuite
 
 from net import Timeout, dial_udp, listen_udp
 from net._sys.common import (
+    ECONNREFUSED,
     IPPROTO_IPV6,
     IPV6_V6ONLY,
     _get_socket_option_int,
@@ -232,6 +233,29 @@ def test_wildcard_listen_receives_ipv4() raises:
     assert_false(result.truncated)
     assert_equal(received[0], Byte(11))
     assert_equal(received[1], Byte(22))
+
+
+def test_connected_udp_surfaces_icmp_refusal() raises:
+    var refused_holder = listen_udp("127.0.0.1:0")
+    var refused = String(refused_holder.local_address())
+    refused_holder.close()
+    var client = dial_udp(refused, Timeout.seconds(1))
+    var probe: Array[Byte, 1] = [1]
+    try:
+        _ = client.write(Span(probe), Timeout.seconds(1))
+    except error:
+        # The refusal may already surface on the send path.
+        assert_true(error.has_errno(ECONNREFUSED))
+        client.close()
+        return
+    var buffer = Array[Byte, 1](fill=0)
+    try:
+        _ = client.read(Span(buffer), Timeout.seconds(1))
+    except error:
+        assert_true(error.has_errno(ECONNREFUSED))
+        client.close()
+        return
+    raise Error("expected ECONNREFUSED from refused UDP peer")
 
 
 def main() raises:

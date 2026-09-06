@@ -310,18 +310,13 @@ struct TCPListener(Movable):
         self._fd.close()
 
 
-def dial_tcp(
-    address: StringSlice, timeout: Optional[Timeout] = None
+def _dial_tcp_candidates(
+    var candidates: List[SocketAddress], deadline: _Deadline
 ) raises NetError -> TCPConn:
-    var _, port = split_host_port(address)
-    if port == 0:
-        raise _invalid_address_error("dial tcp", "invalid TCP address")
-    var addresses = resolve_socket_addresses(address, SOCK_STREAM)
-    var deadline = _Deadline.from_optional(timeout)
     var last_error: Optional[NetError] = None
     var has_attempted = False
 
-    for candidate in addresses:
+    for candidate in candidates:
         try:
             var domain = AF_INET6 if candidate.ip.is_ipv6() else AF_INET
             var raw = _socket_address_to_raw(candidate)
@@ -347,6 +342,17 @@ def dial_tcp(
         "dial tcp",
         _invalid_address_error("dial tcp", "invalid TCP address"),
     )
+
+
+def dial_tcp(
+    address: StringSlice, timeout: Optional[Timeout] = None
+) raises NetError -> TCPConn:
+    var _, port = split_host_port(address)
+    if port == 0:
+        raise _invalid_address_error("dial tcp", "invalid TCP address")
+    var addresses = resolve_socket_addresses(address, SOCK_STREAM)
+    var deadline = _Deadline.from_optional(timeout)
+    return _dial_tcp_candidates(addresses^, deadline)
 
 
 def listen_tcp(
