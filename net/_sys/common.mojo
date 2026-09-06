@@ -334,12 +334,37 @@ def _verify_abi_layouts():
         comptime assert size_of[_MsgHdr]() == 56, "invalid Linux msghdr ABI"
 
 
+def _copy_c_string(address: Pointer[Byte, MutUntrackedOrigin]) -> String:
+    var length = 0
+    while length < 256 and address[unsafe_offset=length] != 0:
+        length += 1
+    var bytes = List[Byte]()
+    for i in range(length):
+        bytes.append(address[unsafe_offset=i])
+    return String(from_utf8_lossy=Span(bytes))
+
+
+def _strerror_text(error_number: Int32) -> String:
+    # NOTE: declared with a bare pointer return to match the stdlib's own
+    # strerror declaration (reached via std.tempfile); an
+    # Optional-wrapped return type conflicts at compile time. strerror
+    # never returns NULL on the supported targets (unknown codes yield
+    # "Unknown error N"). strerror may use a static buffer and is not
+    # guaranteed thread-safe; that is acceptable while net-mojo is
+    # single-threaded by design, and must be revisited (strerror_r) if
+    # threading support is ever added.
+    var message = external_call["strerror", Pointer[Byte, MutUntrackedOrigin]](
+        c_int(error_number)
+    )
+    return _copy_c_string(message)
+
+
 def _system_error(operation: String, error_number: Int32) -> NetError:
     return NetError(
         NetErrorKind.system_error(),
         operation,
         Int(error_number),
-        "system call failed",
+        _strerror_text(error_number),
     )
 
 

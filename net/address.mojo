@@ -11,6 +11,7 @@ from net._sys.common import (
     _addrinfo_address_length,
     _addrinfo_family,
     _addrinfo_next,
+    _copy_c_string,
 )
 from .error import NetError, NetErrorKind
 from .ip import IPAddress, _from_ipv4_bytes, _from_ipv6_bytes
@@ -338,12 +339,27 @@ def _split_host_zone(
     return address^, scope_id
 
 
-def _resolution_error(status: Int32) -> NetError:
+def _gai_error_text(status: Int32) -> String:
+    var message = external_call[
+        "gai_strerror", Optional[Pointer[Byte, MutUntrackedOrigin]]
+    ](c_int(status))
+    if not message:
+        return "name resolution failed"
+    return _copy_c_string(message.value())
+
+
+def _resolution_error(
+    status: Int32, message: Optional[String] = None
+) -> NetError:
+    var text = _gai_error_text(status)
+    if message:
+        text = message.value()
     return NetError(
         NetErrorKind.resolution_failed(),
         "resolve socket address",
+        None,
+        text,
         Int(status),
-        "name resolution failed",
     )
 
 
@@ -410,7 +426,9 @@ def resolve_socket_addresses(
         raise error^
     _free_addrinfo(head)
     if len(addresses) == 0:
-        raise _resolution_error(status)
+        raise _resolution_error(
+            status, "name resolution yielded no usable addresses"
+        )
     return addresses^
 
 
