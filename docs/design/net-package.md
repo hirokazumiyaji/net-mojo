@@ -34,8 +34,10 @@ cannot be verified on the supported matrix.
 | `net/poll.mojo` | Single-threaded readiness multiplexing (`Poller`) |
 | `net/_sys/` | POSIX bindings, ABI layout checks, per-platform constants |
 
-Only `net/_sys/` performs `external_call`. The protocol modules compose those
-primitives, so an ABI change is confined to one directory.
+Only `net/_sys/` performs low-level socket `external_call`. `net/address.mojo`
+additionally calls libc directly for name resolution and zone handling
+(`getaddrinfo`/`freeaddrinfo`, `if_nametoindex`/`if_indextoname`), so an ABI
+change is confined to those two places.
 
 ### Platform constants
 
@@ -44,11 +46,13 @@ layouts that differ between the two targets (`AF_INET6`, `SOCK_CLOEXEC`, errno
 values, `sockaddr` prefix layout, `MSG_*` flags). `net/_sys/common.mojo` selects
 between them at compile time. ABI safety is enforced by `_verify_abi_layouts()`,
 a `comptime assert` bundle invoked from the three ABI-storage constructors
-(`_OwnedFD`, `_RawSocketAddress`, `_ResolverHints`): it rejects unsupported
+(`_OwnedFD`, `_RawSocketAddress`, `_ResolverHints`) and from the
+`net/address.mojo` zone helpers (`_resolve_zone`, `_format_zone`), which
+call libc without building any of those three types: it rejects unsupported
 targets and pins the size of each FFI struct, so an ABI drift fails the build
-instead of corrupting memory at runtime. Every FFI path constructs at least
-one of these three types, so an unsupported target still fails to build
-without repeating the check on every entry path.
+instead of corrupting memory at runtime. Every FFI path runs at least one of
+these checks, so an unsupported target still fails to build without repeating
+the check on every entry path.
 
 ## Descriptor ownership
 
@@ -111,6 +115,7 @@ is reserved for real errnos — with the `gai_strerror` text as the message
 `IPAddress` stores 16 bytes plus a family tag; IPv4 values keep their four bytes
 in the leading positions. Formatting follows RFC 5952: lowercase hexadecimal, no
 leading zeros, and a single longest run of zero groups compressed to `::`.
+IPv4-mapped addresses render in mixed notation (`::ffff:192.0.2.1`).
 IPv4-mapped addresses parse and round-trip.
 
 `SocketAddress` adds a port and an IPv6 scope ID. Textual forms accept both
@@ -125,15 +130,20 @@ bracketed IPv6 literals are required to carry brackets, an unbracketed literal
 with a colon is rejected, ports are bounded to five digits and 16 bits, and
 embedded NUL bytes are rejected before any value reaches libc. Listeners use the
 same routine with an empty host allowed, so `:0` means "any address, ephemeral
-port".
+port". A wildcard IPv6 bind (`:port`, `[::]:port`) is dual-stack
+(`IPV6_V6ONLY=0`), accepting IPv4 clients too, and falls back to `0.0.0.0`
+where IPv6 is unavailable; pass `ipv6_only=True` for a v6-only socket.
+A specific IPv6 address such as `[::1]` stays v6-only.
 
 ## Name resolution
 
 `resolve_socket_addresses` tries a numeric parse first and only calls
 `getaddrinfo` when that fails, so literal addresses never touch the resolver.
 Resolution is the OS's synchronous `getaddrinfo`; the package does not implement
-a DNS client. The candidate list preserves the order the OS returned and is
-capped at 64 entries to bound the work a hostile resolver can create. The
+a DNS client. The candidate list preserves the order the OS returned and scans
+at most the first 64 `addrinfo` chain entries (skipped non-INET families
+count toward the scan, so a chain leading with 64 unusable entries yields no
+candidates) to bound the work a hostile resolver can create. The
 `addrinfo` chain is freed on both the success and error paths.
 
 Resolver time is deliberately outside the connect timeout: `getaddrinfo` offers
@@ -146,7 +156,9 @@ families the host does not support.
 
 Stream reads are allowed to be partial, and the count is returned rather than
 looping internally, which is what a caller framing its own protocol needs.
-`write_all` loops until every byte is written or an error occurs, since a partial
+A return of `0` means the peer shut down its write side (EOF) — except on
+an empty buffer, where `0` only means nothing was requested. `write_all`
+loops until every byte is written or an error occurs, since a partial
 write is almost never useful to a caller. UDP separates the two modes it can be
 in: `dial_udp` returns a connected socket exposing `read`/`write`, `listen_udp`
 returns an unconnected one exposing `recv_from`/`send_to`, and using the wrong

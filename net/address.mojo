@@ -12,6 +12,7 @@ from net._sys.common import (
     _addrinfo_family,
     _addrinfo_next,
     _copy_c_string,
+    _verify_abi_layouts,
 )
 from .error import NetError, NetErrorKind
 from .ip import IPAddress, _from_ipv4_bytes, _from_ipv6_bytes
@@ -270,6 +271,7 @@ def _invalid_zone() -> NetError:
 
 
 def _resolve_zone(zone: StringSlice) raises NetError -> UInt32:
+    _verify_abi_layouts()
     var input = zone.as_bytes()
     if len(input) == 0:
         raise _invalid_zone()
@@ -299,6 +301,7 @@ def _resolve_zone(zone: StringSlice) raises NetError -> UInt32:
 
 
 def _format_zone(scope_id: UInt32) -> String:
+    _verify_abi_layouts()
     var buffer = Array[Byte, IF_NAMESIZE](fill=0)
     var bytes = Span(buffer)
     var result = external_call[

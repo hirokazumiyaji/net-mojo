@@ -229,7 +229,28 @@ def _write_hextet[W: Writer](value: UInt16, mut writer: W):
             started = True
 
 
+def _is_ipv4_mapped(bytes: Array[Byte, 16]) -> Bool:
+    for i in range(10):
+        if bytes[i] != 0:
+            return False
+    return bytes[10] == Byte(0xFF) and bytes[11] == Byte(0xFF)
+
+
+def _write_ipv4_tail[W: Writer](bytes: Array[Byte, 16], mut writer: W):
+    writer.write(Int(bytes[12]))
+    writer.write(".")
+    writer.write(Int(bytes[13]))
+    writer.write(".")
+    writer.write(Int(bytes[14]))
+    writer.write(".")
+    writer.write(Int(bytes[15]))
+
+
 def _write_ipv6[W: Writer](bytes: Array[Byte, 16], mut writer: W):
+    if _is_ipv4_mapped(bytes):
+        writer.write("::ffff:")
+        _write_ipv4_tail(bytes, writer)
+        return
     var hextets = Array[UInt16, 8](fill=0)
     for i in range(8):
         hextets[i] = (UInt16(bytes[i * 2]) << 8) | UInt16(bytes[i * 2 + 1])

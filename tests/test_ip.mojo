@@ -18,7 +18,19 @@ def test_canonical_formatting() raises:
         String(IPAddress.parse("2001:0:0:1:0:0:1:1")),
         "2001::1:0:0:1:1",
     )
-    assert_equal(String(IPAddress.parse("::ffff:192.0.2.1")), "::ffff:c000:201")
+    assert_equal(
+        String(IPAddress.parse("::ffff:192.0.2.1")), "::ffff:192.0.2.1"
+    )
+
+
+def test_ipv4_mapped_formatting_uses_dotted_quad() raises:
+    assert_equal(
+        String(IPAddress.parse("0:0:0:0:0:ffff:192.0.2.1")), "::ffff:192.0.2.1"
+    )
+    assert_equal(String(IPAddress.parse("::ffff:0.0.0.0")), "::ffff:0.0.0.0")
+    # Near-misses stay hexadecimal: 6to4 and a final group below ffff.
+    assert_equal(String(IPAddress.parse("2002:c000:201::")), "2002:c000:201::")
+    assert_equal(String(IPAddress.parse("::fffe:c000:201")), "::fffe:c000:201")
 
 
 def test_single_zero_hextet_is_not_compressed() raises:
