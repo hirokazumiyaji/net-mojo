@@ -1,0 +1,11 @@
+# ---> pixi managed files
+.pixi/
+# ---> Mojo build artifacts
+build/
+*.mojoc
+*.mojopkg
+# ---> Python bytecode (pixi hooks, tooling)
+__pycache__/
+*.pyc
+# ---> macOS metadata
+.DS_Store
