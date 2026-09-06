@@ -7,8 +7,9 @@ from std.testing import (
 )
 
 from net.error import NetErrorKind
-from net import listen_tcp, listen_udp
+from net import dial_tcp, listen_tcp, listen_udp
 from net.timeout import Timeout, _Deadline
+from tests.support import _count_open_fds
 from net._sys.common import (
     AF_INET,
     AF_UNIX,
@@ -224,6 +225,27 @@ def test_default_backlog_is_a_stable_valid_listen_size() raises:
     assert_true(first >= 1)
     assert_true(first <= Int(Int32.MAX))
     assert_equal(first, second)
+
+
+def test_open_fd_count_returns_to_baseline() raises:
+    var listener = listen_tcp("127.0.0.1:0")
+    var target = String(listener.local_address())
+    # Warm-up absorbs one-time runtime allocations before measuring.
+    for _ in range(3):
+        var warm_client = dial_tcp(target, Timeout.seconds(1))
+        var warm_server = listener.accept(Timeout.seconds(1))
+        warm_client.close()
+        warm_server.close()
+    var before = _count_open_fds()
+    assert_true(before > 0)
+    for _ in range(20):
+        var client = dial_tcp(target, Timeout.seconds(1))
+        var server = listener.accept(Timeout.seconds(1))
+        client.close()
+        server.close()
+    var after = _count_open_fds()
+    assert_equal(before, after)
+    listener.close()
 
 
 def main() raises:
