@@ -7,6 +7,6 @@ from .address import (
     resolve_socket_addresses,
     split_host_port,
 )
-from .tcp import TCPConn, TCPListener, dial_tcp, listen_tcp
+from .tcp import TCPConn, TCPAcceptResult, TCPListener, dial_tcp, listen_tcp
 from .udp import UDPConn, UDPReceiveResult, dial_udp, listen_udp
 from .unix import UnixAddress, UnixConn, UnixListener, dial_unix, listen_unix

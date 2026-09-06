@@ -13,6 +13,7 @@ from net._sys.common import (
 from ._stream import (
     _SocketWriteStep,
     _accept_stream,
+    _accept_stream_pair,
     _read_with_deadline,
     _write_all_loop,
     _write_with_deadline,
@@ -94,6 +95,12 @@ struct TCPConn(Movable):
         self._fd.close()
 
 
+@fieldwise_init
+struct TCPAcceptResult(Movable):
+    var conn: TCPConn
+    var address: SocketAddress
+
+
 struct TCPListener(Movable):
     var _fd: _OwnedFD
 
@@ -105,6 +112,21 @@ struct TCPListener(Movable):
     ) raises NetError -> TCPConn:
         var deadline = _Deadline.from_optional(timeout)
         return TCPConn(_accept_stream(self._fd.raw(), deadline))
+
+    def accept_with_address(
+        self, timeout: Optional[Timeout] = None
+    ) raises NetError -> TCPAcceptResult:
+        """Accepts one connection and returns the peer address captured
+        by the same syscall, saving a `getpeername` round trip."""
+        var deadline = _Deadline.from_optional(timeout)
+        var accepted = _accept_stream_pair(self._fd.raw(), deadline)
+        var peer_length = accepted.peer.length
+        var address = _socket_address_from_raw(
+            accepted.peer.unsafe_ptr(), peer_length
+        )
+        return TCPAcceptResult(
+            conn=TCPConn(accepted.take_fd()), address=address^
+        )
 
     def local_address(self) raises NetError -> SocketAddress:
         var raw = _socket_name(self._fd.raw(), False)

@@ -1,5 +1,6 @@
 from net._sys.common import (
     _OwnedFD,
+    _RawSocketAddress,
     _accept_status,
     _is_interrupted,
     _is_would_block,
@@ -107,6 +108,25 @@ def _write_all_loop[
 
 
 def _accept_stream(fd: Int32, deadline: _Deadline) raises NetError -> _OwnedFD:
+    var accepted = _accept_stream_pair(fd, deadline)
+    return accepted.take_fd()
+
+
+@fieldwise_init
+struct _AcceptedStream(Movable):
+    var fd: _OwnedFD
+    var peer: _RawSocketAddress
+
+    def take_fd(mut self) -> _OwnedFD:
+        return _OwnedFD(self.fd._take())
+
+    def take_peer(mut self) -> _RawSocketAddress:
+        return self.peer.take()
+
+
+def _accept_stream_pair(
+    fd: Int32, deadline: _Deadline
+) raises NetError -> _AcceptedStream:
     while True:
         var status = _accept_status(fd)
         if status.invalid_state:
@@ -117,7 +137,9 @@ def _accept_stream(fd: Int32, deadline: _Deadline) raises NetError -> _OwnedFD:
                 "accepted descriptor configuration failed",
             )
         if status.error_number == 0:
-            return status.take_fd()
+            var taken_fd = status.take_fd()
+            var taken_peer = status.take_peer()
+            return _AcceptedStream(fd=taken_fd^, peer=taken_peer^)
         if _is_interrupted(status.error_number):
             if deadline.expired():
                 raise _timeout_error("accept")
