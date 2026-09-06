@@ -13,6 +13,7 @@ comptime SO_RCVBUF: Int32 = 0x1002
 comptime SO_SNDBUF: Int32 = 0x1001
 comptime SO_LINGER: Int32 = 0x0080
 comptime SO_NOSIGPIPE: Int32 = 0x1022
+comptime SOMAXCONN: Int32 = 128
 comptime IPPROTO_TCP: Int32 = 6
 comptime TCP_NODELAY: Int32 = 0x01
 comptime TCP_KEEPALIVE: Int32 = 0x10

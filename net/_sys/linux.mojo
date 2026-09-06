@@ -13,6 +13,7 @@ comptime SO_RCVBUF: Int32 = 8
 comptime SO_SNDBUF: Int32 = 7
 comptime SO_LINGER: Int32 = 13
 comptime SO_NOSIGPIPE: Int32 = 0
+comptime SOMAXCONN: Int32 = 4096
 comptime IPPROTO_TCP: Int32 = 6
 comptime TCP_NODELAY: Int32 = 1
 comptime TCP_KEEPIDLE: Int32 = 4

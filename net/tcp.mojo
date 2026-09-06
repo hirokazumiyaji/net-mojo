@@ -13,6 +13,7 @@ from net._sys.common import (
     _OwnedFD,
     _connect_candidate,
     _create_bound_socket,
+    _default_listen_backlog,
     _listen,
     _final_error,
     _set_linger,
@@ -349,9 +350,15 @@ def dial_tcp(
 
 
 def listen_tcp(
-    address: StringSlice, backlog: Int = 128, ipv6_only: Bool = False
+    address: StringSlice, backlog: Optional[Int] = None, ipv6_only: Bool = False
 ) raises NetError -> TCPListener:
-    if backlog < 1 or backlog > Int(Int32.MAX):
+    """Listens for TCP connections. Without an explicit backlog the
+    kernel's somaxconn applies (`/proc/sys/net/core/somaxconn` on
+    Linux, `kern.ipc.somaxconn` on macOS)."""
+    var effective = _default_listen_backlog()
+    if backlog:
+        effective = backlog.value()
+    if effective < 1 or effective > Int(Int32.MAX):
         raise _invalid_backlog_error("listen tcp")
     var addresses = _listen_addresses(address, SOCK_STREAM)
     var last_error: Optional[NetError] = None
@@ -369,7 +376,7 @@ def listen_tcp(
                 True,
                 v6only,
             )
-            _listen(fd.raw(), Int32(backlog))
+            _listen(fd.raw(), Int32(effective))
             return TCPListener(fd^)
         except error:
             last_error = error.copy()
