@@ -52,6 +52,9 @@ Each operation converts its relative timeout to one absolute deadline.
 TCP and Unix stream reads may be partial, and `write_all` loops until all bytes are written or an error occurs.
 `dial_udp` returns connected mode for `read` and `write`; `listen_udp` returns unconnected mode for `recv_from` and `send_to`.
 Connections and listeners own their descriptors through move-only types.
+TCP connections default to `TCP_NODELAY=1` (Go parity); tune with
+`set_no_delay`, `set_keep_alive`, `set_keep_alive_period`,
+`set_read_buffer`, `set_write_buffer`, and `set_linger`.
 
 Unix socket paths are never removed by the library.
 Callers must remove a path after closing all descriptors.

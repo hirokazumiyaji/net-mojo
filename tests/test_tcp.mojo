@@ -4,7 +4,16 @@ from net import Timeout, dial_tcp, listen_tcp
 from net.error import NetError, NetErrorKind
 from net._sys.common import (
     IPPROTO_IPV6,
+    IPPROTO_TCP,
     IPV6_V6ONLY,
+    SOL_SOCKET,
+    SO_KEEPALIVE,
+    SO_RCVBUF,
+    SO_SNDBUF,
+    TCP_KEEPIDLE,
+    TCP_KEEPINTVL,
+    TCP_NODELAY,
+    _get_linger,
     _get_socket_option_int,
 )
 from net._stream import _WriteAllStep, _write_all_loop
@@ -216,6 +225,119 @@ def test_write_all_advances_partial_progress_with_one_deadline() raises:
     assert_equal(write_step.expected_offset, 10)
     assert_true(write_step.offsets_are_correct)
     assert_true(write_step.deadline_is_shared)
+
+
+def test_no_delay_defaults_to_enabled_and_toggles() raises:
+    var listener = listen_tcp("127.0.0.1:0")
+    var listening = listener.local_address()
+    var client = dial_tcp(String(listening), Timeout.seconds(1))
+    var server = listener.accept(Timeout.seconds(1))
+    # NOTE: macOS reports boolean options as nonzero flag bits
+    # (TCP_NODELAY -> 4), so enabled means != 0 portably.
+    assert_true(
+        _get_socket_option_int(client._fd.raw(), IPPROTO_TCP, TCP_NODELAY) != 0
+    )
+    assert_true(
+        _get_socket_option_int(server._fd.raw(), IPPROTO_TCP, TCP_NODELAY) != 0
+    )
+    client.set_no_delay(False)
+    assert_equal(
+        _get_socket_option_int(client._fd.raw(), IPPROTO_TCP, TCP_NODELAY),
+        0,
+    )
+    client.set_no_delay(True)
+    assert_true(
+        _get_socket_option_int(client._fd.raw(), IPPROTO_TCP, TCP_NODELAY) != 0
+    )
+    client.close()
+    server.close()
+    listener.close()
+
+
+def test_keep_alive_toggle_and_period() raises:
+    var listener = listen_tcp("127.0.0.1:0")
+    var listening = listener.local_address()
+    var client = dial_tcp(String(listening), Timeout.seconds(1))
+    var server = listener.accept(Timeout.seconds(1))
+    assert_equal(
+        _get_socket_option_int(client._fd.raw(), SOL_SOCKET, SO_KEEPALIVE),
+        0,
+    )
+    client.set_keep_alive(True)
+    # NOTE: macOS reports SO_KEEPALIVE as the nonzero flag bit (8).
+    assert_true(
+        _get_socket_option_int(client._fd.raw(), SOL_SOCKET, SO_KEEPALIVE) != 0
+    )
+    client.set_keep_alive_period(Timeout.seconds(30))
+    assert_true(
+        _get_socket_option_int(client._fd.raw(), SOL_SOCKET, SO_KEEPALIVE) != 0
+    )
+    assert_equal(
+        _get_socket_option_int(client._fd.raw(), IPPROTO_TCP, TCP_KEEPIDLE),
+        30,
+    )
+    assert_equal(
+        _get_socket_option_int(client._fd.raw(), IPPROTO_TCP, TCP_KEEPINTVL),
+        30,
+    )
+    client.set_keep_alive(False)
+    assert_equal(
+        _get_socket_option_int(client._fd.raw(), SOL_SOCKET, SO_KEEPALIVE),
+        0,
+    )
+    client.close()
+    server.close()
+    listener.close()
+
+
+def test_socket_buffers_round_up() raises:
+    var listener = listen_tcp("127.0.0.1:0")
+    var listening = listener.local_address()
+    var client = dial_tcp(String(listening), Timeout.seconds(1))
+    var server = listener.accept(Timeout.seconds(1))
+    client.set_read_buffer(65536)
+    assert_true(
+        _get_socket_option_int(client._fd.raw(), SOL_SOCKET, SO_RCVBUF) >= 65536
+    )
+    client.set_write_buffer(65536)
+    assert_true(
+        _get_socket_option_int(client._fd.raw(), SOL_SOCKET, SO_SNDBUF) >= 65536
+    )
+    try:
+        client.set_read_buffer(0)
+    except error:
+        assert_equal(error.kind, NetErrorKind.invalid_argument())
+    else:
+        raise Error("set_read_buffer accepted zero")
+    client.close()
+    server.close()
+    listener.close()
+
+
+def test_linger_enable_disable_and_rejects_overflow() raises:
+    var listener = listen_tcp("127.0.0.1:0")
+    var listening = listener.local_address()
+    var client = dial_tcp(String(listening), Timeout.seconds(1))
+    var server = listener.accept(Timeout.seconds(1))
+    client.set_linger(-1)
+    assert_equal(_get_linger(client._fd.raw()).onoff, 0)
+    client.set_linger(0)
+    var immediate = _get_linger(client._fd.raw())
+    assert_equal(immediate.onoff, 1)
+    assert_equal(immediate.seconds, 0)
+    client.set_linger(5)
+    var delayed = _get_linger(client._fd.raw())
+    assert_equal(delayed.onoff, 1)
+    assert_equal(delayed.seconds, 5)
+    try:
+        client.set_linger(Int(Int32.MAX) + 1)
+    except error:
+        assert_equal(error.kind, NetErrorKind.invalid_argument())
+    else:
+        raise Error("set_linger accepted an oversized period")
+    client.close()
+    server.close()
+    listener.close()
 
 
 def main() raises:

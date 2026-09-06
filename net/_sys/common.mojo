@@ -47,6 +47,28 @@ comptime SO_ERROR: Int32 = darwin.SO_ERROR if _DARWIN else linux.SO_ERROR
 comptime SO_REUSEADDR: Int32 = (
     darwin.SO_REUSEADDR if _DARWIN else linux.SO_REUSEADDR
 )
+comptime SO_KEEPALIVE: Int32 = (
+    darwin.SO_KEEPALIVE if _DARWIN else linux.SO_KEEPALIVE
+)
+comptime SO_RCVBUF: Int32 = (darwin.SO_RCVBUF if _DARWIN else linux.SO_RCVBUF)
+comptime SO_SNDBUF: Int32 = (darwin.SO_SNDBUF if _DARWIN else linux.SO_SNDBUF)
+comptime SO_LINGER: Int32 = (darwin.SO_LINGER if _DARWIN else linux.SO_LINGER)
+comptime IPPROTO_TCP: Int32 = (
+    darwin.IPPROTO_TCP if _DARWIN else linux.IPPROTO_TCP
+)
+comptime TCP_NODELAY: Int32 = (
+    darwin.TCP_NODELAY if _DARWIN else linux.TCP_NODELAY
+)
+# The idle-time knob is TCP_KEEPALIVE on Darwin and TCP_KEEPIDLE on Linux.
+comptime TCP_KEEPIDLE: Int32 = (
+    darwin.TCP_KEEPALIVE if _DARWIN else linux.TCP_KEEPIDLE
+)
+comptime TCP_KEEPINTVL: Int32 = (
+    darwin.TCP_KEEPINTVL if _DARWIN else linux.TCP_KEEPINTVL
+)
+comptime TCP_KEEPCNT: Int32 = (
+    darwin.TCP_KEEPCNT if _DARWIN else linux.TCP_KEEPCNT
+)
 comptime SO_NOSIGPIPE: Int32 = (
     darwin.SO_NOSIGPIPE if _DARWIN else linux.SO_NOSIGPIPE
 )
@@ -294,6 +316,7 @@ def _verify_abi_layouts():
     ), "invalid raw socket address storage"
     comptime assert size_of[_SockaddrIn]() == 16, "invalid sockaddr_in ABI"
     comptime assert size_of[_SockaddrIn6]() == 28, "invalid sockaddr_in6 ABI"
+    comptime assert size_of[_Linger]() == 8, "invalid linger ABI"
     comptime assert size_of[_IOVec]() == 16, "invalid iovec ABI"
     comptime if _DARWIN:
         comptime assert (
@@ -749,6 +772,12 @@ def _recv_from_status[
     )
 
 
+@fieldwise_init
+struct _Linger(Copyable, Movable):
+    var onoff: Int32
+    var seconds: Int32
+
+
 def _set_socket_option_int(
     fd: Int32,
     level: Int32,
@@ -792,6 +821,45 @@ def _get_socket_option_int(
             "invalid socket option length",
         )
     return value
+
+
+def _set_linger(
+    fd: Int32, onoff: Int32, seconds: Int32, operation: String
+) raises NetError:
+    var value = _Linger(onoff=onoff, seconds=seconds)
+    var result = external_call["setsockopt", c_int](
+        c_int(fd),
+        c_int(SOL_SOCKET),
+        c_int(SO_LINGER),
+        Pointer(to=value),
+        c_uint(size_of[_Linger]()),
+    )
+    if result == -1:
+        var error_number = _last_errno()
+        raise _system_error(operation, error_number)
+
+
+def _get_linger(fd: Int32) raises NetError -> _Linger:
+    var value = _Linger(onoff=0, seconds=0)
+    var length = UInt32(size_of[_Linger]())
+    var result = external_call["getsockopt", c_int](
+        c_int(fd),
+        c_int(SOL_SOCKET),
+        c_int(SO_LINGER),
+        Pointer(to=value),
+        Pointer(to=length),
+    )
+    if result == -1:
+        var error_number = _last_errno()
+        raise _system_error("getsockopt", error_number)
+    if length != UInt32(size_of[_Linger]()):
+        raise NetError(
+            NetErrorKind.invalid_state(),
+            "getsockopt",
+            None,
+            "invalid socket option length",
+        )
+    return value^
 
 
 def _bind(fd: Int32, mut address: _RawSocketAddress) raises NetError:
