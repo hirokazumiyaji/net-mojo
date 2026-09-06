@@ -274,11 +274,15 @@ struct _PollFD:
 
 
 def _verify_abi_layouts():
+    # Linux uses the generic ABI on both x86_64 and aarch64: the errno
+    # numbers, SOCK_*/O_* flags, and sockaddr/addrinfo/msghdr layouts in
+    # net/_sys/linux.mojo match on either target (only alpha/mips/sparc
+    # style ABIs differ), so any 64-bit Linux target is accepted.
     comptime assert (
         _DARWIN and CompilationTarget.is_apple_silicon() and is_64bit()
     ) or (
-        _LINUX and CompilationTarget.is_x86() and is_64bit()
-    ), "net supports only macOS arm64 and Linux x86_64"
+        _LINUX and is_64bit()
+    ), "net supports only macOS arm64 and 64-bit Linux"
     comptime assert size_of[_PollFD]() == 8, "invalid pollfd ABI"
     comptime assert (
         size_of[darwin._AddrInfo]() == 48
