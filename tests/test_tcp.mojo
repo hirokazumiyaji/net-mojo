@@ -1,9 +1,11 @@
-from std.ffi import c_int
+from std.ffi import c_int, c_ulong, external_call
 from std.testing import assert_equal, assert_true, TestSuite
+from std.time import perf_counter_ns, sleep
 
 from net import SocketAddress, TCPConn, Timeout, dial_tcp, listen_tcp
 from net.error import NetError, NetErrorKind
 from net.tcp import _dial_tcp_candidates
+from net._stream import _read_with_deadline
 from net._sys.common import (
     ECONNREFUSED,
     ECONNRESET,
@@ -27,7 +29,13 @@ from net._sys.common import (
     _get_socket_option_int,
 )
 from net.timeout import _Deadline
-from tests.support import _assert_bytes_equal
+from tests.support import (
+    _arm_eintr_probe,
+    _assert_bytes_equal,
+    _disarm_alarm,
+    _join_thread,
+    _sound_alarm,
+)
 
 
 def test_ipv4_loopback_round_trip_and_eof() raises:
@@ -574,6 +582,101 @@ def test_repeated_dial_close_reuses_descriptors() raises:
         client.close()
         server.close()
     assert_true(high - low < 10)
+    listener.close()
+
+
+@fieldwise_init
+struct _DrainCtx(Copyable, Movable):
+    var fd: Int
+    var want: Int
+    var got: Int
+    var sum: Int
+    var err: Int
+    var deadline: _Deadline
+
+
+def _drain_entry(
+    arg: Pointer[Byte, MutUntrackedOrigin],
+) -> Pointer[Byte, MutUntrackedOrigin]:
+    var cp = arg.unsafe_bitcast[_DrainCtx]()
+    var fd = Int32(cp[].fd)
+    var deadline = cp[].deadline.copy()
+    var buf = Array[Byte, 65536](fill=0)
+    while cp[].got < cp[].want:
+        try:
+            var n = _read_with_deadline(fd, Span(buf), deadline)
+            if n == 0:
+                break
+            var chunk_sum = 0
+            for i in range(n):
+                chunk_sum += Int(buf[i])
+            cp[].got = cp[].got + n
+            cp[].sum = cp[].sum + chunk_sum
+            sleep(0.005)
+        except e:
+            cp[].err = -1
+            break
+    return arg
+
+
+def test_threaded_slow_reader_drains_large_transfer() raises:
+    var listener = listen_tcp("127.0.0.1:0")
+    var listening = listener.local_address()
+    var client = dial_tcp(String(listening), Timeout.seconds(1))
+    var server = listener.accept(Timeout.seconds(1))
+    var total = 1024 * 1024
+    var ctx = _DrainCtx(
+        Int(server._fd.raw()),
+        total,
+        0,
+        0,
+        0,
+        _Deadline.from_timeout(Timeout.seconds(15)),
+    )
+    var handle: UInt64 = 0
+    var rc = external_call["pthread_create", c_int](
+        Pointer(to=handle),
+        Optional[Pointer[Byte, MutUntrackedOrigin]](None),
+        _drain_entry,
+        Pointer(to=ctx).unsafe_bitcast[Byte](),
+    )
+    assert_equal(Int(rc), 0)
+    var payload = Array[Byte, 1024 * 1024](fill=0)
+    var expected_sum = 0
+    for i in range(len(payload)):
+        payload[i] = Byte(i % 251)
+        expected_sum += Int(payload[i])
+    client.write_all(Span(payload), Timeout.seconds(15))
+    _join_thread(handle)
+    assert_equal(ctx.err, 0)
+    assert_equal(ctx.got, total)
+    assert_equal(ctx.sum, expected_sum)
+    client.close()
+    server.close()
+    listener.close()
+
+
+def test_real_signal_eintr_retries_to_deadline() raises:
+    var listener = listen_tcp("127.0.0.1:0")
+    var listening = listener.local_address()
+    var client = dial_tcp(String(listening), Timeout.seconds(1))
+    var server = listener.accept(Timeout.seconds(1))
+    # SIGALRM fires 1s into a 3s blocking read with no data coming.
+    # The EINTR must be retried internally: the read survives to its
+    # deadline and reports a timeout instead of a system error.
+    _arm_eintr_probe()
+    _sound_alarm(1)
+    var buf = Array[Byte, 64](fill=0)
+    var start = Int(perf_counter_ns())
+    try:
+        _ = server.read(Span(buf), Timeout.seconds(3))
+    except e:
+        assert_equal(e.kind, NetErrorKind.timeout())
+    var elapsed_ms = (Int(perf_counter_ns()) - start) // 1_000_000
+    _disarm_alarm()
+    assert_true(elapsed_ms >= 2500)
+    client.close()
+    server.close()
     listener.close()
 
 
