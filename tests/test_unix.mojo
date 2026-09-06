@@ -312,5 +312,39 @@ def test_zero_timeout_allows_immediate_unix_connect() raises:
     _ = cleanup.path
 
 
+def test_unix_addresses_and_half_close() raises:
+    var path = _unique_path("addrs")
+    _unlink(path)
+    var cleanup = _PathCleanup(path)
+    var listener = listen_unix(path)
+    assert_equal(String(listener.local_address()), path)
+    var client = dial_unix(path, Timeout.seconds(1))
+    var server = listener.accept(Timeout.seconds(1))
+    # The accepted socket reports the bound path; the dial side was
+    # never bound, so its own addresses are unavailable.
+    assert_equal(String(server.local_address()), path)
+    try:
+        _ = client.local_address()
+    except error:
+        assert_equal(error.kind, NetErrorKind.invalid_address())
+    else:
+        raise Error("unbound Unix client reported a local address")
+    try:
+        _ = server.remote_address()
+    except error:
+        assert_equal(error.kind, NetErrorKind.invalid_address())
+    else:
+        raise Error("server reported an address for an unbound peer")
+    # Half-close sends EOF without closing the descriptor.
+    client.shutdown(False, True)
+    var eof_buffer = Array[Byte, 1](fill=0)
+    assert_equal(server.read(Span(eof_buffer), Timeout.seconds(1)), 0)
+    client.close()
+    server.close()
+    listener.close()
+    _unlink(path)
+    _ = cleanup.path
+
+
 def main() raises:
     TestSuite.discover_tests[__functions_in_module()]().run()

@@ -19,9 +19,9 @@ from ._stream import _read_with_deadline, _write_with_deadline
 from .address import (
     SocketAddress,
     _listen_addresses,
+    _resolve_parsed,
     _socket_address_from_raw,
     _socket_address_to_raw,
-    resolve_socket_addresses,
     split_host_port,
 )
 from .error import (
@@ -180,10 +180,10 @@ struct UDPConn(Movable):
 def dial_udp(
     address: StringSlice, timeout: Optional[Timeout] = None
 ) raises NetError -> UDPConn:
-    var _, port = split_host_port(address)
+    var host, port = split_host_port(address)
     if port == 0:
         raise _invalid_address_error("dial udp", "invalid UDP address")
-    var addresses = resolve_socket_addresses(address, SOCK_DGRAM)
+    var addresses = _resolve_parsed(host^, port, SOCK_DGRAM)
     var deadline = _Deadline.from_optional(timeout)
     var last_error: Optional[NetError] = None
     var has_attempted = False
@@ -231,5 +231,5 @@ def listen_udp(address: StringSlice) raises NetError -> UDPConn:
     raise _final_error(
         last_error,
         "listen udp",
-        _invalid_address_error("dial udp", "invalid UDP address"),
+        _invalid_address_error("listen udp", "invalid UDP address"),
     )

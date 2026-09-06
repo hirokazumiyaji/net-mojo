@@ -355,6 +355,12 @@ def resolve_socket_addresses(
     value: StringSlice, socket_type: Int32
 ) raises NetError -> List[SocketAddress]:
     var host, port = split_host_port(value)
+    return _resolve_parsed(host^, port, socket_type)
+
+
+def _resolve_parsed(
+    var host: String, port: UInt16, socket_type: Int32
+) raises NetError -> List[SocketAddress]:
     var address_text, scope_id = _split_host_zone(host)
 
     try:
@@ -419,7 +425,7 @@ def _listen_addresses(
 ) raises NetError -> List[SocketAddress]:
     var host, port = _split_host_port(value, True)
     if host.byte_length() != 0:
-        return resolve_socket_addresses(value, socket_type)
+        return _resolve_parsed(host^, port, socket_type)
     var addresses = List[SocketAddress]()
     addresses.append(
         SocketAddress(ip=IPAddress.parse("::"), port=port, scope_id=0)
