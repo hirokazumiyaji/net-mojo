@@ -42,6 +42,10 @@ jobs:
         run: pixi run test-udp
       - name: Test Unix sockets
         run: pixi run test-unix
+      - name: Package precompiled artifact
+        run: pixi run package
+      - name: Verify packaged artifact
+        run: pixi run test-package
       - name: Sanitize system bindings
         run: pixi run sanitize-sys
       - name: Sanitize TCP

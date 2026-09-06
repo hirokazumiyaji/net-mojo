@@ -29,6 +29,26 @@ Run a Mojo program with the repository on the import path:
 pixi run example-tcp
 ```
 
+Depend on a pinned source revision and put the repository on the import
+path (`mojo run -I <repo> ...`). For a faster build, use the precompiled
+artifact instead:
+
+```bash
+pixi run package
+# then: mojo run -I build my_program.mojo  # `from net import ...`
+```
+
+Precompiled artifacts are tied to the compiler version that produced
+them; rebuilding from source always works.
+
+## Versioning and compatibility
+
+Releases follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
+with the version source of truth in `pixi.toml`. Changes are recorded in
+[CHANGELOG.md](CHANGELOG.md). Public API is every name reachable from
+`net` that does not start with an underscore; anything under `net/_sys/`
+or starting with `_` is internal and may change without a version bump.
+
 ## Public API
 
 Import public types and functions from `net`:
