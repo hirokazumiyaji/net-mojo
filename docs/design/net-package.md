@@ -61,7 +61,12 @@ a connection value would duplicate ownership of the descriptor.
 
 Descriptors are created close-on-exec: `SOCK_CLOEXEC` and `accept4` on Linux,
 `fcntl(FD_CLOEXEC)` immediately after `socket`/`accept` on macOS, where those
-atomic variants do not exist. Writes avoid killing the process on a closed peer
+atomic variants do not exist. Linux needs no follow-up `fcntl` at all; macOS
+reads the status flags once and sets what is missing (`F_GETFL`, then
+`F_SETFL` and `F_SETFD` only as needed) instead of reading everything back
+to verify. `accept` captures the peer address into the same syscall, so
+`TCPListener.accept_with_address` returns it without a `getpeername` round
+trip. Writes avoid killing the process on a closed peer
 via `MSG_NOSIGNAL` on Linux and the `SO_NOSIGPIPE` socket option on macOS; both
 turn a broken pipe into an ordinary `EPIPE` error.
 

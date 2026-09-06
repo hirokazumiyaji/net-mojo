@@ -189,6 +189,19 @@ struct _RawSocketAddress(Movable):
     def unsafe_ptr(mut self) -> Pointer[Byte, origin_of(self)]:
         return Pointer(to=self).unsafe_bitcast[Byte]()
 
+    def take(mut self) -> Self:
+        # Move-only storage cannot be moved out of a borrowed struct, so
+        # copy the words and reset the source instead. The payload is at
+        # most 28 bytes; the copy costs nothing next to the syscall that
+        # produced it.
+        var out = Self()
+        for i in range(16):
+            out._storage[i] = self._storage[i]
+            self._storage[i] = 0
+        out.length = self.length
+        self.length = 0
+        return out^
+
 
 def _invalid_unix_path() -> NetError:
     return NetError(
@@ -271,21 +284,27 @@ struct _RawDatagramReceiveStatus(Movable):
 
 struct _AcceptStatus(Movable):
     var fd: _OwnedFD
+    var peer: _RawSocketAddress
     var error_number: Int32
     var invalid_state: Bool
 
     def __init__(
         out self,
         var fd: _OwnedFD,
+        var peer: _RawSocketAddress,
         error_number: Int32,
         invalid_state: Bool = False,
     ):
         self.fd = fd^
+        self.peer = peer^
         self.error_number = error_number
         self.invalid_state = invalid_state
 
     def take_fd(mut self) -> _OwnedFD:
         return _OwnedFD(self.fd._take())
+
+    def take_peer(mut self) -> _RawSocketAddress:
+        return self.peer.take()
 
 
 @fieldwise_init
@@ -500,6 +519,10 @@ def _fcntl[*types: Intable](fd: c_int, command: c_int, *args: *types) -> c_int:
 
 
 def _nonblocking_cloexec_status(fd: Int32) -> _SyscallStatus:
+    # Fresh descriptors start with file flags 0: read the status flags
+    # once, set O_NONBLOCK when missing, then set FD_CLOEXEC
+    # unconditionally. The kernel applies what it is told, so reading the
+    # flags back to verify wastes two syscalls per descriptor.
     var status = _fcntl(c_int(fd), c_int(F_GETFL), c_int(0))
     if status == -1:
         return _SyscallStatus(value=-1, error_number=_last_errno())
@@ -509,26 +532,10 @@ def _nonblocking_cloexec_status(fd: Int32) -> _SyscallStatus:
         )
         if set_status == -1:
             return _SyscallStatus(value=-1, error_number=_last_errno())
-        status = _fcntl(c_int(fd), c_int(F_GETFL), c_int(0))
-        if status == -1:
-            return _SyscallStatus(value=-1, error_number=_last_errno())
-        if (status & O_NONBLOCK) == 0:
-            return _SyscallStatus(value=-2, error_number=0)
 
-    var descriptor = _fcntl(c_int(fd), c_int(F_GETFD), c_int(0))
-    if descriptor == -1:
+    var set_descriptor = _fcntl(c_int(fd), c_int(F_SETFD), c_int(FD_CLOEXEC))
+    if set_descriptor == -1:
         return _SyscallStatus(value=-1, error_number=_last_errno())
-    if (descriptor & FD_CLOEXEC) == 0:
-        var set_descriptor = _fcntl(
-            c_int(fd), c_int(F_SETFD), c_int(descriptor | FD_CLOEXEC)
-        )
-        if set_descriptor == -1:
-            return _SyscallStatus(value=-1, error_number=_last_errno())
-        descriptor = _fcntl(c_int(fd), c_int(F_GETFD), c_int(0))
-        if descriptor == -1:
-            return _SyscallStatus(value=-1, error_number=_last_errno())
-        if (descriptor & FD_CLOEXEC) == 0:
-            return _SyscallStatus(value=-2, error_number=0)
     return _SyscallStatus(value=0, error_number=0)
 
 
@@ -549,13 +556,6 @@ def _no_sigpipe_status(fd: Int32) -> _SyscallStatus:
 
 def _set_nonblocking_cloexec(fd: Int32) raises NetError:
     var status = _nonblocking_cloexec_status(fd)
-    if status.value == -2:
-        raise NetError(
-            NetErrorKind.invalid_state(),
-            "fcntl",
-            None,
-            "descriptor configuration failed",
-        )
     if status.error_number != 0:
         raise _system_error("fcntl", status.error_number)
 
@@ -579,8 +579,10 @@ def _socket(
         var error_number = _last_errno()
         raise _system_error("socket", error_number)
     var result = _OwnedFD(raw)
-    _set_nonblocking_cloexec(result.raw())
     comptime if _DARWIN:
+        # Linux sets SOCK_NONBLOCK | SOCK_CLOEXEC atomically above and
+        # needs no follow-up fcntl calls.
+        _set_nonblocking_cloexec(result.raw())
         if socket_type == SOCK_STREAM:
             _set_no_sigpipe(result.raw())
     return result^
@@ -599,33 +601,43 @@ def _accepted_fd_configuration_status(
 
 
 def _accept_status(fd: Int32, stream: Bool = True) -> _AcceptStatus:
+    # The peer address rides along for free: accept fills the buffer as
+    # part of the same syscall, so accept_with_address needs no extra
+    # getpeername round trip.
+    var peer = _RawSocketAddress()
+    var peer_length = UInt32(128)
     var raw: Int32
     comptime if _LINUX:
         raw = external_call["accept4", c_int](
             c_int(fd),
-            Optional[Pointer[Byte, MutUntrackedOrigin]](None),
-            Optional[Pointer[UInt32, MutUntrackedOrigin]](None),
+            peer.unsafe_ptr(),
+            Pointer(to=peer_length),
             c_int(SOCK_NONBLOCK | SOCK_CLOEXEC),
         )
     else:
         raw = external_call["accept", c_int](
             c_int(fd),
-            Optional[Pointer[Byte, MutUntrackedOrigin]](None),
-            Optional[Pointer[UInt32, MutUntrackedOrigin]](None),
+            peer.unsafe_ptr(),
+            Pointer(to=peer_length),
         )
     if raw == -1:
         var error_number = _last_errno()
-        return _AcceptStatus(_OwnedFD(-1), error_number)
+        return _AcceptStatus(_OwnedFD(-1), peer^, error_number)
+    if peer_length > 128:
+        return _AcceptStatus(
+            _OwnedFD(raw),
+            peer^,
+            0,
+            invalid_state=True,
+        )
+    peer.length = peer_length
     var result = _OwnedFD(raw)
     comptime if _DARWIN:
+        # Linux configures flags atomically via accept4 above.
         var configuration = _accepted_fd_configuration_status(raw, stream)
-        if configuration.value != 0:
-            return _AcceptStatus(
-                result^,
-                configuration.error_number,
-                invalid_state=configuration.value == -2,
-            )
-    return _AcceptStatus(result^, 0)
+        if configuration.error_number != 0:
+            return _AcceptStatus(result^, peer^, configuration.error_number)
+    return _AcceptStatus(result^, peer^, 0)
 
 
 def _recv_status[

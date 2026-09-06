@@ -1,11 +1,16 @@
+from std.ffi import c_int
 from std.testing import assert_equal, assert_true, TestSuite
 
 from net import Timeout, dial_tcp, listen_tcp
 from net.error import NetError, NetErrorKind
 from net._sys.common import (
+    FD_CLOEXEC,
+    F_GETFD,
+    F_GETFL,
     IPPROTO_IPV6,
     IPPROTO_TCP,
     IPV6_V6ONLY,
+    O_NONBLOCK,
     SOL_SOCKET,
     SO_KEEPALIVE,
     SO_RCVBUF,
@@ -13,6 +18,7 @@ from net._sys.common import (
     TCP_KEEPIDLE,
     TCP_KEEPINTVL,
     TCP_NODELAY,
+    _fcntl,
     _get_linger,
     _get_socket_option_int,
 )
@@ -268,6 +274,53 @@ def test_write_all_advances_partial_progress_with_one_deadline() raises:
     assert_equal(write_step.expected_offset, 10)
     assert_true(write_step.offsets_are_correct)
     assert_true(write_step.deadline_is_shared)
+
+
+def test_accept_with_address_returns_peer_without_getpeername() raises:
+    var listener = listen_tcp("127.0.0.1:0")
+    var listening = listener.local_address()
+    var client = dial_tcp(String(listening), Timeout.seconds(1))
+    var accepted = listener.accept_with_address(Timeout.seconds(1))
+    # NOTE: compare via String rendering of bound vars. Passing
+    # SocketAddress values (fields or call temporaries) straight into
+    # generic assert_equal misreads the second argument in-suite (same
+    # Mojo 1.0 temporary-lifetime family as #18); String comparisons
+    # evaluate correctly.
+    var peer_side = accepted.address.copy()
+    var client_side = client.local_address()
+    assert_equal(String(peer_side), String(client_side))
+    assert_equal(String(accepted.conn.local_address()), String(listening))
+    assert_equal(String(accepted.conn.remote_address()), String(client_side))
+
+    var ping: Array[Byte, 4] = [
+        Byte(ord("p")),
+        Byte(ord("i")),
+        Byte(ord("n")),
+        Byte(ord("g")),
+    ]
+    client.write_all(Span(ping), Timeout.seconds(1))
+    var received = Array[Byte, 4](fill=0)
+    assert_equal(accepted.conn.read(Span(received), Timeout.seconds(1)), 4)
+    _assert_bytes_equal(Span(received), Span(ping))
+
+    client.close()
+    accepted.conn.close()
+    listener.close()
+
+
+def test_sockets_are_nonblocking_and_cloexec() raises:
+    var listener = listen_tcp("127.0.0.1:0")
+    var listening = listener.local_address()
+    var client = dial_tcp(String(listening), Timeout.seconds(1))
+    var server = listener.accept(Timeout.seconds(1))
+    for fd in [client._fd.raw(), server._fd.raw(), listener._fd.raw()]:
+        var flags = _fcntl(c_int(fd), c_int(F_GETFL), c_int(0))
+        assert_true((flags & O_NONBLOCK) != 0)
+        var descriptor = _fcntl(c_int(fd), c_int(F_GETFD), c_int(0))
+        assert_true((descriptor & FD_CLOEXEC) != 0)
+    client.close()
+    server.close()
+    listener.close()
 
 
 def test_no_delay_defaults_to_enabled_and_toggles() raises:
