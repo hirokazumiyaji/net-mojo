@@ -4,6 +4,7 @@ from net._sys.common import (
     _OwnedFD,
     _connect_candidate,
     _create_bound_socket,
+    _default_listen_backlog,
     _listen,
     _unix_address_to_raw,
     _validate_unix_path,
@@ -103,12 +104,17 @@ def dial_unix(
 
 
 def listen_unix(
-    path: StringSlice, backlog: Int = 128
+    path: StringSlice, backlog: Optional[Int] = None
 ) raises NetError -> UnixListener:
-    if backlog < 1 or backlog > Int(Int32.MAX):
+    """Listens for Unix stream connections. Without an explicit backlog
+    the kernel's somaxconn applies (see `listen_tcp`)."""
+    var effective = _default_listen_backlog()
+    if backlog:
+        effective = backlog.value()
+    if effective < 1 or effective > Int(Int32.MAX):
         raise _invalid_backlog_error("listen unix")
     var address = UnixAddress.parse(path)
     var raw = _unix_address_to_raw(address.path)
     var fd = _create_bound_socket(AF_UNIX, SOCK_STREAM, raw, False, False)
-    _listen(fd.raw(), Int32(backlog))
+    _listen(fd.raw(), Int32(effective))
     return UnixListener(fd^)

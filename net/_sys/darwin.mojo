@@ -9,6 +9,7 @@ comptime SOL_SOCKET: Int32 = 0xFFFF
 comptime SO_ERROR: Int32 = 0x1007
 comptime SO_REUSEADDR: Int32 = 0x0004
 comptime SO_NOSIGPIPE: Int32 = 0x1022
+comptime SOMAXCONN: Int32 = 128
 comptime IPPROTO_IPV6: Int32 = 41
 comptime IPV6_V6ONLY: Int32 = 27
 comptime POLLIN: Int16 = 0x001

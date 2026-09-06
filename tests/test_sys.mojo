@@ -28,6 +28,8 @@ from net._sys.common import (
     _accept_status,
     _connect_attempt_allowed,
     _connect_disposition,
+    _default_listen_backlog,
+    _parse_backlog_limit,
     _recv_from_status,
     _recv_status,
     _recv,
@@ -194,6 +196,33 @@ def test_nonblocking_recvmsg_returns_errno_status_without_throwing() raises:
     assert_true(
         status.error_number == EAGAIN or status.error_number == EWOULDBLOCK
     )
+
+
+def test_backlog_limit_parser_accepts_plain_integers() raises:
+    var sized = _parse_backlog_limit("4096\n")
+    if not sized:
+        raise Error("parser rejected a valid backlog value")
+    assert_equal(sized.value(), 4096)
+    var plain = _parse_backlog_limit("128")
+    if not plain:
+        raise Error("parser rejected a valid backlog value")
+    assert_equal(plain.value(), 128)
+
+
+def test_backlog_limit_parser_rejects_garbage() raises:
+    var cases = ["", "   \n", "0", "-1", "12a4", "abc", "4294967296"]
+    for text in cases:
+        var parsed = _parse_backlog_limit(text)
+        if parsed:
+            raise Error("parser accepted a garbage backlog value")
+
+
+def test_default_backlog_is_a_stable_valid_listen_size() raises:
+    var first = _default_listen_backlog()
+    var second = _default_listen_backlog()
+    assert_true(first >= 1)
+    assert_true(first <= Int(Int32.MAX))
+    assert_equal(first, second)
 
 
 def main() raises:

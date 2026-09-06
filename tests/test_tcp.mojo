@@ -218,5 +218,20 @@ def test_write_all_advances_partial_progress_with_one_deadline() raises:
     assert_true(write_step.deadline_is_shared)
 
 
+def test_explicit_backlog_serves_a_connection() raises:
+    var listener = listen_tcp("127.0.0.1:0", backlog=1)
+    var listening = listener.local_address()
+    var client = dial_tcp(String(listening), Timeout.seconds(1))
+    var server = listener.accept(Timeout.seconds(1))
+    var sent: Array[Byte, 1] = [7]
+    client.write_all(Span(sent), Timeout.seconds(1))
+    var received = Array[Byte, 1](fill=0)
+    assert_equal(server.read(Span(received), Timeout.seconds(1)), 1)
+    assert_equal(received[0], Byte(7))
+    client.close()
+    server.close()
+    listener.close()
+
+
 def main() raises:
     TestSuite.discover_tests[__functions_in_module()]().run()

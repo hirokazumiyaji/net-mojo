@@ -50,6 +50,7 @@ comptime SO_REUSEADDR: Int32 = (
 comptime SO_NOSIGPIPE: Int32 = (
     darwin.SO_NOSIGPIPE if _DARWIN else linux.SO_NOSIGPIPE
 )
+comptime SOMAXCONN: Int32 = (darwin.SOMAXCONN if _DARWIN else linux.SOMAXCONN)
 comptime IPPROTO_IPV6: Int32 = (
     darwin.IPPROTO_IPV6 if _DARWIN else linux.IPPROTO_IPV6
 )
@@ -943,3 +944,68 @@ def _wait_readable(fd: Int32, deadline: _Deadline) raises NetError -> Bool:
 
 def _wait_writable(fd: Int32, deadline: _Deadline) raises NetError -> Bool:
     return _wait(fd, POLLOUT, deadline)
+
+
+def _parse_backlog_limit(text: StringSlice) -> Optional[Int]:
+    var bytes = text.as_bytes()
+    var value = 0
+    var digits = 0
+    for i in range(len(bytes)):
+        var byte = bytes[i]
+        if (
+            byte == Byte(ord(" "))
+            or byte == Byte(ord("\t"))
+            or byte == Byte(ord("\n"))
+            or byte == Byte(ord("\r"))
+        ):
+            continue
+        if byte < Byte(ord("0")) or byte > Byte(ord("9")):
+            return None
+        digits += 1
+        value = value * 10 + Int(byte - Byte(ord("0")))
+        if value > Int(Int32.MAX):
+            return None
+    if digits == 0 or value < 1:
+        return None
+    return value
+
+
+def _darwin_backlog_limit() -> Optional[Int]:
+    var name = String("kern.ipc.somaxconn")
+    var c_name = name.as_c_string_slice()
+    var value: Int32 = 0
+    var length = UInt64(size_of[Int32]())
+    var result = external_call["sysctlbyname", c_int](
+        c_name.unsafe_ptr(),
+        Pointer(to=value),
+        Pointer(to=length),
+        Optional[Pointer[Byte, MutUntrackedOrigin]](None),
+        c_size_t(0),
+    )
+    if result == -1:
+        return None
+    if length != UInt64(size_of[Int32]()) or value < 1:
+        return None
+    return Int(value)
+
+
+def _linux_backlog_limit() -> Optional[Int]:
+    try:
+        var handle = open("/proc/sys/net/core/somaxconn", "r")
+        return _parse_backlog_limit(handle.read())
+    except:
+        return None
+
+
+def _kernel_backlog_limit() -> Optional[Int]:
+    comptime if _DARWIN:
+        return _darwin_backlog_limit()
+    else:
+        return _linux_backlog_limit()
+
+
+def _default_listen_backlog() -> Int:
+    var limit = _kernel_backlog_limit()
+    if limit:
+        return limit.value()
+    return Int(SOMAXCONN)
