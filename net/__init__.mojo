@@ -8,5 +8,6 @@ from .address import (
     split_host_port,
 )
 from .tcp import TCPConn, TCPListener, dial_tcp, listen_tcp
+from .poll import Poller
 from .udp import UDPConn, UDPReceiveResult, dial_udp, listen_udp
 from .unix import UnixAddress, UnixConn, UnixListener, dial_unix, listen_unix

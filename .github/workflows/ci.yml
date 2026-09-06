@@ -42,6 +42,8 @@ jobs:
         run: pixi run test-udp
       - name: Test Unix sockets
         run: pixi run test-unix
+      - name: Test Poller multiplexing
+        run: pixi run test-poll
       - name: Sanitize system bindings
         run: pixi run sanitize-sys
       - name: Sanitize TCP
