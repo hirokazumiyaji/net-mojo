@@ -322,7 +322,10 @@ def _strerror_text(error_number: Int32) -> String:
     # strerror declaration (reached via std.tempfile); an
     # Optional-wrapped return type conflicts at compile time. strerror
     # never returns NULL on the supported targets (unknown codes yield
-    # "Unknown error N").
+    # "Unknown error N"). strerror may use a static buffer and is not
+    # guaranteed thread-safe; that is acceptable while net-mojo is
+    # single-threaded by design, and must be revisited (strerror_r) if
+    # threading support is ever added.
     var message = external_call["strerror", Pointer[Byte, MutUntrackedOrigin]](
         c_int(error_number)
     )
