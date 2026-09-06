@@ -22,6 +22,7 @@ from .address import (
     _listen_addresses,
     _socket_address_from_raw,
     _socket_address_to_raw,
+    _v6only_for_listen,
     resolve_socket_addresses,
     split_host_port,
 )
@@ -161,9 +162,7 @@ def listen_tcp(
             continue
         try:
             var raw = _socket_address_to_raw(candidate)
-            var v6only = candidate.ip.is_ipv6() and (
-                ipv6_only or not candidate.ip.is_unspecified()
-            )
+            var v6only = _v6only_for_listen(candidate, ipv6_only)
             var fd = _create_bound_socket(
                 AF_INET6 if candidate.ip.is_ipv6() else AF_INET,
                 SOCK_STREAM,

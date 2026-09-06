@@ -414,6 +414,12 @@ def resolve_socket_addresses(
     return addresses^
 
 
+def _v6only_for_listen(address: SocketAddress, ipv6_only: Bool) -> Bool:
+    return address.ip.is_ipv6() and (
+        ipv6_only or not address.ip.is_unspecified()
+    )
+
+
 def _listen_addresses(
     value: StringSlice, socket_type: Int32
 ) raises NetError -> List[SocketAddress]:

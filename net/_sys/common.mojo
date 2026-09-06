@@ -815,7 +815,7 @@ def _create_bound_socket(
     socket_type: Int32,
     mut address: _RawSocketAddress,
     reuse_address: Bool,
-    ipv6_only: Bool,
+    v6only: Bool,
 ) raises NetError -> _OwnedFD:
     var fd = _socket(domain, socket_type, 0)
     if reuse_address:
@@ -831,7 +831,7 @@ def _create_bound_socket(
             fd.raw(),
             IPPROTO_IPV6,
             IPV6_V6ONLY,
-            Int32(1) if ipv6_only else Int32(0),
+            Int32(1) if v6only else Int32(0),
             "setsockopt(IPV6_V6ONLY)",
         )
     _bind(fd.raw(), address)
