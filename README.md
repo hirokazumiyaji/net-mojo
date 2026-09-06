@@ -12,6 +12,7 @@ The design rationale is documented in [docs/design/net-package.md](docs/design/n
 | --- | --- | --- |
 | macOS | arm64, 64-bit | `macos-14` |
 | Linux | x86_64, 64-bit | `ubuntu-24.04` |
+| Linux | aarch64, 64-bit | `ubuntu-24.04-arm` |
 
 Windows, 32-bit ABIs, and unlisted targets are outside the supported matrix.
 
@@ -90,7 +91,7 @@ The initial release excludes asynchronous I/O, cancellation, a custom DNS client
 IPv4、IPv6、OS の名前解決、TCP、UDP、Unix stream socket を提供します。
 runtime 依存は Mojo の `std` と文書化した libc/POSIX ABI だけです。
 
-対応環境は macOS arm64 と Linux x86_64 です。
+対応環境は macOS arm64 と Linux x86_64 / aarch64 です。
 Windows、32-bit ABI、表にない target は対象外です。
 
 環境は `pixi install --frozen` で構築します。
