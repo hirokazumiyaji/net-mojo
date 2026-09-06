@@ -66,6 +66,13 @@ comptime EAGAIN: Int32 = darwin.EAGAIN if _DARWIN else linux.EAGAIN
 comptime EWOULDBLOCK: Int32 = (
     darwin.EWOULDBLOCK if _DARWIN else linux.EWOULDBLOCK
 )
+comptime ECONNREFUSED: Int32 = (
+    darwin.ECONNREFUSED if _DARWIN else linux.ECONNREFUSED
+)
+comptime ECONNRESET: Int32 = (
+    darwin.ECONNRESET if _DARWIN else linux.ECONNRESET
+)
+comptime EPIPE: Int32 = darwin.EPIPE if _DARWIN else linux.EPIPE
 comptime EAFNOSUPPORT: Int32 = (
     darwin.EAFNOSUPPORT if _DARWIN else linux.EAFNOSUPPORT
 )
