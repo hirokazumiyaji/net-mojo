@@ -149,7 +149,7 @@ def dial_tcp(
 
 
 def listen_tcp(
-    address: StringSlice, backlog: Int = 128
+    address: StringSlice, backlog: Int = 128, ipv6_only: Bool = False
 ) raises NetError -> TCPListener:
     if backlog < 1 or backlog > Int(Int32.MAX):
         raise _invalid_backlog_error("listen tcp")
@@ -157,14 +157,19 @@ def listen_tcp(
     var last_error: Optional[NetError] = None
 
     for candidate in addresses:
+        if ipv6_only and not candidate.ip.is_ipv6():
+            continue
         try:
             var raw = _socket_address_to_raw(candidate)
+            var v6only = candidate.ip.is_ipv6() and (
+                ipv6_only or not candidate.ip.is_unspecified()
+            )
             var fd = _create_bound_socket(
                 AF_INET6 if candidate.ip.is_ipv6() else AF_INET,
                 SOCK_STREAM,
                 raw,
                 True,
-                candidate.ip.is_ipv6(),
+                v6only,
             )
             _listen(fd.raw(), Int32(backlog))
             return TCPListener(fd^)

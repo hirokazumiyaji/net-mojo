@@ -826,12 +826,12 @@ def _create_bound_socket(
             1,
             "setsockopt(SO_REUSEADDR)",
         )
-    if ipv6_only:
+    if domain == AF_INET6:
         _set_socket_option_int(
             fd.raw(),
             IPPROTO_IPV6,
             IPV6_V6ONLY,
-            1,
+            Int32(1) if ipv6_only else Int32(0),
             "setsockopt(IPV6_V6ONLY)",
         )
     _bind(fd.raw(), address)

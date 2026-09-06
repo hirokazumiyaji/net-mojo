@@ -79,6 +79,49 @@ def test_ipv6_loopback_and_v6only() raises:
     assert_equal(received_byte, Byte(91))
 
 
+def test_wildcard_listen_accepts_ipv4() raises:
+    var listener = listen_tcp(":0")
+    var listening = listener.local_address()
+    if listening.ip.is_ipv6():
+        var v6only = Int(
+            _get_socket_option_int(
+                listener._fd.raw(), IPPROTO_IPV6, IPV6_V6ONLY
+            )
+        )
+        assert_equal(v6only, 0)
+    var port = listening.port
+    var client = dial_tcp(String(t"127.0.0.1:{port}"), Timeout.seconds(1))
+    var server = listener.accept(Timeout.seconds(1))
+    var sent = Array[Byte, 1](fill=77)
+    assert_equal(client.write(Span(sent), Timeout.seconds(1)), 1)
+    var received = Array[Byte, 1](fill=0)
+    assert_equal(server.read(Span(received), Timeout.seconds(1)), 1)
+    assert_equal(received[0], Byte(77))
+
+
+def test_wildcard_ipv6_only_option() raises:
+    var listening_port: UInt16
+    var v6only_value: Int
+    var was_v6: Bool
+    try:
+        var listener = listen_tcp(":0", ipv6_only=True)
+        v6only_value = Int(
+            _get_socket_option_int(
+                listener._fd.raw(), IPPROTO_IPV6, IPV6_V6ONLY
+            )
+        )
+        var listening = listener.local_address()
+        listening_port = listening.port
+        was_v6 = listening.ip.is_ipv6()
+    except error:
+        if error.kind == NetErrorKind.unsupported():
+            return
+        raise error^
+    assert_true(was_v6)
+    assert_equal(v6only_value, 1)
+    assert_true(listening_port != 0)
+
+
 def test_accept_timeout() raises:
     var listener = listen_tcp("127.0.0.1:0")
     try:

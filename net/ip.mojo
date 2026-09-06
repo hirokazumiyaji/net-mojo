@@ -51,6 +51,12 @@ struct IPAddress(Copyable, Equatable, Hashable, Writable):
     def is_ipv6(self) -> Bool:
         return self._family.value == 6
 
+    def is_unspecified(self) -> Bool:
+        for i in range(16):
+            if self._bytes[i] != 0:
+                return False
+        return True
+
     def as_bytes(self) -> Span[Byte, origin_of(self._bytes)]:
         return Span(self._bytes)
 

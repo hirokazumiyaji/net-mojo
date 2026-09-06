@@ -207,5 +207,32 @@ def test_ipv6_loopback_when_available() raises:
     assert_equal(second_byte, Byte(82))
 
 
+def test_wildcard_listen_receives_ipv4() raises:
+    from net.address import SocketAddress
+
+    var receiver = listen_udp(":0")
+    var bound = receiver.local_address()
+    if bound.ip.is_ipv6():
+        var v6only = Int(
+            _get_socket_option_int(
+                receiver._fd.raw(), IPPROTO_IPV6, IPV6_V6ONLY
+            )
+        )
+        assert_equal(v6only, 0)
+    var port = bound.port
+    var destination = SocketAddress.parse(String(t"127.0.0.1:{port}"))
+    var sender = listen_udp("127.0.0.1:0")
+    var payload: Array[Byte, 2] = [11, 22]
+    assert_equal(
+        sender.send_to(Span(payload), destination, Timeout.seconds(1)), 2
+    )
+    var received = Array[Byte, 2](fill=0)
+    var result = receiver.recv_from(Span(received), Timeout.seconds(1))
+    assert_equal(result.count, 2)
+    assert_false(result.truncated)
+    assert_equal(received[0], Byte(11))
+    assert_equal(received[1], Byte(22))
+
+
 def main() raises:
     TestSuite.discover_tests[__functions_in_module()]().run()

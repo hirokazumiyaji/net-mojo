@@ -211,19 +211,26 @@ def dial_udp(
     )
 
 
-def listen_udp(address: StringSlice) raises NetError -> UDPConn:
+def listen_udp(
+    address: StringSlice, ipv6_only: Bool = False
+) raises NetError -> UDPConn:
     var addresses = _listen_addresses(address, SOCK_DGRAM)
     var last_error: Optional[NetError] = None
 
     for candidate in addresses:
+        if ipv6_only and not candidate.ip.is_ipv6():
+            continue
         try:
             var raw = _socket_address_to_raw(candidate)
+            var v6only = candidate.ip.is_ipv6() and (
+                ipv6_only or not candidate.ip.is_unspecified()
+            )
             var fd = _create_bound_socket(
                 AF_INET6 if candidate.ip.is_ipv6() else AF_INET,
                 SOCK_DGRAM,
                 raw,
                 False,
-                candidate.ip.is_ipv6(),
+                v6only,
             )
             return UDPConn(fd^, False)
         except error:
