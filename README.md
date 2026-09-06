@@ -53,6 +53,7 @@ Each operation converts its relative timeout to one absolute deadline.
 TCP and Unix stream reads may be partial, and `write_all` loops until all bytes are written or an error occurs.
 `dial_udp` returns connected mode for `read` and `write`; `listen_udp` returns unconnected mode for `recv_from` and `send_to`.
 Connections and listeners own their descriptors through move-only types.
+One thread can serve many connections: register each socket's `raw_fd()` with `Poller`, call `wait`, then use `try_read` / `try_write` / `try_accept` on the ready indices. A would-block `try_*` call reports `timeout` instead of waiting.
 
 Unix socket paths are never removed by the library.
 Callers must remove a path after closing all descriptors.
@@ -67,7 +68,7 @@ pixi run example-udp
 pixi run example-unix
 ```
 
-Run the whole test suite with `pixi run test`, or a focused module with `pixi run test-tcp` and the analogous `test-core`, `test-ip`, `test-address`, `test-sys`, `test-udp`, and `test-unix` tasks.
+Run the whole test suite with `pixi run test`, or a focused module with `pixi run test-tcp` and the analogous `test-core`, `test-ip`, `test-address`, `test-sys`, `test-udp`, `test-unix`, and `test-poll` tasks.
 Run benchmarks with `pixi run benchmark-ip` and `pixi run benchmark-loopback`.
 Benchmarks report measurements and do not define pass or fail thresholds.
 

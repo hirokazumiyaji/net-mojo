@@ -14,6 +14,9 @@ from ._stream import (
     _SocketWriteStep,
     _accept_stream,
     _read_with_deadline,
+    _try_accept,
+    _try_recv,
+    _try_send,
     _write_all_loop,
     _write_with_deadline,
 )
@@ -76,6 +79,27 @@ struct TCPConn(Movable):
         var write_step = _SocketWriteStep(fd, buffer)
         _write_all_loop(len(buffer), deadline, write_step)
 
+    def try_read[
+        origin: MutOrigin
+    ](self, buffer: Span[mut=True, Byte, origin]) raises NetError -> Int:
+        """One `read` attempt that never waits: a would-block socket
+        reports `timeout` instead, so a `Poller` event loop can serve
+        the next ready descriptor."""
+        return _try_recv(self._fd.raw(), buffer)
+
+    def try_write[
+        origin: ImmOrigin
+    ](self, buffer: Span[Byte, origin]) raises NetError -> Int:
+        """One `write` attempt that never waits; see `try_read`."""
+        return _try_send(self._fd.raw(), buffer)
+
+    def raw_fd(self) raises NetError -> Int32:
+        """Borrows the descriptor number for `Poller` registration.
+
+        The socket keeps ownership: do not close the returned value.
+        """
+        return self._fd.raw()
+
     def local_address(self) raises NetError -> SocketAddress:
         var raw = _socket_name(self._fd.raw(), False)
         var length = raw.length
@@ -106,6 +130,17 @@ struct TCPListener(Movable):
     ) raises NetError -> TCPConn:
         var deadline = _Deadline.from_optional(timeout)
         return TCPConn(_accept_stream(self._fd.raw(), deadline))
+
+    def try_accept(self) raises NetError -> TCPConn:
+        """One `accept` attempt that never waits; see `TCPConn.try_read`."""
+        return TCPConn(_try_accept(self._fd.raw()))
+
+    def raw_fd(self) raises NetError -> Int32:
+        """Borrows the descriptor number for `Poller` registration.
+
+        The listener keeps ownership: do not close the returned value.
+        """
+        return self._fd.raw()
 
     def local_address(self) raises NetError -> SocketAddress:
         var raw = _socket_name(self._fd.raw(), False)

@@ -31,6 +31,7 @@ cannot be verified on the supported matrix.
 | `net/error.mojo` | `NetError`, `NetErrorKind` |
 | `net/timeout.mojo` | `Timeout` and the internal absolute `_Deadline` |
 | `net/tcp.mojo`, `net/udp.mojo`, `net/unix.mojo` | Protocol-specific public types |
+| `net/poll.mojo` | Single-threaded readiness multiplexing (`Poller`) |
 | `net/_sys/` | POSIX bindings, ABI layout checks, per-platform constants |
 
 Only `net/_sys/` performs `external_call`. The protocol modules compose those
@@ -144,6 +145,36 @@ buffer is detected rather than being silently cut.
 Unix socket paths are never unlinked by the package. Removing a path is only
 safe once every descriptor bound to it is closed, and only the caller knows
 when that is true.
+
+## Multiplexing
+
+One thread serves many connections with `Poller` (`net/poll.mojo`), a
+level-triggered readiness set built on `poll(2)`: register each socket's
+`raw_fd()`, call `wait` with an optional `Timeout`, then use `try_read` /
+`try_write` / `try_accept` / `try_recv_from` / `try_send_to` on the ready
+indices. This is the minimal multiplexing step — it reuses the package's
+existing non-blocking descriptors and per-fd `poll` logic, so an event loop
+needs no threads. `poll(2)` scans every registration on each call; an
+epoll/kqueue backend is a future optimization that keeps this API.
+
+`try_*` methods make exactly one syscall attempt: `EINTR` is retried and a
+would-block socket reports `NetErrorKind.timeout()` instead of waiting, so
+the loop can move on to the next ready descriptor. A readable registration
+also covers hangup and error conditions, so a closed peer surfaces as `0`
+(EOF) or a system error on the next `try_*` call rather than hanging the
+loop.
+
+`raw_fd()` borrows the descriptor number; ownership stays with the socket.
+The owner must keep each registered socket alive until it is removed:
+Mojo destroys a move-only value at its last use, so an unreferenced socket
+may be closed while `wait` still watches its number, and a recycled number
+can then report readiness for the wrong socket. Hold every registered
+socket in a live binding or close it explicitly.
+
+Thread-based cancellation (calling `shutdown` from another thread to break
+a blocking `read`) and async I/O remain future work: thread sharing of
+sockets is unexercised on the supported matrix, so `cancellation` stays a
+non-goal until the threading story is proven out.
 
 ## Testing
 

@@ -64,6 +64,70 @@ def _write_with_deadline[
             raise _timeout_error("write")
 
 
+def _try_recv[
+    origin: MutOrigin
+](fd: Int32, buffer: Span[mut=True, Byte, origin]) raises NetError -> Int:
+    """One `recv` attempt without waiting: `EINTR` is retried, `EAGAIN`
+    is reported as a timeout so event loops can move on to the next fd."""
+    if len(buffer) == 0:
+        return 0
+    while True:
+        var status = _recv_status(fd, buffer)
+        if status.error_number == 0:
+            return status.value
+        if _is_interrupted(status.error_number):
+            continue
+        if _is_would_block(status.error_number):
+            raise _timeout_error("read")
+        raise _system_error("recv", status.error_number)
+
+
+def _try_send[
+    origin: ImmOrigin
+](fd: Int32, buffer: Span[Byte, origin]) raises NetError -> Int:
+    """One `send` attempt without waiting, with the same mapping as
+    `_try_recv`."""
+    if len(buffer) == 0:
+        return 0
+    while True:
+        var status = _send_status(fd, buffer)
+        if status.error_number == 0:
+            if status.value == 0:
+                raise NetError(
+                    NetErrorKind.invalid_state(),
+                    "write",
+                    None,
+                    "non-empty write made no progress",
+                )
+            return status.value
+        if _is_interrupted(status.error_number):
+            continue
+        if _is_would_block(status.error_number):
+            raise _timeout_error("write")
+        raise _system_error("send", status.error_number)
+
+
+def _try_accept(fd: Int32) raises NetError -> _OwnedFD:
+    """One `accept` attempt without waiting, with the same mapping as
+    `_try_recv`."""
+    while True:
+        var status = _accept_status(fd)
+        if status.invalid_state:
+            raise NetError(
+                NetErrorKind.invalid_state(),
+                "accept",
+                None,
+                "accepted descriptor configuration failed",
+            )
+        if status.error_number == 0:
+            return status.take_fd()
+        if _is_interrupted(status.error_number):
+            continue
+        if _is_would_block(status.error_number):
+            raise _timeout_error("accept")
+        raise _system_error("accept", status.error_number)
+
+
 trait _WriteAllStep:
     def write(
         mut self, offset: Int, remaining: Int, deadline: _Deadline

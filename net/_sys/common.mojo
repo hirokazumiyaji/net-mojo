@@ -267,7 +267,7 @@ struct _AcceptStatus(Movable):
 
 
 @fieldwise_init
-struct _PollFD:
+struct _PollFD(Copyable, Movable):
     var fd: Int32
     var events: Int16
     var revents: Int16
@@ -943,3 +943,56 @@ def _wait_readable(fd: Int32, deadline: _Deadline) raises NetError -> Bool:
 
 def _wait_writable(fd: Int32, deadline: _Deadline) raises NetError -> Bool:
     return _wait(fd, POLLOUT, deadline)
+
+
+def _poll_timeout_ms(deadline: _Deadline) -> Int32:
+    if deadline.is_indefinite():
+        return -1
+    var remaining = deadline.remaining_milliseconds()
+    if remaining < Int(Int32.MAX):
+        return Int32(remaining)
+    return Int32.MAX
+
+
+def _poll_multiple(
+    mut entries: List[_PollFD], deadline: _Deadline
+) raises NetError -> Int:
+    """Polls every entry at once, mirroring `_wait` timeout semantics.
+
+    Returns the number of entries with a nonzero `revents`. An empty list
+    returns 0 immediately. The poll is always attempted at least once, so
+    an expired deadline still reports what is already ready instead of
+    sleeping. `EINTR` restarts the wait against the same deadline instead
+    of surfacing to the caller. `revents` is cleared up front so a caller
+    never observes state left over from a previous wait.
+    """
+    if len(entries) == 0:
+        return 0
+    for i in range(len(entries)):
+        entries[i].revents = 0
+    while True:
+        var timeout = _poll_timeout_ms(deadline)
+        var result: Int32
+        comptime if _DARWIN:
+            result = external_call["poll", c_int](
+                Pointer(to=entries[0]),
+                c_uint(len(entries)),
+                c_int(timeout),
+            )
+        else:
+            result = external_call["poll", c_int](
+                Pointer(to=entries[0]),
+                c_ulong(len(entries)),
+                c_int(timeout),
+            )
+        if result > 0:
+            return Int(result)
+        if result == 0:
+            if deadline.expired():
+                return 0
+            continue
+        var error_number = _last_errno()
+        if error_number != EINTR:
+            raise _system_error("poll", error_number)
+        if deadline.expired():
+            return 0

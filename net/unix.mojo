@@ -13,6 +13,9 @@ from ._stream import (
     _SocketWriteStep,
     _accept_stream,
     _read_with_deadline,
+    _try_accept,
+    _try_recv,
+    _try_send,
     _write_all_loop,
     _write_with_deadline,
 )
@@ -70,6 +73,25 @@ struct UnixConn(Movable):
         var write_step = _SocketWriteStep(self._fd.raw(), buffer)
         _write_all_loop(len(buffer), deadline, write_step)
 
+    def try_read[
+        origin: MutOrigin
+    ](self, buffer: Span[mut=True, Byte, origin]) raises NetError -> Int:
+        """One `read` attempt that never waits; see `TCPConn.try_read`."""
+        return _try_recv(self._fd.raw(), buffer)
+
+    def try_write[
+        origin: ImmOrigin
+    ](self, buffer: Span[Byte, origin]) raises NetError -> Int:
+        """One `write` attempt that never waits; see `TCPConn.try_read`."""
+        return _try_send(self._fd.raw(), buffer)
+
+    def raw_fd(self) raises NetError -> Int32:
+        """Borrows the descriptor number for `Poller` registration.
+
+        The socket keeps ownership: do not close the returned value.
+        """
+        return self._fd.raw()
+
     def close(mut self) raises NetError:
         self._fd.close()
 
@@ -85,6 +107,17 @@ struct UnixListener(Movable):
     ) raises NetError -> UnixConn:
         var deadline = _Deadline.from_optional(timeout)
         return UnixConn(_accept_stream(self._fd.raw(), deadline))
+
+    def try_accept(self) raises NetError -> UnixConn:
+        """One `accept` attempt that never waits; see `TCPConn.try_read`."""
+        return UnixConn(_try_accept(self._fd.raw()))
+
+    def raw_fd(self) raises NetError -> Int32:
+        """Borrows the descriptor number for `Poller` registration.
+
+        The listener keeps ownership: do not close the returned value.
+        """
+        return self._fd.raw()
 
     def close(mut self) raises NetError:
         self._fd.close()
