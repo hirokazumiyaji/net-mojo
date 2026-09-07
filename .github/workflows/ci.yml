@@ -45,6 +45,14 @@ jobs:
         run: pixi run test-unix
       - name: Test Poller multiplexing
         run: pixi run test-poll
+      - name: Test Reactor readiness
+        run: pixi run test-reactor
+      - name: Test HTTP API probe
+        run: pixi run test-http-api
+      - name: Test HTTP parser
+        run: pixi run test-http-parser
+      - name: Test HTTP response
+        run: pixi run test-http-response
       - name: Package precompiled artifact
         run: pixi run package
       - name: Verify packaged artifact

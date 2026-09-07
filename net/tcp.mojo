@@ -253,6 +253,21 @@ struct TCPAcceptResult(Movable):
     var address: SocketAddress
 
 
+def _apply_tcp_defaults(fd: Int32) raises NetError:
+    """Applies the documented defaults to a new connected socket.
+
+    Every accept and dial path runs through here so no route inherits
+    silently: new connections default to `TCP_NODELAY=1` (Go parity).
+    """
+    _set_socket_option_int(
+        fd,
+        IPPROTO_TCP,
+        TCP_NODELAY,
+        Int32(1),
+        "setsockopt(TCP_NODELAY)",
+    )
+
+
 struct TCPListener(Movable):
     var _fd: _OwnedFD
 
@@ -264,18 +279,14 @@ struct TCPListener(Movable):
     ) raises NetError -> TCPConn:
         var deadline = _Deadline.from_optional(timeout)
         var fd = _accept_stream(self._fd.raw(), deadline)
-        _set_socket_option_int(
-            fd.raw(),
-            IPPROTO_TCP,
-            TCP_NODELAY,
-            Int32(1),
-            "setsockopt(TCP_NODELAY)",
-        )
+        _apply_tcp_defaults(fd.raw())
         return TCPConn(fd^)
 
     def try_accept(self) raises NetError -> TCPConn:
         """One `accept` attempt that never waits; see `TCPConn.try_read`."""
-        return TCPConn(_try_accept(self._fd.raw()))
+        var fd = _try_accept(self._fd.raw())
+        _apply_tcp_defaults(fd.raw())
+        return TCPConn(fd^)
 
     def raw_fd(self) raises NetError -> Int32:
         """Borrows the descriptor number for `Poller` registration.
@@ -295,9 +306,9 @@ struct TCPListener(Movable):
         var address = _socket_address_from_raw(
             accepted.peer.unsafe_ptr(), peer_length
         )
-        return TCPAcceptResult(
-            conn=TCPConn(accepted.take_fd()), address=address^
-        )
+        var fd = accepted.take_fd()
+        _apply_tcp_defaults(fd.raw())
+        return TCPAcceptResult(conn=TCPConn(fd^), address=address^)
 
     def local_address(self) raises NetError -> SocketAddress:
         var raw = _socket_name(self._fd.raw(), False)
@@ -321,13 +332,7 @@ def _dial_tcp_candidates(
             var fd = _connect_candidate(
                 domain, SOCK_STREAM, raw, has_attempted, deadline
             )
-            _set_socket_option_int(
-                fd.raw(),
-                IPPROTO_TCP,
-                TCP_NODELAY,
-                Int32(1),
-                "setsockopt(TCP_NODELAY)",
-            )
+            _apply_tcp_defaults(fd.raw())
             return TCPConn(fd^)
         except error:
             if error.kind == NetErrorKind.timeout():

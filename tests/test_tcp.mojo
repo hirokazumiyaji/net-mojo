@@ -2,7 +2,7 @@ from std.ffi import c_int, c_ulong, external_call
 from std.testing import assert_equal, assert_true, TestSuite
 from std.time import perf_counter_ns, sleep
 
-from net import SocketAddress, TCPConn, Timeout, dial_tcp, listen_tcp
+from net import Poller, SocketAddress, TCPConn, Timeout, dial_tcp, listen_tcp
 from net.error import NetError, NetErrorKind
 from net.tcp import _dial_tcp_candidates
 from net._stream import _read_with_deadline
@@ -343,6 +343,40 @@ def test_no_delay_defaults_to_enabled_and_toggles() raises:
     )
     client.close()
     server.close()
+    listener.close()
+
+
+def test_try_accept_enables_no_delay() raises:
+    var listener = listen_tcp("127.0.0.1:0")
+    var listening = listener.local_address()
+    var client = dial_tcp(String(listening), Timeout.seconds(1))
+    # Wait until the pending connection is ready, then take the
+    # non-blocking path used by event loops.
+    var waiter = Poller()
+    waiter.add(listener.raw_fd())
+    assert_equal(waiter.wait(Timeout.seconds(1)), 1)
+    var server = listener.try_accept()
+    assert_true(
+        _get_socket_option_int(server._fd.raw(), IPPROTO_TCP, TCP_NODELAY) != 0
+    )
+    client.close()
+    server.close()
+    listener.close()
+
+
+def test_accept_with_address_enables_no_delay() raises:
+    var listener = listen_tcp("127.0.0.1:0")
+    var listening = listener.local_address()
+    var client = dial_tcp(String(listening), Timeout.seconds(1))
+    var accepted = listener.accept_with_address(Timeout.seconds(1))
+    assert_true(
+        _get_socket_option_int(
+            accepted.conn._fd.raw(), IPPROTO_TCP, TCP_NODELAY
+        )
+        != 0
+    )
+    client.close()
+    accepted.conn.close()
     listener.close()
 
 

@@ -14,6 +14,7 @@ test-tcp = "mojo run --Werror -I . tests/test_tcp.mojo"
 test-udp = "mojo run --Werror -I . tests/test_udp.mojo"
 test-unix = "mojo run --Werror -I . tests/test_unix.mojo"
 test-poll = "mojo run --Werror -I . tests/test_poll.mojo"
+test-reactor = "mojo run --Werror -I . tests/test_reactor.mojo"
 test-http-api = "mojo run --Werror -I . tests/test_http_api.mojo"
 test-http-parser = "mojo run --Werror -I . tests/test_http_parser.mojo"
 test-http-response = "mojo run --Werror -I . tests/test_http_response.mojo"
@@ -30,6 +31,7 @@ test = { depends-on = [
   "test-udp",
   "test-unix",
   "test-poll",
+  "test-reactor",
   "test-http-api",
   "test-http-parser",
   "test-http-response",
