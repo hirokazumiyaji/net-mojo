@@ -449,6 +449,14 @@ struct Server(Movable):
             if not self._conns[idx].active:
                 return
         if self._conns[idx].state == STATE_READING:
+            if (
+                self._conns[idx].read_eof
+                and self._conns[idx].buffered_len() == 0
+                and self._conns[idx].pending_remaining() == 0
+            ):
+                # Drained everything the half-closed peer sent.
+                self._close_conn(idx)
+                return
             self._pump_read(idx, readable, now)
             if not self._conns[idx].active:
                 return
@@ -738,22 +746,17 @@ struct Server(Movable):
         if len(writer.body) > cap:
             self._send_error(idx, 500)
             return
-        if len(writer.headers) > self.config.max_response_headers_count:
-            self._send_error(idx, 500)
-            return
-        var header_bytes = 0
-        for i in range(len(writer.headers)):
-            header_bytes += (
-                writer.headers.name_at(i).byte_length()
-                + writer.headers.value_at(i).byte_length()
-                + 4
-            )
-        if header_bytes > self.config.max_response_headers_bytes:
-            self._send_error(idx, 500)
-            return
+        # Header count/bytes are enforced inside the encoder, the single
+        # authoritative site; its failure below becomes a 500 the same way.
         var wire: List[Byte]
         try:
-            wire = encode_response(writer, is_head, self._tick_date)
+            wire = encode_response(
+                writer,
+                is_head,
+                self._tick_date,
+                self.config.max_response_headers_count,
+                self.config.max_response_headers_bytes,
+            )
         except e:
             _ = e
             self._send_error(idx, 500)
@@ -762,10 +765,17 @@ struct Server(Movable):
             self._send_error(idx, 500)
             return
         self._conns[idx].set_pending(wire^)
+        # A half-closed peer (read_eof) forces close only when nothing
+        # is left to answer: pipelined requests already buffered must
+        # still be served first. The EOF drain rule in _drive_conn
+        # closes the connection once the buffer runs dry.
         self._conns[idx].should_close = (
             req_close
             or writer.should_close
-            or self._conns[idx].read_eof
+            or (
+                self._conns[idx].read_eof
+                and self._conns[idx].buffered_len() == 0
+            )
             or self._shutdown_at != NO_DEADLINE
         )
         self._conns[idx].write_at = deadline_from_now(

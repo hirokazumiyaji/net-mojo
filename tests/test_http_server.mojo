@@ -340,6 +340,27 @@ def _drain_until_eof(
     return out^
 
 
+def _drain_until_eof_driven[
+    H: Handler
+](mut server: Server, mut handler: H, client: TCPConn) raises -> List[Byte]:
+    # Ticks the server while draining: for flows where the server only
+    # progresses while being driven.
+    var out = List[Byte]()
+    var tmp = Array[Byte, 65536](fill=0)
+    for _ in range(500):
+        _ = server.tick(handler, Timeout.nanoseconds(0))
+        try:
+            var n = client.try_read(Span(tmp))
+            if n == 0:
+                break
+            for i in range(n):
+                out.append(tmp[i])
+        except e:
+            _ = e
+            continue
+    return out^
+
+
 def test_pipelined_chain_completes_without_extra_waits() raises:
     # Six pipelined requests must all complete well before six ticks:
     # chaining parses each buffered request in the same drive instead
@@ -579,6 +600,43 @@ def test_eof_after_complete_responds_then_closes() raises:
     _tick_n(server, handler, 50)
     assert_equal(server.active_connections(), 0)
     assert_true(saw_eof)
+    client.close()
+
+
+def test_eof_after_pipelined_batch_serves_all() raises:
+    # Three pipelined requests followed by a write-side shutdown: every
+    # queued request is answered before the connection closes.
+    var server = Server(ServerConfig.default())
+    server.add_listener(listen_tcp("127.0.0.1:0"))
+    var port = server.local_address().port
+    var handler = _TwoHandler()
+    var client = dial_tcp(
+        String("127.0.0.1:") + String(port), Timeout.seconds(2)
+    )
+    client.write_all(
+        String(
+            "GET /one HTTP/1.1\r\nHost: x\r\n\r\nGET /two HTTP/1.1\r\nHost:"
+            " x\r\n\r\nGET /one HTTP/1.1\r\nHost: x\r\n\r\n"
+        ).as_bytes(),
+        Timeout.seconds(2),
+    )
+    client.shutdown(False, True)
+    var out = _drain_until_eof_driven(server, handler, client)
+    var text = String(from_utf8_lossy=Span(out))
+    var ones = 0
+    var rest = text
+    while True:
+        var at = rest.find("ONE")
+        if at < 0:
+            break
+        ones += 1
+        var rest_bytes = rest.as_bytes()
+        var tail = String(from_utf8_lossy=rest_bytes[at + 3 : len(rest_bytes)])
+        rest = tail^
+    assert_equal(ones, 2)
+    assert_true(text.find("TWO") >= 0)
+    _tick_n(server, handler, 20)
+    assert_equal(server.active_connections(), 0)
     client.close()
 
 
