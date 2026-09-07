@@ -167,16 +167,43 @@ def _has_close_token(value: StringSlice) -> Bool:
 
 
 def encode_response(
-    writer: ResponseWriter, is_head: Bool, date: StringSlice
+    writer: ResponseWriter,
+    is_head: Bool,
+    date: StringSlice,
+    max_headers: Int,
+    max_bytes: Int,
 ) raises NetError -> List[Byte]:
     """Renders a buffered response with explicit `Date` (tests pin it;
-    servers pass `current_http_date()`)."""
+    servers pass `current_http_date()`).
+
+    Response header count and bytes are enforced here so every encoder
+    user, not just the server loop, honors the advertised bounds.
+    """
     if writer.status < 100 or writer.status > 999:
         raise NetError(
             NetErrorKind.invalid_argument(),
             "encode response",
             None,
             "response status is not a three-digit code",
+        )
+    if len(writer.headers) > max_headers:
+        raise NetError(
+            NetErrorKind.invalid_argument(),
+            "encode response",
+            None,
+            "too many response headers",
+        )
+    var header_bytes = 0
+    for i in range(len(writer.headers)):
+        header_bytes += writer.headers.name_at(i).byte_length()
+        header_bytes += writer.headers.value_byte_length(i)
+        header_bytes += 4
+    if header_bytes > max_bytes:
+        raise NetError(
+            NetErrorKind.invalid_argument(),
+            "encode response",
+            None,
+            "response headers too large",
         )
     var send_body = has_body_for_status(writer.status, is_head)
     # HEAD omits body bytes but keeps the GET-equivalent length.

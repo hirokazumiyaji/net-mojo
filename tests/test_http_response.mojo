@@ -27,7 +27,9 @@ def test_normal_response_has_length_and_date() raises:
     var writer = ResponseWriter(1024)
     writer.headers.add(String("Content-Type"), String("text/plain"))
     writer.write_string("hello")
-    var wire = encode_response(writer, False, "Thu, 01 Jan 1970 00:00:00 GMT")
+    var wire = encode_response(
+        writer, False, "Thu, 01 Jan 1970 00:00:00 GMT", 100, 32768
+    )
     var text = _bytes_to_string(Span(wire))
     assert_true(text.startswith("HTTP/1.1 200 OK\r\n"))
     assert_true(text.find("Content-Type: text/plain\r\n") >= 0)
@@ -40,7 +42,9 @@ def test_head_keeps_length_but_omits_body() raises:
     var writer = ResponseWriter(1024)
     writer.headers.add(String("Content-Type"), String("text/plain"))
     writer.write_string("hello")
-    var wire = encode_response(writer, True, "Thu, 01 Jan 1970 00:00:00 GMT")
+    var wire = encode_response(
+        writer, True, "Thu, 01 Jan 1970 00:00:00 GMT", 100, 32768
+    )
     var text = _bytes_to_string(Span(wire))
     assert_true(text.find("Content-Length: 5\r\n") >= 0)
     assert_true(text.endswith("\r\n\r\n"))
@@ -54,7 +58,11 @@ def test_no_body_statuses_drop_body_and_length() raises:
         writer.headers.add(String("Content-Type"), String("text/plain"))
         writer.write_string("dropped")
         var wire = encode_response(
-            writer, False, "Thu, 01 Jan 1970 00:00:00 GMT"
+            writer,
+            False,
+            "Thu, 01 Jan 1970 00:00:00 GMT",
+            100,
+            32768,
         )
         var text = _bytes_to_string(Span(wire))
         assert_true(text.find("Content-Length") < 0)
@@ -63,7 +71,11 @@ def test_no_body_statuses_drop_body_and_length() raises:
     var informational = ResponseWriter(1024)
     informational.set_status(100)
     var wire_info = encode_response(
-        informational, False, "Thu, 01 Jan 1970 00:00:00 GMT"
+        informational,
+        False,
+        "Thu, 01 Jan 1970 00:00:00 GMT",
+        100,
+        32768,
     )
     var text_info = _bytes_to_string(Span(wire_info))
     assert_true(text_info.find("Content-Length") < 0)
@@ -74,7 +86,9 @@ def test_duplicate_response_headers_preserved() raises:
     writer.headers.add(String("X-Multi"), String("1"))
     writer.headers.add(String("x-multi"), String("2"))
     writer.write_string("ok")
-    var wire = encode_response(writer, False, "Thu, 01 Jan 1970 00:00:00 GMT")
+    var wire = encode_response(
+        writer, False, "Thu, 01 Jan 1970 00:00:00 GMT", 100, 32768
+    )
     var text = _bytes_to_string(Span(wire))
     assert_true(text.find("X-Multi: 1\r\n") >= 0)
     assert_true(text.find("x-multi: 2\r\n") >= 0)
@@ -97,7 +111,9 @@ def test_content_length_consistency_enforced() raises:
     var matching = ResponseWriter(1024)
     matching.headers.add(String("Content-Length"), String("2"))
     matching.write_string("ab")
-    var wire = encode_response(matching, False, "Thu, 01 Jan 1970 00:00:00 GMT")
+    var wire = encode_response(
+        matching, False, "Thu, 01 Jan 1970 00:00:00 GMT", 100, 32768
+    )
     var text = _bytes_to_string(Span(wire))
     assert_true(text.find("Content-Length: 2\r\n") >= 0)
     var mismatch = ResponseWriter(1024)
@@ -105,7 +121,9 @@ def test_content_length_consistency_enforced() raises:
     mismatch.write_string("ab")
     var failed = False
     try:
-        _ = encode_response(mismatch, False, "Thu, 01 Jan 1970 00:00:00 GMT")
+        _ = encode_response(
+            mismatch, False, "Thu, 01 Jan 1970 00:00:00 GMT", 100, 32768
+        )
     except error:
         assert_equal(error.kind, NetErrorKind.invalid_argument())
         failed = True
@@ -120,7 +138,9 @@ def test_transfer_encoding_on_response_is_rejected() raises:
     writer.write_string("hello")
     var failed = False
     try:
-        _ = encode_response(writer, False, "Thu, 01 Jan 1970 00:00:00 GMT")
+        _ = encode_response(
+            writer, False, "Thu, 01 Jan 1970 00:00:00 GMT", 100, 32768
+        )
     except error:
         assert_equal(error.kind, NetErrorKind.invalid_argument())
         failed = True
@@ -131,7 +151,9 @@ def test_caller_date_is_kept() raises:
     var writer = ResponseWriter(1024)
     writer.headers.add(String("Date"), String("Thu, 01 Jan 1970 00:00:00 GMT"))
     writer.write_string("hi")
-    var wire = encode_response(writer, False, "Sat, 01 Jan 2000 00:00:00 GMT")
+    var wire = encode_response(
+        writer, False, "Sat, 01 Jan 2000 00:00:00 GMT", 100, 32768
+    )
     var text = _bytes_to_string(Span(wire))
     assert_true(text.find("Date: Thu, 01 Jan 1970 00:00:00 GMT\r\n") >= 0)
     assert_true(text.find("Sat, 01 Jan 2000") < 0)
@@ -141,7 +163,9 @@ def test_connection_close_advertised() raises:
     var writer = ResponseWriter(1024)
     writer.set_should_close(True)
     writer.write_string("bye")
-    var wire = encode_response(writer, False, "Thu, 01 Jan 1970 00:00:00 GMT")
+    var wire = encode_response(
+        writer, False, "Thu, 01 Jan 1970 00:00:00 GMT", 100, 32768
+    )
     var text = _bytes_to_string(Span(wire))
     assert_true(text.find("Connection: close\r\n") >= 0)
 
@@ -154,7 +178,11 @@ def test_connection_close_needs_whole_token() raises:
     tricky.headers.add(String("Connection"), String("x-close"))
     tricky.write_string("bye")
     var tricky_wire = encode_response(
-        tricky, False, "Thu, 01 Jan 1970 00:00:00 GMT"
+        tricky,
+        False,
+        "Thu, 01 Jan 1970 00:00:00 GMT",
+        100,
+        32768,
     )
     var tricky_text = _bytes_to_string(Span(tricky_wire))
     assert_true(tricky_text.find("Connection: close\r\n") >= 0)
@@ -163,10 +191,50 @@ def test_connection_close_needs_whole_token() raises:
     listed.headers.add(String("Connection"), String("Keep-Alive, close"))
     listed.write_string("bye")
     var listed_wire = encode_response(
-        listed, False, "Thu, 01 Jan 1970 00:00:00 GMT"
+        listed,
+        False,
+        "Thu, 01 Jan 1970 00:00:00 GMT",
+        100,
+        32768,
     )
     var listed_text = _bytes_to_string(Span(listed_wire))
     assert_true(listed_text.find("Connection: close\r\n") < 0)
+
+
+def test_response_header_limits_are_enforced() raises:
+    var many = ResponseWriter(1024)
+    for _ in range(101):
+        many.headers.add(String("X-A"), String("1"))
+    many.write_string("x")
+    var failed_count = False
+    try:
+        _ = encode_response(
+            many, False, "Thu, 01 Jan 1970 00:00:00 GMT", 100, 32768
+        )
+    except error:
+        assert_equal(error.kind, NetErrorKind.invalid_argument())
+        failed_count = True
+    assert_true(failed_count)
+    var big = ResponseWriter(1024)
+    big.headers.add(String("X-A"), String("y") * 40000)
+    big.write_string("x")
+    var failed_bytes = False
+    try:
+        _ = encode_response(
+            big, False, "Thu, 01 Jan 1970 00:00:00 GMT", 100, 32768
+        )
+    except error:
+        assert_equal(error.kind, NetErrorKind.invalid_argument())
+        failed_bytes = True
+    assert_true(failed_bytes)
+    # Exactly at the limits still encodes.
+    var edge = ResponseWriter(1024)
+    edge.headers.add(String("X-A"), String("1"))
+    edge.write_string("x")
+    var wire = encode_response(
+        edge, False, "Thu, 01 Jan 1970 00:00:00 GMT", 1, 32768
+    )
+    assert_true(len(wire) > 0)
 
 
 def test_100_continue_encoding() raises:
@@ -182,7 +250,9 @@ def test_invalid_status_codes_are_rejected() raises:
         writer.write_string("x")
         var failed = False
         try:
-            _ = encode_response(writer, False, "Thu, 01 Jan 1970 00:00:00 GMT")
+            _ = encode_response(
+                writer, False, "Thu, 01 Jan 1970 00:00:00 GMT", 100, 32768
+            )
         except error:
             assert_equal(error.kind, NetErrorKind.invalid_argument())
             failed = True
