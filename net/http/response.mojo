@@ -50,6 +50,7 @@ struct ResponseWriter(Movable, Sized):
                 None,
                 "response body exceeds limit",
             )
+        self.body.reserve(len(self.body) + len(data))
         for i in range(len(data)):
             self.body.append(data[i])
 
@@ -62,6 +63,7 @@ struct ResponseWriter(Movable, Sized):
                 None,
                 "response body exceeds limit",
             )
+        self.body.reserve(len(self.body) + len(bytes))
         for i in range(len(bytes)):
             self.body.append(bytes[i])
 
