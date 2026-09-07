@@ -306,6 +306,24 @@ def _chunk_ext_valid(ext: StringSlice) -> Bool:
     return not expect_item
 
 
+def _split_chunk_size(line: StringSlice) -> Tuple[String, String, Bool]:
+    # Splits a chunk-size line at the first `;`, trimming BWS only when
+    # an extension is actually present: a bare size line is hexadecimal
+    # digits only, so leading/trailing whitespace there is malformed
+    # framing rather than extension padding.
+    var bytes = line.as_bytes()
+    var semi = -1
+    for i in range(len(bytes)):
+        if bytes[i] == Byte(ord(";")):
+            semi = i
+            break
+    if semi < 0:
+        return String(line), String(""), False
+    var size = _trim_ows(String(from_utf8_lossy=bytes[0:semi]))
+    var ext = String(from_utf8_lossy=bytes[semi + 1 :])
+    return size^, ext^, True
+
+
 def _parse_hex_size(data: StringSlice) -> Int:
     var bytes = data.as_bytes()
     if len(bytes) == 0:
@@ -324,6 +342,60 @@ def _parse_hex_size(data: StringSlice) -> Int:
         if value > 16 * 1024 * 1024 * 1024:
             return -1
     return value
+
+
+def _is_hex_digit(byte: Byte) -> Bool:
+    return (
+        (byte >= Byte(ord("0")) and byte <= Byte(ord("9")))
+        or (byte >= Byte(ord("a")) and byte <= Byte(ord("f")))
+        or (byte >= Byte(ord("A")) and byte <= Byte(ord("F")))
+    )
+
+
+def _is_reg_name(hostname: StringSlice) -> Bool:
+    # Unbracketed reg-name (RFC 3986): unreserved / pct-encoded /
+    # sub-delims. In particular `%` must open two hex digits and
+    # characters outside the set (backslash, DQUOTE, ...) are rejected
+    # instead of passed to routing.
+    var bytes = hostname.as_bytes()
+    if len(bytes) == 0:
+        return False
+    var i = 0
+    while i < len(bytes):
+        var byte = bytes[i]
+        if byte == Byte(ord("%")):
+            if i + 2 >= len(bytes):
+                return False
+            if not _is_hex_digit(bytes[i + 1]):
+                return False
+            if not _is_hex_digit(bytes[i + 2]):
+                return False
+            i += 3
+            continue
+        var ok = (
+            (byte >= Byte(ord("A")) and byte <= Byte(ord("Z")))
+            or (byte >= Byte(ord("a")) and byte <= Byte(ord("z")))
+            or (byte >= Byte(ord("0")) and byte <= Byte(ord("9")))
+            or byte == Byte(ord("-"))
+            or byte == Byte(ord("."))
+            or byte == Byte(ord("_"))
+            or byte == Byte(ord("~"))
+            or byte == Byte(ord("!"))
+            or byte == Byte(ord("$"))
+            or byte == Byte(ord("&"))
+            or byte == Byte(ord("'"))
+            or byte == Byte(ord("("))
+            or byte == Byte(ord(")"))
+            or byte == Byte(ord("*"))
+            or byte == Byte(ord("+"))
+            or byte == Byte(ord(","))
+            or byte == Byte(ord(";"))
+            or byte == Byte(ord("="))
+        )
+        if not ok:
+            return False
+        i += 1
+    return True
 
 
 def _is_valid_port(port: StringSlice) -> Bool:
@@ -416,14 +488,17 @@ def _host_is_valid(data: StringSlice) -> Bool:
     if colons > 1:
         # Bare IPv6 must arrive bracketed.
         return False
-    if colons == 0:
-        return True
-    if last_colon == 0 or last_colon + 1 >= len(bytes):
-        return False
-    for i in range(last_colon):
-        if bytes[i] == Byte(ord("%")):
+    var hostname = String(from_utf8_lossy=bytes)
+    if colons == 1:
+        if last_colon == 0 or last_colon + 1 >= len(bytes):
             return False
-    return _is_valid_port(String(from_utf8_lossy=bytes[last_colon + 1 :]))
+        for i in range(last_colon):
+            if bytes[i] == Byte(ord("%")):
+                return False
+        if not _is_valid_port(String(from_utf8_lossy=bytes[last_colon + 1 :])):
+            return False
+        hostname = String(from_utf8_lossy=bytes[0:last_colon])
+    return _is_reg_name(hostname)
 
 
 def _parse_absolute_authority(
@@ -460,6 +535,233 @@ def _parse_absolute_authority(
         # to `/` so root handlers see one path for both spellings.
         path = String("/")
     return True, authority^, path^, query^
+
+
+def _trailer_forbidden(name: StringSlice) -> Bool:
+    # RFC 9112 6.5.1 forbids trailers that change framing, routing,
+    # authentication, or payload processing.
+    var lowered = String(name).lower()
+    return (
+        lowered == "content-length"
+        or lowered == "transfer-encoding"
+        or lowered == "te"
+        or lowered == "trailer"
+        or lowered == "host"
+        or lowered == "expect"
+        or lowered == "connection"
+        or lowered == "keep-alive"
+        or lowered == "upgrade"
+        or lowered == "authorization"
+        or lowered == "proxy-authenticate"
+        or lowered == "proxy-authorization"
+        or lowered == "content-encoding"
+        or lowered == "content-type"
+        or lowered == "content-range"
+    )
+
+
+@fieldwise_init
+struct _ChunkScan(Copyable, Movable):
+    """Structural pre-scan of a chunked body: validates framing and
+    counts bytes without materializing anything."""
+
+    var kind: UInt8
+    var consumed: Int
+    var decoded: Int
+    var error: HttpError
+
+    @staticmethod
+    def need_more() -> Self:
+        return Self(
+            kind=0,
+            consumed=0,
+            decoded=0,
+            error=HttpError(status=0, message=String(""), should_close=False),
+        )
+
+    @staticmethod
+    def complete(consumed: Int, decoded: Int) -> Self:
+        return Self(
+            kind=1,
+            consumed=consumed,
+            decoded=decoded,
+            error=HttpError(status=0, message=String(""), should_close=False),
+        )
+
+    @staticmethod
+    def failure(var error: HttpError) -> Self:
+        return Self(kind=2, consumed=0, decoded=0, error=error^)
+
+    def is_need_more(self) -> Bool:
+        return self.kind == 0
+
+    def is_complete(self) -> Bool:
+        return self.kind == 1
+
+    def is_error(self) -> Bool:
+        return self.kind == 2
+
+    def take_error(self) -> HttpError:
+        return self.error.copy()
+
+
+def _scan_chunked[
+    origin: ImmOrigin
+](
+    buf: Span[Byte, origin],
+    config: ServerConfig,
+    mut wire: Int,
+    mut meta: Int,
+    mut decoded: Int,
+) -> _ChunkScan:
+    """Walks chunk framing forward without storing body bytes, so a
+    peer dripping one byte per feed cannot force per-feed reallocation
+    and recopying of everything decoded so far. The `(wire, meta,
+    decoded)` triple is both the resume point on entry and the updated
+    frontier on a `need_more` exit, letting callers continue where the
+    previous feed stopped. Every check mirrors the materializing loop
+    below; the two must agree on all inputs."""
+    var length = len(buf)
+    var consumed = wire
+    var done = False
+    while not done:
+        var size_end = _find_crlf(buf, wire)
+        if size_end < 0:
+            if _has_lone_lf_before(buf, wire, length):
+                return _ChunkScan.failure(
+                    HttpError.bad_request(String("bad chunk"))
+                )
+            if meta + (length - wire) > config.max_chunk_metadata:
+                return _ChunkScan.failure(
+                    HttpError.payload_too_large(
+                        String("chunk metadata too large")
+                    )
+                )
+            return _ChunkScan.need_more()
+        if _has_lone_lf_before(buf, wire, size_end):
+            return _ChunkScan.failure(
+                HttpError.bad_request(String("bad chunk"))
+            )
+        var size_line_len = size_end - wire + 2
+        meta += size_line_len
+        if meta > config.max_chunk_metadata:
+            return _ChunkScan.failure(
+                HttpError.payload_too_large(String("chunk metadata too large"))
+            )
+        var size_line = String(from_utf8_lossy=buf[wire:size_end])
+        var size_text, ext_text, has_ext = _split_chunk_size(size_line)
+        if has_ext and not _chunk_ext_valid(ext_text):
+            return _ChunkScan.failure(
+                HttpError.bad_request(String("bad chunk extension"))
+            )
+        var chunk_size = _parse_hex_size(size_text)
+        if chunk_size < 0:
+            return _ChunkScan.failure(
+                HttpError.bad_request(String("bad chunk size"))
+            )
+        var data_start = size_end + 2
+        if chunk_size == 0:
+            var trailer_pos = data_start
+            var trailer_bytes_total = 0
+            var trailer_count = 0
+            while True:
+                if trailer_pos >= length:
+                    return _ChunkScan.need_more()
+                if trailer_pos == length - 1 and buf[trailer_pos] == Byte(
+                    ord("\r")
+                ):
+                    return _ChunkScan.need_more()
+                var trailer_end = _find_crlf(buf, trailer_pos)
+                if trailer_end < 0:
+                    if _has_lone_lf_before(buf, trailer_pos, length):
+                        return _ChunkScan.failure(
+                            HttpError.bad_request(String("bad trailer"))
+                        )
+                    if (
+                        trailer_bytes_total + (length - trailer_pos)
+                        > config.max_trailer_bytes
+                    ):
+                        return _ChunkScan.failure(
+                            HttpError.header_too_large(
+                                String("trailers too large")
+                            )
+                        )
+                    return _ChunkScan.need_more()
+                if _has_lone_lf_before(buf, trailer_pos, trailer_end):
+                    return _ChunkScan.failure(
+                        HttpError.bad_request(String("bad trailer"))
+                    )
+                if trailer_end == trailer_pos:
+                    consumed = trailer_end + 2
+                    done = True
+                    break
+                var trailer_line_len = trailer_end - trailer_pos + 2
+                trailer_bytes_total += trailer_line_len
+                if (
+                    trailer_bytes_total > config.max_trailer_bytes
+                    or trailer_count + 1 > config.max_trailer_count
+                ):
+                    return _ChunkScan.failure(
+                        HttpError.header_too_large(String("trailers too large"))
+                    )
+                var trailer_line = String(
+                    from_utf8_lossy=buf[trailer_pos:trailer_end]
+                )
+                var trailer_bytes = trailer_line.as_bytes()
+                if len(trailer_bytes) > 0 and (
+                    trailer_bytes[0] == Byte(ord(" "))
+                    or trailer_bytes[0] == Byte(ord("\t"))
+                ):
+                    return _ChunkScan.failure(
+                        HttpError.bad_request(String("bad trailer"))
+                    )
+                var trailer_colon = -1
+                for i in range(len(trailer_bytes)):
+                    if trailer_bytes[i] == Byte(ord(":")):
+                        trailer_colon = i
+                        break
+                if trailer_colon <= 0:
+                    return _ChunkScan.failure(
+                        HttpError.bad_request(String("bad trailer"))
+                    )
+                var trailer_name = String(
+                    from_utf8_lossy=trailer_bytes[0:trailer_colon]
+                )
+                if not _is_token(trailer_name):
+                    return _ChunkScan.failure(
+                        HttpError.bad_request(String("bad trailer"))
+                    )
+                if _trailer_forbidden(trailer_name):
+                    return _ChunkScan.failure(
+                        HttpError.bad_request(
+                            String("trailer modifies framing")
+                        )
+                    )
+                trailer_count += 1
+                trailer_pos = trailer_end + 2
+                if trailer_pos < length and (
+                    buf[trailer_pos] == Byte(ord(" "))
+                    or buf[trailer_pos] == Byte(ord("\t"))
+                ):
+                    return _ChunkScan.failure(
+                        HttpError.bad_request(String("bad trailer"))
+                    )
+            continue
+        if decoded + chunk_size > config.max_body_bytes:
+            return _ChunkScan.failure(
+                HttpError.payload_too_large(String("body too large"))
+            )
+        if data_start + chunk_size + 2 > length:
+            return _ChunkScan.need_more()
+        decoded += chunk_size
+        if buf[data_start + chunk_size] != Byte(ord("\r")) or buf[
+            data_start + chunk_size + 1
+        ] != Byte(ord("\n")):
+            return _ChunkScan.failure(
+                HttpError.bad_request(String("bad chunk data"))
+            )
+        wire = data_start + chunk_size + 2
+    return _ChunkScan.complete(consumed, decoded)
 
 
 struct HeadInfo(Movable):
@@ -958,8 +1260,12 @@ def parse_head[
                     HttpError.bad_request(String("bad authority")), 0, True
                 )
             authority = String(abs_authority)
-            if target.lower().startswith("https://"):
-                scheme = String("https")
+            # This server speaks plaintext HTTP/1.1: the scheme stays
+            # "http" even for https:// absolute-form targets (a TLS
+            # terminator in front owns the real scheme). Reporting
+            # "https" here would mislead origin checks, secure-cookie
+            # policy, and redirects into trusting an unprotected hop,
+            # and contradicts the Request contract.
             path = String(abs_path)
             query = String(abs_query)
         else:
@@ -995,240 +1301,6 @@ def parse_head[
     )
 
 
-def _trailer_forbidden(name: StringSlice) -> Bool:
-    # RFC 9112 6.5.1 forbids trailers that change framing, routing,
-    # authentication, or payload processing.
-    var lowered = String(name).lower()
-    return (
-        lowered == "content-length"
-        or lowered == "transfer-encoding"
-        or lowered == "te"
-        or lowered == "trailer"
-        or lowered == "host"
-        or lowered == "expect"
-        or lowered == "connection"
-        or lowered == "keep-alive"
-        or lowered == "upgrade"
-        or lowered == "authorization"
-        or lowered == "proxy-authenticate"
-        or lowered == "proxy-authorization"
-        or lowered == "content-encoding"
-        or lowered == "content-type"
-        or lowered == "content-range"
-    )
-
-
-@fieldwise_init
-struct _ChunkScan(Copyable, Movable):
-    """Structural pre-scan of a chunked body: validates framing and
-    counts bytes without materializing anything."""
-
-    var kind: UInt8
-    var consumed: Int
-    var decoded: Int
-    var error: HttpError
-
-    @staticmethod
-    def need_more() -> Self:
-        return Self(
-            kind=0,
-            consumed=0,
-            decoded=0,
-            error=HttpError(status=0, message=String(""), should_close=False),
-        )
-
-    @staticmethod
-    def complete(consumed: Int, decoded: Int) -> Self:
-        return Self(
-            kind=1,
-            consumed=consumed,
-            decoded=decoded,
-            error=HttpError(status=0, message=String(""), should_close=False),
-        )
-
-    @staticmethod
-    def failure(var error: HttpError) -> Self:
-        return Self(kind=2, consumed=0, decoded=0, error=error^)
-
-    def is_need_more(self) -> Bool:
-        return self.kind == 0
-
-    def is_complete(self) -> Bool:
-        return self.kind == 1
-
-    def is_error(self) -> Bool:
-        return self.kind == 2
-
-    def take_error(self) -> HttpError:
-        return self.error.copy()
-
-
-def _scan_chunked[
-    origin: ImmOrigin
-](buf: Span[Byte, origin], config: ServerConfig, body_start: Int) -> _ChunkScan:
-    """Walks chunk framing end to end without storing body bytes, so a
-    peer dripping one byte per feed cannot force per-feed reallocation
-    and recopying of everything decoded so far. Every check mirrors
-    the materializing loop below; the two must agree on all inputs."""
-    var length = len(buf)
-    var chunk_metadata_total = 0
-    var decoded_total = 0
-    var chunk_pos = body_start
-    var consumed = body_start
-    var done = False
-    while not done:
-        var size_end = _find_crlf(buf, chunk_pos)
-        if size_end < 0:
-            if _has_lone_lf_before(buf, chunk_pos, length):
-                return _ChunkScan.failure(
-                    HttpError.bad_request(String("bad chunk"))
-                )
-            if (
-                chunk_metadata_total + (length - chunk_pos)
-                > config.max_chunk_metadata
-            ):
-                return _ChunkScan.failure(
-                    HttpError.payload_too_large(
-                        String("chunk metadata too large")
-                    )
-                )
-            return _ChunkScan.need_more()
-        if _has_lone_lf_before(buf, chunk_pos, size_end):
-            return _ChunkScan.failure(
-                HttpError.bad_request(String("bad chunk"))
-            )
-        var size_line_len = size_end - chunk_pos + 2
-        chunk_metadata_total += size_line_len
-        if chunk_metadata_total > config.max_chunk_metadata:
-            return _ChunkScan.failure(
-                HttpError.payload_too_large(String("chunk metadata too large"))
-            )
-        var size_line = String(from_utf8_lossy=buf[chunk_pos:size_end])
-        var semi = -1
-        for i in range(len(size_line.as_bytes())):
-            if size_line.as_bytes()[i] == Byte(ord(";")):
-                semi = i
-                break
-        var size_text = String(size_line)
-        if semi >= 0:
-            size_text = String(from_utf8_lossy=size_line.as_bytes()[0:semi])
-            if not _chunk_ext_valid(
-                String(from_utf8_lossy=size_line.as_bytes()[semi + 1 :])
-            ):
-                return _ChunkScan.failure(
-                    HttpError.bad_request(String("bad chunk extension"))
-                )
-        size_text = _trim_ows(size_text)
-        var chunk_size = _parse_hex_size(size_text)
-        if chunk_size < 0:
-            return _ChunkScan.failure(
-                HttpError.bad_request(String("bad chunk size"))
-            )
-        var data_start = size_end + 2
-        if chunk_size == 0:
-            var trailer_pos = data_start
-            var trailer_bytes_total = 0
-            var trailer_count = 0
-            while True:
-                if trailer_pos >= length:
-                    return _ChunkScan.need_more()
-                if trailer_pos == length - 1 and buf[trailer_pos] == Byte(
-                    ord("\r")
-                ):
-                    return _ChunkScan.need_more()
-                var trailer_end = _find_crlf(buf, trailer_pos)
-                if trailer_end < 0:
-                    if _has_lone_lf_before(buf, trailer_pos, length):
-                        return _ChunkScan.failure(
-                            HttpError.bad_request(String("bad trailer"))
-                        )
-                    if (
-                        trailer_bytes_total + (length - trailer_pos)
-                        > config.max_trailer_bytes
-                    ):
-                        return _ChunkScan.failure(
-                            HttpError.header_too_large(
-                                String("trailers too large")
-                            )
-                        )
-                    return _ChunkScan.need_more()
-                if _has_lone_lf_before(buf, trailer_pos, trailer_end):
-                    return _ChunkScan.failure(
-                        HttpError.bad_request(String("bad trailer"))
-                    )
-                if trailer_end == trailer_pos:
-                    consumed = trailer_end + 2
-                    done = True
-                    break
-                var trailer_line_len = trailer_end - trailer_pos + 2
-                trailer_bytes_total += trailer_line_len
-                if (
-                    trailer_bytes_total > config.max_trailer_bytes
-                    or trailer_count + 1 > config.max_trailer_count
-                ):
-                    return _ChunkScan.failure(
-                        HttpError.header_too_large(String("trailers too large"))
-                    )
-                var trailer_line = String(
-                    from_utf8_lossy=buf[trailer_pos:trailer_end]
-                )
-                var trailer_bytes = trailer_line.as_bytes()
-                if len(trailer_bytes) > 0 and (
-                    trailer_bytes[0] == Byte(ord(" "))
-                    or trailer_bytes[0] == Byte(ord("\t"))
-                ):
-                    return _ChunkScan.failure(
-                        HttpError.bad_request(String("bad trailer"))
-                    )
-                var trailer_colon = -1
-                for i in range(len(trailer_bytes)):
-                    if trailer_bytes[i] == Byte(ord(":")):
-                        trailer_colon = i
-                        break
-                if trailer_colon <= 0:
-                    return _ChunkScan.failure(
-                        HttpError.bad_request(String("bad trailer"))
-                    )
-                var trailer_name = String(
-                    from_utf8_lossy=trailer_bytes[0:trailer_colon]
-                )
-                if not _is_token(trailer_name):
-                    return _ChunkScan.failure(
-                        HttpError.bad_request(String("bad trailer"))
-                    )
-                if _trailer_forbidden(trailer_name):
-                    return _ChunkScan.failure(
-                        HttpError.bad_request(
-                            String("trailer modifies framing")
-                        )
-                    )
-                trailer_count += 1
-                trailer_pos = trailer_end + 2
-                if trailer_pos < length and (
-                    buf[trailer_pos] == Byte(ord(" "))
-                    or buf[trailer_pos] == Byte(ord("\t"))
-                ):
-                    return _ChunkScan.failure(
-                        HttpError.bad_request(String("bad trailer"))
-                    )
-            continue
-        if decoded_total + chunk_size > config.max_body_bytes:
-            return _ChunkScan.failure(
-                HttpError.payload_too_large(String("body too large"))
-            )
-        if data_start + chunk_size + 2 > length:
-            return _ChunkScan.need_more()
-        decoded_total += chunk_size
-        if buf[data_start + chunk_size] != Byte(ord("\r")) or buf[
-            data_start + chunk_size + 1
-        ] != Byte(ord("\n")):
-            return _ChunkScan.failure(
-                HttpError.bad_request(String("bad chunk data"))
-            )
-        chunk_pos = data_start + chunk_size + 2
-    return _ChunkScan.complete(consumed, decoded_total)
-
-
 def parse_one[
     origin: ImmOrigin
 ](buf: Span[Byte, origin], config: ServerConfig) -> ParseResult:
@@ -1248,7 +1320,12 @@ def parse_one[
         # per-feed reallocation and recopying of decoded chunks. The
         # materializing walk below then runs exactly once, on complete
         # input, with an exactly sized buffer.
-        var scan = _scan_chunked(buf, config, outcome.head.header_end)
+        var scan_wire = outcome.head.header_end
+        var scan_meta = 0
+        var scan_decoded = 0
+        var scan = _scan_chunked(
+            buf, config, scan_wire, scan_meta, scan_decoded
+        )
         if scan.is_need_more():
             return ParseResult.need_more()
         if scan.is_error():
@@ -1296,27 +1373,17 @@ def parse_one[
                     True,
                 )
             var size_line = String(from_utf8_lossy=buf[chunk_pos:size_end])
-            var semi = -1
-            for i in range(len(size_line.as_bytes())):
-                if size_line.as_bytes()[i] == Byte(ord(";")):
-                    semi = i
-                    break
-            var size_text = String(size_line)
-            if semi >= 0:
-                size_text = String(from_utf8_lossy=size_line.as_bytes()[0:semi])
-                # Extensions follow strict grammar (RFC 9112 7.1.1):
-                # `;name[=value]` chains with token names and token or
-                # quoted values. Lax parsing here would let strict
-                # intermediaries disagree about validity.
-                if not _chunk_ext_valid(
-                    String(from_utf8_lossy=size_line.as_bytes()[semi + 1 :])
-                ):
-                    return ParseResult.failure(
-                        HttpError.bad_request(String("bad chunk extension")),
-                        0,
-                        True,
-                    )
-            size_text = _trim_ows(size_text)
+            var size_text, ext_text, has_ext = _split_chunk_size(size_line)
+            # Extensions follow strict grammar (RFC 9112 7.1.1):
+            # `;name[=value]` chains with token names and token or
+            # quoted values. Lax parsing here would let strict
+            # intermediaries disagree about validity.
+            if has_ext and not _chunk_ext_valid(ext_text):
+                return ParseResult.failure(
+                    HttpError.bad_request(String("bad chunk extension")),
+                    0,
+                    True,
+                )
             var chunk_size = _parse_hex_size(size_text)
             if chunk_size < 0:
                 return ParseResult.failure(
@@ -1505,12 +1572,46 @@ def parse_one[
 
 struct HttpParser(Movable):
     """Owns unprocessed bytes for one connection. Feed arbitrary splits;
-    call `next_result` repeatedly to drain pipelined requests."""
+    call `next_result` repeatedly to drain pipelined requests.
+
+    Incremental state is retained across feeds so dripping senders
+    cannot force quadratic work: the validated head end (with its
+    chunked flag and declared length) plus the chunk-scan frontier
+    (`wire`, `meta`, `decoded`) persist while a request is incomplete.
+    Each feed therefore revalidates only new bytes (plus a bounded
+    partial tail). Completion and errors delegate to `parse_one` for a
+    single authoritative assembly walk. All retained state is plain
+    scalars; buffers are append-only until a terminal outcome drains
+    them, which also resets the cache.
+    """
 
     var _buf: List[Byte]
+    var _head_end: Int
+    var _head_chunked: Bool
+    var _head_clen: Int
+    var _scan_wire: Int
+    var _scan_meta: Int
+    var _scan_decoded: Int
+    var _scan_active: Bool
 
     def __init__(out self):
         self._buf = List[Byte]()
+        self._head_end = -1
+        self._head_chunked = False
+        self._head_clen = -1
+        self._scan_wire = 0
+        self._scan_meta = 0
+        self._scan_decoded = 0
+        self._scan_active = False
+
+    def _reset_progress(mut self):
+        self._head_end = -1
+        self._head_chunked = False
+        self._head_clen = -1
+        self._scan_wire = 0
+        self._scan_meta = 0
+        self._scan_decoded = 0
+        self._scan_active = False
 
     def buffered_len(self) -> Int:
         return len(self._buf)
@@ -1525,8 +1626,43 @@ struct HttpParser(Movable):
             self._buf.append(bytes[i])
 
     def next_result(mut self, config: ServerConfig) -> ParseResult:
+        if self._head_end < 0:
+            var head = parse_head(Span(self._buf), config)
+            if head.is_need_more():
+                return ParseResult.need_more()
+            if head.is_error():
+                self._reset_progress()
+                return ParseResult.failure(head.take_error(), 0, True)
+            self._head_end = head.head.header_end
+            self._head_chunked = head.head.chunked
+            self._head_clen = head.head.content_length
+        if not self._head_chunked:
+            var want = self._head_clen if self._head_clen >= 0 else 0
+            if len(self._buf) < self._head_end + want:
+                return ParseResult.need_more()
+        else:
+            if not self._scan_active:
+                self._scan_wire = self._head_end
+                self._scan_meta = 0
+                self._scan_decoded = 0
+                self._scan_active = True
+            var wire = self._scan_wire
+            var meta = self._scan_meta
+            var decoded = self._scan_decoded
+            var scan = _scan_chunked(
+                Span(self._buf), config, wire, meta, decoded
+            )
+            self._scan_wire = wire
+            self._scan_meta = meta
+            self._scan_decoded = decoded
+            if scan.is_need_more():
+                return ParseResult.need_more()
+            # Terminal scan verdicts still assemble through parse_one
+            # once, keeping a single authoritative construction path.
+            self._reset_progress()
         var result = parse_one(Span(self._buf), config)
         if result.is_complete() or result.is_error():
+            self._reset_progress()
             var remaining = List[Byte]()
             for i in range(result.consumed, len(self._buf)):
                 remaining.append(self._buf[i])
@@ -1535,3 +1671,4 @@ struct HttpParser(Movable):
 
     def clear(mut self):
         self._buf.clear()
+        self._reset_progress()
