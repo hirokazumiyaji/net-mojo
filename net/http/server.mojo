@@ -360,10 +360,13 @@ struct Server(Movable):
         # Release the whole pending reservation, not just the unsent
         # suffix: bytes already written were charged when queued, and
         # leaving the sent prefix charged would leak budget on every
-        # partial-send close until unrelated requests see 503s.
+        # partial-send close until unrelated requests see 503s. Any
+        # admission reservation still held is released the same way.
         self._budget.release(
             self._conns[idx].buffered_len() + len(self._conns[idx].pending)
         )
+        self._budget.release(self._conns[idx].reserved)
+        self._conns[idx].reserved = 0
         try:
             self._conns[idx].close()
         except e:
@@ -442,9 +445,16 @@ struct Server(Movable):
             return
         if self._conns[idx].read_eof:
             return
-        while self._conns[idx].bytes_this_tick < self.config.max_bytes_per_tick:
+        while True:
+            var room = (
+                self.config.max_bytes_per_tick
+                - self._conns[idx].bytes_this_tick
+            )
+            if room <= 0:
+                break
+            var limit = room if room < _READ_CHUNK else _READ_CHUNK
             try:
-                var chunk = self._conns[idx].try_read_bytes(_READ_CHUNK)
+                var chunk = self._conns[idx].try_read_bytes(limit)
                 if len(chunk) == 0:
                     self._conns[idx].read_eof = True
                     if (
@@ -456,7 +466,7 @@ struct Server(Movable):
                         self._close_conn(idx)
                         return
                     break
-                if not self._budget.try_reserve(len(chunk)):
+                if not self._charge_read(idx, len(chunk)):
                     self._admit_over_budget(idx)
                     return
                 var first = self._conns[idx].buffered_len() == 0
@@ -466,13 +476,25 @@ struct Server(Movable):
                     self._conns[idx].header_at = deadline_from_now(
                         self.config.header_deadline
                     )
-                if len(chunk) < _READ_CHUNK:
+                if len(chunk) < limit:
                     break
             except e:
                 if e.kind == NetErrorKind.timeout():
                     break
                 self._close_conn(idx)
                 return
+
+    def _charge_read(mut self, idx: Int, count: Int) -> Bool:
+        # Bytes covered by an admission reservation reuse it; only the
+        # remainder draws from the shared budget.
+        var covered = count
+        if covered > self._conns[idx].reserved:
+            covered = self._conns[idx].reserved
+        self._conns[idx].reserved -= covered
+        var rest = count - covered
+        if rest <= 0:
+            return True
+        return self._budget.try_reserve(rest)
 
     def _admit_over_budget(mut self, idx: Int) raises NetError:
         # The kernel still holds the unread bytes; answer from what is
@@ -517,12 +539,28 @@ struct Server(Movable):
             var outstanding = content_length - buffered_body
             if outstanding < 0:
                 outstanding = 0
+            # The live reservation is part of `used`: subtract it before
+            # adding the outstanding remainder, or every re-parse while
+            # the body is still arriving would charge the same bytes
+            # twice and 503 admitted requests.
+            var unreserved = self._budget.used - self._conns[idx].reserved
             if (
                 content_length > 0
-                and self._budget.used + outstanding > self._budget.total
+                and unreserved + outstanding > self._budget.total
             ):
                 self._send_error(idx, 503)
                 return
+            # Reserve the missing bytes now so concurrent admissions
+            # cannot promise the same capacity twice. Arrivals consume
+            # the reservation via _charge_read; completion and close
+            # release whatever remains. Guarded to reserve once per
+            # request: re-parses while the body is still arriving must
+            # not charge again.
+            if outstanding > 0 and self._conns[idx].reserved == 0:
+                if not self._budget.try_reserve(outstanding):
+                    self._send_error(idx, 503)
+                    return
+                self._conns[idx].reserved += outstanding
             if head.head.expect_100 and not self._conns[idx].sent_100:
                 if not self._send_100(idx):
                     return
@@ -564,6 +602,11 @@ struct Server(Movable):
                 var rest = List[Byte]()
                 for i in range(written, len(cont)):
                     rest.append(cont[i])
+                # Queued bytes join the budget like any pending send so
+                # the later full-length release stays balanced.
+                if not self._budget.try_reserve(len(rest)):
+                    self._close_conn(idx)
+                    return False
                 self._conns[idx].set_pending(rest^)
                 self._conns[idx].state = STATE_SENDING_100
                 self._conns[idx].write_at = deadline_from_now(
@@ -573,6 +616,9 @@ struct Server(Movable):
                 return False
         except e:
             if e.kind == NetErrorKind.timeout():
+                if not self._budget.try_reserve(len(cont)):
+                    self._close_conn(idx)
+                    return False
                 self._conns[idx].set_pending(cont^)
                 self._conns[idx].state = STATE_SENDING_100
                 self._conns[idx].write_at = deadline_from_now(
@@ -611,6 +657,12 @@ struct Server(Movable):
             handler.handle(req^, writer)
         except e:
             _ = e
+            self._send_error(idx, 500)
+            return
+        # Handlers may append to `writer.body` directly, bypassing the
+        # per-call cap enforced by `write`; re-check the bound here so
+        # an oversized body becomes a 500 either way.
+        if len(writer.body) > cap:
             self._send_error(idx, 500)
             return
         if len(writer.headers) > self.config.max_response_headers_count:

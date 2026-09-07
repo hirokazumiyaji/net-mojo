@@ -288,5 +288,43 @@ def test_terminal_hangup_reported_without_interests() raises:
     listener.close()
 
 
+def test_paused_readable_direction_stays_quiet() raises:
+    # Disabling reads while keeping writes must suppress ordinary
+    # readiness: backpressure pauses must not spin or starve others.
+    var listener = listen_tcp("127.0.0.1:0")
+    var client = dial_tcp(String(listener.local_address()), Timeout.seconds(1))
+    var server = listener.accept(Timeout.seconds(1))
+
+    var reactor = Reactor()
+    var token = reactor.register(server.raw_fd(), readable=False, writable=True)
+    var ping: Array[Byte, 1] = [5]
+    client.write_all(Span(ping), Timeout.seconds(1))
+    # The idle socket is writable, so an event arrives — but it must
+    # not claim readability for the paused direction.
+    var quiet = reactor.wait(Timeout.milliseconds(100))
+    assert_equal(len(quiet), 1)
+    assert_false(quiet[0].readable)
+    assert_true(quiet[0].writable)
+
+    assert_true(reactor.modify(token, True, True))
+    # The byte was already in flight; collect until readability shows
+    # (a wait may return first on the always-ready writable side).
+    var seen_readable = False
+    for _ in range(20):
+        var events = reactor.wait(Timeout.milliseconds(100))
+        for i in range(len(events)):
+            if events[i].token == token and events[i].readable:
+                seen_readable = True
+                break
+        if seen_readable:
+            break
+    assert_true(seen_readable)
+
+    assert_true(reactor.remove(token))
+    client.close()
+    server.close()
+    listener.close()
+
+
 def main() raises:
     TestSuite.discover_tests[__functions_in_module()]().run()

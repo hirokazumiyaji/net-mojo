@@ -48,10 +48,11 @@ def test_head_keeps_length_but_omits_body() raises:
 
 
 def test_no_body_statuses_drop_body_and_length() raises:
-    for status in [204, 304]:
+    for status in [204, 205, 304]:
         var writer = ResponseWriter(1024)
         writer.set_status(status)
         writer.headers.add(String("Content-Type"), String("text/plain"))
+        writer.write_string("dropped")
         var wire = encode_response(
             writer, False, "Thu, 01 Jan 1970 00:00:00 GMT"
         )
@@ -143,6 +144,29 @@ def test_connection_close_advertised() raises:
     var wire = encode_response(writer, False, "Thu, 01 Jan 1970 00:00:00 GMT")
     var text = _bytes_to_string(Span(wire))
     assert_true(text.find("Connection: close\r\n") >= 0)
+
+
+def test_connection_close_needs_whole_token() raises:
+    # `x-close` must not suppress the real header; `Keep-Alive, close`
+    # must.
+    var tricky = ResponseWriter(1024)
+    tricky.set_should_close(True)
+    tricky.headers.add(String("Connection"), String("x-close"))
+    tricky.write_string("bye")
+    var tricky_wire = encode_response(
+        tricky, False, "Thu, 01 Jan 1970 00:00:00 GMT"
+    )
+    var tricky_text = _bytes_to_string(Span(tricky_wire))
+    assert_true(tricky_text.find("Connection: close\r\n") >= 0)
+    var listed = ResponseWriter(1024)
+    listed.set_should_close(True)
+    listed.headers.add(String("Connection"), String("Keep-Alive, close"))
+    listed.write_string("bye")
+    var listed_wire = encode_response(
+        listed, False, "Thu, 01 Jan 1970 00:00:00 GMT"
+    )
+    var listed_text = _bytes_to_string(Span(listed_wire))
+    assert_true(listed_text.find("Connection: close\r\n") < 0)
 
 
 def test_100_continue_encoding() raises:

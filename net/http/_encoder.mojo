@@ -141,6 +141,31 @@ def _reject_response_injection(
             )
 
 
+def _has_close_token(value: StringSlice) -> Bool:
+    # `Connection` is a comma-separated token list: only a whole,
+    # case-insensitive `close` token counts, so `x-close` or
+    # `close-ended` must not suppress the real header.
+    var bytes = value.as_bytes()
+    var start = 0
+    for i in range(len(bytes) + 1):
+        if i == len(bytes) or bytes[i] == Byte(ord(",")):
+            var lo = start
+            var hi = i
+            while lo < hi and (
+                bytes[lo] == Byte(ord(" ")) or bytes[lo] == Byte(ord("\t"))
+            ):
+                lo += 1
+            while hi > lo and (
+                bytes[hi - 1] == Byte(ord(" "))
+                or bytes[hi - 1] == Byte(ord("\t"))
+            ):
+                hi -= 1
+            if String(from_utf8_lossy=bytes[lo:hi]).lower() == "close":
+                return True
+            start = i + 1
+    return False
+
+
 def encode_response(
     writer: ResponseWriter, is_head: Bool, date: StringSlice
 ) raises NetError -> List[Byte]:
@@ -148,14 +173,19 @@ def encode_response(
     servers pass `current_http_date()`)."""
     var send_body = has_body_for_status(writer.status, is_head)
     # HEAD omits body bytes but keeps the GET-equivalent length.
-    # 1xx / 204 / 304 omit both length and bytes.
+    # 1xx / 204 / 205 / 304 omit both length and bytes.
     var wire_length = -1
     if writer.status < 100 or writer.status > 199:
-        if writer.status != 204 and writer.status != 304:
+        if (
+            writer.status != 204
+            and writer.status != 205
+            and writer.status != 304
+        ):
             wire_length = len(writer.body)
     # Validate a caller-supplied Content-Length against the framed length.
     # For HEAD the framed length is the GET-equivalent body length.
-    # For 1xx/204/304 there is no framed length; a caller value is dropped.
+    # For 1xx/204/205/304 there is no framed length; a caller value is
+    # dropped.
     # A caller-supplied Transfer-Encoding is always rejected: this server
     # sends buffered responses with a known length, so emitting both
     # would create a request/response smuggling vector (RFC 9112 6.1).
@@ -232,7 +262,7 @@ def encode_response(
         var connection = writer.headers.get_first("Connection")
         var has_close = False
         if connection:
-            has_close = String(connection.value()).lower().find("close") >= 0
+            has_close = _has_close_token(connection.value())
         if not has_close:
             _append_string(out, String("Connection: close\r\n"))
     _append_string(out, String("\r\n"))

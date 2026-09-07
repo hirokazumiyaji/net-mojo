@@ -31,6 +31,7 @@ struct HttpConnection(Movable):
     var requests_served: Int
     var bytes_this_tick: Int
     var requests_this_tick: Int
+    var reserved: Int
     var active: Bool
 
     def __init__(
@@ -56,6 +57,7 @@ struct HttpConnection(Movable):
         self.requests_served = 0
         self.bytes_this_tick = 0
         self.requests_this_tick = 0
+        self.reserved = 0
         self.active = True
 
     def wants_read(self) -> Bool:
@@ -141,6 +143,10 @@ struct HttpConnection(Movable):
 
     def close(mut self) raises NetError:
         self.active = False
-        self.buf.clear()
+        # Drop the allocations instead of clearing: clear() would retain
+        # capacity on a free-listed slot, hoarding memory the budget no
+        # longer accounts for.
+        self.buf = List[Byte]()
         self.clear_pending()
+        self.reserved = 0
         self.conn.close()

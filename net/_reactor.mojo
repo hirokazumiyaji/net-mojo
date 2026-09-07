@@ -169,20 +169,22 @@ struct Reactor(Movable, Sized):
         is already ready. Stale tokens never appear in the output.
 
         Terminal conditions (`POLLERR`, `POLLNVAL`, `POLLHUP`) are
-        always reported. In addition, an observed `POLLIN` is always
-        surfaced as readable even when `POLLIN` was not requested:
-        `poll` cannot tell data from EOF without reading (macOS in
-        particular reports an orderly peer shutdown as bare `POLLIN`,
-        and reports nothing at all for an empty mask, hence the
-        always-on `POLLIN` watch above). The event obliges the owner
-        to drain via `try_*` until would-block or EOF and to remove
-        the registration on EOF. Every delivered event therefore makes
-        progress (bytes or EOF) and no hangup can trap the loop
-        eventlessly; over-delivery on a level-triggered baseline is
-        always safe. The interest flags keep their meaning as the
-        delivery contract for the Phase 4 edge backends. `has_error`
-        stays reserved for `POLLERR | POLLNVAL`; a pure hangup arrives
-        as `readable` with `has_error == False`.
+        always reported. An observed `POLLIN` is surfaced as readable
+        when `POLLIN` was requested, or — regardless of interests — when
+        the registration asked for nothing at all (`readable == False`
+        and `writable == False`): `poll` cannot tell data from EOF
+        without reading (macOS in particular reports an orderly peer
+        shutdown as bare `POLLIN`, and reports nothing at all for an
+        empty mask, hence the always-on `POLLIN` watch above). A
+        deliberately paused direction stays quiet — ordinary `POLLIN`
+        on a `readable == False, writable == True` registration is not
+        reported — so disabling reads reliably suppresses work (e.g.
+        backpressure), while a fully disinterested slot can still learn
+        that its peer went away. Any surfaced hangup obliges the owner
+        to drain via `try_*` until would-block or EOF and to remove the
+        registration on EOF, so no hangup can trap the loop eventlessly.
+        `has_error` stays reserved for `POLLERR | POLLNVAL`; a pure
+        hangup arrives as `readable` with `has_error == False`.
         """
         var out = List[ReactorEvent]()
         if self._active_count == 0:
@@ -208,16 +210,32 @@ struct Reactor(Movable, Sized):
         if polled == 0:
             return out^
         for i in range(len(self._pollfds)):
-            # The mask always watches POLLIN (see above), so any
-            # observed readiness bit here is worth reporting; terminal
-            # bits ride along in the mask.
-            var readable = (self._pollfds[i].revents & _READABLE_MASK) != 0
-            var writable = ((self._pollfds[i].events & POLLOUT) != 0) and (
+            # The mask always watches POLLIN (see above), so gate
+            # delivery on the requested interests: terminal bits ride
+            # along unconditionally, while plain POLLIN is additionally
+            # surfaced only to registrations that asked for nothing —
+            # the one case where silence could hide a peer shutdown.
+            var slot = self._poll_slots[i]
+            var terminal = (
+                self._pollfds[i].revents & (POLLERR | POLLNVAL | POLLHUP)
+            ) != 0
+            var no_interests = (not self._slots[slot].readable) and (
+                not self._slots[slot].writable
+            )
+            var readable = False
+            if self._slots[slot].readable:
+                if (self._pollfds[i].revents & _READABLE_MASK) != 0:
+                    readable = True
+            if terminal:
+                readable = True
+            if no_interests:
+                if (self._pollfds[i].revents & POLLIN) != 0:
+                    readable = True
+            var writable = (self._slots[slot].writable) and (
                 (self._pollfds[i].revents & _WRITABLE_MASK) != 0
             )
             if not readable and not writable:
                 continue
-            var slot = self._poll_slots[i]
             out.append(
                 ReactorEvent(
                     token=ReactorToken(

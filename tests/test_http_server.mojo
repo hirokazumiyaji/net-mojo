@@ -98,6 +98,18 @@ struct _HugeHandler(Handler):
         writer.write_string(String("a") * (1024 * 1024 + 1))
 
 
+struct _DirectHugeHandler(Handler):
+    def __init__(out self):
+        pass
+
+    def handle(mut self, req: Request, mut writer: ResponseWriter) raises:
+        # Bypasses write()/write_string() on purpose: the server must
+        # still enforce the cap after the handler returns.
+        writer.set_status(200)
+        for i in range(1024 * 1024 + 1):
+            writer.body.append(Byte(ord("z")))
+
+
 struct _TwoHandler(Handler):
     def __init__(out self):
         pass
@@ -616,6 +628,81 @@ def test_response_over_limit_is_500() raises:
     )
     assert_equal(_status_of(out), 500)
     client.close()
+
+
+def test_direct_body_append_over_limit_is_500() raises:
+    var server = Server(ServerConfig.default())
+    server.add_listener(listen_tcp("127.0.0.1:0"))
+    var port = server.local_address().port
+    var handler = _DirectHugeHandler()
+    var client = dial_tcp(
+        String("127.0.0.1:") + String(port), Timeout.seconds(2)
+    )
+    var out = _exchange(
+        server,
+        handler,
+        client,
+        "GET /big HTTP/1.1\r\nHost: x\r\n\r\n",
+    )
+    assert_equal(_status_of(out), 500)
+    client.close()
+
+
+def test_admitted_body_reservation_blocks_second_client() raises:
+    # The first client's missing body bytes are reserved at admission,
+    # so a second client promising the same no longer fits and gets
+    # 503 while the first still completes.
+    var config = ServerConfig.default()
+    config.total_buffer_budget = 8192
+    var server = Server(config^)
+    server.add_listener(listen_tcp("127.0.0.1:0"))
+    var port = server.local_address().port
+    var handler = _EchoHandler()
+    var first = dial_tcp(
+        String("127.0.0.1:") + String(port), Timeout.seconds(2)
+    )
+    var second = dial_tcp(
+        String("127.0.0.1:") + String(port), Timeout.seconds(2)
+    )
+    first.write_all(
+        String(
+            "POST /echo HTTP/1.1\r\nHost: x\r\nContent-Length: 6000\r\n\r\n"
+        ).as_bytes(),
+        Timeout.seconds(2),
+    )
+    _tick_n(server, handler, 20)
+    second.write_all(
+        String(
+            "POST /echo HTTP/1.1\r\nHost: x\r\nContent-Length: 6000\r\n\r\n"
+        ).as_bytes(),
+        Timeout.seconds(2),
+    )
+    var payload = String("b") * 6000
+    first.write_all(payload.as_bytes(), Timeout.seconds(2))
+    var first_out = List[Byte]()
+    var second_out = List[Byte]()
+    var tmp = Array[Byte, 65536](fill=0)
+    for _ in range(400):
+        _ = server.tick(handler, Timeout.nanoseconds(0))
+        try:
+            var n = first.try_read(Span(tmp))
+            for i in range(n):
+                first_out.append(tmp[i])
+        except e:
+            _ = e
+        try:
+            var n = second.try_read(Span(tmp))
+            for i in range(n):
+                second_out.append(tmp[i])
+        except e:
+            _ = e
+        if _response_complete(first_out) and _response_complete(second_out):
+            break
+    assert_equal(_status_of(first_out), 200)
+    assert_equal(_content_length_of(first_out), 6000)
+    assert_equal(_status_of(second_out), 503)
+    first.close()
+    second.close()
 
 
 def test_small_budget_rejects_with_503() raises:
