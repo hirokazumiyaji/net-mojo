@@ -171,6 +171,13 @@ def encode_response(
 ) raises NetError -> List[Byte]:
     """Renders a buffered response with explicit `Date` (tests pin it;
     servers pass `current_http_date()`)."""
+    if writer.status < 100 or writer.status > 999:
+        raise NetError(
+            NetErrorKind.invalid_argument(),
+            "encode response",
+            None,
+            "response status is not a three-digit code",
+        )
     var send_body = has_body_for_status(writer.status, is_head)
     # HEAD omits body bytes but keeps the GET-equivalent length.
     # 1xx / 204 / 205 / 304 omit both length and bytes.
