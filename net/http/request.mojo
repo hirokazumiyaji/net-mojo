@@ -82,7 +82,13 @@ struct Request(Movable):
 def split_path_query(
     target: StringSlice,
 ) -> Tuple[String, String]:
-    """Splits `path?query` on the first `?` without percent decoding."""
+    """Splits `path?query` on the first `?` without percent decoding.
+
+    Callers pass ASCII request targets (the parser rejects non-ASCII
+    target bytes with 400, since raw non-ASCII bytes are invalid in a
+    request-target and must arrive percent-encoded), so the conversion
+    below is lossless in practice.
+    """
     var bytes = target.as_bytes()
     for i in range(len(bytes)):
         if bytes[i] == Byte(ord("?")):

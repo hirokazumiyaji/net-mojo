@@ -30,9 +30,52 @@ def _civil_from_days(z: Int) -> Tuple[Int, Int, Int]:
     return y, m, d
 
 
+def _weekday_name(wday: Int) -> String:
+    if wday == 0:
+        return "Sun"
+    if wday == 1:
+        return "Mon"
+    if wday == 2:
+        return "Tue"
+    if wday == 3:
+        return "Wed"
+    if wday == 4:
+        return "Thu"
+    if wday == 5:
+        return "Fri"
+    return "Sat"
+
+
+def _month_name(m: Int) -> String:
+    if m == 1:
+        return "Jan"
+    if m == 2:
+        return "Feb"
+    if m == 3:
+        return "Mar"
+    if m == 4:
+        return "Apr"
+    if m == 5:
+        return "May"
+    if m == 6:
+        return "Jun"
+    if m == 7:
+        return "Jul"
+    if m == 8:
+        return "Aug"
+    if m == 9:
+        return "Sep"
+    if m == 10:
+        return "Oct"
+    if m == 11:
+        return "Nov"
+    return "Dec"
+
+
 def http_date(timestamp: Int) -> String:
     """Formats a Unix timestamp as an IMF-fixdate (`Sun, 06 Nov 1994
-    08:49:37 GMT`). Pure arithmetic, no libc calendar call."""
+    08:49:37 GMT`). Pure arithmetic, no libc calendar call, and no
+    heap tables on the hot path."""
     var days = timestamp // 86400
     var secs = timestamp % 86400
     var hh = secs // 3600
@@ -42,31 +85,10 @@ def http_date(timestamp: Int) -> String:
     var wday = (days + 4) % 7
     if wday < 0:
         wday += 7
-    var wdays = List[String]()
-    wdays.append("Sun")
-    wdays.append("Mon")
-    wdays.append("Tue")
-    wdays.append("Wed")
-    wdays.append("Thu")
-    wdays.append("Fri")
-    wdays.append("Sat")
-    var months = List[String]()
-    months.append("Jan")
-    months.append("Feb")
-    months.append("Mar")
-    months.append("Apr")
-    months.append("May")
-    months.append("Jun")
-    months.append("Jul")
-    months.append("Aug")
-    months.append("Sep")
-    months.append("Oct")
-    months.append("Nov")
-    months.append("Dec")
-    var out = String(wdays[wday]) + ", "
+    var out = _weekday_name(wday) + ", "
     if d < 10:
         out += "0"
-    out += String(d) + " " + String(months[m - 1]) + " " + String(y) + " "
+    out += String(d) + " " + _month_name(m) + " " + String(y) + " "
     if hh < 10:
         out += "0"
     out += String(hh) + ":"
@@ -134,6 +156,16 @@ def encode_response(
     # Validate a caller-supplied Content-Length against the framed length.
     # For HEAD the framed length is the GET-equivalent body length.
     # For 1xx/204/304 there is no framed length; a caller value is dropped.
+    # A caller-supplied Transfer-Encoding is always rejected: this server
+    # sends buffered responses with a known length, so emitting both
+    # would create a request/response smuggling vector (RFC 9112 6.1).
+    if writer.headers.get_first("Transfer-Encoding"):
+        raise NetError(
+            NetErrorKind.invalid_argument(),
+            "encode response",
+            None,
+            "Transfer-Encoding is not supported on responses",
+        )
     var declared = writer.headers.get_first("Content-Length")
     if declared and wire_length >= 0:
         var text = declared.value()

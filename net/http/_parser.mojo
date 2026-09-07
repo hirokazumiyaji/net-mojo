@@ -313,19 +313,18 @@ def parse_one[
             0,
             True,
         )
-    var line = String(from_utf8_lossy=buf[0:line_end])
-    var line_bytes = line.as_bytes()
-    # Split METHOD SP TARGET SP VERSION.
+    # Split METHOD SP TARGET SP VERSION directly on the wire bytes:
+    # no intermediate line String is allocated on this hot path.
     var first_sp = -1
     var second_sp = -1
-    for i in range(len(line_bytes)):
-        if line_bytes[i] == Byte(ord(" ")):
+    for i in range(line_end):
+        if buf[i] == Byte(ord(" ")):
             if first_sp < 0:
                 first_sp = i
             else:
                 second_sp = i
                 break
-        if line_bytes[i] == Byte(ord("\r")) or line_bytes[i] == Byte(ord("\n")):
+        if buf[i] == Byte(ord("\r")) or buf[i] == Byte(ord("\n")):
             return ParseResult.failure(
                 HttpError.bad_request(String("bad request line")), 0, True
             )
@@ -334,16 +333,14 @@ def parse_one[
             HttpError.bad_request(String("bad request line")), 0, True
         )
     # Reject extra spaces inside the version part.
-    for i in range(second_sp + 1, len(line_bytes)):
-        if line_bytes[i] == Byte(ord(" ")):
+    for i in range(second_sp + 1, line_end):
+        if buf[i] == Byte(ord(" ")):
             return ParseResult.failure(
                 HttpError.bad_request(String("bad request line")), 0, True
             )
-    var method = String(from_utf8_lossy=line_bytes[0:first_sp])
-    var target = String(from_utf8_lossy=line_bytes[first_sp + 1 : second_sp])
-    var version_text = String(
-        from_utf8_lossy=line_bytes[second_sp + 1 : len(line_bytes)]
-    )
+    var method = String(from_utf8_lossy=buf[0:first_sp])
+    var target = String(from_utf8_lossy=buf[first_sp + 1 : second_sp])
+    var version_text = String(from_utf8_lossy=buf[second_sp + 1 : line_end])
     if not _is_valid_method(method):
         return ParseResult.failure(
             HttpError.bad_request(String("bad method")), 0, True
@@ -357,6 +354,18 @@ def parse_one[
         if Int(byte) < 33 or Int(byte) == 127:
             return ParseResult.failure(
                 HttpError.bad_request(String("bad request target")), 0, True
+            )
+        # Raw non-ASCII bytes are invalid in a request-target (RFC 9112
+        # 3.1: senders must percent-encode them). Rejecting here keeps
+        # the downstream path/query split lossless, which operates on
+        # ASCII and would otherwise normalize bytes irreversibly.
+        if Int(byte) > 126:
+            return ParseResult.failure(
+                HttpError.bad_request(
+                    String("non-ASCII request target must be percent-encoded")
+                ),
+                0,
+                True,
             )
     if target.byte_length() > config.max_request_line:
         return ParseResult.failure(
@@ -731,11 +740,24 @@ def parse_one[
                             True,
                         )
                     var trailer_lower = trailer_name.lower()
+                    # RFC 9112 6.5.1 forbids trailers that change framing,
+                    # routing, authentication, or payload processing.
                     if (
                         trailer_lower == "content-length"
                         or trailer_lower == "transfer-encoding"
+                        or trailer_lower == "te"
+                        or trailer_lower == "trailer"
                         or trailer_lower == "host"
                         or trailer_lower == "expect"
+                        or trailer_lower == "connection"
+                        or trailer_lower == "keep-alive"
+                        or trailer_lower == "upgrade"
+                        or trailer_lower == "authorization"
+                        or trailer_lower == "proxy-authenticate"
+                        or trailer_lower == "proxy-authorization"
+                        or trailer_lower == "content-encoding"
+                        or trailer_lower == "content-type"
+                        or trailer_lower == "content-range"
                     ):
                         return ParseResult.failure(
                             HttpError.bad_request(
@@ -819,7 +841,15 @@ def parse_one[
 
 struct HttpParser(Movable):
     """Owns unprocessed bytes for one connection. Feed arbitrary splits;
-    call `next_result` repeatedly to drain pipelined requests."""
+    call `next_result` repeatedly to drain pipelined requests.
+
+    `parse_one` is stateless, so a `need_more` discards the partially
+    decoded body and the next feed re-parses from the buffer start. The
+    cost stays bounded by the configured caps (body and chunk-metadata
+    limits), which is what makes this safe against slow-drip senders;
+    a stateful incremental decoder that resumes mid-body is tracked
+    follow-up work for the performance phases.
+    """
 
     var _buf: List[Byte]
 
