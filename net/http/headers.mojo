@@ -61,9 +61,9 @@ def _reject_bad_name(name: StringSlice, operation: String) raises NetError:
             )
 
 
-def _check_value_bytes[origin: Origin](
-    bytes: Span[Byte, origin], operation: String
-) raises NetError:
+def _check_value_bytes[
+    origin: Origin
+](bytes: Span[Byte, origin], operation: String) raises NetError:
     for i in range(len(bytes)):
         var byte = bytes[i]
         if byte == Byte(ord("\r")) or byte == Byte(ord("\n")):
@@ -108,9 +108,7 @@ struct Headers(Movable, Sized):
     def __len__(self) -> Int:
         return len(self._names)
 
-    def _append_validated(
-        mut self, var name: String, var value: List[Byte]
-    ):
+    def _append_validated(mut self, var name: String, var value: List[Byte]):
         var lowered = name.lower()
         self._names.append(name^)
         self._values.append(value^)

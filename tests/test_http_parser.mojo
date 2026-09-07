@@ -498,6 +498,37 @@ def test_chunk_extension_fragment_no_double_count() raises:
     assert_equal(len(second.request.body), 5)
 
 
+def test_dripped_headers_complete_identically() raises:
+    # Two thousand header bytes dripped one at a time: the incremental
+    # head scan must reach the same verdict as the one-shot parse.
+    var config = ServerConfig.default()
+    var full = _to_bytes("POST /drip HTTP/1.1\r\nHost: h\r\n")
+    for i in range(40):
+        var line = _to_bytes(
+            String("X-Pad-") + String(i) + String(": abcdefghij\r\n")
+        )
+        for k in range(len(line)):
+            full.append(line[k])
+    var tail = _to_bytes("Content-Length: 3\r\n\r\nabc")
+    for i in range(len(tail)):
+        full.append(tail[i])
+    var expected = parse_one(Span(full), config)
+    assert_true(expected.is_complete())
+    var parser = HttpParser()
+    for i in range(len(full)):
+        var one = List[Byte]()
+        one.append(full[i])
+        parser.feed(Span(one))
+        var interim = parser.next_result(config)
+        if i + 1 < len(full):
+            assert_true(interim.is_need_more())
+        else:
+            assert_true(interim.is_complete())
+            assert_equal(len(interim.request.body), 3)
+            assert_equal(interim.request.headers.count("X-Pad-7"), 1)
+            assert_equal(interim.consumed, expected.consumed)
+
+
 def test_dripped_tail_decodes_without_loss() raises:
     # One completed chunk followed by byte-wise drips: slow feeds must
     # neither lose bytes nor change the outcome.
