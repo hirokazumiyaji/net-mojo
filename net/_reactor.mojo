@@ -69,12 +69,19 @@ struct _ReactorSlot(Copyable, Movable):
 
 
 struct Reactor(Movable, Sized):
-    """Level-triggered readiness set over `poll(2)` with stable tokens."""
+    """Level-triggered readiness set over `poll(2)` with stable tokens.
+
+    The poll scratch buffers live on the reactor and are reused every
+    `wait` so the loop tick performs no per-call registrations-list
+    allocation.
+    """
 
     var _slots: List[_ReactorSlot]
     var _free: List[Int]
     var _active_count: Int
     var _next_generation: UInt64
+    var _pollfds: List[_PollFD]
+    var _poll_slots: List[Int]
 
     def __init__(out self):
         self._slots = List[_ReactorSlot]()
@@ -83,6 +90,8 @@ struct Reactor(Movable, Sized):
         # Generation 0 is reserved for never-issued tokens so a
         # default-constructed token never validates.
         self._next_generation = 1
+        self._pollfds = List[_PollFD]()
+        self._poll_slots = List[Int]()
 
     def __len__(self) -> Int:
         return self._active_count
@@ -158,48 +167,68 @@ struct Reactor(Movable, Sized):
         An empty reactor returns an empty list without a syscall. A
         `None` timeout waits indefinitely; a zero timeout reports what
         is already ready. Stale tokens never appear in the output.
+
+        Terminal conditions (`POLLERR`, `POLLNVAL`, `POLLHUP`) are
+        always reported. In addition, an observed `POLLIN` is always
+        surfaced as readable even when `POLLIN` was not requested:
+        `poll` cannot tell data from EOF without reading (macOS in
+        particular reports an orderly peer shutdown as bare `POLLIN`,
+        and reports nothing at all for an empty mask, hence the
+        always-on `POLLIN` watch above). The event obliges the owner
+        to drain via `try_*` until would-block or EOF and to remove
+        the registration on EOF. Every delivered event therefore makes
+        progress (bytes or EOF) and no hangup can trap the loop
+        eventlessly; over-delivery on a level-triggered baseline is
+        always safe. The interest flags keep their meaning as the
+        delivery contract for the Phase 4 edge backends. `has_error`
+        stays reserved for `POLLERR | POLLNVAL`; a pure hangup arrives
+        as `readable` with `has_error == False`.
         """
         var out = List[ReactorEvent]()
         if self._active_count == 0:
             return out^
-        var pollfds = List[_PollFD]()
-        var slots = List[Int]()
+        self._pollfds.clear()
+        self._poll_slots.clear()
         for i in range(len(self._slots)):
             if not self._slots[i].active:
                 continue
-            var interests: Int16 = 0
-            if self._slots[i].readable:
-                interests |= POLLIN
+            # POLLIN is always watched: several platforms only report an
+            # orderly peer shutdown when it is in the mask (with an empty
+            # mask, macOS reports nothing at all). Delivery still follows
+            # the reporting rules below.
+            var interests: Int16 = POLLIN
             if self._slots[i].writable:
                 interests |= POLLOUT
-            pollfds.append(
+            self._pollfds.append(
                 _PollFD(fd=self._slots[i].fd, events=interests, revents=0)
             )
-            slots.append(i)
+            self._poll_slots.append(i)
         var deadline = _Deadline.from_optional(timeout)
-        var polled = _poll_multiple(pollfds, deadline)
+        var polled = _poll_multiple(self._pollfds, deadline)
         if polled == 0:
             return out^
-        for i in range(len(pollfds)):
-            var readable = ((pollfds[i].events & POLLIN) != 0) and (
-                (pollfds[i].revents & _READABLE_MASK) != 0
-            )
-            var writable = ((pollfds[i].events & POLLOUT) != 0) and (
-                (pollfds[i].revents & _WRITABLE_MASK) != 0
+        for i in range(len(self._pollfds)):
+            # The mask always watches POLLIN (see above), so any
+            # observed readiness bit here is worth reporting; terminal
+            # bits ride along in the mask.
+            var readable = (self._pollfds[i].revents & _READABLE_MASK) != 0
+            var writable = ((self._pollfds[i].events & POLLOUT) != 0) and (
+                (self._pollfds[i].revents & _WRITABLE_MASK) != 0
             )
             if not readable and not writable:
                 continue
-            var slot = slots[i]
+            var slot = self._poll_slots[i]
             out.append(
                 ReactorEvent(
                     token=ReactorToken(
                         slot=slot,
                         generation=self._slots[slot].generation,
                     ),
-                    fd=pollfds[i].fd,
+                    fd=self._pollfds[i].fd,
                     readable=readable,
                     writable=writable,
-                    has_error=(pollfds[i].revents & (POLLERR | POLLNVAL)) != 0,
+                    has_error=(self._pollfds[i].revents & (POLLERR | POLLNVAL))
+                    != 0,
                 )
             )
         return out^

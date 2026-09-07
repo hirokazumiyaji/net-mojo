@@ -41,7 +41,7 @@ def _read_response(
 def main() raises:
     var server = Server(ServerConfig.default())
     server.add_listener(listen_tcp("127.0.0.1:0"))
-    var port = server._listener.value().local_address().port
+    var port = server.local_address().port
     var handler = HelloHandler()
     var client = dial_tcp(
         String("127.0.0.1:") + String(port), Timeout.seconds(2)

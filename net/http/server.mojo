@@ -30,7 +30,7 @@ Ownership and resources:
   (reads are paused) so one slow reader cannot grow user buffers.
 """
 
-from net import TCPListener, Timeout, listen_tcp
+from net import SocketAddress, TCPListener, Timeout, listen_tcp
 from net._reactor import Reactor, ReactorToken
 from net.error import NetError, NetErrorKind
 
@@ -60,8 +60,13 @@ comptime _SHUTDOWN_QUIET_MS: Int = 10
 
 
 struct ServerControl(Movable):
-    """Shutdown handle. Only the request crosses threads (flag polled on
-    a bounded tick); the loop owner performs every socket operation."""
+    """Shutdown request handle polled by the loop owner.
+
+    NOT yet safe to share across threads (plain `Bool` fields, no
+    atomics available): today the owner thread calls `request_shutdown`
+    or drives shutdown through `Server`. Cross-thread requests plus a
+    wakeup fd are tracked Phase 4 work; see the module docstring.
+    """
 
     var _requested: Bool
     var _exited: Bool
@@ -95,6 +100,7 @@ struct Server(Movable):
     var _conns: List[HttpConnection]
     var _conn_free: List[Int]
     var _slot_map: List[Int]
+    var _fired: List[UInt8]
     var _active_conns: Int
     var _budget: BufferBudget
     var _shutdown_at: Int
@@ -111,6 +117,7 @@ struct Server(Movable):
         self._conns = List[HttpConnection]()
         self._conn_free = List[Int]()
         self._slot_map = List[Int]()
+        self._fired = List[UInt8]()
         self._active_conns = 0
         self._budget = BufferBudget(budget_total)
         self._shutdown_at = NO_DEADLINE
@@ -162,20 +169,44 @@ struct Server(Movable):
                 if events[i].token == self._listener_token:
                     self._accept_pending(now)
                     break
+        # O(events + conns) dispatch: fold the ready batch into a reused
+        # per-connection bitmask (1 = readable, 2 = writable) via the
+        # slot map instead of scanning events per connection. The token
+        # equality check also pins the generation, so a reused reactor
+        # slot can never steer an event at the wrong connection.
+        while len(self._fired) < len(self._conns):
+            self._fired.append(0)
+        for i in range(len(self._conns)):
+            self._fired[i] = 0
+        for k in range(len(events)):
+            var slot = events[k].token.slot
+            if slot < 0 or slot >= len(self._slot_map):
+                continue
+            var idx = self._slot_map[slot]
+            if idx < 0 or idx >= len(self._conns):
+                continue
+            if not self._conns[idx].active:
+                continue
+            if not (self._conns[idx].token == events[k].token):
+                continue
+            var mask = self._fired[idx]
+            if events[k].readable:
+                mask |= 1
+            if events[k].writable:
+                mask |= 2
+            self._fired[idx] = mask
         for i in range(len(self._conns)):
             if not self._conns[i].active:
                 continue
-            var event = False
-            for k in range(len(events)):
-                if events[k].token == self._conns[i].token:
-                    event = True
-                    break
+            var readable = (self._fired[i] & 1) != 0
+            var writable = (self._fired[i] & 2) != 0
             if (
-                event
+                readable
+                or writable
                 or self._conns[i].buffered_len() > 0
                 or self._conns[i].pending_remaining() > 0
             ):
-                self._drive_conn(i, event, handler, now)
+                self._drive_conn(i, readable, writable, handler, now)
         self._check_deadlines(now_ns())
         if not self._listener and self._active_conns == 0:
             self.control.mark_exited()
@@ -191,6 +222,46 @@ struct Server(Movable):
         while True:
             if not self.tick(handler, None):
                 break
+
+    def serve_with_control[
+        H: Handler
+    ](
+        mut self,
+        var listener: TCPListener,
+        mut handler: H,
+        mut control: ServerControl,
+    ) raises:
+        """Runs the event loop like `serve`, but polls and exits through
+        a caller-held `ServerControl` instead of the owned one, so the
+        caller keeps a shutdown handle across the blocking call.
+
+        The handle is still polled, not shared: calling
+        `request_shutdown` from another thread becomes safe only once
+        the control is backed by shared atomic state (tracked Phase 4
+        work). Single-threaded callers can already structure
+        signal-driven shutdown around this seam.
+        """
+        self.add_listener(listener^)
+        while True:
+            if control.is_shutdown_requested():
+                self.control.request_shutdown()
+            if not self.tick(handler, None):
+                break
+            if self.control.is_shutdown_requested():
+                control.request_shutdown()
+        control.mark_exited()
+
+    def local_address(self) raises NetError -> SocketAddress:
+        """Returns the bound listener address (handy with ephemeral
+        ports). Fails when no listener is installed."""
+        if not self._listener:
+            raise NetError(
+                NetErrorKind.invalid_state(),
+                "local address",
+                None,
+                "server has no listener",
+            )
+        return self._listener.value().local_address()
 
     def _ensure_slot_map(mut self, slot: Int):
         while len(self._slot_map) <= slot:
@@ -286,9 +357,12 @@ struct Server(Movable):
         if token.slot >= 0 and token.slot < len(self._slot_map):
             if self._slot_map[token.slot] == idx:
                 self._slot_map[token.slot] = -1
+        # Release the whole pending reservation, not just the unsent
+        # suffix: bytes already written were charged when queued, and
+        # leaving the sent prefix charged would leak budget on every
+        # partial-send close until unrelated requests see 503s.
         self._budget.release(
-            self._conns[idx].buffered_len()
-            + self._conns[idx].pending_remaining()
+            self._conns[idx].buffered_len() + len(self._conns[idx].pending)
         )
         try:
             self._conns[idx].close()
@@ -329,24 +403,36 @@ struct Server(Movable):
 
     def _drive_conn[
         H: Handler
-    ](mut self, idx: Int, event: Bool, mut handler: H, now: Int,) raises:
+    ](
+        mut self,
+        idx: Int,
+        readable: Bool,
+        writable: Bool,
+        mut handler: H,
+        now: Int,
+    ) raises:
         if not self._conns[idx].active:
             return
         if (
             self._conns[idx].state == STATE_SENDING
             or self._conns[idx].state == STATE_SENDING_100
         ):
-            self._pump_send(idx, event)
+            self._pump_send(idx, writable)
             if not self._conns[idx].active:
                 return
         if self._conns[idx].state == STATE_READING:
-            self._pump_read(idx, event, now)
+            self._pump_read(idx, readable, now)
             if not self._conns[idx].active:
                 return
+            # Remember whether a response was already queued: only a
+            # response queued by the parse below earns an optimistic
+            # first flush without waiting for a writable event.
+            var queued_before = self._conns[idx].pending_remaining() > 0
             self._pump_parse(idx, handler, now)
             if not self._conns[idx].active:
                 return
-            self._pump_send(idx, True)
+            if not queued_before and self._conns[idx].pending_remaining() > 0:
+                self._pump_send(idx, True)
             if not self._conns[idx].active:
                 return
         self._sync_interests(idx)
@@ -419,9 +505,21 @@ struct Server(Movable):
                 self._send_error(idx, head_status)
                 return
             var content_length = head.head.content_length
+            # Admit only the body bytes still missing: what is already
+            # buffered is counted in the budget, so adding the full
+            # declared length would charge it twice and 503 requests
+            # that actually fit.
+            var buffered_body = (
+                self._conns[idx].buffered_len() - head.head.header_end
+            )
+            if buffered_body < 0:
+                buffered_body = 0
+            var outstanding = content_length - buffered_body
+            if outstanding < 0:
+                outstanding = 0
             if (
                 content_length > 0
-                and self._budget.used + content_length > self._budget.total
+                and self._budget.used + outstanding > self._budget.total
             ):
                 self._send_error(idx, 503)
                 return
@@ -432,6 +530,11 @@ struct Server(Movable):
                 self._conns[idx].body_at = deadline_from_now(
                     self.config.body_deadline
                 )
+                # The header phase is over once a validated head hands
+                # off to body reading; leaving header_at armed would let
+                # the short header deadline kill a slow but admitted
+                # upload.
+                self._conns[idx].header_at = NO_DEADLINE
             var result = parse_one(Span(self._conns[idx].buf), self.config)
             if result.is_need_more():
                 if self._conns[idx].read_eof:
@@ -552,8 +655,14 @@ struct Server(Movable):
         if not event:
             return
         while self._conns[idx].pending_remaining() > 0:
+            var allowance = (
+                self.config.max_bytes_per_tick
+                - self._conns[idx].bytes_this_tick
+            )
+            if allowance <= 0:
+                break
             try:
-                var n = self._conns[idx].try_write_pending()
+                var n = self._conns[idx].try_write_pending_capped(allowance)
                 self._conns[idx].bytes_this_tick += n
             except e:
                 if e.kind == NetErrorKind.timeout():
@@ -580,10 +689,24 @@ struct Server(Movable):
             return
         self._conns[idx].state = STATE_READING
         self._conns[idx].sent_100 = False
-        self._conns[idx].header_at = NO_DEADLINE
         self._conns[idx].body_at = NO_DEADLINE
         self._conns[idx].write_at = NO_DEADLINE
-        self._conns[idx].idle_at = deadline_from_now(self.config.idle_timeout)
+        if self._conns[idx].buffered_len() > 0:
+            # A pipelined next head is already waiting: arm its header
+            # deadline now. Without this, clearing below would leave a
+            # partial head with no deadline at all (idle only applies to
+            # empty buffers), retaining the connection indefinitely.
+            self._conns[idx].header_at = deadline_from_now(
+                self.config.header_deadline
+            )
+            self._conns[idx].idle_at = deadline_from_now(
+                self.config.idle_timeout
+            )
+        else:
+            self._conns[idx].header_at = NO_DEADLINE
+            self._conns[idx].idle_at = deadline_from_now(
+                self.config.idle_timeout
+            )
 
     def _check_deadlines(mut self, now: Int) raises NetError:
         for i in range(len(self._conns)):
@@ -634,22 +757,32 @@ struct Server(Movable):
         for i in range(len(self._conns)):
             if not self._conns[i].active:
                 continue
-            var marks = List[Int]()
-            marks.append(self._conns[i].idle_at)
-            marks.append(self._conns[i].header_at)
-            marks.append(self._conns[i].body_at)
-            marks.append(self._conns[i].write_at)
-            for k in range(len(marks)):
-                if marks[k] == NO_DEADLINE:
-                    continue
-                var left_ms = (marks[k] - now) // 1_000_000
-                if left_ms < 0:
-                    left_ms = 0
-                if left_ms < best:
-                    best = Int(left_ms)
+            # Mirror _check_deadlines: only phases that can actually
+            # fire for the current state shorten the wait. Stale
+            # timestamps from earlier phases must not busy-poll the
+            # loop (e.g. an old header deadline during a long send).
+            if self._conns[i].state == STATE_READING:
+                if self._conns[i].buffered_len() > 0:
+                    best = _sooner(best, self._conns[i].body_at, now)
+                    best = _sooner(best, self._conns[i].header_at, now)
+                else:
+                    best = _sooner(best, self._conns[i].idle_at, now)
+            else:
+                best = _sooner(best, self._conns[i].write_at, now)
         if best < 0:
             best = 0
         return Timeout.milliseconds(UInt64(best))
+
+
+def _sooner(best: Int, mark: Int, now: Int) -> Int:
+    if mark == NO_DEADLINE:
+        return best
+    var left_ms = (mark - now) // 1_000_000
+    if left_ms < 0:
+        left_ms = 0
+    if Int(left_ms) < best:
+        return Int(left_ms)
+    return best
 
 
 def _Deadline_from_optional_ms(timeout: Optional[Timeout]) -> Int:
@@ -671,3 +804,19 @@ def listen_and_serve[
     var server = Server(config^)
     var listener = listen_tcp(address)
     server.serve(listener^, handler)
+
+
+def listen_and_serve_with_control[
+    H: Handler
+](
+    address: StringSlice,
+    var config: ServerConfig,
+    mut handler: H,
+    mut control: ServerControl,
+) raises:
+    """Binds `address` and serves like `listen_and_serve`, but through a
+    caller-held shutdown handle. See `serve_with_control` for the
+    polling (not yet cross-thread-safe) contract."""
+    var server = Server(config^)
+    var listener = listen_tcp(address)
+    server.serve_with_control(listener^, handler, control)

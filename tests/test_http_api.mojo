@@ -164,6 +164,57 @@ def test_header_injection_is_rejected() raises:
     assert_equal(len(headers), 0)
 
 
+def _assert_add_rejected(var name: String, var value: String) raises:
+    var headers = Headers()
+    var rejected = False
+    try:
+        headers.add(name^, value^)
+    except error:
+        assert_equal(error.kind, NetErrorKind.invalid_argument())
+        rejected = True
+    assert_true(rejected)
+    assert_equal(len(headers), 0)
+
+
+def _string_with_byte(prefix: String, byte: Byte, suffix: String) -> String:
+    var raw = List[Byte]()
+    var head = prefix.as_bytes()
+    for i in range(len(head)):
+        raw.append(head[i])
+    raw.append(byte)
+    var tail = suffix.as_bytes()
+    for i in range(len(tail)):
+        raw.append(tail[i])
+    return String(from_utf8_lossy=Span(raw))
+
+
+def test_header_names_must_be_valid_tokens() raises:
+    _assert_add_rejected(String("Bad Header"), String("1"))
+    _assert_add_rejected(String("Bad:Header"), String("1"))
+    _assert_add_rejected(String("Bad\tHeader"), String("1"))
+    _assert_add_rejected(String(""), String("1"))
+    _assert_add_rejected(
+        _string_with_byte(String("X-Bad"), Byte(127), String("")), String("1")
+    )
+
+
+def test_header_values_reject_control_bytes() raises:
+    _assert_add_rejected(
+        String("X-Bad"), _string_with_byte(String("a"), Byte(0), String("b"))
+    )
+    _assert_add_rejected(
+        String("X-Bad"), _string_with_byte(String("a"), Byte(1), String("b"))
+    )
+    _assert_add_rejected(
+        String("X-Bad"),
+        _string_with_byte(String("a"), Byte(127), String("b")),
+    )
+    # HTAB and SP remain legal field-value bytes.
+    var headers = Headers()
+    headers.add(String("X-Ok"), String("a\tb c"))
+    assert_equal(len(headers), 1)
+
+
 def test_path_query_split_has_no_percent_decoding() raises:
     var path, query = split_path_query("/a%2Fb?x=%41")
     assert_equal(path, "/a%2Fb")

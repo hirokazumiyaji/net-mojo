@@ -2,12 +2,14 @@ from std.testing import assert_equal, assert_false, assert_true, TestSuite
 from std.time import sleep
 
 from net import TCPConn, Timeout, dial_tcp, listen_tcp
+from net.error import NetErrorKind
 from net.http import (
     Handler,
     Request,
     ResponseWriter,
     Server,
     ServerConfig,
+    ServerControl,
 )
 
 
@@ -234,7 +236,7 @@ def _assert_body(wire: List[Byte], expected: String) raises:
 def test_hello_keep_alive_two_requests() raises:
     var server = Server(ServerConfig.default())
     server.add_listener(listen_tcp("127.0.0.1:0"))
-    var port = server._listener.value().local_address().port
+    var port = server.local_address().port
     var handler = _HelloHandler()
     var client = dial_tcp(
         String("127.0.0.1:") + String(port), Timeout.seconds(2)
@@ -265,7 +267,7 @@ def test_hello_keep_alive_two_requests() raises:
 def test_pipeline_order_preserved() raises:
     var server = Server(ServerConfig.default())
     server.add_listener(listen_tcp("127.0.0.1:0"))
-    var port = server._listener.value().local_address().port
+    var port = server.local_address().port
     var handler = _TwoHandler()
     var client = dial_tcp(
         String("127.0.0.1:") + String(port), Timeout.seconds(2)
@@ -307,7 +309,7 @@ def test_pipeline_order_preserved() raises:
 def test_100_continue_flow() raises:
     var server = Server(ServerConfig.default())
     server.add_listener(listen_tcp("127.0.0.1:0"))
-    var port = server._listener.value().local_address().port
+    var port = server.local_address().port
     var handler = _EchoHandler()
     var client = dial_tcp(
         String("127.0.0.1:") + String(port), Timeout.seconds(2)
@@ -358,7 +360,7 @@ def test_100_continue_flow() raises:
 def test_unknown_expectation_is_417() raises:
     var server = Server(ServerConfig.default())
     server.add_listener(listen_tcp("127.0.0.1:0"))
-    var port = server._listener.value().local_address().port
+    var port = server.local_address().port
     var handler = _EchoHandler()
     var client = dial_tcp(
         String("127.0.0.1:") + String(port), Timeout.seconds(2)
@@ -379,7 +381,7 @@ def test_unknown_expectation_is_417() raises:
 def test_partial_send_byte_at_a_time() raises:
     var server = Server(ServerConfig.default())
     server.add_listener(listen_tcp("127.0.0.1:0"))
-    var port = server._listener.value().local_address().port
+    var port = server.local_address().port
     var handler = _HelloHandler()
     var client = dial_tcp(
         String("127.0.0.1:") + String(port), Timeout.seconds(2)
@@ -423,7 +425,7 @@ def test_partial_send_byte_at_a_time() raises:
 def test_eof_after_complete_responds_then_closes() raises:
     var server = Server(ServerConfig.default())
     server.add_listener(listen_tcp("127.0.0.1:0"))
-    var port = server._listener.value().local_address().port
+    var port = server.local_address().port
     var handler = _HelloHandler()
     var client = dial_tcp(
         String("127.0.0.1:") + String(port), Timeout.seconds(2)
@@ -459,7 +461,7 @@ def test_eof_after_complete_responds_then_closes() raises:
 def test_eof_mid_request_closes_without_success() raises:
     var server = Server(ServerConfig.default())
     server.add_listener(listen_tcp("127.0.0.1:0"))
-    var port = server._listener.value().local_address().port
+    var port = server.local_address().port
     var handler = _HelloHandler()
     var client = dial_tcp(
         String("127.0.0.1:") + String(port), Timeout.seconds(2)
@@ -492,7 +494,7 @@ def test_slow_reader_does_not_block_fast_client() raises:
     var config = ServerConfig.default()
     var server = Server(config^)
     server.add_listener(listen_tcp("127.0.0.1:0"))
-    var port = server._listener.value().local_address().port
+    var port = server.local_address().port
     var handler = _BigJsonHandler()
     var slow = dial_tcp(String("127.0.0.1:") + String(port), Timeout.seconds(2))
     # Shrink the slow client's receive window so the 256 KiB response
@@ -551,7 +553,7 @@ def test_slow_reader_does_not_block_fast_client() raises:
 def test_malformed_request_is_400() raises:
     var server = Server(ServerConfig.default())
     server.add_listener(listen_tcp("127.0.0.1:0"))
-    var port = server._listener.value().local_address().port
+    var port = server.local_address().port
     var handler = _HelloHandler()
     var client = dial_tcp(
         String("127.0.0.1:") + String(port), Timeout.seconds(2)
@@ -571,7 +573,7 @@ def test_malformed_request_is_400() raises:
 def test_handler_error_is_500_and_loop_continues() raises:
     var server = Server(ServerConfig.default())
     server.add_listener(listen_tcp("127.0.0.1:0"))
-    var port = server._listener.value().local_address().port
+    var port = server.local_address().port
     var boom = _BoomHandler()
     var bad = dial_tcp(String("127.0.0.1:") + String(port), Timeout.seconds(2))
     var out = _exchange(
@@ -601,7 +603,7 @@ def test_handler_error_is_500_and_loop_continues() raises:
 def test_response_over_limit_is_500() raises:
     var server = Server(ServerConfig.default())
     server.add_listener(listen_tcp("127.0.0.1:0"))
-    var port = server._listener.value().local_address().port
+    var port = server.local_address().port
     var handler = _HugeHandler()
     var client = dial_tcp(
         String("127.0.0.1:") + String(port), Timeout.seconds(2)
@@ -621,7 +623,7 @@ def test_small_budget_rejects_with_503() raises:
     config.total_buffer_budget = 2048
     var server = Server(config^)
     server.add_listener(listen_tcp("127.0.0.1:0"))
-    var port = server._listener.value().local_address().port
+    var port = server.local_address().port
     var handler = _EchoHandler()
     var client = dial_tcp(
         String("127.0.0.1:") + String(port), Timeout.seconds(2)
@@ -639,7 +641,7 @@ def test_small_budget_rejects_with_503() raises:
 def test_connection_close_roundtrip() raises:
     var server = Server(ServerConfig.default())
     server.add_listener(listen_tcp("127.0.0.1:0"))
-    var port = server._listener.value().local_address().port
+    var port = server.local_address().port
     var handler = _HelloHandler()
     var client = dial_tcp(
         String("127.0.0.1:") + String(port), Timeout.seconds(2)
@@ -661,7 +663,7 @@ def test_connection_close_roundtrip() raises:
 def test_head_omits_body_bytes() raises:
     var server = Server(ServerConfig.default())
     server.add_listener(listen_tcp("127.0.0.1:0"))
-    var port = server._listener.value().local_address().port
+    var port = server.local_address().port
     var handler = _HelloHandler()
     var client = dial_tcp(
         String("127.0.0.1:") + String(port), Timeout.seconds(2)
@@ -690,7 +692,7 @@ def test_head_omits_body_bytes() raises:
 def test_chunked_echo_roundtrip() raises:
     var server = Server(ServerConfig.default())
     server.add_listener(listen_tcp("127.0.0.1:0"))
-    var port = server._listener.value().local_address().port
+    var port = server.local_address().port
     var handler = _EchoHandler()
     var client = dial_tcp(
         String("127.0.0.1:") + String(port), Timeout.seconds(2)
@@ -712,7 +714,7 @@ def test_chunked_echo_roundtrip() raises:
 def test_binary_body_roundtrip() raises:
     var server = Server(ServerConfig.default())
     server.add_listener(listen_tcp("127.0.0.1:0"))
-    var port = server._listener.value().local_address().port
+    var port = server.local_address().port
     var handler = _EchoHandler()
     var client = dial_tcp(
         String("127.0.0.1:") + String(port), Timeout.seconds(2)
@@ -758,7 +760,7 @@ def test_max_connections_pauses_listener() raises:
     config.max_connections = 1
     var server = Server(config^)
     server.add_listener(listen_tcp("127.0.0.1:0"))
-    var port = server._listener.value().local_address().port
+    var port = server.local_address().port
     var handler = _HelloHandler()
     var first = dial_tcp(
         String("127.0.0.1:") + String(port), Timeout.seconds(2)
@@ -803,7 +805,7 @@ def test_slow_header_times_out() raises:
     config.header_deadline = Timeout.milliseconds(200)
     var server = Server(config^)
     server.add_listener(listen_tcp("127.0.0.1:0"))
-    var port = server._listener.value().local_address().port
+    var port = server.local_address().port
     var handler = _HelloHandler()
     var client = dial_tcp(
         String("127.0.0.1:") + String(port), Timeout.seconds(2)
@@ -825,7 +827,7 @@ def test_idle_connection_times_out() raises:
     config.idle_timeout = Timeout.milliseconds(200)
     var server = Server(config^)
     server.add_listener(listen_tcp("127.0.0.1:0"))
-    var port = server._listener.value().local_address().port
+    var port = server.local_address().port
     var handler = _HelloHandler()
     var client = dial_tcp(
         String("127.0.0.1:") + String(port), Timeout.seconds(2)
@@ -841,7 +843,7 @@ def test_idle_connection_times_out() raises:
 def test_shutdown_drains_in_flight_and_exits() raises:
     var server = Server(ServerConfig.default())
     server.add_listener(listen_tcp("127.0.0.1:0"))
-    var port = server._listener.value().local_address().port
+    var port = server.local_address().port
     var handler = _HelloHandler()
     var idle = dial_tcp(String("127.0.0.1:") + String(port), Timeout.seconds(2))
     var busy = dial_tcp(String("127.0.0.1:") + String(port), Timeout.seconds(2))
@@ -872,6 +874,31 @@ def test_shutdown_drains_in_flight_and_exits() raises:
     server.request_shutdown()
     idle.close()
     busy.close()
+
+
+def test_local_address_reports_bound_port() raises:
+    var bare = Server(ServerConfig.default())
+    var missing = False
+    try:
+        _ = bare.local_address()
+    except error:
+        assert_equal(error.kind, NetErrorKind.invalid_state())
+        missing = True
+    assert_true(missing)
+    var server = Server(ServerConfig.default())
+    server.add_listener(listen_tcp("127.0.0.1:0"))
+    assert_true(server.local_address().port != 0)
+
+
+def test_serve_with_control_uses_caller_handle() raises:
+    var server = Server(ServerConfig.default())
+    var listener = listen_tcp("127.0.0.1:0")
+    var handler = _HelloHandler()
+    var control = ServerControl()
+    control.request_shutdown()
+    server.serve_with_control(listener^, handler, control)
+    assert_true(control.is_shutdown_requested())
+    assert_equal(server.active_connections(), 0)
 
 
 def main() raises:

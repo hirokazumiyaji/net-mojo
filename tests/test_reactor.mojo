@@ -116,17 +116,21 @@ def test_read_write_simultaneous_notifications() raises:
     client.write_all(Span(ping), Timeout.seconds(1))
     server.write_all(Span(pong), Timeout.seconds(1))
 
-    var events = reactor.wait(Timeout.seconds(1))
-    assert_equal(len(events), 2)
+    # `wait` returns on the first readiness, so collect across waits
+    # until both directions have been observed.
     var saw_server = False
     var saw_client = False
-    for i in range(len(events)):
-        if events[i].token == server_token:
-            saw_server = True
-            assert_true(events[i].readable)
-        if events[i].token == client_token:
-            saw_client = True
-            assert_true(events[i].readable)
+    for _ in range(20):
+        var events = reactor.wait(Timeout.milliseconds(100))
+        for i in range(len(events)):
+            if events[i].token == server_token:
+                saw_server = True
+                assert_true(events[i].readable)
+            if events[i].token == client_token:
+                saw_client = True
+                assert_true(events[i].readable)
+        if saw_server and saw_client:
+            break
     assert_true(saw_server)
     assert_true(saw_client)
 
@@ -252,6 +256,35 @@ def test_remove_then_close_leaves_no_watch_or_leak() raises:
 
     var after = _count_open_fds()
     assert_equal(before, after)
+    listener.close()
+
+
+def test_terminal_hangup_reported_without_interests() raises:
+    # A registration with neither interest must still surface a peer
+    # close: otherwise the loop would spin on an undeliverable hangup
+    # with no event to act on.
+    var listener = listen_tcp("127.0.0.1:0")
+    var client = dial_tcp(String(listener.local_address()), Timeout.seconds(1))
+    var server = listener.accept(Timeout.seconds(1))
+
+    var reactor = Reactor()
+    var token = reactor.register(
+        server.raw_fd(), readable=False, writable=False
+    )
+    var quiet = reactor.wait(Timeout.nanoseconds(0))
+    assert_equal(len(quiet), 0)
+
+    client.close()
+    var events = reactor.wait(Timeout.seconds(1))
+    assert_equal(len(events), 1)
+    assert_equal(events[0].token, token)
+    assert_true(events[0].readable)
+
+    var eof = Array[Byte, 1](fill=0)
+    assert_equal(server.try_read(Span(eof)), 0)
+
+    assert_true(reactor.remove(token))
+    server.close()
     listener.close()
 
 

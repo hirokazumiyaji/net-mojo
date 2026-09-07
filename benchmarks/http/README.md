@@ -10,7 +10,7 @@ stay comparable.
   `go version` output with each measurement.
 - Go baseline: `benchmarks/http_go/main.go` (`go.mod` pins `go 1.24`).
 - Mojo toolchain: `pixi.toml` pinned `mojo >=1.0.0,<2` (local `1.0.0`).
-- Build: Go `go build -o http_go_baseline ./benchmarks/http_go`;
+- Build: Go `go -C benchmarks/http_go build -o /tmp/http_go_baseline .` (run from the repository root; `benchmarks/http_go` is its own module);
   Mojo optimized executable (`mojo build`), compile and startup time
   excluded from the measurement window.
 
@@ -66,7 +66,7 @@ Verified Phase 0 (loopback, `GOMAXPROCS=1`):
 ## Running the Go baseline
 
 ```bash
-go build -o /tmp/http_go_baseline ./benchmarks/http_go
+go -C benchmarks/http_go build -o /tmp/http_go_baseline .
 GOMAXPROCS=1 /tmp/http_go_baseline -addr 127.0.0.1:18080 &
 curl -D - http://127.0.0.1:18080/fixed -o /tmp/fixed.body
 curl -D - http://127.0.0.1:18080/json -o /tmp/json.body

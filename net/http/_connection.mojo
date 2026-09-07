@@ -117,8 +117,17 @@ struct HttpConnection(Movable):
             out.append(tmp[i])
         return out^
 
-    def try_write_pending(mut self) raises NetError -> Int:
-        var written = self.conn.try_write(self.pending_span())
+    def try_write_pending_capped(mut self, cap: Int) raises NetError -> Int:
+        """Writes at most `cap` pending bytes so one connection cannot
+        exceed its per-tick fairness allowance in a single call."""
+        var available = len(self.pending) - self.pending_offset
+        var bound = available if available < cap else cap
+        if bound <= 0:
+            return 0
+        var end = self.pending_offset + bound
+        var written = self.conn.try_write(
+            Span(self.pending)[self.pending_offset : end]
+        )
         self.pending_offset += written
         return written
 
