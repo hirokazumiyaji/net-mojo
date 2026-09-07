@@ -576,6 +576,25 @@ def test_chunk_extension_grammar() raises:
         assert_equal(result.error.status, 400)
 
 
+def test_bare_chunk_size_rejects_whitespace() raises:
+    # Without an extension, the size line is bare hex: surrounding
+    # whitespace is malformed framing, not extension padding.
+    _assert_status(
+        (
+            "POST /a HTTP/1.1\r\nHost: h\r\nTransfer-Encoding:"
+            " chunked\r\n\r\n 5\r\nhello\r\n0\r\n\r\n"
+        ),
+        400,
+    )
+    _assert_status(
+        (
+            "POST /a HTTP/1.1\r\nHost: h\r\nTransfer-Encoding:"
+            " chunked\r\n\r\n5 \r\nhello\r\n0\r\n\r\n"
+        ),
+        400,
+    )
+
+
 def test_multiple_expect_fields_all_must_agree() raises:
     # A later 100-continue must not whitewash an earlier unsupported
     # expectation, in either order.
@@ -617,11 +636,32 @@ def test_host_authority_structure() raises:
         "example.com:abc",
         "example.com:",
         "2001:db8::1",
+        "%zz",
+        "%2G",
     ]:
         _assert_status(
             String("GET /a HTTP/1.1\r\nHost: ") + bad + String("\r\n\r\n"),
             400,
         )
+    # Backslash and DQUOTE need byte-level construction.
+    var backslash_host = _to_bytes("GET /a HTTP/1.1\r\nHost: a")
+    backslash_host.append(Byte(92))
+    var backslash_tail = _to_bytes("b\r\n\r\n")
+    for i in range(len(backslash_tail)):
+        backslash_host.append(backslash_tail[i])
+    var backslash_result = parse_one(
+        Span(backslash_host), ServerConfig.default()
+    )
+    assert_true(backslash_result.is_error())
+    assert_equal(backslash_result.error.status, 400)
+    var quote_host = _to_bytes("GET /a HTTP/1.1\r\nHost: ")
+    quote_host.append(Byte(34))
+    var quote_tail = _to_bytes('x"\r\n\r\n')
+    for i in range(len(quote_tail)):
+        quote_host.append(quote_tail[i])
+    var quote_result = parse_one(Span(quote_host), ServerConfig.default())
+    assert_true(quote_result.is_error())
+    assert_equal(quote_result.error.status, 400)
 
 
 def test_expect_and_connection_flags() raises:
