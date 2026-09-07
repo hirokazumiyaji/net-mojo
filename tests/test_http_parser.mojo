@@ -419,6 +419,89 @@ def test_fragment_in_target_is_rejected() raises:
     )
 
 
+def test_quoted_pair_rejects_bad_escapes() raises:
+    # A backslash must quote HTAB / SP / VCHAR / obs-text only: CR,
+    # NUL, and DEL after it are rejected like a strict intermediary.
+    var bad_cr = _to_bytes(
+        "POST /a HTTP/1.1\r\nHost: h\r\nTransfer-Encoding:"
+        ' chunked\r\n\r\n5;e="a\\\r"\r\nhello\r\n0\r\n\r\n'
+    )
+    var config = ServerConfig.default()
+    var bad_result = parse_one(Span(bad_cr), config)
+    assert_true(bad_result.is_error())
+    assert_equal(bad_result.error.status, 400)
+    var good = _to_bytes(
+        "POST /a HTTP/1.1\r\nHost: h\r\nTransfer-Encoding:"
+        ' chunked\r\n\r\n5;e="a\\"b"\r\nhello\r\n0\r\n\r\n'
+    )
+    var good_result = parse_one(Span(good), config)
+    assert_true(good_result.is_complete())
+    assert_equal(len(good_result.request.body), 5)
+
+
+def test_version_grammar_splits_400_and_505() raises:
+    _assert_status("GET /a HTTP/2.0\r\nHost: h\r\n\r\n", 505)
+    _assert_status("GET /a HTTP/10.20\r\nHost: h\r\n\r\n", 505)
+    _assert_status("GET /a HTTP/foo\r\nHost: h\r\n\r\n", 400)
+    _assert_status("GET /a HTTP/1\r\nHost: h\r\n\r\n", 400)
+    _assert_status("GET /a HTTP/1.1x\r\nHost: h\r\n\r\n", 400)
+    _assert_status("GET /a HTTP/1.1.1\r\nHost: h\r\n\r\n", 400)
+
+
+def test_expect_comma_list_all_supported() raises:
+    var config = ServerConfig.default()
+    var buf = _to_bytes(
+        "POST /a HTTP/1.1\r\nHost: h\r\nContent-Length:"
+        " 3\r\nExpect: 100-continue, 100-continue\r\n\r\nabc"
+    )
+    var result = parse_one(Span(buf), config)
+    assert_true(result.is_complete())
+    assert_true(result.needs_100_continue)
+    _assert_status(
+        "GET /a HTTP/1.1\r\nHost: h\r\nExpect: 100-continue, close\r\n\r\n",
+        417,
+    )
+
+
+def test_dripped_tail_decodes_without_loss() raises:
+    # One completed chunk followed by byte-wise drips: slow feeds must
+    # neither lose bytes nor change the outcome.
+    var config = ServerConfig.default()
+    var full = _to_bytes(
+        "POST /drip HTTP/1.1\r\nHost: h\r\nTransfer-Encoding:"
+        " chunked\r\n\r\n400\r\n"
+    )
+    for i in range(1024):
+        full.append(Byte(ord("x")))
+    var tail = _to_bytes("\r\n3\r\nabc\r\n0\r\nX-T: 1\r\n\r\n")
+    for i in range(len(tail)):
+        full.append(tail[i])
+    var expected = parse_one(Span(full), config)
+    assert_true(expected.is_complete())
+    var parser = HttpParser()
+    var head_end = len(full) - len(tail)
+    var first = List[Byte]()
+    for i in range(head_end):
+        first.append(full[i])
+    parser.feed(Span(first))
+    var early = parser.next_result(config)
+    assert_true(early.is_need_more())
+    var done = False
+    for i in range(head_end, len(full)):
+        var one = List[Byte]()
+        one.append(full[i])
+        parser.feed(Span(one))
+        var interim = parser.next_result(config)
+        if i + 1 < len(full):
+            assert_true(interim.is_need_more())
+        else:
+            assert_true(interim.is_complete())
+            assert_equal(len(interim.request.body), len(expected.request.body))
+            assert_equal(interim.consumed, expected.consumed)
+            done = True
+    assert_true(done)
+
+
 def test_chunk_extension_grammar() raises:
     var config = ServerConfig.default()
     var ext_ok = _to_bytes(
