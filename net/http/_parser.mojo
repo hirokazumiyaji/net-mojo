@@ -643,8 +643,10 @@ def _scan_chunked[
                 HttpError.bad_request(String("bad chunk"))
             )
         var size_line_len = size_end - wire + 2
-        meta += size_line_len
-        if meta > config.max_chunk_metadata:
+        # Commit line metadata only together with its data below: on a
+        # need_more exit (wire, meta, decoded) must describe exactly
+        # what was validated, or resuming re-counts the same line.
+        if meta + size_line_len > config.max_chunk_metadata:
             return _ChunkScan.failure(
                 HttpError.payload_too_large(String("chunk metadata too large"))
             )
@@ -753,13 +755,14 @@ def _scan_chunked[
             )
         if data_start + chunk_size + 2 > length:
             return _ChunkScan.need_more()
-        decoded += chunk_size
         if buf[data_start + chunk_size] != Byte(ord("\r")) or buf[
             data_start + chunk_size + 1
         ] != Byte(ord("\n")):
             return _ChunkScan.failure(
                 HttpError.bad_request(String("bad chunk data"))
             )
+        meta += size_line_len
+        decoded += chunk_size
         wire = data_start + chunk_size + 2
     return _ChunkScan.complete(consumed, decoded)
 
