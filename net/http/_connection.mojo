@@ -145,8 +145,9 @@ struct HttpConnection(Movable):
         self.active = False
         # Drop the allocations instead of clearing: clear() would retain
         # capacity on a free-listed slot, hoarding memory the budget no
-        # longer accounts for.
+        # longer accounts for. Both lists are replaced, not cleared.
         self.buf = List[Byte]()
-        self.clear_pending()
+        self.pending = List[Byte]()
+        self.pending_offset = 0
         self.reserved = 0
         self.conn.close()

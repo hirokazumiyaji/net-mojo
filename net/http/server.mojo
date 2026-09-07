@@ -427,17 +427,34 @@ struct Server(Movable):
             self._pump_read(idx, readable, now)
             if not self._conns[idx].active:
                 return
-            # Remember whether a response was already queued: only a
-            # response queued by the parse below earns an optimistic
-            # first flush without waiting for a writable event.
-            var queued_before = self._conns[idx].pending_remaining() > 0
-            self._pump_parse(idx, handler, now)
-            if not self._conns[idx].active:
-                return
-            if not queued_before and self._conns[idx].pending_remaining() > 0:
-                self._pump_send(idx, True)
-            if not self._conns[idx].active:
-                return
+            # Chain pipelined requests inside one drive: after an eager
+            # flush lands back in READING with bytes buffered, parsing
+            # the next request immediately avoids a ~100ms stall behind
+            # the next tick's wait although no socket event is needed.
+            while True:
+                if self._conns[idx].state != STATE_READING:
+                    break
+                if self._conns[idx].buffered_len() == 0:
+                    break
+                if (
+                    self._conns[idx].requests_this_tick
+                    >= self.config.max_requests_per_tick
+                ):
+                    break
+                # Only a response queued by the parse below earns an
+                # optimistic first flush without a writable event.
+                var queued_before = self._conns[idx].pending_remaining() > 0
+                self._pump_parse(idx, handler, now)
+                if not self._conns[idx].active:
+                    return
+                if self._conns[idx].state == STATE_READING:
+                    break
+                if not queued_before and (
+                    self._conns[idx].pending_remaining() > 0
+                ):
+                    self._pump_send(idx, True)
+                if not self._conns[idx].active:
+                    return
         self._sync_interests(idx)
 
     def _pump_read(mut self, idx: Int, event: Bool, now: Int) raises NetError:
@@ -486,15 +503,19 @@ struct Server(Movable):
 
     def _charge_read(mut self, idx: Int, count: Int) -> Bool:
         # Bytes covered by an admission reservation reuse it; only the
-        # remainder draws from the shared budget.
+        # remainder draws from the shared budget. The reservation is
+        # decremented only after the extra draw succeeds: on failure the
+        # chunk is discarded and the error path still releases the full
+        # reservation, so decrementing first would leak the covered part
+        # out of the budget forever.
         var covered = count
         if covered > self._conns[idx].reserved:
             covered = self._conns[idx].reserved
-        self._conns[idx].reserved -= covered
         var rest = count - covered
-        if rest <= 0:
-            return True
-        return self._budget.try_reserve(rest)
+        if rest > 0 and not self._budget.try_reserve(rest):
+            return False
+        self._conns[idx].reserved -= covered
+        return True
 
     def _admit_over_budget(mut self, idx: Int) raises NetError:
         # The kernel still holds the unread bytes; answer from what is

@@ -318,6 +318,58 @@ def test_pipeline_order_preserved() raises:
     client.close()
 
 
+def test_pipelined_chain_completes_without_extra_waits() raises:
+    # Six pipelined requests must all complete well before six ticks:
+    # chaining parses each buffered request in the same drive instead
+    # of stalling one poll wait per request. The bound is deliberately
+    # loose (chaining needs two ticks: accept, then everything) so no
+    # wall-clock timing is asserted, only tick counts.
+    var server = Server(ServerConfig.default())
+    server.add_listener(listen_tcp("127.0.0.1:0"))
+    var port = server.local_address().port
+    var handler = _TwoHandler()
+    var client = dial_tcp(
+        String("127.0.0.1:") + String(port), Timeout.seconds(2)
+    )
+    var batch = String("")
+    for _ in range(5):
+        batch += String("GET /one HTTP/1.1\r\nHost: x\r\n\r\n")
+    batch += String("GET /two HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n")
+    client.write_all(batch.as_bytes(), Timeout.seconds(2))
+    # Drain until empty after each tick: loopback delivery lags the
+    # server's kernel handoff by microseconds, and a single try_read
+    # may catch only part of what was sent.
+    var out = List[Byte]()
+    var tmp = Array[Byte, 65536](fill=0)
+    for _ in range(4):
+        _ = server.tick(handler, Timeout.nanoseconds(0))
+        for _ in range(50):
+            try:
+                var n = client.try_read(Span(tmp))
+                if n == 0:
+                    break
+                for i in range(n):
+                    out.append(tmp[i])
+            except e:
+                _ = e
+                break
+    var text = String(from_utf8_lossy=Span(out))
+    assert_equal(server.active_connections(), 0)
+    var ones = 0
+    var rest = text
+    while True:
+        var at = rest.find("ONE")
+        if at < 0:
+            break
+        ones += 1
+        var rest_bytes = rest.as_bytes()
+        var tail = String(from_utf8_lossy=rest_bytes[at + 3 : len(rest_bytes)])
+        rest = tail^
+    assert_equal(ones, 5)
+    assert_true(text.find("TWO") >= 0)
+    client.close()
+
+
 def test_100_continue_flow() raises:
     var server = Server(ServerConfig.default())
     server.add_listener(listen_tcp("127.0.0.1:0"))

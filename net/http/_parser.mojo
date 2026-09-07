@@ -205,6 +205,70 @@ def _parse_decimal_length(data: StringSlice) -> Int:
     return value
 
 
+def _skip_bws[origin: Origin](bytes: Span[Byte, origin], mut i: Int):
+    while i < len(bytes) and (
+        bytes[i] == Byte(ord(" ")) or bytes[i] == Byte(ord("\t"))
+    ):
+        i += 1
+
+
+def _chunk_ext_valid(ext: StringSlice) -> Bool:
+    # Validates `chunk-ext` after the leading size (RFC 9112 7.1.1):
+    # `*( BWS ";" BWS name [ BWS "=" BWS value ] )` with token names
+    # and token or quoted-string values.
+    var bytes = ext.as_bytes()
+    if len(bytes) == 0:
+        return False
+    var i = 0
+    var expect_item = True
+    while i < len(bytes):
+        if expect_item:
+            _skip_bws(bytes, i)
+            var name_start = i
+            while i < len(bytes) and _is_tchar(bytes[i]):
+                i += 1
+            if i == name_start:
+                return False
+            _skip_bws(bytes, i)
+            if i < len(bytes) and bytes[i] == Byte(ord("=")):
+                i += 1
+                _skip_bws(bytes, i)
+                if i < len(bytes) and bytes[i] == Byte(ord('"')):
+                    i += 1
+                    var closed = False
+                    while i < len(bytes):
+                        if bytes[i] == Byte(ord("\\")) and i + 1 < len(bytes):
+                            i += 2
+                            continue
+                        if bytes[i] == Byte(ord('"')):
+                            closed = True
+                            i += 1
+                            break
+                        if bytes[i] == Byte(0) or (
+                            Int(bytes[i]) < 32 and bytes[i] != Byte(ord("\t"))
+                        ):
+                            return False
+                        if Int(bytes[i]) == 127:
+                            return False
+                        i += 1
+                    if not closed:
+                        return False
+                else:
+                    var value_start = i
+                    while i < len(bytes) and _is_tchar(bytes[i]):
+                        i += 1
+                    if i == value_start:
+                        return False
+            expect_item = False
+        else:
+            _skip_bws(bytes, i)
+            if i >= len(bytes) or bytes[i] != Byte(ord(";")):
+                return False
+            i += 1
+            expect_item = True
+    return not expect_item
+
+
 def _parse_hex_size(data: StringSlice) -> Int:
     var bytes = data.as_bytes()
     if len(bytes) == 0:
@@ -354,6 +418,10 @@ def _parse_absolute_authority(
     if remainder.byte_length() == 0:
         remainder = String("/")
     var path, query = split_path_query(remainder)
+    if path.byte_length() == 0:
+        # `http://host?query` carries an empty authority path: normalize
+        # to `/` so root handlers see one path for both spellings.
+        path = String("/")
     return True, authority^, path^, query^
 
 
@@ -585,6 +653,17 @@ def parse_head[
             return HeadOutcome.failure(
                 HttpError.bad_request(String("bad request target")), 0, True
             )
+        # Fragments are never sent on the wire (RFC 9112 3.1): a literal
+        # `#` would route differently across clients and intermediaries
+        # that strip it, so reject instead of exposing it to handlers.
+        if byte == Byte(ord("#")):
+            return HeadOutcome.failure(
+                HttpError.bad_request(
+                    String("fragment not allowed in request target")
+                ),
+                0,
+                True,
+            )
         # Raw non-ASCII bytes are invalid in a request-target (RFC 9112
         # 3.1: senders must percent-encode them). Rejecting here keeps
         # the downstream path/query split lossless, which operates on
@@ -656,7 +735,10 @@ def parse_head[
                     0,
                     True,
                 )
-            if length - pos > config.max_headers_bytes:
+            # Count completed lines plus the unfinished tail: without
+            # the completed part, nearly twice the header budget could
+            # be retained behind one unterminated line.
+            if header_bytes_total + (length - pos) > config.max_headers_bytes:
                 return HeadOutcome.failure(
                     HttpError.header_too_large(String("headers too large")),
                     0,
@@ -931,6 +1013,18 @@ def parse_one[
             var size_text = String(size_line)
             if semi >= 0:
                 size_text = String(from_utf8_lossy=size_line.as_bytes()[0:semi])
+                # Extensions follow strict grammar (RFC 9112 7.1.1):
+                # `;name[=value]` chains with token names and token or
+                # quoted values. Lax parsing here would let strict
+                # intermediaries disagree about validity.
+                if not _chunk_ext_valid(
+                    String(from_utf8_lossy=size_line.as_bytes()[semi + 1 :])
+                ):
+                    return ParseResult.failure(
+                        HttpError.bad_request(String("bad chunk extension")),
+                        0,
+                        True,
+                    )
             size_text = _trim_ows(size_text)
             var chunk_size = _parse_hex_size(size_text)
             if chunk_size < 0:

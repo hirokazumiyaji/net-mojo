@@ -175,16 +175,18 @@ struct Reactor(Movable, Sized):
         and `writable == False`): `poll` cannot tell data from EOF
         without reading (macOS in particular reports an orderly peer
         shutdown as bare `POLLIN`, and reports nothing at all for an
-        empty mask, hence the always-on `POLLIN` watch above). A
-        deliberately paused direction stays quiet — ordinary `POLLIN`
-        on a `readable == False, writable == True` registration is not
-        reported — so disabling reads reliably suppresses work (e.g.
-        backpressure), while a fully disinterested slot can still learn
-        that its peer went away. Any surfaced hangup obliges the owner
-        to drain via `try_*` until would-block or EOF and to remove the
-        registration on EOF, so no hangup can trap the loop eventlessly.
-        `has_error` stays reserved for `POLLERR | POLLNVAL`; a pure
-        hangup arrives as `readable` with `has_error == False`.
+        empty mask, hence the forced `POLLIN` watch for disinterested
+        slots below). A deliberately paused direction stays quiet —
+        ordinary `POLLIN` on a `readable == False, writable == True`
+        registration is neither watched nor reported — so disabling
+        reads reliably suppresses work (e.g. backpressure) instead of
+        spinning on suppressed wakeups, while a fully disinterested
+        slot can still learn that its peer went away. Any surfaced
+        hangup obliges the owner to drain via `try_*` until would-block
+        or EOF and to remove the registration on EOF, so no hangup can
+        trap the loop eventlessly. `has_error` stays reserved for
+        `POLLERR | POLLNVAL`; a pure hangup arrives as `readable` with
+        `has_error == False`.
         """
         var out = List[ReactorEvent]()
         if self._active_count == 0:
@@ -194,11 +196,19 @@ struct Reactor(Movable, Sized):
         for i in range(len(self._slots)):
             if not self._slots[i].active:
                 continue
-            # POLLIN is always watched: several platforms only report an
-            # orderly peer shutdown when it is in the mask (with an empty
-            # mask, macOS reports nothing at all). Delivery still follows
-            # the reporting rules below.
-            var interests: Int16 = POLLIN
+            # POLLIN is watched when reads are enabled, plus for fully
+            # disinterested slots: with an empty mask several platforms
+            # report nothing at all, which would hide a peer shutdown
+            # behind silence. A partially enabled slot (e.g. writable
+            # only under backpressure) must NOT watch POLLIN, or every
+            # wait would wake immediately on unread bytes while delivery
+            # stays suppressed and the loop would spin on empty batches.
+            # Every kernel wakeup therefore maps to a non-empty batch
+            # below: poll returns only for watched readiness or
+            # terminal bits, each of which yields an event.
+            var interests: Int16 = 0
+            if self._slots[i].readable or not self._slots[i].writable:
+                interests |= POLLIN
             if self._slots[i].writable:
                 interests |= POLLOUT
             self._pollfds.append(
