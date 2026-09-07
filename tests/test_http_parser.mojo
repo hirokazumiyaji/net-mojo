@@ -393,6 +393,14 @@ def test_absolute_form_and_options_star() raises:
     assert_equal(absolute.request.authority, "example.com")
     assert_equal(absolute.request.path, "/abs")
     assert_equal(absolute.request.query, "q=2")
+    assert_equal(absolute.request.scheme, "http")
+    var secure_buf = _to_bytes(
+        "GET https://example.com/s HTTP/1.1\r\nHost: example.com\r\n\r\n"
+    )
+    var secure = parse_one(Span(secure_buf), config)
+    assert_true(secure.is_complete())
+    # Plaintext hop: never report https from the target alone.
+    assert_equal(secure.request.scheme, "http")
     var star_buf = _to_bytes("OPTIONS * HTTP/1.1\r\nHost: h\r\n\r\n")
     var star = parse_one(Span(star_buf), config)
     assert_true(star.is_complete())
@@ -471,7 +479,7 @@ def test_dripped_tail_decodes_without_loss() raises:
         "POST /drip HTTP/1.1\r\nHost: h\r\nTransfer-Encoding:"
         " chunked\r\n\r\n400\r\n"
     )
-    for i in range(1024):
+    for _ in range(1024):
         full.append(Byte(ord("x")))
     var tail = _to_bytes("\r\n3\r\nabc\r\n0\r\nX-T: 1\r\n\r\n")
     for i in range(len(tail)):
@@ -500,6 +508,48 @@ def test_dripped_tail_decodes_without_loss() raises:
             assert_equal(interim.consumed, expected.consumed)
             done = True
     assert_true(done)
+
+
+def test_resume_advances_past_completed_chunks() raises:
+    # Feed five chunks one at a time through one HttpParser: every
+    # intermediate call must report need_more (never a spurious
+    # complete or error), and the final call must match the one-shot
+    # parse exactly. This exercises prime/resume transitions across
+    # feeds rather than one-shot decoding.
+    var config = ServerConfig.default()
+    var chunks = List[String]()
+    chunks.append("1\r\na\r\n")
+    chunks.append("2\r\nbc\r\n")
+    chunks.append("3\r\ndef\r\n")
+    chunks.append("1\r\ng\r\n")
+    chunks.append("0\r\n\r\n")
+    var full = _to_bytes(
+        "POST /r HTTP/1.1\r\nHost: h\r\nTransfer-Encoding: chunked\r\n\r\n"
+    )
+    for i in range(len(chunks)):
+        var part = _to_bytes(chunks[i])
+        for k in range(len(part)):
+            full.append(part[k])
+    var expected = parse_one(Span(full), config)
+    assert_true(expected.is_complete())
+    assert_equal(len(expected.request.body), 7)
+    var parser = HttpParser()
+    var head_raw = _to_bytes(
+        "POST /r HTTP/1.1\r\nHost: h\r\nTransfer-Encoding: chunked\r\n\r\n"
+    )
+    parser.feed(Span(head_raw))
+    var head_only = parser.next_result(config)
+    assert_true(head_only.is_need_more())
+    for i in range(len(chunks)):
+        var part = _to_bytes(chunks[i])
+        parser.feed(Span(part))
+        var interim = parser.next_result(config)
+        if i + 1 < len(chunks):
+            assert_true(interim.is_need_more())
+        else:
+            assert_true(interim.is_complete())
+            assert_equal(len(interim.request.body), 7)
+            assert_equal(interim.consumed, expected.consumed)
 
 
 def test_chunk_extension_grammar() raises:
