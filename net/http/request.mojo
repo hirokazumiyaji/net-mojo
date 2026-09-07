@@ -35,8 +35,13 @@ struct HttpVersion(Copyable, Equatable, Writable):
     def write_to[W: Writer](self, mut writer: W):
         if self.value == 0:
             writer.write("HTTP/1.0")
-        else:
+        elif self.value == 1:
             writer.write("HTTP/1.1")
+        else:
+            # Never misidentify an unsupported version as 1.1 in
+            # diagnostics: HTTP/2+ adapters will introduce their own
+            # version spellings.
+            writer.write("HTTP/unknown")
 
 
 struct Request(Movable):
