@@ -471,6 +471,33 @@ def test_expect_comma_list_all_supported() raises:
     )
 
 
+def test_chunk_extension_fragment_no_double_count() raises:
+    # A size line larger than half the metadata cap, fragmented right
+    # after its CRLF: the first feed must report need_more (not an
+    # error), and the second must complete (not a spurious 413 from
+    # counting the same line twice across the resume).
+    var config = ServerConfig.default()
+    var part1 = _to_bytes(
+        "POST /a HTTP/1.1\r\nHost: h\r\nTransfer-Encoding: chunked\r\n\r\n5;"
+    )
+    var padding = String("e") * 40000
+    var pad_bytes = padding.as_bytes()
+    for i in range(len(pad_bytes)):
+        part1.append(pad_bytes[i])
+    var crlf = _to_bytes("\r\n")
+    for i in range(len(crlf)):
+        part1.append(crlf[i])
+    var parser = HttpParser()
+    parser.feed(Span(part1))
+    var first = parser.next_result(config)
+    assert_true(first.is_need_more())
+    var part2 = _to_bytes("hello\r\n0\r\n\r\n")
+    parser.feed(Span(part2))
+    var second = parser.next_result(config)
+    assert_true(second.is_complete())
+    assert_equal(len(second.request.body), 5)
+
+
 def test_dripped_tail_decodes_without_loss() raises:
     # One completed chunk followed by byte-wise drips: slow feeds must
     # neither lose bytes nor change the outcome.
