@@ -224,6 +224,26 @@ def test_header_values_reject_control_bytes() raises:
     assert_equal(len(headers), 1)
 
 
+def test_header_values_preserve_wire_bytes() raises:
+    # Legal obs-text bytes have no UTF-8 decoding: they must survive
+    # storage exactly and reappear on the wire unchanged.
+    var headers = Headers()
+    var raw = List[Byte]()
+    raw.append(Byte(ord("a")))
+    raw.append(Byte(128))
+    raw.append(Byte(ord("b")))
+    headers.add_bytes(String("X-Bin"), Span(raw))
+    assert_equal(len(headers), 1)
+    var stored = headers.value_bytes_at(0)
+    assert_equal(len(stored), 3)
+    assert_equal(stored[0], Byte(ord("a")))
+    assert_equal(stored[1], Byte(128))
+    assert_equal(stored[2], Byte(ord("b")))
+    assert_equal(headers.value_byte_length(0), 3)
+    var found = headers.get_first("x-bin")
+    assert_true(Bool(found))
+
+
 def test_path_query_split_has_no_percent_decoding() raises:
     var path, query = split_path_query("/a%2Fb?x=%41")
     assert_equal(path, "/a%2Fb")
