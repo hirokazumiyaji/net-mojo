@@ -14,6 +14,7 @@ test-tcp = "mojo run --Werror -I . tests/test_tcp.mojo"
 test-udp = "mojo run --Werror -I . tests/test_udp.mojo"
 test-unix = "mojo run --Werror -I . tests/test_unix.mojo"
 test-poll = "mojo run --Werror -I . tests/test_poll.mojo"
+test-http-api = "mojo run --Werror -I . tests/test_http_api.mojo"
 sanitize-sys = "mojo run --sanitize address -I . tests/test_sys.mojo"
 sanitize-tcp = "mojo run --sanitize address -I . tests/test_tcp.mojo"
 sanitize-udp = "mojo run --sanitize address -I . tests/test_udp.mojo"
@@ -27,6 +28,7 @@ test = { depends-on = [
   "test-udp",
   "test-unix",
   "test-poll",
+  "test-http-api",
 ] }
 example-tcp = "mojo run --Werror -I . examples/tcp_echo.mojo"
 example-udp = "mojo run --Werror -I . examples/udp_echo.mojo"
