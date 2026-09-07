@@ -399,6 +399,50 @@ def test_absolute_form_and_options_star() raises:
     assert_equal(star.request.path, "*")
 
 
+def test_absolute_query_only_normalizes_to_root() raises:
+    var config = ServerConfig.default()
+    var buf = _to_bytes(
+        "GET http://example.com?q=1 HTTP/1.1\r\nHost: example.com\r\n\r\n"
+    )
+    var result = parse_one(Span(buf), config)
+    assert_true(result.is_complete())
+    assert_equal(result.request.authority, "example.com")
+    assert_equal(result.request.path, "/")
+    assert_equal(result.request.query, "q=1")
+
+
+def test_fragment_in_target_is_rejected() raises:
+    _assert_status("GET /account#admin HTTP/1.1\r\nHost: h\r\n\r\n", 400)
+    _assert_status(
+        "GET http://example.com/a#frag HTTP/1.1\r\nHost: example.com\r\n\r\n",
+        400,
+    )
+
+
+def test_chunk_extension_grammar() raises:
+    var config = ServerConfig.default()
+    var ext_ok = _to_bytes(
+        "POST /a HTTP/1.1\r\nHost: h\r\nTransfer-Encoding:"
+        " chunked\r\n\r\n5;ext=1\r\nhello\r\n5 ; a = b"
+        ' ;c="d;e"\r\nhello\r\n0\r\n\r\n'
+    )
+    var ok_result = parse_one(Span(ext_ok), config)
+    assert_true(ok_result.is_complete())
+    assert_equal(len(ok_result.request.body), 10)
+    for bad in ["1;", "1;=", "1;=v", "1;a b", '1;a="oops']:
+        var raw = _to_bytes(
+            String(
+                "POST /a HTTP/1.1\r\nHost:"
+                " h\r\nTransfer-Encoding: chunked\r\n\r\n"
+            )
+            + bad
+            + String("\r\nx\r\n0\r\n\r\n")
+        )
+        var result = parse_one(Span(raw), config)
+        assert_true(result.is_error())
+        assert_equal(result.error.status, 400)
+
+
 def test_multiple_expect_fields_all_must_agree() raises:
     # A later 100-continue must not whitewash an earlier unsupported
     # expectation, in either order.
