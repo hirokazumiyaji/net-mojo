@@ -129,10 +129,19 @@ def test_response_body_limit_is_enforced() raises:
 def test_no_body_statuses_have_no_frame_body() raises:
     assert_false(has_body_for_status(200, True))
     assert_false(has_body_for_status(204, False))
+    assert_false(has_body_for_status(205, False))
     assert_false(has_body_for_status(304, False))
     assert_false(has_body_for_status(100, False))
     assert_true(has_body_for_status(200, False))
     assert_true(has_body_for_status(404, False))
+
+
+def test_version_rendering_distinguishes_unsupported() raises:
+    assert_equal(String(HttpVersion.http10()), "HTTP/1.0")
+    assert_equal(String(HttpVersion.http11()), "HTTP/1.1")
+    assert_equal(String(HttpVersion(value=9)), "HTTP/unknown")
+    assert_true(HttpVersion.http11().is_supported())
+    assert_false(HttpVersion(value=9).is_supported())
 
 
 def test_headers_are_case_insensitive_with_duplicates() raises:

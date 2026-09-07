@@ -85,15 +85,17 @@ func main() {
 	mux.HandleFunc("/echo", echoHandler)
 
 	server := &http.Server{
-		Addr:              *addr,
-		Handler:           mux,
+		Addr:    *addr,
+		Handler: mux,
+		// Go offers no split body deadline: ReadTimeout covers headers
+		// plus body, so it is set to the Mojo phases composed (5s
+		// header + 30s body) to keep slow-client timeouts comparable.
+		// ReadHeaderTimeout matches the Mojo header phase alone.
 		ReadHeaderTimeout: 5 * time.Second,
-		ReadTimeout:       30 * time.Second,
+		ReadTimeout:       35 * time.Second,
 		WriteTimeout:      30 * time.Second,
 		IdleTimeout:       60 * time.Second,
 		ErrorLog:          log.New(io.Discard, "", 0),
-		BaseContext:       nil,
-		ConnContext:       nil,
 	}
 
 	ln, err := net.Listen("tcp", *addr)
