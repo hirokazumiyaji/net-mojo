@@ -111,6 +111,46 @@ def test_binary_body_preserved() raises:
     assert_equal(result.request.body[5], Byte(65))
 
 
+def test_non_ascii_target_is_rejected() raises:
+    # Raw non-ASCII bytes must arrive percent-encoded; accepting them
+    # would let the ASCII path/query split normalize bytes irreversibly.
+    var config = ServerConfig.default()
+    var buf = _to_bytes("GET /caf")
+    buf.append(Byte(195))
+    buf.append(Byte(169))
+    var tail = _to_bytes(" HTTP/1.1\r\nHost: h\r\n\r\n")
+    for i in range(len(tail)):
+        buf.append(tail[i])
+    var result = parse_one(Span(buf), config)
+    assert_true(result.is_error())
+    assert_equal(result.error.status, 400)
+
+
+def test_many_tiny_chunks_decode_correctly() raises:
+    # 100 one-byte chunks exercise the incremental path without losing
+    # bytes; per-tick reparse cost stays bounded by the body cap.
+    var config = ServerConfig.default()
+    var buf = _to_bytes(
+        "POST /many HTTP/1.1\r\nHost: h\r\nTransfer-Encoding: chunked\r\n\r\n"
+    )
+    for i in range(100):
+        var head = _to_bytes("1\r\n")
+        for k in range(len(head)):
+            buf.append(head[k])
+        buf.append(Byte(ord("a") + (i % 26)))
+        var crlf = _to_bytes("\r\n")
+        for k in range(len(crlf)):
+            buf.append(crlf[k])
+    var tail = _to_bytes("0\r\n\r\n")
+    for i in range(len(tail)):
+        buf.append(tail[i])
+    var result = parse_one(Span(buf), config)
+    assert_true(result.is_complete())
+    assert_equal(len(result.request.body), 100)
+    assert_equal(result.request.body[0], Byte(ord("a")))
+    assert_equal(result.request.body[99], Byte(ord("a") + (99 % 26)))
+
+
 def test_chunked_with_extension_and_trailer() raises:
     var config = ServerConfig.default()
     var buf = _to_bytes(
@@ -310,6 +350,26 @@ def test_chunk_metadata_and_trailer_limits() raises:
         ),
         400,
     )
+    # RFC 9112 6.5.1: trailers must not carry framing, routing,
+    # authentication, or payload-processing fields.
+    for name in [
+        "Authorization",
+        "Proxy-Authorization",
+        "Connection",
+        "Trailer",
+        "Content-Type",
+        "Content-Encoding",
+        "TE",
+    ]:
+        _assert_status(
+            (
+                "POST /a HTTP/1.1\r\nHost: h\r\nTransfer-Encoding:"
+                " chunked\r\n\r\n0\r\n"
+                + name
+                + ": 1\r\n\r\n"
+            ),
+            400,
+        )
 
 
 def test_strict_crlf_token_obs_fold() raises:

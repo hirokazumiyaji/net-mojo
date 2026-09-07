@@ -111,6 +111,21 @@ def test_content_length_consistency_enforced() raises:
     assert_true(failed)
 
 
+def test_transfer_encoding_on_response_is_rejected() raises:
+    # Emitting Transfer-Encoding alongside Content-Length would create a
+    # smuggling vector (RFC 9112 6.1); handlers must not set it.
+    var writer = ResponseWriter(1024)
+    writer.headers.add(String("Transfer-Encoding"), String("chunked"))
+    writer.write_string("hello")
+    var failed = False
+    try:
+        _ = encode_response(writer, False, "Thu, 01 Jan 1970 00:00:00 GMT")
+    except error:
+        assert_equal(error.kind, NetErrorKind.invalid_argument())
+        failed = True
+    assert_true(failed)
+
+
 def test_caller_date_is_kept() raises:
     var writer = ResponseWriter(1024)
     writer.headers.add(String("Date"), String("Thu, 01 Jan 1970 00:00:00 GMT"))
