@@ -399,6 +399,54 @@ def test_absolute_form_and_options_star() raises:
     assert_equal(star.request.path, "*")
 
 
+def test_multiple_expect_fields_all_must_agree() raises:
+    # A later 100-continue must not whitewash an earlier unsupported
+    # expectation, in either order.
+    _assert_status(
+        (
+            "GET /a HTTP/1.1\r\nHost: h\r\nExpect: unsupported\r\nExpect:"
+            " 100-continue\r\n\r\n"
+        ),
+        417,
+    )
+    _assert_status(
+        (
+            "GET /a HTTP/1.1\r\nHost: h\r\nExpect: 100-continue\r\nExpect:"
+            " unsupported\r\n\r\n"
+        ),
+        417,
+    )
+
+
+def test_host_authority_structure() raises:
+    for good in [
+        "example.com",
+        "example.com:8080",
+        "127.0.0.1:80",
+        "[::1]",
+        "[::1]:8080",
+        "[fe80::1%25en0]",
+    ]:
+        var config = ServerConfig.default()
+        var raw = _to_bytes(
+            String("GET /a HTTP/1.1\r\nHost: ") + good + String("\r\n\r\n")
+        )
+        var result = parse_one(Span(raw), config)
+        assert_true(result.is_complete())
+    for bad in [
+        "[::1",
+        "[::1]extra",
+        "user@example.com",
+        "example.com:abc",
+        "example.com:",
+        "2001:db8::1",
+    ]:
+        _assert_status(
+            String("GET /a HTTP/1.1\r\nHost: ") + bad + String("\r\n\r\n"),
+            400,
+        )
+
+
 def test_expect_and_connection_flags() raises:
     var config = ServerConfig.default()
     var cont_buf = _to_bytes(

@@ -210,8 +210,50 @@ def _parse_hex_size(data: StringSlice) -> Int:
     return value
 
 
+def _is_valid_port(port: StringSlice) -> Bool:
+    var bytes = port.as_bytes()
+    if len(bytes) == 0 or len(bytes) > 5:
+        return False
+    var value = 0
+    for i in range(len(bytes)):
+        var byte = bytes[i]
+        if byte < Byte(ord("0")) or byte > Byte(ord("9")):
+            return False
+        value = value * 10 + Int(byte - Byte(ord("0")))
+    return value <= 65535
+
+
+def _is_bracket_inner_valid(inner: StringSlice) -> Bool:
+    var bytes = inner.as_bytes()
+    if len(bytes) == 0:
+        return False
+    for i in range(len(bytes)):
+        var byte = bytes[i]
+        var ok = (
+            (byte >= Byte(ord("0")) and byte <= Byte(ord("9")))
+            or (byte >= Byte(ord("a")) and byte <= Byte(ord("f")))
+            or (byte >= Byte(ord("A")) and byte <= Byte(ord("F")))
+            or (byte >= Byte(ord("G")) and byte <= Byte(ord("Z")))
+            or (byte >= Byte(ord("g")) and byte <= Byte(ord("z")))
+            or byte == Byte(ord(":"))
+            or byte == Byte(ord("."))
+            or byte == Byte(ord("%"))
+            or byte == Byte(ord("-"))
+            or byte == Byte(ord("_"))
+            or byte == Byte(ord("~"))
+        )
+        if not ok:
+            return False
+    return True
+
+
 def _host_is_valid(data: StringSlice) -> Bool:
-    var bytes = data.as_bytes()
+    """Validates a Host/authority value structurally, not just by
+    blacklist: bracketed literals need a closing bracket and optional
+    numeric port, unbracketed names allow a single host:port split and
+    never userinfo or bare IPv6 colons."""
+    var text = String(data)
+    var bytes = text.as_bytes()
     if len(bytes) == 0:
         return False
     for i in range(len(bytes)):
@@ -228,7 +270,44 @@ def _host_is_valid(data: StringSlice) -> Bool:
             return False
         if byte == Byte(ord("\r")) or byte == Byte(ord("\n")):
             return False
-    return True
+    if bytes[0] == Byte(ord("[")):
+        var close = -1
+        for i in range(1, len(bytes)):
+            if bytes[i] == Byte(ord("]")):
+                close = i
+                break
+        if close < 0:
+            return False
+        if not _is_bracket_inner_valid(String(from_utf8_lossy=bytes[1:close])):
+            return False
+        if close + 1 == len(bytes):
+            return True
+        if bytes[close + 1] != Byte(ord(":")):
+            return False
+        return _is_valid_port(String(from_utf8_lossy=bytes[close + 2 :]))
+    for i in range(len(bytes)):
+        if bytes[i] == Byte(ord("[")) or bytes[i] == Byte(ord("]")):
+            return False
+        if bytes[i] == Byte(ord("@")):
+            # No userinfo in a Host field.
+            return False
+    var colons = 0
+    var last_colon = -1
+    for i in range(len(bytes)):
+        if bytes[i] == Byte(ord(":")):
+            colons += 1
+            last_colon = i
+    if colons > 1:
+        # Bare IPv6 must arrive bracketed.
+        return False
+    if colons == 0:
+        return True
+    if last_colon == 0 or last_colon + 1 >= len(bytes):
+        return False
+    for i in range(last_colon):
+        if bytes[i] == Byte(ord("%")):
+            return False
+    return _is_valid_port(String(from_utf8_lossy=bytes[last_colon + 1 :]))
 
 
 def _parse_absolute_authority(
@@ -406,7 +485,7 @@ def parse_one[
     var transfer_encoding_seen = False
     var transfer_encoding_chunked_only = False
     var transfer_encoding_raw = String("")
-    var expect_value = String("")
+    var expect_invalid = False
     var expect_seen = False
     var connection_close = False
     var has_upgrade = False
@@ -514,8 +593,11 @@ def parse_one[
                 transfer_encoding_raw += ","
             transfer_encoding_raw += value
         elif lowered == "expect":
+            # Every occurrence must ask for 100-continue: later fields
+            # must not silently override an unsupported expectation.
             expect_seen = True
-            expect_value = String(value)
+            if value.lower() != "100-continue":
+                expect_invalid = True
         elif lowered == "connection":
             var tokens = _split_comma_tokens(value)
             for i in range(len(tokens)):
@@ -574,7 +656,7 @@ def parse_one[
         )
     var needs_100 = False
     if expect_seen:
-        if expect_value.lower() != "100-continue":
+        if expect_invalid:
             return ParseResult.failure(
                 HttpError.expectation_failed(String("unknown Expect")),
                 0,
@@ -632,6 +714,20 @@ def parse_one[
                         0,
                         True,
                     )
+                # An unterminated size line still counts against the
+                # metadata cap: without this, a peer could stream an
+                # endless line and grow the buffer without bound.
+                if (
+                    chunk_metadata_total + (length - chunk_pos)
+                    > config.max_chunk_metadata
+                ):
+                    return ParseResult.failure(
+                        HttpError.payload_too_large(
+                            String("chunk metadata too large")
+                        ),
+                        0,
+                        True,
+                    )
                 return ParseResult.need_more()
             if _has_lone_lf_before(buf, chunk_pos, size_end):
                 return ParseResult.failure(
@@ -680,6 +776,20 @@ def parse_one[
                         if _has_lone_lf_before(buf, trailer_pos, length):
                             return ParseResult.failure(
                                 HttpError.bad_request(String("bad trailer")),
+                                0,
+                                True,
+                            )
+                        # Like chunk-size lines, an unterminated trailer
+                        # line counts while incomplete so it cannot grow
+                        # past the trailer cap without CRLF.
+                        if (
+                            trailer_bytes_total + (length - trailer_pos)
+                            > config.max_trailer_bytes
+                        ):
+                            return ParseResult.failure(
+                                HttpError.header_too_large(
+                                    String("trailers too large")
+                                ),
                                 0,
                                 True,
                             )
