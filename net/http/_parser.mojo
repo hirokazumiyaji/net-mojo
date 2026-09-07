@@ -1,0 +1,851 @@
+"""Incremental HTTP/1.1 request parser (Phase 1, socket-independent).
+
+`parse_one` parses a single request from the start of a byte buffer and
+reports `need_more`, `complete`, or `error` with the consumed count, so
+callers get identical results for any byte-wise split and never mistake
+pipelined next-request bytes for a body. `HttpParser` owns the buffer
+for connection use.
+"""
+
+from net.http import Headers, HttpError, HttpVersion, Request, ServerConfig
+from net.http import split_path_query
+
+
+@fieldwise_init
+struct ParseResult(Movable):
+    var kind: UInt8
+    var consumed: Int
+    var request: Request
+    var error: HttpError
+    var needs_100_continue: Bool
+    var should_close: Bool
+
+    @staticmethod
+    def need_more() -> Self:
+        return Self(
+            kind=0,
+            consumed=0,
+            request=Request(
+                String(""),
+                String(""),
+                String(""),
+                String(""),
+                HttpVersion.http11(),
+            ),
+            error=HttpError(status=0, message=String(""), should_close=False),
+            needs_100_continue=False,
+            should_close=False,
+        )
+
+    @staticmethod
+    def complete(
+        var request: Request,
+        consumed: Int,
+        needs_100_continue: Bool,
+        should_close: Bool,
+    ) -> Self:
+        return Self(
+            kind=1,
+            consumed=consumed,
+            request=request^,
+            error=HttpError(status=0, message=String(""), should_close=False),
+            needs_100_continue=needs_100_continue,
+            should_close=should_close,
+        )
+
+    @staticmethod
+    def failure(
+        var error: HttpError, consumed: Int, should_close: Bool
+    ) -> Self:
+        return Self(
+            kind=2,
+            consumed=consumed,
+            request=Request(
+                String(""),
+                String(""),
+                String(""),
+                String(""),
+                HttpVersion.http11(),
+            ),
+            error=error^,
+            needs_100_continue=False,
+            should_close=should_close,
+        )
+
+    def is_need_more(self) -> Bool:
+        return self.kind == 0
+
+    def is_complete(self) -> Bool:
+        return self.kind == 1
+
+    def is_error(self) -> Bool:
+        return self.kind == 2
+
+
+def _is_tchar(byte: Byte) -> Bool:
+    if (
+        (byte >= Byte(ord("A")) and byte <= Byte(ord("Z")))
+        or (byte >= Byte(ord("a")) and byte <= Byte(ord("z")))
+        or (byte >= Byte(ord("0")) and byte <= Byte(ord("9")))
+    ):
+        return True
+    if (
+        byte == Byte(ord("!"))
+        or byte == Byte(ord("#"))
+        or byte == Byte(ord("$"))
+        or byte == Byte(ord("%"))
+        or byte == Byte(ord("&"))
+        or byte == Byte(ord("'"))
+        or byte == Byte(ord("*"))
+        or byte == Byte(ord("+"))
+        or byte == Byte(ord("-"))
+        or byte == Byte(ord("."))
+        or byte == Byte(ord("^"))
+        or byte == Byte(ord("_"))
+        or byte == Byte(ord("`"))
+        or byte == Byte(ord("|"))
+        or byte == Byte(ord("~"))
+    ):
+        return True
+    return False
+
+
+def _is_token(data: StringSlice) -> Bool:
+    var bytes = data.as_bytes()
+    if len(bytes) == 0:
+        return False
+    for i in range(len(bytes)):
+        if not _is_tchar(bytes[i]):
+            return False
+    return True
+
+
+def _is_valid_method(data: StringSlice) -> Bool:
+    return _is_token(data)
+
+
+def _find_crlf[origin: Origin](buf: Span[Byte, origin], start: Int) -> Int:
+    var i = start
+    while i + 1 < len(buf):
+        if buf[i] == Byte(ord("\r")) and buf[i + 1] == Byte(ord("\n")):
+            return i
+        i += 1
+    return -1
+
+
+def _has_lone_lf_before[
+    origin: Origin
+](buf: Span[Byte, origin], start: Int, end: Int) -> Bool:
+    # True when a bare LF appears before `end` without a preceding CR.
+    # A trailing CR at `end - 1` may be a split CRLF; the caller treats
+    # end-of-buffer CR as need_more, not an error.
+    for i in range(start, end):
+        if buf[i] == Byte(ord("\n")):
+            if i == start or buf[i - 1] != Byte(ord("\r")):
+                return True
+    return False
+
+
+def _trim_ows(data: StringSlice) -> String:
+    var bytes = data.as_bytes()
+    var start = 0
+    var end = len(bytes)
+    while start < end and (
+        bytes[start] == Byte(ord(" ")) or bytes[start] == Byte(ord("\t"))
+    ):
+        start += 1
+    while end > start and (
+        bytes[end - 1] == Byte(ord(" ")) or bytes[end - 1] == Byte(ord("\t"))
+    ):
+        end -= 1
+    return String(from_utf8_lossy=bytes[start:end])
+
+
+def _split_comma_tokens(data: StringSlice) -> List[String]:
+    var out = List[String]()
+    var bytes = data.as_bytes()
+    var start = 0
+    for i in range(len(bytes) + 1):
+        if i == len(bytes) or bytes[i] == Byte(ord(",")):
+            var part = String(from_utf8_lossy=bytes[start:i])
+            var trimmed = _trim_ows(part)
+            if trimmed.byte_length() > 0:
+                out.append(trimmed^)
+            start = i + 1
+    return out^
+
+
+def _parse_decimal_length(data: StringSlice) -> Int:
+    var bytes = data.as_bytes()
+    if len(bytes) == 0:
+        return -1
+    var value = 0
+    for i in range(len(bytes)):
+        var byte = bytes[i]
+        if byte < Byte(ord("0")) or byte > Byte(ord("9")):
+            return -1
+        value = value * 10 + Int(byte - Byte(ord("0")))
+        if value > 16 * 1024 * 1024 * 1024:
+            return -1
+    return value
+
+
+def _parse_hex_size(data: StringSlice) -> Int:
+    var bytes = data.as_bytes()
+    if len(bytes) == 0:
+        return -1
+    var value = 0
+    for i in range(len(bytes)):
+        var byte = bytes[i]
+        if byte >= Byte(ord("0")) and byte <= Byte(ord("9")):
+            value = value * 16 + Int(byte - Byte(ord("0")))
+        elif byte >= Byte(ord("a")) and byte <= Byte(ord("f")):
+            value = value * 16 + Int(byte - Byte(ord("a"))) + 10
+        elif byte >= Byte(ord("A")) and byte <= Byte(ord("F")):
+            value = value * 16 + Int(byte - Byte(ord("A"))) + 10
+        else:
+            return -1
+        if value > 16 * 1024 * 1024 * 1024:
+            return -1
+    return value
+
+
+def _host_is_valid(data: StringSlice) -> Bool:
+    var bytes = data.as_bytes()
+    if len(bytes) == 0:
+        return False
+    for i in range(len(bytes)):
+        var byte = bytes[i]
+        if byte == Byte(ord(" ")) or byte == Byte(ord("\t")):
+            return False
+        if Int(byte) < 33 or Int(byte) == 127:
+            return False
+        if (
+            byte == Byte(ord("/"))
+            or byte == Byte(ord("?"))
+            or byte == Byte(ord("#"))
+        ):
+            return False
+        if byte == Byte(ord("\r")) or byte == Byte(ord("\n")):
+            return False
+    return True
+
+
+def _parse_absolute_authority(
+    target: StringSlice,
+) -> Tuple[Bool, String, String, String]:
+    # Returns (matched, authority, path, query). Only http/https.
+    var text = String(target)
+    var rest: String
+    if (
+        text.byte_length() >= 7
+        and String(from_utf8_lossy=text.as_bytes()[0:7]).lower() == "http://"
+    ):
+        rest = String(from_utf8_lossy=text.as_bytes()[7:])
+    elif (
+        text.byte_length() >= 8
+        and String(from_utf8_lossy=text.as_bytes()[0:8]).lower() == "https://"
+    ):
+        rest = String(from_utf8_lossy=text.as_bytes()[8:])
+    else:
+        return False, String(""), String(""), String("")
+    var authority_end = len(rest.as_bytes())
+    for i in range(len(rest.as_bytes())):
+        var byte = rest.as_bytes()[i]
+        if byte == Byte(ord("/")) or byte == Byte(ord("?")):
+            authority_end = i
+            break
+    var authority = String(from_utf8_lossy=rest.as_bytes()[0:authority_end])
+    var remainder = String(from_utf8_lossy=rest.as_bytes()[authority_end:])
+    if remainder.byte_length() == 0:
+        remainder = String("/")
+    var path, query = split_path_query(remainder)
+    return True, authority^, path^, query^
+
+
+def parse_one[
+    origin: ImmOrigin
+](buf: Span[Byte, origin], config: ServerConfig) -> ParseResult:
+    var length = len(buf)
+    # --- Request line. ---
+    var line_end = _find_crlf(buf, 0)
+    if line_end < 0:
+        if _has_lone_lf_before(buf, 0, length):
+            return ParseResult.failure(
+                HttpError.bad_request(String("bare LF in request line")),
+                0,
+                True,
+            )
+        # A trailing CR may be a split CRLF.
+        if length > config.max_request_line:
+            return ParseResult.failure(
+                HttpError.header_too_large(String("request line too long")),
+                0,
+                True,
+            )
+        return ParseResult.need_more()
+    if _has_lone_lf_before(buf, 0, line_end):
+        return ParseResult.failure(
+            HttpError.bad_request(String("bare LF in request line")), 0, True
+        )
+    if line_end > config.max_request_line:
+        # Target-only excess maps to 414, other line excess to 431.
+        # Scan for the target span even though the line is overlong.
+        var first = -1
+        var second = -1
+        for i in range(line_end):
+            if buf[i] == Byte(ord(" ")):
+                if first < 0:
+                    first = i
+                else:
+                    second = i
+                    break
+        if first >= 0 and second > first:
+            var target_len = second - first - 1
+            if target_len > config.max_request_line:
+                return ParseResult.failure(
+                    HttpError.uri_too_long(String("request target too long")),
+                    0,
+                    True,
+                )
+        return ParseResult.failure(
+            HttpError.header_too_large(String("request line too long")),
+            0,
+            True,
+        )
+    var line = String(from_utf8_lossy=buf[0:line_end])
+    var line_bytes = line.as_bytes()
+    # Split METHOD SP TARGET SP VERSION.
+    var first_sp = -1
+    var second_sp = -1
+    for i in range(len(line_bytes)):
+        if line_bytes[i] == Byte(ord(" ")):
+            if first_sp < 0:
+                first_sp = i
+            else:
+                second_sp = i
+                break
+        if line_bytes[i] == Byte(ord("\r")) or line_bytes[i] == Byte(ord("\n")):
+            return ParseResult.failure(
+                HttpError.bad_request(String("bad request line")), 0, True
+            )
+    if first_sp < 0 or second_sp < 0:
+        return ParseResult.failure(
+            HttpError.bad_request(String("bad request line")), 0, True
+        )
+    # Reject extra spaces inside the version part.
+    for i in range(second_sp + 1, len(line_bytes)):
+        if line_bytes[i] == Byte(ord(" ")):
+            return ParseResult.failure(
+                HttpError.bad_request(String("bad request line")), 0, True
+            )
+    var method = String(from_utf8_lossy=line_bytes[0:first_sp])
+    var target = String(from_utf8_lossy=line_bytes[first_sp + 1 : second_sp])
+    var version_text = String(
+        from_utf8_lossy=line_bytes[second_sp + 1 : len(line_bytes)]
+    )
+    if not _is_valid_method(method):
+        return ParseResult.failure(
+            HttpError.bad_request(String("bad method")), 0, True
+        )
+    if target.byte_length() == 0:
+        return ParseResult.failure(
+            HttpError.bad_request(String("empty request target")), 0, True
+        )
+    for i in range(len(target.as_bytes())):
+        var byte = target.as_bytes()[i]
+        if Int(byte) < 33 or Int(byte) == 127:
+            return ParseResult.failure(
+                HttpError.bad_request(String("bad request target")), 0, True
+            )
+    if target.byte_length() > config.max_request_line:
+        return ParseResult.failure(
+            HttpError.uri_too_long(String("request target too long")),
+            0,
+            True,
+        )
+    var version = HttpVersion.http11()
+    if version_text == "HTTP/1.1":
+        pass
+    elif version_text == "HTTP/1.0":
+        return ParseResult.failure(
+            HttpError.version_not_supported(String("HTTP/1.0 not supported")),
+            0,
+            True,
+        )
+    else:
+        # Malformed version token vs unsupported version number.
+        if version_text.startswith("HTTP/"):
+            return ParseResult.failure(
+                HttpError.version_not_supported(String("unsupported version")),
+                0,
+                True,
+            )
+        return ParseResult.failure(
+            HttpError.bad_request(String("bad version")), 0, True
+        )
+    if method == "CONNECT":
+        return ParseResult.failure(
+            HttpError.bad_request(String("CONNECT not supported")), 0, True
+        )
+    # --- Headers. ---
+    var headers = Headers()
+    var pos = line_end + 2
+    var header_bytes_total = 0
+    var content_length_count = 0
+    var content_length_value = -1
+    var transfer_encoding_seen = False
+    var transfer_encoding_chunked_only = False
+    var transfer_encoding_raw = String("")
+    var expect_value = String("")
+    var expect_seen = False
+    var connection_close = False
+    var has_upgrade = False
+    var host_count = 0
+    var host_value = String("")
+    while True:
+        if pos >= length:
+            return ParseResult.need_more()
+        # Trailing CR without LF yet.
+        if pos == length - 1 and buf[pos] == Byte(ord("\r")):
+            return ParseResult.need_more()
+        var header_end = _find_crlf(buf, pos)
+        if header_end < 0:
+            if _has_lone_lf_before(buf, pos, length):
+                return ParseResult.failure(
+                    HttpError.bad_request(String("bare LF in headers")),
+                    0,
+                    True,
+                )
+            if length - pos > config.max_headers_bytes:
+                return ParseResult.failure(
+                    HttpError.header_too_large(String("headers too large")),
+                    0,
+                    True,
+                )
+            return ParseResult.need_more()
+        if _has_lone_lf_before(buf, pos, header_end):
+            return ParseResult.failure(
+                HttpError.bad_request(String("bare LF in headers")), 0, True
+            )
+        if header_end == pos:
+            pos += 2
+            break
+        var header_line_len = header_end - pos + 2
+        header_bytes_total += header_line_len
+        if header_bytes_total > config.max_headers_bytes:
+            return ParseResult.failure(
+                HttpError.header_too_large(String("headers too large")),
+                0,
+                True,
+            )
+        if len(headers) + 1 > config.max_headers_count:
+            return ParseResult.failure(
+                HttpError.header_too_large(String("too many headers")),
+                0,
+                True,
+            )
+        # obs-fold: CRLF followed by SP/HT is rejected, never folded.
+        # (Checked after the empty-line test: a header line itself never
+        # starts with OWS because the colon scan below rejects it, and a
+        # continuation line would appear as a line starting with SP/HT.)
+        var header_line = String(from_utf8_lossy=buf[pos:header_end])
+        var header_line_bytes = header_line.as_bytes()
+        if len(header_line_bytes) > 0 and (
+            header_line_bytes[0] == Byte(ord(" "))
+            or header_line_bytes[0] == Byte(ord("\t"))
+        ):
+            return ParseResult.failure(
+                HttpError.bad_request(String("obs-fold not supported")),
+                0,
+                True,
+            )
+        var colon = -1
+        for i in range(len(header_line_bytes)):
+            if header_line_bytes[i] == Byte(ord(":")):
+                colon = i
+                break
+        if colon <= 0:
+            return ParseResult.failure(
+                HttpError.bad_request(String("bad header line")), 0, True
+            )
+        var raw_name = String(from_utf8_lossy=header_line_bytes[0:colon])
+        # No whitespace between field-name and colon.
+        if raw_name.as_bytes()[len(raw_name.as_bytes()) - 1] == Byte(
+            ord(" ")
+        ) or raw_name.as_bytes()[len(raw_name.as_bytes()) - 1] == Byte(
+            ord("\t")
+        ):
+            return ParseResult.failure(
+                HttpError.bad_request(String("bad header name")), 0, True
+            )
+        if not _is_token(raw_name):
+            return ParseResult.failure(
+                HttpError.bad_request(String("bad header name")), 0, True
+            )
+        var raw_value = String(from_utf8_lossy=header_line_bytes[colon + 1 :])
+        var value = _trim_ows(raw_value)
+        var lowered = raw_name.lower()
+        if lowered == "host":
+            host_count += 1
+            host_value = String(value)
+        elif lowered == "content-length":
+            content_length_count += 1
+            var parsed = _parse_decimal_length(value)
+            if parsed < 0:
+                return ParseResult.failure(
+                    HttpError.bad_request(String("bad Content-Length")),
+                    0,
+                    True,
+                )
+            content_length_value = parsed
+        elif lowered == "transfer-encoding":
+            transfer_encoding_seen = True
+            if transfer_encoding_raw.byte_length() > 0:
+                transfer_encoding_raw += ","
+            transfer_encoding_raw += value
+        elif lowered == "expect":
+            expect_seen = True
+            expect_value = String(value)
+        elif lowered == "connection":
+            var tokens = _split_comma_tokens(value)
+            for i in range(len(tokens)):
+                if tokens[i].lower() == "close":
+                    connection_close = True
+        elif lowered == "upgrade":
+            has_upgrade = True
+        try:
+            headers.add(String(raw_name), String(value))
+        except e:
+            return ParseResult.failure(
+                HttpError.bad_request(String("bad header")), 0, True
+            )
+        pos = header_end + 2
+        # Peek for obs-fold on the next line without consuming: if the
+        # next bytes start with SP/HT right after this CRLF, the sender
+        # attempted folding.
+        if pos < length and (
+            buf[pos] == Byte(ord(" ")) or buf[pos] == Byte(ord("\t"))
+        ):
+            return ParseResult.failure(
+                HttpError.bad_request(String("obs-fold not supported")),
+                0,
+                True,
+            )
+    if has_upgrade:
+        return ParseResult.failure(
+            HttpError.bad_request(String("Upgrade not supported")), 0, True
+        )
+    if host_count != 1 or not _host_is_valid(host_value):
+        return ParseResult.failure(
+            HttpError.bad_request(String("bad Host")), 0, True
+        )
+    if content_length_count > 1:
+        return ParseResult.failure(
+            HttpError.bad_request(String("duplicate Content-Length")),
+            0,
+            True,
+        )
+    if transfer_encoding_seen:
+        var tokens = _split_comma_tokens(transfer_encoding_raw)
+        if len(tokens) != 1 or tokens[0].lower() != "chunked":
+            return ParseResult.failure(
+                HttpError.bad_request(String("unsupported Transfer-Encoding")),
+                0,
+                True,
+            )
+        transfer_encoding_chunked_only = True
+    if transfer_encoding_seen and content_length_count > 0:
+        return ParseResult.failure(
+            HttpError.bad_request(
+                String("Content-Length with Transfer-Encoding")
+            ),
+            0,
+            True,
+        )
+    var needs_100 = False
+    if expect_seen:
+        if expect_value.lower() != "100-continue":
+            return ParseResult.failure(
+                HttpError.expectation_failed(String("unknown Expect")),
+                0,
+                True,
+            )
+        needs_100 = True
+    # --- Request target forms. ---
+    var path = String("*")
+    var query = String("")
+    var scheme = String("http")
+    var authority = String(host_value)
+    var is_options_star = method == "OPTIONS" and target == "*"
+    if not is_options_star:
+        var matched, abs_authority, abs_path, abs_query = (
+            _parse_absolute_authority(target)
+        )
+        if matched:
+            if not _host_is_valid(abs_authority):
+                return ParseResult.failure(
+                    HttpError.bad_request(String("bad authority")), 0, True
+                )
+            authority = String(abs_authority)
+            if target.lower().startswith("https://"):
+                scheme = String("https")
+            path = String(abs_path)
+            query = String(abs_query)
+        else:
+            if not target.startswith("/"):
+                return ParseResult.failure(
+                    HttpError.bad_request(String("bad request target")),
+                    0,
+                    True,
+                )
+            var split_path, split_query = split_path_query(target)
+            path = String(split_path)
+            query = String(split_query)
+    if content_length_value > config.max_body_bytes:
+        return ParseResult.failure(
+            HttpError.payload_too_large(String("body too large")), 0, True
+        )
+    # --- Body. ---
+    var body = List[Byte]()
+    var trailers = Headers()
+    var consumed: Int
+    if transfer_encoding_chunked_only:
+        var chunk_metadata_total = 0
+        var decoded_total = 0
+        var chunk_pos = pos
+        while True:
+            var size_end = _find_crlf(buf, chunk_pos)
+            if size_end < 0:
+                if _has_lone_lf_before(buf, chunk_pos, length):
+                    return ParseResult.failure(
+                        HttpError.bad_request(String("bad chunk")),
+                        0,
+                        True,
+                    )
+                return ParseResult.need_more()
+            if _has_lone_lf_before(buf, chunk_pos, size_end):
+                return ParseResult.failure(
+                    HttpError.bad_request(String("bad chunk")), 0, True
+                )
+            var size_line_len = size_end - chunk_pos + 2
+            chunk_metadata_total += size_line_len
+            if chunk_metadata_total > config.max_chunk_metadata:
+                return ParseResult.failure(
+                    HttpError.payload_too_large(
+                        String("chunk metadata too large")
+                    ),
+                    0,
+                    True,
+                )
+            var size_line = String(from_utf8_lossy=buf[chunk_pos:size_end])
+            var semi = -1
+            for i in range(len(size_line.as_bytes())):
+                if size_line.as_bytes()[i] == Byte(ord(";")):
+                    semi = i
+                    break
+            var size_text = String(size_line)
+            if semi >= 0:
+                size_text = String(from_utf8_lossy=size_line.as_bytes()[0:semi])
+            size_text = _trim_ows(size_text)
+            var chunk_size = _parse_hex_size(size_text)
+            if chunk_size < 0:
+                return ParseResult.failure(
+                    HttpError.bad_request(String("bad chunk size")), 0, True
+                )
+            var data_start = size_end + 2
+            if chunk_size == 0:
+                # Trailers until empty line.
+                var trailer_pos = data_start
+                var trailer_bytes_total = 0
+                var trailer_count = 0
+                while True:
+                    if trailer_pos >= length:
+                        return ParseResult.need_more()
+                    if trailer_pos == length - 1 and buf[trailer_pos] == Byte(
+                        ord("\r")
+                    ):
+                        return ParseResult.need_more()
+                    var trailer_end = _find_crlf(buf, trailer_pos)
+                    if trailer_end < 0:
+                        if _has_lone_lf_before(buf, trailer_pos, length):
+                            return ParseResult.failure(
+                                HttpError.bad_request(String("bad trailer")),
+                                0,
+                                True,
+                            )
+                        return ParseResult.need_more()
+                    if _has_lone_lf_before(buf, trailer_pos, trailer_end):
+                        return ParseResult.failure(
+                            HttpError.bad_request(String("bad trailer")),
+                            0,
+                            True,
+                        )
+                    if trailer_end == trailer_pos:
+                        consumed = trailer_end + 2
+                        break
+                    var trailer_line_len = trailer_end - trailer_pos + 2
+                    trailer_bytes_total += trailer_line_len
+                    if (
+                        trailer_bytes_total > config.max_trailer_bytes
+                        or trailer_count + 1 > config.max_trailer_count
+                    ):
+                        return ParseResult.failure(
+                            HttpError.header_too_large(
+                                String("trailers too large")
+                            ),
+                            0,
+                            True,
+                        )
+                    var trailer_line = String(
+                        from_utf8_lossy=buf[trailer_pos:trailer_end]
+                    )
+                    var trailer_bytes = trailer_line.as_bytes()
+                    if len(trailer_bytes) > 0 and (
+                        trailer_bytes[0] == Byte(ord(" "))
+                        or trailer_bytes[0] == Byte(ord("\t"))
+                    ):
+                        return ParseResult.failure(
+                            HttpError.bad_request(String("bad trailer")),
+                            0,
+                            True,
+                        )
+                    var trailer_colon = -1
+                    for i in range(len(trailer_bytes)):
+                        if trailer_bytes[i] == Byte(ord(":")):
+                            trailer_colon = i
+                            break
+                    if trailer_colon <= 0:
+                        return ParseResult.failure(
+                            HttpError.bad_request(String("bad trailer")),
+                            0,
+                            True,
+                        )
+                    var trailer_name = String(
+                        from_utf8_lossy=trailer_bytes[0:trailer_colon]
+                    )
+                    if not _is_token(trailer_name):
+                        return ParseResult.failure(
+                            HttpError.bad_request(String("bad trailer")),
+                            0,
+                            True,
+                        )
+                    var trailer_lower = trailer_name.lower()
+                    if (
+                        trailer_lower == "content-length"
+                        or trailer_lower == "transfer-encoding"
+                        or trailer_lower == "host"
+                        or trailer_lower == "expect"
+                    ):
+                        return ParseResult.failure(
+                            HttpError.bad_request(
+                                String("trailer modifies framing")
+                            ),
+                            0,
+                            True,
+                        )
+                    var trailer_value = _trim_ows(
+                        String(
+                            from_utf8_lossy=trailer_bytes[trailer_colon + 1 :]
+                        )
+                    )
+                    try:
+                        trailers.add(
+                            String(trailer_name), String(trailer_value)
+                        )
+                    except e:
+                        return ParseResult.failure(
+                            HttpError.bad_request(String("bad trailer")),
+                            0,
+                            True,
+                        )
+                    trailer_count += 1
+                    trailer_pos = trailer_end + 2
+                    if trailer_pos < length and (
+                        buf[trailer_pos] == Byte(ord(" "))
+                        or buf[trailer_pos] == Byte(ord("\t"))
+                    ):
+                        return ParseResult.failure(
+                            HttpError.bad_request(String("bad trailer")),
+                            0,
+                            True,
+                        )
+                break
+            if data_start + chunk_size + 2 > length:
+                # Incomplete data or split CRLF: wait for more unless the
+                # available bytes already prove overflow.
+                if decoded_total + chunk_size > config.max_body_bytes:
+                    return ParseResult.failure(
+                        HttpError.payload_too_large(String("body too large")),
+                        0,
+                        True,
+                    )
+                return ParseResult.need_more()
+            if decoded_total + chunk_size > config.max_body_bytes:
+                return ParseResult.failure(
+                    HttpError.payload_too_large(String("body too large")),
+                    0,
+                    True,
+                )
+            for i in range(chunk_size):
+                body.append(buf[data_start + i])
+            decoded_total += chunk_size
+            if buf[data_start + chunk_size] != Byte(ord("\r")) or buf[
+                data_start + chunk_size + 1
+            ] != Byte(ord("\n")):
+                return ParseResult.failure(
+                    HttpError.bad_request(String("bad chunk data")), 0, True
+                )
+            chunk_pos = data_start + chunk_size + 2
+        # `consumed` was set to the trailer terminator in the zero-size
+        # branch above.
+    else:
+        var want = content_length_value if content_length_value >= 0 else 0
+        if pos + want > length:
+            return ParseResult.need_more()
+        for i in range(want):
+            body.append(buf[pos + i])
+        consumed = pos + want
+    var request = Request(
+        String(method), String(target), String(path), String(query), version
+    )
+    request.scheme = String(scheme)
+    request.authority = String(authority)
+    request.headers = headers^
+    request.trailers = trailers^
+    request.body = body^
+    return ParseResult.complete(request^, consumed, needs_100, connection_close)
+
+
+struct HttpParser(Movable):
+    """Owns unprocessed bytes for one connection. Feed arbitrary splits;
+    call `next_result` repeatedly to drain pipelined requests."""
+
+    var _buf: List[Byte]
+
+    def __init__(out self):
+        self._buf = List[Byte]()
+
+    def buffered_len(self) -> Int:
+        return len(self._buf)
+
+    def feed[origin: ImmOrigin](mut self, data: Span[Byte, origin]):
+        for i in range(len(data)):
+            self._buf.append(data[i])
+
+    def feed_string(mut self, data: StringSlice):
+        var bytes = data.as_bytes()
+        for i in range(len(bytes)):
+            self._buf.append(bytes[i])
+
+    def next_result(mut self, config: ServerConfig) -> ParseResult:
+        var result = parse_one(Span(self._buf), config)
+        if result.is_complete() or result.is_error():
+            var remaining = List[Byte]()
+            for i in range(result.consumed, len(self._buf)):
+                remaining.append(self._buf[i])
+            self._buf = remaining^
+        return result^
+
+    def clear(mut self):
+        self._buf.clear()

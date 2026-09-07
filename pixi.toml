@@ -15,6 +15,8 @@ test-udp = "mojo run --Werror -I . tests/test_udp.mojo"
 test-unix = "mojo run --Werror -I . tests/test_unix.mojo"
 test-poll = "mojo run --Werror -I . tests/test_poll.mojo"
 test-http-api = "mojo run --Werror -I . tests/test_http_api.mojo"
+test-http-parser = "mojo run --Werror -I . tests/test_http_parser.mojo"
+test-http-response = "mojo run --Werror -I . tests/test_http_response.mojo"
 sanitize-sys = "mojo run --sanitize address -I . tests/test_sys.mojo"
 sanitize-tcp = "mojo run --sanitize address -I . tests/test_tcp.mojo"
 sanitize-udp = "mojo run --sanitize address -I . tests/test_udp.mojo"
@@ -29,6 +31,8 @@ test = { depends-on = [
   "test-unix",
   "test-poll",
   "test-http-api",
+  "test-http-parser",
+  "test-http-response",
 ] }
 example-tcp = "mojo run --Werror -I . examples/tcp_echo.mojo"
 example-udp = "mojo run --Werror -I . examples/udp_echo.mojo"
@@ -37,6 +41,7 @@ package = "mkdir -p build && mojo precompile net -o build/net.mojoc"
 test-package = "mojo run --Werror -I build tests/package_smoke.mojo"
 benchmark-ip = "mojo run --Werror -I . benchmarks/ip_parse.mojo"
 benchmark-loopback = "mojo run --Werror -I . benchmarks/loopback_io.mojo"
+benchmark-http-parse = "mojo run --Werror -I . benchmarks/http_parse.mojo"
 
 [dependencies]
 mojo = ">=1.0.0,<2"
