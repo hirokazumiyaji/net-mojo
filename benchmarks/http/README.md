@@ -79,3 +79,30 @@ curl -X POST --data-binary @/tmp/fixed.body \
 - `benchmarks/http_parse.mojo` (Phase 1): parser time by input size.
 - `benchmarks/http_server.mojo` (Phase 3+): poll vs epoll/kqueue delta,
   Go comparison, CPU profile, memory measurement.
+
+## Phase 3 poll baseline (preliminary, same host)
+
+Not the formal procedure above (loader shared the server host, no CPU
+pinning on the Mojo side, single 10 s run each). Recorded to anchor the
+poll implementation before Phase 4 optimizes it.
+
+- Machine: Apple M2 Pro, darwin/arm64, `mojo 1.0.0`, `go1.26.4`.
+- Mojo server: blocking `serve` loop with the hello handler
+  (`GET /hello` -> 17 B `text/plain`), `mojo build` binary, RSS
+  ~12.8 MB with 50 keep-alive connections.
+- Loader: 50 concurrent keep-alive clients, 10 s window, same host.
+- Interop verified first: curl (200 + 404 + keep-alive reuse) and an
+  independent Go `net/http` client (200/404/200 with exact bodies).
+
+| Server | Throughput |
+| --- | --- |
+| Mojo poll server (`/hello`, 17 B) | ~28,000 rps, 0 failures |
+| Go baseline (`/fixed`, 64 B, all cores) | ~80,000 rps, 0 failures |
+| Go baseline (`/fixed`, 64 B, `GOMAXPROCS=1`) | ~56,000 rps, 0 failures |
+
+Mojo sits near 50% of the pinned Go figure here, under the 90%
+development target. Known unoptimized spots carried into Phase 4:
+per-tick full-table scans (poll set build, deadline checks, interest
+sync), a `time()` syscall per tick for `Date`, string copies on the
+request path, and `List` prefix drains. No feature is cut to chase the
+number; the gap is profiled and closed in Phase 4.

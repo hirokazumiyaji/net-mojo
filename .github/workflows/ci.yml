@@ -53,6 +53,8 @@ jobs:
         run: pixi run test-http-parser
       - name: Test HTTP response
         run: pixi run test-http-response
+      - name: Test HTTP server
+        run: pixi run test-http-server
       - name: Package precompiled artifact
         run: pixi run package
       - name: Verify packaged artifact
