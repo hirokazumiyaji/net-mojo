@@ -277,13 +277,40 @@ def encode_response(
     )
     for i in range(len(writer.headers)):
         var name = writer.headers.name_at(i)
-        var value = writer.headers.value_at(i)
+        var value = writer.headers.value_bytes_at(i)
         # Skip a caller Content-Length on no-body responses; it is
         # re-derived below for framed bodies only.
         if name.lower() == "content-length":
             continue
-        _reject_response_injection(name, value)
-        _append_string(out, name + String(": ") + value + String("\r\n"))
+        # Values were validated at ingress, but the encoder is the last
+        # line before the wire: reject CR/LF here on the exact bytes
+        # being emitted (names are ASCII tokens by construction).
+        var name_bytes = name.as_bytes()
+        var value_bytes = Span(value)
+        for k in range(len(name_bytes)):
+            if name_bytes[k] == Byte(ord("\r")) or name_bytes[k] == Byte(
+                ord("\n")
+            ):
+                raise NetError(
+                    NetErrorKind.invalid_argument(),
+                    "encode response",
+                    None,
+                    "response header contains CR or LF",
+                )
+        for k in range(len(value_bytes)):
+            if value_bytes[k] == Byte(ord("\r")) or value_bytes[k] == Byte(
+                ord("\n")
+            ):
+                raise NetError(
+                    NetErrorKind.invalid_argument(),
+                    "encode response",
+                    None,
+                    "response header contains CR or LF",
+                )
+        _append_string(out, name + String(": "))
+        for k in range(len(value_bytes)):
+            out.append(value_bytes[k])
+        _append_string(out, String("\r\n"))
     if not writer.headers.get_first("Date"):
         _reject_response_injection("Date", date)
         _append_string(out, String("Date: ") + String(date) + String("\r\n"))

@@ -237,6 +237,29 @@ def test_response_header_limits_are_enforced() raises:
     assert_true(len(wire) > 0)
 
 
+def test_obs_text_header_value_emitted_verbatim() raises:
+    # A stored 0x80 byte must reach the wire unchanged, not as U+FFFD.
+    var writer = ResponseWriter(1024)
+    var raw = List[Byte]()
+    raw.append(Byte(ord("a")))
+    raw.append(Byte(128))
+    writer.headers.add_bytes(String("X-Bin"), Span(raw))
+    writer.write_string("ok")
+    var wire = encode_response(
+        writer, False, "Thu, 01 Jan 1970 00:00:00 GMT", 100, 32768
+    )
+    var found = False
+    for i in range(len(wire) - 2):
+        if (
+            wire[i] == Byte(ord("a"))
+            and wire[i + 1] == Byte(128)
+            and wire[i + 2] == Byte(ord("\r"))
+        ):
+            found = True
+            break
+    assert_true(found)
+
+
 def test_100_continue_encoding() raises:
     var wire = encode_100_continue()
     var text = _bytes_to_string(Span(wire))

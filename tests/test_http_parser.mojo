@@ -498,6 +498,24 @@ def test_chunk_extension_fragment_no_double_count() raises:
     assert_equal(len(second.request.body), 5)
 
 
+def test_obs_text_header_value_preserved() raises:
+    # obs-text (0x80+) is legal in field values: the parser accepts it
+    # and stores the exact wire bytes instead of lossy decoding.
+    var config = ServerConfig.default()
+    var buf = _to_bytes("GET /a HTTP/1.1\r\nHost: h\r\nX-Bin: a")
+    buf.append(Byte(128))
+    var tail = _to_bytes("b\r\n\r\n")
+    for i in range(len(tail)):
+        buf.append(tail[i])
+    var result = parse_one(Span(buf), config)
+    assert_true(result.is_complete())
+    var stored = result.request.headers.value_bytes_at(1)
+    assert_equal(len(stored), 3)
+    assert_equal(stored[0], Byte(ord("a")))
+    assert_equal(stored[1], Byte(128))
+    assert_equal(stored[2], Byte(ord("b")))
+
+
 def test_dripped_headers_complete_identically() raises:
     # Two thousand header bytes dripped one at a time: the incremental
     # head scan must reach the same verdict as the one-shot parse.

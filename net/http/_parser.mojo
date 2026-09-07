@@ -1261,6 +1261,22 @@ def parse_head[
             )
         var raw_value = String(from_utf8_lossy=header_line_bytes[colon + 1 :])
         var value = _trim_ows(raw_value)
+        # The stored value keeps raw wire bytes (lossless for obs-text):
+        # offsets below reuse the header_line scan, which is exact here
+        # because the field name already validated as pure ASCII above,
+        # so no lossy replacement precedes the colon.
+        var value_start = pos + colon + 1
+        var value_end = header_end
+        while value_start < value_end and (
+            buf[value_start] == Byte(ord(" "))
+            or buf[value_start] == Byte(ord("\t"))
+        ):
+            value_start += 1
+        while value_end > value_start and (
+            buf[value_end - 1] == Byte(ord(" "))
+            or buf[value_end - 1] == Byte(ord("\t"))
+        ):
+            value_end -= 1
         var lowered = raw_name.lower()
         if lowered == "host":
             host_count += 1
@@ -1301,7 +1317,7 @@ def parse_head[
         elif lowered == "upgrade":
             has_upgrade = True
         try:
-            headers.add(String(raw_name), String(value))
+            headers.add_bytes(String(raw_name), buf[value_start:value_end])
         except e:
             return HeadOutcome.failure(
                 HttpError.bad_request(String("bad header")), 0, True
@@ -1602,14 +1618,24 @@ def parse_one[
                             0,
                             True,
                         )
-                    var trailer_value = _trim_ows(
-                        String(
-                            from_utf8_lossy=trailer_bytes[trailer_colon + 1 :]
-                        )
-                    )
+                    # Raw wire bytes, OWS-trimmed at byte level (same
+                    # ASCII-name alignment argument as header values).
+                    var tvalue_start = trailer_pos + trailer_colon + 1
+                    var tvalue_end = trailer_end
+                    while tvalue_start < tvalue_end and (
+                        buf[tvalue_start] == Byte(ord(" "))
+                        or buf[tvalue_start] == Byte(ord("\t"))
+                    ):
+                        tvalue_start += 1
+                    while tvalue_end > tvalue_start and (
+                        buf[tvalue_end - 1] == Byte(ord(" "))
+                        or buf[tvalue_end - 1] == Byte(ord("\t"))
+                    ):
+                        tvalue_end -= 1
                     try:
-                        trailers.add(
-                            String(trailer_name), String(trailer_value)
+                        trailers.add_bytes(
+                            String(trailer_name),
+                            buf[tvalue_start:tvalue_end],
                         )
                     except e:
                         return ParseResult.failure(
