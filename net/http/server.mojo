@@ -105,7 +105,6 @@ struct Server(Movable):
     var _budget: BufferBudget
     var _shutdown_at: Int
     var _tick_date: String
-    var _more_work: Bool
 
     def __init__(out self, var config: ServerConfig):
         var budget_total = config.total_buffer_budget
@@ -123,7 +122,6 @@ struct Server(Movable):
         self._budget = BufferBudget(budget_total)
         self._shutdown_at = NO_DEADLINE
         self._tick_date = String("")
-        self._more_work = False
 
     def is_shutdown_requested(self) -> Bool:
         return self.control.is_shutdown_requested()
@@ -161,17 +159,19 @@ struct Server(Movable):
         if not self._listener and self._active_conns == 0:
             self.control.mark_exited()
             return False
+        var rush = False
         for i in range(len(self._conns)):
             if self._conns[i].active:
                 self._conns[i].reset_tick()
+                if self._conns[i].more_work:
+                    rush = True
         # A previous tick capped by max_requests_per_tick with buffered
         # work left behind skips the wait: the next requests need no
         # socket event, and blocking up to the poll cap here would stall
         # a pipelined flood ~100ms per 16 requests.
         var wait_timeout = self._compute_timeout(now, timeout)
-        if self._more_work:
+        if rush:
             wait_timeout = Timeout.nanoseconds(0)
-        self._more_work = False
         var events = self._reactor.wait(wait_timeout)
         now = now_ns()
         if self._listener:
@@ -212,11 +212,13 @@ struct Server(Movable):
             var writable = (self._fired[i] & 2) != 0
             # Buffered bytes are re-driven only when they can make
             # progress without new I/O: freshly arrived unscanned bytes,
-            # or a capped pipeline remainder carried by _more_work. A
-            # fully scanned partial head waits for its next event (or
-            # deadline) instead of rescanning every tick. Likewise,
-            # queued sends wait for writability; only fresh queues earn
-            # an optimistic flush inside the drive itself.
+            # or a capped pipeline remainder flagged on its own
+            # connection. A fully scanned partial head waits for its
+            # next event (or deadline) instead of rescanning every tick,
+            # so one capped connection cannot force rescans on thousands
+            # of idle ones. Likewise, queued sends wait for writability;
+            # only fresh queues earn an optimistic flush inside the drive
+            # itself.
             var drive = readable or writable
             if not drive and self._conns[i].state == STATE_READING:
                 if self._conns[i].buffered_len() > 0:
@@ -225,9 +227,10 @@ struct Server(Movable):
                         > self._conns[i].scanned_len
                     ):
                         drive = True
-                    elif self._more_work:
+                    elif self._conns[i].more_work:
                         drive = True
             if drive:
+                self._conns[i].more_work = False
                 self._drive_conn(i, readable, writable, handler, now)
         self._check_deadlines(now_ns())
         if not self._listener and self._active_conns == 0:
@@ -464,7 +467,9 @@ struct Server(Movable):
                 ):
                     # Capped with work left behind: the next tick must
                     # not wait on the kernel for bytes already held.
-                    self._more_work = True
+                    # Flagged per connection so unrelated idle
+                    # connections are not re-driven with it.
+                    self._conns[idx].more_work = True
                     break
                 # Only a response queued by the parse below earns an
                 # optimistic first flush without a writable event.

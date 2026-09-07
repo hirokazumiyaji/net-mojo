@@ -761,11 +761,12 @@ def test_direct_body_append_over_limit_is_500() raises:
 
 
 def test_admitted_body_reservation_blocks_second_client() raises:
-    # Admission follows data, not accept order: whichever connection is
-    # admitted first reserves its missing body bytes, so the second
-    # headers-only client no longer fits and gets 503 while the first
-    # still completes. The first client always has data first here, so
-    # the outcome is deterministic either way.
+    # Admission follows data: the client with headers buffered first
+    # reserves its missing body bytes, so the second headers-only
+    # client no longer fits and gets 503 while the first still
+    # completes afterwards. The second verdict is collected BEFORE the
+    # first body arrives, so completion order cannot free the budget
+    # early and flip the outcome.
     var config = ServerConfig.default()
     config.total_buffer_budget = 8192
     var server = Server(config^)
@@ -784,30 +785,36 @@ def test_admitted_body_reservation_blocks_second_client() raises:
     first.write_all(head.as_bytes(), Timeout.seconds(2))
     _tick_n(server, handler, 20)
     second.write_all(head.as_bytes(), Timeout.seconds(2))
+    var second_out = List[Byte]()
+    var tmp = Array[Byte, 65536](fill=0)
+    for _ in range(200):
+        _ = server.tick(handler, Timeout.nanoseconds(0))
+        try:
+            var n = second.try_read(Span(tmp))
+            for i in range(n):
+                second_out.append(tmp[i])
+            if _response_complete(second_out):
+                break
+        except e:
+            _ = e
+            continue
+    assert_equal(_status_of(second_out), 503)
     var payload = String("b") * 6000
     first.write_all(payload.as_bytes(), Timeout.seconds(2))
     var first_out = List[Byte]()
-    var second_out = List[Byte]()
-    var tmp = Array[Byte, 65536](fill=0)
     for _ in range(400):
         _ = server.tick(handler, Timeout.nanoseconds(0))
         try:
             var n = first.try_read(Span(tmp))
             for i in range(n):
                 first_out.append(tmp[i])
+            if _response_complete(first_out):
+                break
         except e:
             _ = e
-        try:
-            var n = second.try_read(Span(tmp))
-            for i in range(n):
-                second_out.append(tmp[i])
-        except e:
-            _ = e
-        if _response_complete(first_out) and _response_complete(second_out):
-            break
+            continue
     assert_equal(_status_of(first_out), 200)
     assert_equal(_content_length_of(first_out), 6000)
-    assert_equal(_status_of(second_out), 503)
     first.close()
     second.close()
 

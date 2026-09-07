@@ -33,6 +33,7 @@ struct HttpConnection(Movable):
     var requests_this_tick: Int
     var reserved: Int
     var scanned_len: Int
+    var more_work: Bool
     var active: Bool
 
     def __init__(
@@ -60,6 +61,7 @@ struct HttpConnection(Movable):
         self.requests_this_tick = 0
         self.reserved = 0
         self.scanned_len = 0
+        self.more_work = False
         self.active = True
 
     def wants_read(self) -> Bool:
