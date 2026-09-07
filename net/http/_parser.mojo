@@ -903,6 +903,117 @@ struct HeadOutcome(Movable):
         return out^
 
 
+@fieldwise_init
+struct _HeadScan(Copyable, Movable):
+    """Structural pre-scan of the request head: finds line boundaries
+    and enforces size caps without allocating header Strings."""
+
+    var kind: UInt8
+    var header_end: Int
+    var status: Int
+
+    @staticmethod
+    def need_more() -> Self:
+        return Self(kind=0, header_end=0, status=0)
+
+    @staticmethod
+    def complete(header_end: Int) -> Self:
+        return Self(kind=1, header_end=header_end, status=0)
+
+    @staticmethod
+    def failure(status: Int) -> Self:
+        return Self(kind=2, header_end=0, status=status)
+
+    def is_need_more(self) -> Bool:
+        return self.kind == 0
+
+    def is_complete(self) -> Bool:
+        return self.kind == 1
+
+    def is_error(self) -> Bool:
+        return self.kind == 2
+
+
+def _head_status_error(status: Int) -> HttpError:
+    if status == 414:
+        return HttpError.uri_too_long(String("request target too long"))
+    if status == 431:
+        return HttpError.header_too_large(String("headers too large"))
+    return HttpError.bad_request(String("bad request head"))
+
+
+def _scan_head[
+    origin: ImmOrigin
+](
+    buf: Span[Byte, origin],
+    config: ServerConfig,
+    mut wire: Int,
+    mut bytes_total: Int,
+    mut line_count: Int,
+    mut in_headers: Bool,
+) -> _HeadScan:
+    """Advances a structural scan of the request head across feeds. Only
+    the undecided tail is re-examined: completed lines stay behind
+    `wire`, so dripped input costs O(new bytes) per feed instead of
+    rescanning and rebuilding every header. Returns complete once the
+    blank terminator is found; the authoritative `parse_head` then runs
+    exactly once for validation and construction."""
+    var length = len(buf)
+    if not in_headers:
+        var line_end = _find_crlf(buf, 0)
+        if line_end < 0:
+            if _has_lone_lf_before(buf, 0, length):
+                return _HeadScan.failure(400)
+            if length > config.max_request_line:
+                return _HeadScan.failure(431)
+            return _HeadScan.need_more()
+        if _has_lone_lf_before(buf, 0, line_end):
+            return _HeadScan.failure(400)
+        if line_end > config.max_request_line:
+            var first = -1
+            var second = -1
+            for i in range(line_end):
+                if buf[i] == Byte(ord(" ")):
+                    if first < 0:
+                        first = i
+                    else:
+                        second = i
+                        break
+            if first >= 0 and second > first:
+                var target_len = second - first - 1
+                if target_len > config.max_request_line:
+                    return _HeadScan.failure(414)
+            return _HeadScan.failure(431)
+        wire = line_end + 2
+        in_headers = True
+    while True:
+        if wire >= length:
+            return _HeadScan.need_more()
+        if wire == length - 1 and buf[wire] == Byte(ord("\r")):
+            return _HeadScan.need_more()
+        var header_end = _find_crlf(buf, wire)
+        if header_end < 0:
+            if _has_lone_lf_before(buf, wire, length):
+                return _HeadScan.failure(400)
+            if bytes_total + (length - wire) > config.max_headers_bytes:
+                return _HeadScan.failure(431)
+            return _HeadScan.need_more()
+        if _has_lone_lf_before(buf, wire, header_end):
+            return _HeadScan.failure(400)
+        if header_end == wire:
+            return _HeadScan.complete(header_end + 2)
+        var next = buf[wire]
+        if next == Byte(ord(" ")) or next == Byte(ord("\t")):
+            return _HeadScan.failure(400)
+        bytes_total += header_end - wire + 2
+        if bytes_total > config.max_headers_bytes:
+            return _HeadScan.failure(431)
+        line_count += 1
+        if line_count > config.max_headers_count:
+            return _HeadScan.failure(431)
+        wire = header_end + 2
+
+
 def parse_head[
     origin: ImmOrigin
 ](buf: Span[Byte, origin], config: ServerConfig) -> HeadOutcome:
@@ -1596,6 +1707,11 @@ struct HttpParser(Movable):
     var _scan_meta: Int
     var _scan_decoded: Int
     var _scan_active: Bool
+    var _hs_wire: Int
+    var _hs_bytes: Int
+    var _hs_count: Int
+    var _hs_in_headers: Bool
+    var _hs_active: Bool
 
     def __init__(out self):
         self._buf = List[Byte]()
@@ -1606,6 +1722,11 @@ struct HttpParser(Movable):
         self._scan_meta = 0
         self._scan_decoded = 0
         self._scan_active = False
+        self._hs_wire = 0
+        self._hs_bytes = 0
+        self._hs_count = 0
+        self._hs_in_headers = False
+        self._hs_active = False
 
     def _reset_progress(mut self):
         self._head_end = -1
@@ -1615,6 +1736,11 @@ struct HttpParser(Movable):
         self._scan_meta = 0
         self._scan_decoded = 0
         self._scan_active = False
+        self._hs_wire = 0
+        self._hs_bytes = 0
+        self._hs_count = 0
+        self._hs_in_headers = False
+        self._hs_active = False
 
     def buffered_len(self) -> Int:
         return len(self._buf)
@@ -1630,8 +1756,42 @@ struct HttpParser(Movable):
 
     def next_result(mut self, config: ServerConfig) -> ParseResult:
         if self._head_end < 0:
+            # Structural head scan first: completed lines stay behind
+            # the frontier, so dripped headers cost O(new bytes) per
+            # feed instead of rescanning and rebuilding every header.
+            if not self._hs_active:
+                self._hs_wire = 0
+                self._hs_bytes = 0
+                self._hs_count = 0
+                self._hs_in_headers = False
+                self._hs_active = True
+            var wire = self._hs_wire
+            var bytes_total = self._hs_bytes
+            var line_count = self._hs_count
+            var in_headers = self._hs_in_headers
+            var scan = _scan_head(
+                Span(self._buf),
+                config,
+                wire,
+                bytes_total,
+                line_count,
+                in_headers,
+            )
+            self._hs_wire = wire
+            self._hs_bytes = bytes_total
+            self._hs_count = line_count
+            self._hs_in_headers = in_headers
+            if scan.is_need_more():
+                return ParseResult.need_more()
+            if scan.is_error():
+                self._reset_progress()
+                return ParseResult.failure(
+                    _head_status_error(scan.status), 0, True
+                )
+            # One authoritative validation and construction pass.
             var head = parse_head(Span(self._buf), config)
             if head.is_need_more():
+                self._reset_progress()
                 return ParseResult.need_more()
             if head.is_error():
                 self._reset_progress()
