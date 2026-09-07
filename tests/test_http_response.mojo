@@ -175,6 +175,20 @@ def test_100_continue_encoding() raises:
     assert_equal(text, "HTTP/1.1 100 Continue\r\n\r\n")
 
 
+def test_invalid_status_codes_are_rejected() raises:
+    for bad in [99, 1000]:
+        var writer = ResponseWriter(1024)
+        writer.set_status(bad)
+        writer.write_string("x")
+        var failed = False
+        try:
+            _ = encode_response(writer, False, "Thu, 01 Jan 1970 00:00:00 GMT")
+        except error:
+            assert_equal(error.kind, NetErrorKind.invalid_argument())
+            failed = True
+        assert_true(failed)
+
+
 def test_error_encoding_is_bounded() raises:
     var wire = encode_error(400, True, "Thu, 01 Jan 1970 00:00:00 GMT")
     var text = _bytes_to_string(Span(wire))

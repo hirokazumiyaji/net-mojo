@@ -66,6 +66,13 @@ func echoHandler(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "Bad Request", http.StatusBadRequest)
 		return
 	}
+	// The body is now fully consumed: restart a 30s write phase so a
+	// slow upload does not eat the response budget. Go arms
+	// WriteTimeout at header completion, which would otherwise leave
+	// about a second to write after a 29s body.
+	if c, ok := r.Context().Value(connKey{}).(net.Conn); ok {
+		_ = c.SetWriteDeadline(time.Now().Add(30 * time.Second))
+	}
 	if len(body) > maxBody {
 		http.Error(w, "Content Too Large", http.StatusRequestEntityTooLarge)
 		return

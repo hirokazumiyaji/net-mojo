@@ -105,6 +105,7 @@ struct Server(Movable):
     var _budget: BufferBudget
     var _shutdown_at: Int
     var _tick_date: String
+    var _more_work: Bool
 
     def __init__(out self, var config: ServerConfig):
         var budget_total = config.total_buffer_budget
@@ -122,6 +123,7 @@ struct Server(Movable):
         self._budget = BufferBudget(budget_total)
         self._shutdown_at = NO_DEADLINE
         self._tick_date = String("")
+        self._more_work = False
 
     def is_shutdown_requested(self) -> Bool:
         return self.control.is_shutdown_requested()
@@ -162,7 +164,15 @@ struct Server(Movable):
         for i in range(len(self._conns)):
             if self._conns[i].active:
                 self._conns[i].reset_tick()
-        var events = self._reactor.wait(self._compute_timeout(now, timeout))
+        # A previous tick capped by max_requests_per_tick with buffered
+        # work left behind skips the wait: the next requests need no
+        # socket event, and blocking up to the poll cap here would stall
+        # a pipelined flood ~100ms per 16 requests.
+        var wait_timeout = self._compute_timeout(now, timeout)
+        if self._more_work:
+            wait_timeout = Timeout.nanoseconds(0)
+        self._more_work = False
+        var events = self._reactor.wait(wait_timeout)
         now = now_ns()
         if self._listener:
             for i in range(len(events)):
@@ -440,6 +450,9 @@ struct Server(Movable):
                     self._conns[idx].requests_this_tick
                     >= self.config.max_requests_per_tick
                 ):
+                    # Capped with work left behind: the next tick must
+                    # not wait on the kernel for bytes already held.
+                    self._more_work = True
                     break
                 # Only a response queued by the parse below earns an
                 # optimistic first flush without a writable event.
@@ -617,8 +630,19 @@ struct Server(Movable):
 
     def _send_100(mut self, idx: Int) raises NetError -> Bool:
         var cont = encode_100_continue()
+        # The interim send obeys the same per-tick allowance as every
+        # other write: cap the slice and account for it, so a tiny
+        # allowance cannot be overshot and later writes do not get a
+        # second full share.
+        var allowance = (
+            self.config.max_bytes_per_tick - self._conns[idx].bytes_this_tick
+        )
+        if allowance < 0:
+            allowance = 0
+        var first = len(cont) if len(cont) < allowance else allowance
         try:
-            var written = self._conns[idx].try_write_bytes(Span(cont))
+            var written = self._conns[idx].try_write_bytes(Span(cont)[0:first])
+            self._conns[idx].bytes_this_tick += written
             if written < len(cont):
                 var rest = List[Byte]()
                 for i in range(written, len(cont)):

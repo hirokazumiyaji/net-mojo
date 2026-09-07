@@ -1,5 +1,5 @@
 from std.testing import assert_equal, assert_false, assert_true, TestSuite
-from std.time import sleep
+from std.time import perf_counter_ns, sleep
 
 from net import TCPConn, Timeout, dial_tcp, listen_tcp
 from net.error import NetErrorKind
@@ -318,6 +318,28 @@ def test_pipeline_order_preserved() raises:
     client.close()
 
 
+def _drain_until_eof(
+    client: TCPConn, max_rounds: Int = 500
+) raises -> List[Byte]:
+    # Drains until EOF: the server under test always ends these flows
+    # with Connection: close, so FIN terminates the loop deterministically
+    # regardless of loopback delivery timing.
+    var out = List[Byte]()
+    var tmp = Array[Byte, 65536](fill=0)
+    for _ in range(max_rounds):
+        try:
+            var n = client.try_read(Span(tmp))
+            if n == 0:
+                break
+            for i in range(n):
+                out.append(tmp[i])
+        except e:
+            _ = e
+            sleep(0.001)
+            continue
+    return out^
+
+
 def test_pipelined_chain_completes_without_extra_waits() raises:
     # Six pipelined requests must all complete well before six ticks:
     # chaining parses each buffered request in the same drive instead
@@ -336,25 +358,17 @@ def test_pipelined_chain_completes_without_extra_waits() raises:
         batch += String("GET /one HTTP/1.1\r\nHost: x\r\n\r\n")
     batch += String("GET /two HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n")
     client.write_all(batch.as_bytes(), Timeout.seconds(2))
-    # Drain until empty after each tick: loopback delivery lags the
-    # server's kernel handoff by microseconds, and a single try_read
-    # may catch only part of what was sent.
-    var out = List[Byte]()
-    var tmp = Array[Byte, 65536](fill=0)
+    # Ticks alone must quiesce the server: client reads play no role in
+    # server progress (kernel buffers hold the small batch), so delivery
+    # timing cannot flake this bound. Without chaining, six requests
+    # need at least seven ticks (accept plus one each).
     for _ in range(4):
         _ = server.tick(handler, Timeout.nanoseconds(0))
-        for _ in range(50):
-            try:
-                var n = client.try_read(Span(tmp))
-                if n == 0:
-                    break
-                for i in range(n):
-                    out.append(tmp[i])
-            except e:
-                _ = e
-                break
-    var text = String(from_utf8_lossy=Span(out))
+        if server.active_connections() == 0:
+            break
     assert_equal(server.active_connections(), 0)
+    var out = _drain_until_eof(client)
+    var text = String(from_utf8_lossy=Span(out))
     var ones = 0
     var rest = text
     while True:
@@ -368,6 +382,52 @@ def test_pipelined_chain_completes_without_extra_waits() raises:
     assert_equal(ones, 5)
     assert_true(text.find("TWO") >= 0)
     client.close()
+
+
+def test_capped_pipeline_does_not_wait_between_batches() raises:
+    # Twenty pipelined requests exceed one tick's request cap, so the
+    # remainder carries into later ticks. Those ticks must not block on
+    # the kernel for bytes already buffered: with real (blocking) waits
+    # the whole batch finishes in milliseconds, not ~100ms per batch.
+    var server = Server(ServerConfig.default())
+    server.add_listener(listen_tcp("127.0.0.1:0"))
+    var port = server.local_address().port
+    var handler = _TwoHandler()
+    var client = dial_tcp(
+        String("127.0.0.1:") + String(port), Timeout.seconds(5)
+    )
+    var batch = String("")
+    for _ in range(19):
+        batch += String("GET /one HTTP/1.1\r\nHost: x\r\n\r\n")
+    batch += String("GET /two HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n")
+    client.write_all(batch.as_bytes(), Timeout.seconds(5))
+    # Server completion is measured without client reads: kernel buffers
+    # hold the batch, so delivery timing cannot flake the bound. Content
+    # is drained separately after quiescence.
+    var start = Int(perf_counter_ns())
+    for _ in range(30):
+        _ = server.tick(handler, None)
+        if server.active_connections() == 0:
+            break
+    var elapsed_ms = (Int(perf_counter_ns()) - start) // 1_000_000
+    assert_equal(server.active_connections(), 0)
+    var out = _drain_until_eof(client)
+    var text = String(from_utf8_lossy=Span(out))
+    var ones = 0
+    var rest = text
+    while True:
+        var at = rest.find("ONE")
+        if at < 0:
+            break
+        ones += 1
+        var rest_bytes = rest.as_bytes()
+        var tail = String(from_utf8_lossy=rest_bytes[at + 3 : len(rest_bytes)])
+        rest = tail^
+    assert_equal(ones, 19)
+    assert_true(text.find("TWO") >= 0)
+    # Without the skip-wait the capped remainder would stall one full
+    # poll cap (~100ms); the margin below is wide in both directions.
+    assert_true(elapsed_ms < 60)
 
 
 def test_100_continue_flow() raises:
@@ -701,9 +761,11 @@ def test_direct_body_append_over_limit_is_500() raises:
 
 
 def test_admitted_body_reservation_blocks_second_client() raises:
-    # The first client's missing body bytes are reserved at admission,
-    # so a second client promising the same no longer fits and gets
-    # 503 while the first still completes.
+    # Admission follows data, not accept order: whichever connection is
+    # admitted first reserves its missing body bytes, so the second
+    # headers-only client no longer fits and gets 503 while the first
+    # still completes. The first client always has data first here, so
+    # the outcome is deterministic either way.
     var config = ServerConfig.default()
     config.total_buffer_budget = 8192
     var server = Server(config^)
@@ -716,19 +778,12 @@ def test_admitted_body_reservation_blocks_second_client() raises:
     var second = dial_tcp(
         String("127.0.0.1:") + String(port), Timeout.seconds(2)
     )
-    first.write_all(
-        String(
-            "POST /echo HTTP/1.1\r\nHost: x\r\nContent-Length: 6000\r\n\r\n"
-        ).as_bytes(),
-        Timeout.seconds(2),
+    var head = String(
+        "POST /echo HTTP/1.1\r\nHost: x\r\nContent-Length: 6000\r\n\r\n"
     )
+    first.write_all(head.as_bytes(), Timeout.seconds(2))
     _tick_n(server, handler, 20)
-    second.write_all(
-        String(
-            "POST /echo HTTP/1.1\r\nHost: x\r\nContent-Length: 6000\r\n\r\n"
-        ).as_bytes(),
-        Timeout.seconds(2),
-    )
+    second.write_all(head.as_bytes(), Timeout.seconds(2))
     var payload = String("b") * 6000
     first.write_all(payload.as_bytes(), Timeout.seconds(2))
     var first_out = List[Byte]()
