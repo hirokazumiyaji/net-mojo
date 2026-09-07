@@ -210,12 +210,24 @@ struct Server(Movable):
                 continue
             var readable = (self._fired[i] & 1) != 0
             var writable = (self._fired[i] & 2) != 0
-            if (
-                readable
-                or writable
-                or self._conns[i].buffered_len() > 0
-                or self._conns[i].pending_remaining() > 0
-            ):
+            # Buffered bytes are re-driven only when they can make
+            # progress without new I/O: freshly arrived unscanned bytes,
+            # or a capped pipeline remainder carried by _more_work. A
+            # fully scanned partial head waits for its next event (or
+            # deadline) instead of rescanning every tick. Likewise,
+            # queued sends wait for writability; only fresh queues earn
+            # an optimistic flush inside the drive itself.
+            var drive = readable or writable
+            if not drive and self._conns[i].state == STATE_READING:
+                if self._conns[i].buffered_len() > 0:
+                    if (
+                        self._conns[i].buffered_len()
+                        > self._conns[i].scanned_len
+                    ):
+                        drive = True
+                    elif self._more_work:
+                        drive = True
+            if drive:
                 self._drive_conn(i, readable, writable, handler, now)
         self._check_deadlines(now_ns())
         if not self._listener and self._active_conns == 0:
@@ -555,6 +567,7 @@ struct Server(Movable):
                 if self._conns[idx].read_eof:
                     self._close_conn(idx)
                     return
+                self._conns[idx].scanned_len = self._conns[idx].buffered_len()
                 break
             if head.is_error():
                 var head_status = head.take_error().status
@@ -612,6 +625,7 @@ struct Server(Movable):
                 if self._conns[idx].read_eof:
                     self._close_conn(idx)
                     return
+                self._conns[idx].scanned_len = self._conns[idx].buffered_len()
                 break
             if result.is_error():
                 var body_status = result.take_error().status
@@ -687,8 +701,17 @@ struct Server(Movable):
     ) raises:
         var req = result.take_request()
         var is_head = req.method == "HEAD"
+        # The advertised body cap subtracts a fixed framing margin for
+        # the status line, Date, Content-Length, and terminator (~130B
+        # worst case, held at 256B), so a body within cap always fits
+        # the wire: handlers are never promised bytes the encoder
+        # cannot send. Subtracting the whole response-header allowance
+        # instead would be dishonest in the other direction — e.g. a
+        # 6KiB echo on an 8KiB budget with a 32KiB header allowance
+        # would cap at zero and 500 everything — while per-header
+        # count/byte caps still bound header-heavy responses above.
         var cap = self.config.max_response_body
-        var room = self._budget.remaining()
+        var room = self._budget.remaining() - 256
         if room < cap:
             cap = room
         if cap < 0:

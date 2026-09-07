@@ -32,6 +32,7 @@ struct HttpConnection(Movable):
     var bytes_this_tick: Int
     var requests_this_tick: Int
     var reserved: Int
+    var scanned_len: Int
     var active: Bool
 
     def __init__(
@@ -58,6 +59,7 @@ struct HttpConnection(Movable):
         self.bytes_this_tick = 0
         self.requests_this_tick = 0
         self.reserved = 0
+        self.scanned_len = 0
         self.active = True
 
     def wants_read(self) -> Bool:
@@ -89,6 +91,12 @@ struct HttpConnection(Movable):
         for i in range(count, len(self.buf)):
             rest.append(self.buf[i])
         self.buf = rest^
+        # The drained prefix was necessarily scanned; the remainder
+        # keeps its scanned prefix length.
+        if self.scanned_len > count:
+            self.scanned_len -= count
+        else:
+            self.scanned_len = 0
 
     def set_pending(mut self, var bytes: List[Byte]):
         self.pending = bytes^
