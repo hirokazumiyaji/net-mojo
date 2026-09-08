@@ -44,6 +44,26 @@ comptime O_NONBLOCK: Int32 = 0x800
 comptime AI_NUMERICSERV: Int32 = 0x400
 comptime IF_NAMESIZE: Int = 16
 
+# --- epoll event queue (Phase 4) ---
+# struct epoll_event { uint32_t events; epoll_data_t data; } on 64-bit
+# Linux: events@0 (4B), 4B padding, data@8 (8B), size 16, align 8.
+comptime EPOLL_CLOEXEC: Int32 = 0x80000
+comptime EPOLL_CTL_ADD: Int32 = 1
+comptime EPOLL_CTL_DEL: Int32 = 2
+comptime EPOLL_CTL_MOD: Int32 = 3
+comptime EPOLLIN: UInt32 = 0x1
+comptime EPOLLOUT: UInt32 = 0x4
+comptime EPOLLERR: UInt32 = 0x8
+comptime EPOLLHUP: UInt32 = 0x10
+comptime EPOLLRDHUP: UInt32 = 0x2000
+
+
+@fieldwise_init
+struct _EpollEvent(Copyable, ImplicitlyCopyable, Movable):
+    var events: UInt32
+    var _reserved: UInt32
+    var data: UInt64
+
 
 @fieldwise_init
 struct _SockaddrIn:

@@ -45,6 +45,30 @@ comptime O_NONBLOCK: Int32 = 0x4
 comptime AI_NUMERICSERV: Int32 = 0x1000
 comptime IF_NAMESIZE: Int = 16
 
+# --- kqueue event queue (Phase 4) ---
+# struct kevent on 64-bit Darwin: ident@0 (8B), filter@8 (2B),
+# flags@10 (2B), fflags@12 (4B), data@16 (8B), udata@24 (8B).
+# Size 32, align 8. Level-triggered: EV_ADD without EV_CLEAR.
+comptime EVFILT_READ: Int16 = -1
+comptime EVFILT_WRITE: Int16 = -2
+comptime EV_ADD: UInt16 = 0x1
+comptime EV_DELETE: UInt16 = 0x2
+comptime EV_ENABLE: UInt16 = 0x4
+comptime EV_DISABLE: UInt16 = 0x8
+comptime EV_CLEAR: UInt16 = 0x20
+comptime EV_EOF: UInt16 = 0x8000
+comptime EV_ERROR: UInt16 = 0x4000
+
+
+@fieldwise_init
+struct _Kevent(Copyable, ImplicitlyCopyable, Movable):
+    var ident: UInt64
+    var filter: Int16
+    var flags: UInt16
+    var fflags: UInt32
+    var data: Int64
+    var udata: UInt64
+
 
 @fieldwise_init
 struct _SockaddrIn:
