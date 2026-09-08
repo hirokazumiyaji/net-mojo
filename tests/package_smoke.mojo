@@ -1,4 +1,36 @@
 from net import Timeout, dial_tcp, listen_tcp
+from net.http import Headers, ServerConfig, has_body_for_status
+from net.http._parser import parse_one
+
+
+def _to_bytes(data: StringSlice) -> List[Byte]:
+    var out = List[Byte]()
+    var bytes = data.as_bytes()
+    for i in range(len(bytes)):
+        out.append(bytes[i])
+    return out^
+
+
+def _check_http_codec() raises:
+    # Proves the precompiled artifact ships `net.http` and its codec:
+    # parse a minimal request, check header case-insensitivity, and
+    # confirm body rules without touching the network.
+    var config = ServerConfig.default()
+    var buf = _to_bytes("GET /hello HTTP/1.1\r\nHost: example.com\r\n\r\n")
+    var result = parse_one(Span(buf), config)
+    if not result.is_complete():
+        raise Error("packaged net.http parser failed")
+    if result.request.method != "GET" or result.request.path != "/hello":
+        raise Error("packaged net.http request mismatch")
+    var headers = Headers()
+    headers.add(String("Content-Type"), String("text/plain"))
+    var found = headers.get_first("content-type")
+    if not Bool(found) or found.value() != "text/plain":
+        raise Error("packaged net.http headers mismatch")
+    if not has_body_for_status(200, False):
+        raise Error("packaged net.http body rule mismatch")
+    if has_body_for_status(204, False):
+        raise Error("packaged net.http 204 rule mismatch")
 
 
 def main() raises:
@@ -15,3 +47,5 @@ def main() raises:
     server.close()
     listener.close()
     print("packaged artifact roundtrip succeeded")
+    _check_http_codec()
+    print("packaged net.http codec succeeded")

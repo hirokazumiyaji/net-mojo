@@ -106,7 +106,7 @@ struct _DirectHugeHandler(Handler):
         # Bypasses write()/write_string() on purpose: the server must
         # still enforce the cap after the handler returns.
         writer.set_status(200)
-        for i in range(1024 * 1024 + 1):
+        for _ in range(1024 * 1024 + 1):
             writer.body.append(Byte(ord("z")))
 
 

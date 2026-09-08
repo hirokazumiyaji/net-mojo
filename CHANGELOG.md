@@ -14,6 +14,43 @@ underscore (see README "Versioning and compatibility"). Anything under
 
 ### Added
 
+- `net.http` plaintext HTTP/1.1 origin server (single event loop, epoll
+  on Linux / kqueue on macOS): `Handler`, `Request`, `Headers`,
+  `ResponseWriter`, `Server`, `ServerConfig`, `ServerControl`,
+  `listen_and_serve`. Bounded buffered requests only; handler runs
+  synchronously on the loop thread. Limits default to 10,000
+  connections, 8 KiB request line, 32 KiB / 100 headers, 1 MiB body,
+  1 MiB response body, 256 MiB total buffer budget, header/body/write
+  deadlines 5 s / 30 s / 30 s, idle keep-alive 60 s, shutdown grace
+  30 s. See `docs/design/http-server.md`.
+- `net._reactor` internal readiness layer with stable slot+generation
+  tokens, interest updates, and ready-event batches (poll baseline,
+  then epoll/kqueue production path). The public `Poller` API is
+  unchanged.
+- `net/_sys/readiness.mojo` with epoll/kqueue bindings, per-arch ABI
+  layout checks, and queue-fd leak tests.
+- `examples/http_hello.mojo` and `examples/http_json.mojo`
+  (`pixi run example-http-hello`, `pixi run example-http-json`).
+- HTTP benchmarks: `benchmarks/http_parse.mojo`
+  (`pixi run benchmark-http-parse`), `benchmarks/http_server.mojo`
+  (`pixi run benchmark-http-server`), Go baseline
+  `benchmarks/http_go/main.go`, and the fixed measurement procedure in
+  `benchmarks/http/README.md`. Benchmarks report numbers only and
+  never gate CI.
+- `tests/package_smoke.mojo` now verifies the precompiled artifact
+  ships `net.http`: `parse_one` codec round-trip, case-insensitive
+  `Headers` lookup, and `has_body_for_status` rules.
+- HTTP test suites: `test-http-api` (handler/ownership/control compile
+  probe), `test-http-parser` (every-byte-boundary splits,
+  seed-recorded randomized fragmentation, malformed corpus, overflow
+  and limit tables), `test-http-response` (HEAD/204/304, Date,
+  injection rejection, length consistency), `test-reactor` (interest
+  changes, fd reuse, stale generations, EINTR, leak checks), and
+  `test-http-server` (keep-alive, pipeline order, 100-continue,
+  partial I/O, EOF, slow clients, budget admission, handler errors,
+  shutdown drain). Long fd/RSS soak tests remain manual follow-up;
+  timing thresholds are not CI gates.
+
 - `Poller` single-threaded readiness multiplexing over `poll(2)` with
   `try_read` / `try_write` / `try_accept` / `try_recv_from` / `try_send_to`
   and `raw_fd()` borrow accessors.
