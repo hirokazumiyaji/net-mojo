@@ -288,21 +288,34 @@ def test_readiness_abi_sizes_offsets_and_token_roundtrip() raises:
         assert_equal(kev_bytes[unsafe_offset=8], 255)
         assert_equal(kev_bytes[unsafe_offset=10], 5)
     else:
-        assert_equal(size_of[linux._EpollEvent](), 16)
-        assert_equal(align_of[linux._EpollEvent](), 8)
-        var ev = linux._EpollEvent(
-            events=UInt32(0x04030201), _reserved=0, data=UInt64(0)
-        )
-        var ev_bytes = Pointer(to=ev).unsafe_bitcast[UInt8]()
-        assert_equal(ev_bytes[unsafe_offset=0], 1)
-        assert_equal(ev_bytes[unsafe_offset=3], 4)
-        # data starts at offset 8 (4B padding after the u32 mask).
-        var ev2 = linux._EpollEvent(
-            events=UInt32(0), _reserved=0, data=UInt64(0x0807060504030201)
-        )
-        var ev2_bytes = Pointer(to=ev2).unsafe_bitcast[UInt8]()
-        assert_equal(ev2_bytes[unsafe_offset=8], 1)
-        assert_equal(ev2_bytes[unsafe_offset=15], 8)
+        comptime if linux._EPOLL_PACKED:
+            # x86-64 packed layout: events@0, data@4, size 12.
+            assert_equal(size_of[linux._EpollEventPacked](), 12)
+            assert_equal(align_of[linux._EpollEventPacked](), 4)
+            var ev = linux._EpollEventPacked(
+                events=UInt32(0x04030201),
+                data_lo=UInt32(0x04030201),
+                data_hi=UInt32(0x08070605),
+            )
+            var ev_bytes = Pointer(to=ev).unsafe_bitcast[UInt8]()
+            assert_equal(ev_bytes[unsafe_offset=0], 1)
+            assert_equal(ev_bytes[unsafe_offset=3], 4)
+            assert_equal(ev_bytes[unsafe_offset=4], 1)
+            assert_equal(ev_bytes[unsafe_offset=11], 8)
+        else:
+            # aarch64 natural layout: events@0, 4B padding, data@8, size 16.
+            assert_equal(size_of[linux._EpollEventAligned](), 16)
+            assert_equal(align_of[linux._EpollEventAligned](), 8)
+            var ev = linux._EpollEventAligned(
+                events=UInt32(0x04030201),
+                _reserved=0,
+                data=UInt64(0x0807060504030201),
+            )
+            var ev_bytes = Pointer(to=ev).unsafe_bitcast[UInt8]()
+            assert_equal(ev_bytes[unsafe_offset=0], 1)
+            assert_equal(ev_bytes[unsafe_offset=3], 4)
+            assert_equal(ev_bytes[unsafe_offset=8], 1)
+            assert_equal(ev_bytes[unsafe_offset=15], 8)
     # Event token round-trip: slot and generation survive the kernel u64.
     var wire = _encode_token(12345, UInt64(0xABCDEF12))
     assert_equal(_decode_slot(wire), 12345)

@@ -58,12 +58,20 @@ def _verify_readiness_abi():
         comptime assert size_of[darwin._Kevent]() == 32, "invalid kevent ABI"
         comptime assert align_of[darwin._Kevent]() == 8, "invalid kevent align"
     else:
-        comptime assert (
-            size_of[linux._EpollEvent]() == 16
-        ), "invalid epoll_event ABI"
-        comptime assert (
-            align_of[linux._EpollEvent]() == 8
-        ), "invalid epoll_event align"
+        comptime if linux._EPOLL_PACKED:
+            comptime assert (
+                size_of[linux._EpollEventPacked]() == 12
+            ), "invalid epoll_event ABI"
+            comptime assert (
+                align_of[linux._EpollEventPacked]() == 4
+            ), "invalid epoll_event align"
+        else:
+            comptime assert (
+                size_of[linux._EpollEventAligned]() == 16
+            ), "invalid epoll_event ABI"
+            comptime assert (
+                align_of[linux._EpollEventAligned]() == 8
+            ), "invalid epoll_event align"
 
 
 def _epoll_mask(readable: Bool, writable: Bool) -> UInt32:
@@ -75,6 +83,16 @@ def _epoll_mask(readable: Bool, writable: Bool) -> UInt32:
     if writable:
         mask |= linux.EPOLLOUT
     return mask
+
+
+def _epoll_ctl_words(mask: UInt32, token: UInt64) -> Array[UInt32, 4]:
+    # Layout-correct ctl buffer for both epoll ABIs (packed x86-64 vs
+    # aligned aarch64); see linux._EPOLL_STRIDE_U32/_EPOLL_DATA_U32.
+    var words = Array[UInt32, 4](fill=0)
+    words[0] = mask
+    words[linux._EPOLL_DATA_U32] = UInt32(token & UInt64(0xFFFFFFFF))
+    words[linux._EPOLL_DATA_U32 + 1] = UInt32(token >> 32)
+    return words^
 
 
 def _kqueue_wants_read(readable: Bool, writable: Bool) -> Bool:
@@ -116,16 +134,12 @@ struct _EventQueue(Movable):
             if writable:
                 self._kevent_add(fd, darwin.EVFILT_WRITE, token)
         else:
-            var event = linux._EpollEvent(
-                events=_epoll_mask(readable, writable),
-                _reserved=0,
-                data=token,
-            )
+            var words = _epoll_ctl_words(_epoll_mask(readable, writable), token)
             var rc = external_call["epoll_ctl", c_int](
                 c_int(self._fd.raw()),
                 c_int(linux.EPOLL_CTL_ADD),
                 c_int(fd),
-                Pointer(to=event),
+                Pointer(to=words[0]),
             )
             if rc == -1:
                 var errno = get_errno().value
@@ -144,28 +158,22 @@ struct _EventQueue(Movable):
             if writable:
                 self._kevent_add(fd, darwin.EVFILT_WRITE, token)
         else:
-            var event = linux._EpollEvent(
-                events=_epoll_mask(readable, writable),
-                _reserved=0,
-                data=token,
-            )
+            var words = _epoll_ctl_words(_epoll_mask(readable, writable), token)
             var rc = external_call["epoll_ctl", c_int](
                 c_int(self._fd.raw()),
                 c_int(linux.EPOLL_CTL_MOD),
                 c_int(fd),
-                Pointer(to=event),
+                Pointer(to=words[0]),
             )
             if rc == -1:
-                var event2 = linux._EpollEvent(
-                    events=_epoll_mask(readable, writable),
-                    _reserved=0,
-                    data=token,
+                var words2 = _epoll_ctl_words(
+                    _epoll_mask(readable, writable), token
                 )
                 var rc2 = external_call["epoll_ctl", c_int](
                     c_int(self._fd.raw()),
                     c_int(linux.EPOLL_CTL_ADD),
                     c_int(fd),
-                    Pointer(to=event2),
+                    Pointer(to=words2[0]),
                 )
                 if rc2 == -1:
                     var errno2 = get_errno().value
@@ -177,12 +185,12 @@ struct _EventQueue(Movable):
             self._kevent_delete(fd, darwin.EVFILT_READ)
             self._kevent_delete(fd, darwin.EVFILT_WRITE)
         else:
-            var event = linux._EpollEvent(events=0, _reserved=0, data=0)
+            var words = _epoll_ctl_words(0, 0)
             _ = external_call["epoll_ctl", c_int](
                 c_int(self._fd._value),
                 c_int(linux.EPOLL_CTL_DEL),
                 c_int(fd),
-                Pointer(to=event),
+                Pointer(to=words[0]),
             )
 
     def wait(
@@ -197,9 +205,7 @@ struct _EventQueue(Movable):
         mut self, deadline: _Deadline
     ) raises NetError -> List[_ReadyEvent]:
         var out = List[_ReadyEvent]()
-        var base = Pointer(to=self._scratch[0]).unsafe_bitcast[
-            linux._EpollEvent
-        ]()
+        var base = Pointer(to=self._scratch[0]).unsafe_bitcast[UInt32]()
         while True:
             var timeout = _epoll_timeout_ms(deadline)
             var rc = external_call["epoll_wait", c_int](
@@ -221,21 +227,25 @@ struct _EventQueue(Movable):
                 continue
             var count = Int(rc)
             for i in range(count):
-                var ev = base[unsafe_offset=i]
-                var readable = (ev.events & linux.EPOLLIN) != 0
-                var writable = (ev.events & linux.EPOLLOUT) != 0
+                var stride = i * linux._EPOLL_STRIDE_U32
+                var mask = base[unsafe_offset=stride]
+                var data_off = stride + linux._EPOLL_DATA_U32
+                var token = (
+                    UInt64(base[unsafe_offset=data_off + 1]) << 32
+                ) | UInt64(base[unsafe_offset=data_off])
+                var readable = (mask & linux.EPOLLIN) != 0
+                var writable = (mask & linux.EPOLLOUT) != 0
                 var eof = (
-                    ev.events
-                    & (linux.EPOLLERR | linux.EPOLLHUP | linux.EPOLLRDHUP)
+                    mask & (linux.EPOLLERR | linux.EPOLLHUP | linux.EPOLLRDHUP)
                 ) != 0
                 out.append(
                     _ReadyEvent(
                         fd=-1,
                         readable=readable,
                         writable=writable,
-                        has_error=(ev.events & linux.EPOLLERR) != 0,
+                        has_error=(mask & linux.EPOLLERR) != 0,
                         eof=eof,
-                        token_data=ev.data,
+                        token_data=token,
                     )
                 )
             return out^
