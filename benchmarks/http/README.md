@@ -74,11 +74,12 @@ curl -X POST --data-binary @/tmp/fixed.body \
   http://127.0.0.1:18080/echo -o /tmp/echo.body
 ```
 
-## Mojo benchmarks (landing later)
+## Mojo benchmarks
 
 - `benchmarks/http_parse.mojo` (Phase 1): parser time by input size.
-- `benchmarks/http_server.mojo` (Phase 3+): poll vs epoll/kqueue delta,
-  Go comparison, CPU profile, memory measurement.
+- `benchmarks/http_server.mojo` (Phase 4): `pixi run benchmark-http-server`.
+  Sequential keep-alive round-trips plus nonblocking tick time with many
+  idle connections (ready-batch-only proof).
 
 ## Phase 3 poll baseline (preliminary, same host)
 
@@ -106,3 +107,40 @@ per-tick full-table scans (poll set build, deadline checks, interest
 sync), a `time()` syscall per tick for `Date`, string copies on the
 request path, and `List` prefix drains. No feature is cut to chase the
 number; the gap is profiled and closed in Phase 4.
+
+## Phase 4 kqueue baseline (preliminary, same host)
+
+Same caveats as Phase 3 (loader shared the server host, single runs, no
+CPU pinning on the Mojo side). Production `serve`-loop numbers with a
+separate loader, `GOMAXPROCS=1` pinning, and the 30 s x 5 procedure above
+are re-recorded as follow-up work; the harness below is checked in so the
+comparison is reproducible (`pixi run benchmark-http-server`).
+
+- Machine: Apple M2 Pro, darwin/arm64, `mojo 1.0.0`.
+- Backend: kqueue (level-triggered) via `net/_sys/readiness.mojo`; the
+  poll set-build is gone from the production path.
+- Tick loop: no per-tick full-table scans. Ready events drive only touched
+  connections (slot map + token generation check); capped pipelines
+  re-drive via an explicit urgent list; fairness counters reset lazily per
+  tick id; deadlines expire via an indexed min-heap and the wait timeout
+  peeks the heap minimum.
+- Harness (`benchmarks/http_server.mojo`, tick-driven, in-process):
+  500 sequential keep-alive `GET /fixed` (64 B) round-trips, then 1000 idle
+  keep-alive connections with nonblocking ticks.
+
+| Measurement | Value |
+| --- | --- |
+| Sequential round-trips/s (tick harness, 64 B) | ~230/s |
+| Avg nonblocking tick with 1000 idle conns | ~14 us |
+| Idle connections accepted / active after close | 1000 / 0 |
+| `test-http-server` (27 tests) | pass |
+| `test-reactor` (11 tests, incl. EOF+unread) | pass |
+| `test-sys` (18 tests, incl. ABI + queue fd leak) | pass |
+
+The ~14 us idle tick (vs a poll build+scan proportional to the
+registration count on every tick) is the Phase 4 delta: active-event
+processing no longer walks the full connection table. Remaining profiled
+costs carried forward (unchanged from Phase 3): one `Date` syscall per
+tick, string copies on the request path, `List` prefix drains. No
+bottleneck optimization beyond the readiness + scan removal was added, per
+the Phase 4 rule (optimizations only with before/after measurements).

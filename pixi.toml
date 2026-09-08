@@ -48,6 +48,7 @@ test-package = "mojo run --Werror -I build tests/package_smoke.mojo"
 benchmark-ip = "mojo run --Werror -I . benchmarks/ip_parse.mojo"
 benchmark-loopback = "mojo run --Werror -I . benchmarks/loopback_io.mojo"
 benchmark-http-parse = "mojo run --Werror -I . benchmarks/http_parse.mojo"
+benchmark-http-server = "mojo run --Werror -I . benchmarks/http_server.mojo"
 
 [dependencies]
 mojo = ">=1.0.0,<2"

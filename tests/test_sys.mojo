@@ -1,4 +1,5 @@
 from std.ffi import c_int, external_call
+from std.sys import CompilationTarget
 from std.testing import (
     assert_equal,
     assert_false,
@@ -10,6 +11,13 @@ from net.error import NetErrorKind
 from net import dial_tcp, listen_tcp, listen_udp
 from net.timeout import Timeout, _Deadline
 from tests.support import _count_open_fds
+from net._sys.readiness import (
+    _decode_gen_low,
+    _decode_slot,
+    _encode_token,
+    _EventQueue,
+    _verify_readiness_abi,
+)
 from net._sys.common import (
     AF_INET,
     AF_UNIX,
@@ -246,6 +254,85 @@ def test_open_fd_count_returns_to_baseline() raises:
     var after = _count_open_fds()
     assert_equal(before, after)
     listener.close()
+
+
+def test_readiness_abi_sizes_offsets_and_token_roundtrip() raises:
+    from std.sys import align_of, size_of
+
+    import net._sys.darwin as darwin
+    import net._sys.linux as linux
+    from net._sys.readiness import _Timespec
+
+    _verify_readiness_abi()
+    assert_equal(size_of[_Timespec](), 16)
+    assert_equal(align_of[_Timespec](), 8)
+    # Offset checks via raw byte writes: each field lands where C expects.
+    var ts = _Timespec(tv_sec=Int64(0x0102030405060708), tv_nsec=Int64(0))
+    var ts_bytes = Pointer(to=ts).unsafe_bitcast[UInt8]()
+    assert_equal(ts_bytes[unsafe_offset=0], 8)
+    assert_equal(ts_bytes[unsafe_offset=7], 1)
+    comptime if CompilationTarget.is_macos():
+        assert_equal(size_of[darwin._Kevent](), 32)
+        assert_equal(align_of[darwin._Kevent](), 8)
+        var kev = darwin._Kevent(
+            ident=UInt64(0x0807060504030201),
+            filter=Int16(-1),
+            flags=UInt16(5),
+            fflags=UInt32(0),
+            data=Int64(0),
+            udata=UInt64(0),
+        )
+        var kev_bytes = Pointer(to=kev).unsafe_bitcast[UInt8]()
+        assert_equal(kev_bytes[unsafe_offset=0], 1)
+        assert_equal(kev_bytes[unsafe_offset=7], 8)
+        assert_equal(kev_bytes[unsafe_offset=8], 255)
+        assert_equal(kev_bytes[unsafe_offset=10], 5)
+    else:
+        comptime if linux._EPOLL_PACKED:
+            # x86-64 packed layout: events@0, data@4, size 12.
+            assert_equal(size_of[linux._EpollEventPacked](), 12)
+            assert_equal(align_of[linux._EpollEventPacked](), 4)
+            var ev = linux._EpollEventPacked(
+                events=UInt32(0x04030201),
+                data_lo=UInt32(0x04030201),
+                data_hi=UInt32(0x08070605),
+            )
+            var ev_bytes = Pointer(to=ev).unsafe_bitcast[UInt8]()
+            assert_equal(ev_bytes[unsafe_offset=0], 1)
+            assert_equal(ev_bytes[unsafe_offset=3], 4)
+            assert_equal(ev_bytes[unsafe_offset=4], 1)
+            assert_equal(ev_bytes[unsafe_offset=11], 8)
+        else:
+            # aarch64 natural layout: events@0, 4B padding, data@8, size 16.
+            assert_equal(size_of[linux._EpollEventAligned](), 16)
+            assert_equal(align_of[linux._EpollEventAligned](), 8)
+            var ev = linux._EpollEventAligned(
+                events=UInt32(0x04030201),
+                _reserved=0,
+                data=UInt64(0x0807060504030201),
+            )
+            var ev_bytes = Pointer(to=ev).unsafe_bitcast[UInt8]()
+            assert_equal(ev_bytes[unsafe_offset=0], 1)
+            assert_equal(ev_bytes[unsafe_offset=3], 4)
+            assert_equal(ev_bytes[unsafe_offset=8], 1)
+            assert_equal(ev_bytes[unsafe_offset=15], 8)
+    # Event token round-trip: slot and generation survive the kernel u64.
+    var wire = _encode_token(12345, UInt64(0xABCDEF12))
+    assert_equal(_decode_slot(wire), 12345)
+    assert_equal(_decode_gen_low(wire), UInt64(0xABCDEF12))
+
+
+def test_event_queue_fd_leak() raises:
+    for _ in range(3):
+        var warm = _EventQueue()
+        _ = warm.raw_fd()
+    var before = _count_open_fds()
+    assert_true(before > 0)
+    for _ in range(20):
+        var queue = _EventQueue()
+        _ = queue.raw_fd()
+    var after = _count_open_fds()
+    assert_equal(before, after)
 
 
 def main() raises:

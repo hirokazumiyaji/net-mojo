@@ -1,3 +1,5 @@
+from std.sys import CompilationTarget
+
 comptime AF_INET: Int32 = 2
 comptime AF_INET6: Int32 = 10
 comptime AF_UNIX: Int32 = 1
@@ -43,6 +45,45 @@ comptime FD_CLOEXEC: Int32 = 1
 comptime O_NONBLOCK: Int32 = 0x800
 comptime AI_NUMERICSERV: Int32 = 0x400
 comptime IF_NAMESIZE: Int = 16
+
+# --- epoll event queue (Phase 4) ---
+# struct epoll_event { uint32_t events; epoll_data_t data; } has a
+# per-arch layout: glibc defines __EPOLL_PACKED only for __x86_64__
+# (i386 ABI compat), giving events@0 (4B), data@4 (8B), size 12,
+# align 4. On aarch64 it is naturally aligned: events@0 (4B), 4B
+# padding, data@8 (8B), size 16, align 8. NEON exists only on ARM, so
+# a non-NEON target means x86-64 here (64-bit targets only).
+comptime EPOLL_CLOEXEC: Int32 = 0x80000
+comptime EPOLL_CTL_ADD: Int32 = 1
+comptime EPOLL_CTL_DEL: Int32 = 2
+comptime EPOLL_CTL_MOD: Int32 = 3
+comptime EPOLLIN: UInt32 = 0x1
+comptime EPOLLOUT: UInt32 = 0x4
+comptime EPOLLERR: UInt32 = 0x8
+comptime EPOLLHUP: UInt32 = 0x10
+comptime EPOLLRDHUP: UInt32 = 0x2000
+
+
+@fieldwise_init
+struct _EpollEventPacked(Copyable, ImplicitlyCopyable, Movable):
+    var events: UInt32
+    var data_lo: UInt32
+    var data_hi: UInt32
+
+
+@fieldwise_init
+struct _EpollEventAligned(Copyable, ImplicitlyCopyable, Movable):
+    var events: UInt32
+    var _reserved: UInt32
+    var data: UInt64
+
+
+comptime _EPOLL_PACKED: Bool = not CompilationTarget.has_neon()
+# u32-word stride and data offset for the ready batch and ctl buffers.
+# Packed (x86-64): [events, data_lo, data_hi]. Aligned (aarch64):
+# [events, pad, data_lo, data_hi].
+comptime _EPOLL_STRIDE_U32: Int = 3 if _EPOLL_PACKED else 4
+comptime _EPOLL_DATA_U32: Int = 1 if _EPOLL_PACKED else 2
 
 
 @fieldwise_init

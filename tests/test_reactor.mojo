@@ -288,8 +288,7 @@ def test_terminal_hangup_reported_without_interests() raises:
     listener.close()
 
 
-def test_paused_readable_direction_stays_quiet() raises:
-    # Disabling reads while keeping writes must suppress ordinary
+def test_paused_readable_direction_stays_quiet() raises:  # Disabling reads while keeping writes must suppress ordinary
     # readiness: backpressure pauses must not spin or starve others.
     var listener = listen_tcp("127.0.0.1:0")
     var client = dial_tcp(String(listener.local_address()), Timeout.seconds(1))
@@ -322,6 +321,43 @@ def test_paused_readable_direction_stays_quiet() raises:
 
     assert_true(reactor.remove(token))
     client.close()
+    server.close()
+    listener.close()
+
+
+def test_eof_with_unread_data_still_surfaces() raises:
+    # kqueue reports a half-close with pending bytes as READ+EOF: the data
+    # must be delivered first, then EOF, never dropped.
+    var listener = listen_tcp("127.0.0.1:0")
+    var client = dial_tcp(String(listener.local_address()), Timeout.seconds(1))
+    var server = listener.accept(Timeout.seconds(1))
+
+    var reactor = Reactor()
+    var token = reactor.register(server.raw_fd(), readable=True, writable=False)
+    var ping: Array[Byte, 5] = [1, 2, 3, 4, 5]
+    client.write_all(Span(ping), Timeout.seconds(1))
+    client.close()
+
+    var events = reactor.wait(Timeout.seconds(1))
+    assert_equal(len(events), 1)
+    assert_equal(events[0].token, token)
+    assert_true(events[0].readable)
+
+    var received = Array[Byte, 5](fill=0)
+    assert_equal(server.try_read(Span(received)), 5)
+    assert_equal(received[0], 1)
+    assert_equal(received[4], 5)
+
+    # The EOF after the drain must still wake the loop.
+    var eof_events = reactor.wait(Timeout.seconds(1))
+    assert_equal(len(eof_events), 1)
+    assert_equal(eof_events[0].token, token)
+    assert_true(eof_events[0].readable)
+
+    var tail = Array[Byte, 1](fill=0)
+    assert_equal(server.try_read(Span(tail)), 0)
+
+    assert_true(reactor.remove(token))
     server.close()
     listener.close()
 
