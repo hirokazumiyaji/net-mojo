@@ -1,4 +1,4 @@
-"""Single event-loop HTTP/1.1 origin server (poll baseline).
+"""Single event-loop HTTP/1.1 origin server (epoll/kqueue).
 
 The loop owns one listener and a table of connections. Handler code runs
 synchronously on the loop thread: blocking I/O or long CPU work inside a
@@ -59,6 +59,13 @@ comptime _READ_CHUNK: Int = 8192
 comptime _SHUTDOWN_QUIET_MS: Int = 10
 
 
+@fieldwise_init
+struct _HeapEntry(Copyable, ImplicitlyCopyable, Movable):
+    var deadline: Int
+    var idx: Int
+    var seq: UInt64
+
+
 struct ServerControl(Movable):
     """Shutdown request handle polled by the loop owner.
 
@@ -100,13 +107,22 @@ struct Server(Movable):
     var _conns: List[HttpConnection]
     var _conn_free: List[Int]
     var _slot_map: List[Int]
-    var _fired: List[UInt8]
     var _active_conns: Int
     var _budget: BufferBudget
     var _shutdown_at: Int
     var _tick_date: String
+    # Phase 4: no per-tick full-table scans. Fairness counters reset lazily
+    # via _tick_seen, capped pipelines re-drive via _urgent, and deadlines
+    # expire via _deadline_heap. Ready events drive only touched conns.
+    var _tick_id: Int
+    var _tick_seen: List[Int]
+    var _urgent: List[Int]
+    var _urgent_flag: List[Bool]
+    var _deadline_heap: List[_HeapEntry]
+    var _deadline_seq: List[UInt64]
+    var _armed_mark: List[Int]
 
-    def __init__(out self, var config: ServerConfig):
+    def __init__(out self, var config: ServerConfig) raises:
         var budget_total = config.total_buffer_budget
         self.config = config^
         self.control = ServerControl()
@@ -117,11 +133,17 @@ struct Server(Movable):
         self._conns = List[HttpConnection]()
         self._conn_free = List[Int]()
         self._slot_map = List[Int]()
-        self._fired = List[UInt8]()
         self._active_conns = 0
         self._budget = BufferBudget(budget_total)
         self._shutdown_at = NO_DEADLINE
         self._tick_date = String("")
+        self._tick_id = 0
+        self._tick_seen = List[Int]()
+        self._urgent = List[Int]()
+        self._urgent_flag = List[Bool]()
+        self._deadline_heap = List[_HeapEntry]()
+        self._deadline_seq = List[UInt64]()
+        self._armed_mark = List[Int]()
 
     def is_shutdown_requested(self) -> Bool:
         return self.control.is_shutdown_requested()
@@ -159,18 +181,20 @@ struct Server(Movable):
         if not self._listener and self._active_conns == 0:
             self.control.mark_exited()
             return False
-        var rush = False
-        for i in range(len(self._conns)):
-            if self._conns[i].active:
-                self._conns[i].reset_tick()
-                if self._conns[i].more_work:
-                    rush = True
-        # A previous tick capped by max_requests_per_tick with buffered
-        # work left behind skips the wait: the next requests need no
-        # socket event, and blocking up to the poll cap here would stall
-        # a pipelined flood ~100ms per 16 requests.
+        self._tick_id += 1
+        # Capped pipelines from the previous tick re-drive without a kernel
+        # event; blocking up to the wait cap here would stall a pipelined
+        # flood ~100ms per 16 requests.
+        var urgent = List[Int]()
+        for i in range(len(self._urgent)):
+            var idx = self._urgent[i]
+            if idx >= 0 and idx < len(self._conns) and self._conns[idx].active:
+                urgent.append(idx)
+            if idx >= 0 and idx < len(self._urgent_flag):
+                self._urgent_flag[idx] = False
+        self._urgent.clear()
         var wait_timeout = self._compute_timeout(now, timeout)
-        if rush:
+        if len(urgent) > 0:
             wait_timeout = Timeout.nanoseconds(0)
         var events = self._reactor.wait(wait_timeout)
         now = now_ns()
@@ -179,15 +203,12 @@ struct Server(Movable):
                 if events[i].token == self._listener_token:
                     self._accept_pending(now)
                     break
-        # O(events + conns) dispatch: fold the ready batch into a reused
-        # per-connection bitmask (1 = readable, 2 = writable) via the
-        # slot map instead of scanning events per connection. The token
-        # equality check also pins the generation, so a reused reactor
-        # slot can never steer an event at the wrong connection.
-        while len(self._fired) < len(self._conns):
-            self._fired.append(0)
-        for i in range(len(self._conns)):
-            self._fired[i] = 0
+        # Fold the ready batch into per-connection masks via the slot map.
+        # Token equality pins the generation, so a reused reactor slot can
+        # never steer an event at the wrong connection. Only touched conns
+        # plus urgent pipelines are driven; idle conns cost nothing.
+        var touched = List[Int]()
+        var masks = List[UInt8]()
         for k in range(len(events)):
             var slot = events[k].token.slot
             if slot < 0 or slot >= len(self._slot_map):
@@ -199,40 +220,51 @@ struct Server(Movable):
                 continue
             if not (self._conns[idx].token == events[k].token):
                 continue
-            var mask = self._fired[idx]
+            var found = -1
+            for t in range(len(touched)):
+                if touched[t] == idx:
+                    found = t
+                    break
+            var mask: UInt8 = 0
+            if found >= 0:
+                mask = masks[found]
             if events[k].readable:
                 mask |= 1
             if events[k].writable:
                 mask |= 2
-            self._fired[idx] = mask
-        for i in range(len(self._conns)):
-            if not self._conns[i].active:
+            if found >= 0:
+                masks[found] = mask
+            else:
+                touched.append(idx)
+                masks.append(mask)
+        for u in range(len(urgent)):
+            var idx = urgent[u]
+            var seen = False
+            for t in range(len(touched)):
+                if touched[t] == idx:
+                    seen = True
+                    break
+            if not seen:
+                touched.append(idx)
+                masks.append(0)
+        for t in range(len(touched)):
+            var idx = touched[t]
+            if not self._conns[idx].active:
                 continue
-            var readable = (self._fired[i] & 1) != 0
-            var writable = (self._fired[i] & 2) != 0
-            # Buffered bytes are re-driven only when they can make
-            # progress without new I/O: freshly arrived unscanned bytes,
-            # or a capped pipeline remainder flagged on its own
-            # connection. A fully scanned partial head waits for its
-            # next event (or deadline) instead of rescanning every tick,
-            # so one capped connection cannot force rescans on thousands
-            # of idle ones. Likewise, queued sends wait for writability;
-            # only fresh queues earn an optimistic flush inside the drive
-            # itself.
-            var drive = readable or writable
-            if not drive and self._conns[i].state == STATE_READING:
-                if self._conns[i].buffered_len() > 0:
-                    if (
-                        self._conns[i].buffered_len()
-                        > self._conns[i].scanned_len
-                    ):
-                        drive = True
-                    elif self._conns[i].more_work:
-                        drive = True
-            if drive:
-                self._conns[i].more_work = False
-                self._drive_conn(i, readable, writable, handler, now)
-        self._check_deadlines(now_ns())
+            if self._tick_seen[idx] != self._tick_id:
+                self._conns[idx].reset_tick()
+                self._tick_seen[idx] = self._tick_id
+            var readable = (masks[t] & 1) != 0
+            var writable = (masks[t] & 2) != 0
+            self._conns[idx].more_work = False
+            self._drive_conn(idx, readable, writable, handler, now)
+            if not self._conns[idx].active:
+                continue
+            if self._conns[idx].more_work:
+                self._push_urgent(idx)
+            else:
+                self._arm_deadline(idx)
+        self._expire_deadlines(now_ns())
         if not self._listener and self._active_conns == 0:
             self.control.mark_exited()
             return False
@@ -292,6 +324,133 @@ struct Server(Movable):
         while len(self._slot_map) <= slot:
             self._slot_map.append(-1)
 
+    def _ensure_conn_arrays(mut self, idx: Int):
+        while len(self._tick_seen) <= idx:
+            self._tick_seen.append(-1)
+            self._urgent_flag.append(False)
+            self._deadline_seq.append(1)
+            self._armed_mark.append(NO_DEADLINE)
+
+    def _push_urgent(mut self, idx: Int):
+        if idx < 0 or idx >= len(self._urgent_flag):
+            return
+        if self._urgent_flag[idx]:
+            return
+        self._urgent_flag[idx] = True
+        self._urgent.append(idx)
+
+    def _next_deadline(self, idx: Int) -> Int:
+        if not self._conns[idx].active:
+            return NO_DEADLINE
+        if self._conns[idx].state == STATE_READING:
+            if self._conns[idx].buffered_len() > 0:
+                var best = NO_DEADLINE
+                if self._conns[idx].body_at != NO_DEADLINE:
+                    best = self._conns[idx].body_at
+                if self._conns[idx].header_at != NO_DEADLINE:
+                    if best == NO_DEADLINE or self._conns[idx].header_at < best:
+                        best = self._conns[idx].header_at
+                return best
+            return self._conns[idx].idle_at
+        return self._conns[idx].write_at
+
+    def _arm_deadline(mut self, idx: Int):
+        if idx < 0 or idx >= len(self._conns):
+            return
+        self._ensure_conn_arrays(idx)
+        if not self._conns[idx].active:
+            self._armed_mark[idx] = NO_DEADLINE
+            return
+        var mark = self._next_deadline(idx)
+        if mark == self._armed_mark[idx]:
+            return
+        var seq = self._deadline_seq[idx] + 1
+        if seq == 0:
+            seq = 1
+        self._deadline_seq[idx] = seq
+        self._armed_mark[idx] = mark
+        if mark == NO_DEADLINE:
+            return
+        self._heap_push(mark, idx, seq)
+
+    def _heap_push(mut self, deadline: Int, idx: Int, seq: UInt64):
+        self._deadline_heap.append(
+            _HeapEntry(deadline=deadline, idx=idx, seq=seq)
+        )
+        var pos = len(self._deadline_heap) - 1
+        while pos > 0:
+            var parent = (pos - 1) // 2
+            if (
+                self._deadline_heap[parent].deadline
+                <= self._deadline_heap[pos].deadline
+            ):
+                break
+            var tmp = self._deadline_heap[parent]
+            self._deadline_heap[parent] = self._deadline_heap[pos]
+            self._deadline_heap[pos] = tmp
+            pos = parent
+
+    def _heap_pop(mut self) -> _HeapEntry:
+        var top = self._deadline_heap[0]
+        var last = self._deadline_heap.pop()
+        if len(self._deadline_heap) > 0:
+            self._deadline_heap[0] = last^
+            var pos = 0
+            while True:
+                var left = pos * 2 + 1
+                var right = left + 1
+                var smallest = pos
+                if (
+                    left < len(self._deadline_heap)
+                    and self._deadline_heap[left].deadline
+                    < self._deadline_heap[smallest].deadline
+                ):
+                    smallest = left
+                if (
+                    right < len(self._deadline_heap)
+                    and self._deadline_heap[right].deadline
+                    < self._deadline_heap[smallest].deadline
+                ):
+                    smallest = right
+                if smallest == pos:
+                    break
+                var tmp = self._deadline_heap[pos]
+                self._deadline_heap[pos] = self._deadline_heap[smallest]
+                self._deadline_heap[smallest] = tmp
+                pos = smallest
+        return top^
+
+    def _expire_deadlines(mut self, now: Int) raises NetError:
+        if self._shutdown_at != NO_DEADLINE and now >= self._shutdown_at:
+            # Shutdown expiry is global and runs once: close everything.
+            # O(N) here is fine; it is not a per-tick hot path.
+            for i in range(len(self._conns)):
+                if self._conns[i].active:
+                    self._close_conn(i)
+            return
+        while len(self._deadline_heap) > 0:
+            var top = self._deadline_heap[0]
+            if top.deadline > now:
+                break
+            _ = self._heap_pop()
+            var idx = top.idx
+            if idx < 0 or idx >= len(self._conns):
+                continue
+            if not self._conns[idx].active:
+                continue
+            if (
+                idx >= len(self._deadline_seq)
+                or self._deadline_seq[idx] != top.seq
+            ):
+                continue
+            # Recompute: only phases that can fire for the current state
+            # close. Stale timestamps from earlier phases must not kill a
+            # connection (e.g. an old header deadline during a long send).
+            var mark = self._next_deadline(idx)
+            if mark == NO_DEADLINE or mark > now:
+                continue
+            self._close_conn(idx)
+
     def _note_shutdown(mut self, now: Int):
         if self.control.is_shutdown_requested():
             if self._shutdown_at == NO_DEADLINE:
@@ -315,6 +474,7 @@ struct Server(Movable):
                         and self._conns[i].idle_at > quiet
                     ):
                         self._conns[i].idle_at = quiet
+                        self._arm_deadline(i)
 
     def _drop_listener(mut self):
         if self._listener:
@@ -364,6 +524,10 @@ struct Server(Movable):
                 self._slot_map[token.slot] = idx
                 self._active_conns += 1
                 accepted += 1
+                self._ensure_conn_arrays(idx)
+                self._tick_seen[idx] = self._tick_id
+                self._urgent_flag[idx] = False
+                self._arm_deadline(idx)
             except e:
                 if e.kind == NetErrorKind.timeout():
                     break
@@ -382,6 +546,15 @@ struct Server(Movable):
         if token.slot >= 0 and token.slot < len(self._slot_map):
             if self._slot_map[token.slot] == idx:
                 self._slot_map[token.slot] = -1
+        if idx >= 0 and idx < len(self._urgent_flag):
+            self._urgent_flag[idx] = False
+        if idx >= 0 and idx < len(self._deadline_seq):
+            var seq = self._deadline_seq[idx] + 1
+            if seq == 0:
+                seq = 1
+            self._deadline_seq[idx] = seq
+        if idx >= 0 and idx < len(self._armed_mark):
+            self._armed_mark[idx] = NO_DEADLINE
         # Release the whole pending reservation, not just the unsent
         # suffix: bytes already written were charged when queued, and
         # leaving the sent prefix charged would leak budget on every
@@ -843,41 +1016,8 @@ struct Server(Movable):
                 self.config.idle_timeout
             )
 
-    def _check_deadlines(mut self, now: Int) raises NetError:
-        for i in range(len(self._conns)):
-            if not self._conns[i].active:
-                continue
-            if self._shutdown_at != NO_DEADLINE and now >= self._shutdown_at:
-                self._close_conn(i)
-                continue
-            if self._conns[i].state == STATE_READING:
-                if self._conns[i].buffered_len() > 0:
-                    if (
-                        self._conns[i].body_at != NO_DEADLINE
-                        and now >= self._conns[i].body_at
-                    ):
-                        self._close_conn(i)
-                        continue
-                    if (
-                        self._conns[i].header_at != NO_DEADLINE
-                        and now >= self._conns[i].header_at
-                    ):
-                        self._close_conn(i)
-                        continue
-                else:
-                    if now >= self._conns[i].idle_at:
-                        self._close_conn(i)
-                        continue
-            else:
-                if (
-                    self._conns[i].write_at != NO_DEADLINE
-                    and now >= self._conns[i].write_at
-                ):
-                    self._close_conn(i)
-                    continue
-
     def _compute_timeout(
-        self, now: Int, timeout: Optional[Timeout]
+        mut self, now: Int, timeout: Optional[Timeout]
     ) raises NetError -> Optional[Timeout]:
         var explicit = _Deadline_from_optional_ms(timeout)
         var best = _TICK_POLL_CAP_MS
@@ -889,21 +1029,31 @@ struct Server(Movable):
                 left_ms = 0
             if left_ms < best:
                 best = Int(left_ms)
-        for i in range(len(self._conns)):
-            if not self._conns[i].active:
+        # Heap peek only: no scan over idle connections. Stale entries are
+        # skipped without popping so a burst of invalidations never costs
+        # more than the live minimum.
+        while len(self._deadline_heap) > 0:
+            var top = self._deadline_heap[0]
+            var idx = top.idx
+            if (
+                idx < 0
+                or idx >= len(self._conns)
+                or not self._conns[idx].active
+            ):
+                _ = self._heap_pop()
                 continue
-            # Mirror _check_deadlines: only phases that can actually
-            # fire for the current state shorten the wait. Stale
-            # timestamps from earlier phases must not busy-poll the
-            # loop (e.g. an old header deadline during a long send).
-            if self._conns[i].state == STATE_READING:
-                if self._conns[i].buffered_len() > 0:
-                    best = _sooner(best, self._conns[i].body_at, now)
-                    best = _sooner(best, self._conns[i].header_at, now)
-                else:
-                    best = _sooner(best, self._conns[i].idle_at, now)
-            else:
-                best = _sooner(best, self._conns[i].write_at, now)
+            if (
+                idx >= len(self._deadline_seq)
+                or self._deadline_seq[idx] != top.seq
+            ):
+                _ = self._heap_pop()
+                continue
+            var mark = self._next_deadline(idx)
+            if mark == NO_DEADLINE or mark != top.deadline:
+                _ = self._heap_pop()
+                continue
+            best = _sooner(best, mark, now)
+            break
         if best < 0:
             best = 0
         return Timeout.milliseconds(UInt64(best))
