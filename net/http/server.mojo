@@ -289,14 +289,15 @@ struct Server(Movable):
         mut control: ServerControl,
     ) raises:
         """Runs the event loop like `serve`, but polls and exits through
-        a caller-held `ServerControl` instead of the owned one, so the
-        caller keeps a shutdown handle across the blocking call.
+        a caller-held `ServerControl` instead of the owned one.
 
-        The handle is still polled, not shared: calling
-        `request_shutdown` from another thread becomes safe only once
-        the control is backed by shared atomic state (tracked Phase 4
-        work). Single-threaded callers can already structure
-        signal-driven shutdown around this seam.
+        The handle is polled, not shared: it is mutably borrowed for the
+        whole call, so the caller cannot use it while this runs, and
+        calling `request_shutdown` from another thread becomes safe only
+        once the control is backed by shared atomic state (tracked Phase 4
+        work). Today this only supports pre-requesting shutdown before
+        entry (then it exits promptly); to stop a running server, drive
+        `add_listener` + `tick` and call `request_shutdown` between ticks.
         """
         self.add_listener(listener^)
         while True:

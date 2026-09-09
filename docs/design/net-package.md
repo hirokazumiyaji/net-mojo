@@ -188,6 +188,19 @@ also covers hangup and error conditions, so a closed peer surfaces as `0`
 (EOF) or a system error on the next `try_*` call rather than hanging the
 loop.
 
+`net/_reactor.mojo` is the internal readiness layer used by `net.http`.
+It keeps the `Poller` contract (single-owner sockets, `raw_fd()` borrows,
+exactly one owner closes) and adds stable slot+generation tokens, interest
+updates, and ready-event batches. The production backend is epoll on Linux
+and kqueue on macOS (`net/_sys/readiness.mojo`, level-triggered, no
+runtime fallback); the poll implementation served as the baseline and is
+not on the production path. Ready events drive only touched connections
+through a slot map with token-equality checks, so idle connections cost
+no per-tick full-table scan; deadlines expire through an indexed min-heap
+and the wait timeout peeks the heap minimum. Per-arch ABI layouts
+(`epoll_event` packed vs aligned, `kevent` size/offsets, token
+round-trip) are pinned by build-time checks covered in `test_sys`.
+
 `raw_fd()` borrows the descriptor number; ownership stays with the socket.
 The owner must keep each registered socket alive until it is removed:
 Mojo destroys a move-only value at its last use, so an unreferenced socket
@@ -208,6 +221,40 @@ in-flight I/O on the same descriptor. `Poller` itself is single-threaded
 state; drive it from one thread. Async I/O remains future work pending
 language support.
 
+## HTTP/1.1 origin server
+
+`net/http/` is a plaintext HTTP/1.1 origin server built on the reactor
+above. The full contract lives in `docs/design/http-server.md`; this
+section records only the package-level boundaries.
+
+- Import from `net.http`, never re-exported through `net`. The parser
+  (`_parser`) and encoder (`_encoder`) are socket-independent; HTTP
+  semantics never leak into `net/_sys`.
+- One event loop owns the listener and the connection table. `serve`
+  takes listener ownership; `tick` runs one iteration and returns
+  `False` once the listener is gone and no connection remains. Tests
+  drive `tick` directly for deterministic I/O.
+- Handlers (`Handler.handle`) run synchronously on the loop thread and
+  see bounded buffered requests only: the full body (up to
+  `max_body_bytes`) arrives before the call. `Request` views and
+  `ResponseWriter` live only for the call; retaining means copying,
+  and the connection owns the queued response until it is sent.
+- One global `BufferBudget` counts wire bytes in receive buffers and
+  queued responses. Admission failures become 503+close, handler
+  overruns and raises become 500+close without leaking details, and a
+  slow reader pauses further reads so kernel buffers absorb the
+  backpressure instead of user memory.
+- Deadlines are absolute monotonic timestamps fixed at phase entry
+  (header/body/write/idle/shutdown grace); receiving one more byte
+  never extends them. Shutdown stops accepting, closes idle
+  connections at once, and drains in-flight requests within the grace
+  period.
+- The server performs no TLS, HTTP/2, or HTTP/3 itself. Shared
+  `Request`/`Headers`/`Handler`/`ResponseWriter` semantics are kept
+  protocol-agnostic (scheme/authority/path/query/trailers from Phase 0)
+  so future `_http2/` and `_http3/` adapters can reuse them; wire
+  formats and state machines stay per protocol.
+
 ## Testing
 
 Tests are split per module (`test_core`, `test_ip`, `test_address`, `test_sys`,
@@ -216,6 +263,18 @@ loopback with an ephemeral port so they neither collide nor reach the network.
 Examples double as end-to-end checks: each one verifies its own payload and
 exits non-zero on mismatch. Benchmarks report measurements only and define no
 pass/fail thresholds, so they cannot fail CI for timing reasons.
+
+HTTP adds `test_http_api`, `test_http_parser`, `test_http_response`,
+`test_reactor`, and `test_http_server` plus `benchmark-http-parse` and
+`benchmark-http-server`. Parser coverage includes every-byte-boundary
+splits, a seed-recorded (seed 42) randomized fragmentation case, a
+malformed corpus mapped to 400/413/414/431/505/417, and overflow/limit
+tables. `package_smoke` verifies the precompiled `build/net.mojoc`
+artifact serves both the TCP round-trip and the `net.http` codec.
+Sanitizer steps (`sanitize-sys`, `sanitize-tcp`, `sanitize-udp`,
+`sanitize-unix`) and fd-leak checks (`test_sys`, `test_reactor`) keep
+running in CI; long RSS/soak runs and formal 30 s x 5 performance
+comparisons stay manual and are recorded in `benchmarks/http/README.md`.
 
 `pixi run test` runs the full suite; per-module tasks (`pixi run test-tcp`, ...)
 match what CI executes step by step.

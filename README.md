@@ -84,6 +84,83 @@ TCP connections default to `TCP_NODELAY=1` (Go parity); tune with
 Unix socket paths are never removed by the library.
 Callers must remove a path after closing all descriptors.
 
+## HTTP/1.1 origin server
+
+`net.http` is a plaintext HTTP/1.1 origin server on a single event loop
+(epoll on Linux, kqueue on macOS). Import from `net.http`, not from `net`:
+
+```mojo
+from net import listen_tcp
+from net.http import Handler, Request, ResponseWriter, Server, ServerConfig
+
+struct HelloHandler(Handler):
+    def __init__(out self):
+        pass
+
+    def handle(mut self, req: Request, mut writer: ResponseWriter) raises:
+        if req.path == "/hello":
+            writer.set_status(200)
+            writer.write_string("hello")
+        else:
+            writer.set_status(404)
+            writer.write_string("missing")
+
+def main() raises:
+    var server = Server(ServerConfig.default())
+    var handler = HelloHandler()
+    server.serve(listen_tcp("127.0.0.1:8080"), handler)
+```
+
+Constraints (see `docs/design/http-server.md` for the full contract):
+
+- The handler runs synchronously on the loop thread. Blocking I/O or
+  long CPU work inside `handle` stalls every connection.
+- Bounded buffered requests only: the full body (up to
+  `max_body_bytes`, default 1 MiB) is received before `handle` runs.
+  Request streaming, response streaming, `Flush`, routers, and
+  middleware are not included.
+- `Request` views and `ResponseWriter` are valid only during the
+  `handle` call. Copy values you want to keep; the server owns the
+  receive buffer and the queued response.
+- Plaintext origin server only. Terminate TLS in front; the server
+  itself has no TLS, HTTP/2, or HTTP/3 support yet (Issue #42
+  Phases 6-10).
+- No client, no HTTP/1.0, no WebSocket/CONNECT/Upgrade switching, no
+  multipart helpers, no body compression, no static file serving.
+
+Resource bounds default to `max_connections=10,000`,
+request line 8 KiB, headers 32 KiB / 100 entries, body 1 MiB,
+response body 1 MiB, total buffer budget 256 MiB, header/body/write
+deadlines 5 s / 30 s / 30 s, idle keep-alive 60 s, shutdown grace
+30 s. Every value is enforced; see `net/http/config.mojo` and
+`ServerConfig.default()`.
+
+Shutdown is cooperative and single-threaded. Drive `add_listener` + `tick`
+from the loop owner and call `server.request_shutdown()` between ticks;
+that stops accepting, closes idle connections, drains in-flight requests
+within the grace period, then makes `tick` return `False`:
+
+```mojo
+server.add_listener(listen_tcp("127.0.0.1:8080"))
+while server.tick(handler):
+    if should_stop:
+        server.request_shutdown()
+```
+
+A running blocking `serve` cannot currently be stopped from another
+thread or from the same thread: `ServerControl` is not thread-safe and
+`serve_with_control` mutably borrows its `control` for the whole call,
+so the handle cannot be used while `serve_with_control` runs.
+Pre-requesting shutdown on the caller-held control before entry only
+makes it exit promptly. Cross-thread shutdown with a wakeup fd is
+future work. See `tests/test_http_server.mojo`
+(`test_shutdown_drains_in_flight_and_exits`).
+
+Reproduce the performance comparison with
+`benchmarks/http/README.md` (Go baseline in `benchmarks/http_go`,
+parser benchmark `pixi run benchmark-http-parse`, server benchmark
+`pixi run benchmark-http-server`). CI does not gate on timing numbers.
+
 ## Examples, Benchmarks, and Tests
 
 Examples are loopback-only and self-check their payloads:
@@ -94,9 +171,10 @@ pixi run example-udp
 pixi run example-unix
 ```
 
-Run the whole test suite with `pixi run test`, or a focused module with `pixi run test-tcp` and the analogous `test-core`, `test-ip`, `test-address`, `test-sys`, `test-udp`, `test-unix`, and `test-poll` tasks.
-Run benchmarks with `pixi run benchmark-ip` and `pixi run benchmark-loopback`.
+Run the whole test suite with `pixi run test`, or a focused module with `pixi run test-tcp` and the analogous `test-core`, `test-ip`, `test-address`, `test-sys`, `test-udp`, `test-unix`, `test-poll`, `test-reactor`, `test-http-api`, `test-http-parser`, `test-http-response`, and `test-http-server` tasks.
+Run benchmarks with `pixi run benchmark-ip`, `pixi run benchmark-loopback`, `pixi run benchmark-http-parse`, and `pixi run benchmark-http-server`.
 Benchmarks report measurements and do not define pass or fail thresholds.
+HTTP examples: `pixi run example-http-hello`, `pixi run example-http-json`.
 
 ## Development and CI
 
@@ -119,6 +197,9 @@ Windows、32-bit ABI、表にない target は対象外です。
 環境は `pixi install --frozen` で構築します。
 test は全体を `pixi run test`、個別を `pixi run test-tcp` のように実行します。
 examples は loopback だけを使い、benchmarks は閾値を持たない測定プログラムです。
+HTTP/1.1 origin server は `net.http` から利用します（`pixi run example-http-hello`）。
+handler は loop 上で同期実行されるため、blocking 処理は入れません。
+詳細は [docs/design/http-server.md](docs/design/http-server.md) を参照してください。
 
 hostname は OS の同期 `getaddrinfo` で解決されます。
 名前解決の時間は connect timeout に含まれません。
