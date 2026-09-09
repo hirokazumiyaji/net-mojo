@@ -135,11 +135,26 @@ deadlines 5 s / 30 s / 30 s, idle keep-alive 60 s, shutdown grace
 30 s. Every value is enforced; see `net/http/config.mojo` and
 `ServerConfig.default()`.
 
-Shutdown: `server.request_shutdown()` stops accepting, closes idle
-connections, drains in-flight requests within the grace period, then
-exits. `serve_with_control` lets a single-threaded caller keep the
-control handle across the blocking call; cross-thread shutdown with a
-wakeup fd is future work.
+Shutdown is cooperative and single-threaded. Drive `add_listener` + `tick`
+from the loop owner and call `server.request_shutdown()` between ticks;
+that stops accepting, closes idle connections, drains in-flight requests
+within the grace period, then makes `tick` return `False`:
+
+```mojo
+server.add_listener(listen_tcp("127.0.0.1:8080"))
+while server.tick(handler):
+    if should_stop:
+        server.request_shutdown()
+```
+
+A running blocking `serve` cannot currently be stopped from another
+thread or from the same thread: `ServerControl` is not thread-safe and
+`serve_with_control` mutably borrows its `control` for the whole call,
+so the handle cannot be used while `serve_with_control` runs.
+Pre-requesting shutdown on the caller-held control before entry only
+makes it exit promptly. Cross-thread shutdown with a wakeup fd is
+future work. See `tests/test_http_server.mojo`
+(`test_shutdown_drains_in_flight_and_exits`).
 
 Reproduce the performance comparison with
 `benchmarks/http/README.md` (Go baseline in `benchmarks/http_go`,
