@@ -126,15 +126,60 @@ def _get_ptr[
     )
 
 
-def _parse_timestamp(b: Span[Byte, _], start_pos: Int) -> Int:
-    var val = 0
-    var pos = start_pos
-    while (
-        pos < len(b) and b[pos] >= Byte(ord("0")) and b[pos] <= Byte(ord("9"))
-    ):
-        val = val * 10 + Int(b[pos] - Byte(ord("0")))
-        pos += 1
-    return val
+def _process_stream_buffer(
+    mut buf: List[Byte],
+    now_ns: Int,
+    mut latencies: List[Int],
+) -> Bool:
+    var marker = "data: ".as_bytes()
+    var marker_len = len(marker)
+    var consumed_to = 0
+    var has_stream_end = False
+
+    var s = String(from_utf8_lossy=Span(buf))
+    if s.find("0\r\n\r\n") >= 0:
+        has_stream_end = True
+
+    var j = 0
+    while j + marker_len <= len(buf):
+        var matched = True
+        for m in range(marker_len):
+            if buf[j + m] != marker[m]:
+                matched = False
+                break
+        if matched:
+            var num_start = j + marker_len
+            var num_end = num_start
+            while (
+                num_end < len(buf)
+                and buf[num_end] != Byte(ord("\n"))
+                and buf[num_end] != Byte(ord("\r"))
+            ):
+                num_end += 1
+
+            if num_end < len(buf):
+                var val: Int = 0
+                for p in range(num_start, num_end):
+                    if buf[p] >= Byte(ord("0")) and buf[p] <= Byte(ord("9")):
+                        val = val * 10 + Int(buf[p] - Byte(ord("0")))
+                if val > 0 and val <= now_ns:
+                    var lat_us = (now_ns - val) // 1000
+                    if lat_us >= 0 and lat_us < 10000000:
+                        latencies.append(lat_us)
+                j = num_end + 1
+                consumed_to = j
+            else:
+                break
+        else:
+            j += 1
+
+    if consumed_to > 0:
+        var remaining = List[Byte]()
+        for k in range(consumed_to, len(buf)):
+            remaining.append(buf[k])
+        buf = remaining^
+
+    return has_stream_end
 
 
 def main() raises:
@@ -211,6 +256,9 @@ def main() raises:
     if Int(threads) == 0:
         raise Error("malloc failed for threads")
 
+    for i in range(num_streams):
+        _get_ptr(threads, i).unsafe_write(0)
+
     var cpu_start = external_call["clock", c_ulong]()
     var bench_start = perf_counter_ns()
 
@@ -235,6 +283,20 @@ def main() raises:
             ctx_p.unsafe_bitcast[Byte](),
         )
         if Int(rc) != 0:
+            var s = ResponseSender(s_addr)
+            s.abort()
+            for prev in range(i):
+                var h = _get_ptr(threads, prev)[]
+                if h != 0:
+                    _ = external_call["pthread_join", c_int](
+                        c_ulong(h),
+                        Optional[Pointer[Byte, MutUntrackedOrigin]](None),
+                    )
+            for rem in range(i + 1, num_streams):
+                var rem_addr = _get_ptr(sender_boxes, rem)[]
+                if rem_addr != 0:
+                    var rem_s = ResponseSender(rem_addr)
+                    rem_s.abort()
             raise Error("pthread_create failed")
         _get_ptr(threads, i).unsafe_write(handle)
 
@@ -242,13 +304,23 @@ def main() raises:
     var latencies = List[Int]()
     var finished_streams = 0
     var stream_finished = List[Bool]()
+    var remainders = List[List[Byte]]()
     for _ in range(num_streams):
         stream_finished.append(False)
+        remainders.append(List[Byte]())
 
     var read_buf = Array[Byte, 8192](fill=0)
-    var marker = "data: ".as_bytes()
+    var bench_deadline_ns = (
+        Int(perf_counter_ns()) + 30 * 1000 * 1000 * 1000
+    )  # 30 second deadline
 
     while finished_streams < num_streams:
+        if Int(perf_counter_ns()) > bench_deadline_ns:
+            raise Error(
+                "Benchmark timed out after 30 seconds waiting for all streams"
+                " to finish"
+            )
+
         # Tick the event loop to flush detached sender messages to sockets
         _ = server.tick(handler, Timeout.milliseconds(2))
 
@@ -260,31 +332,21 @@ def main() raises:
             try:
                 var n = clients[i].try_read(Span(read_buf))
                 if n > 0:
-                    var span = Span(read_buf)[:n]
-                    # Scan for data: <timestamp>
-                    for j in range(len(span) - len(marker)):
-                        var matched = True
-                        for m in range(len(marker)):
-                            if span[j + m] != marker[m]:
-                                matched = False
-                                break
-                        if matched:
-                            var ts = _parse_timestamp(span, j + len(marker))
-                            if ts > 0 and ts <= now:
-                                var lat_us = (now - ts) // 1000
-                                if lat_us >= 0 and lat_us < 10000000:
-                                    latencies.append(lat_us)
-
-                    # Check for stream end
-                    var chunk_str = String(from_utf8_lossy=span)
-                    if chunk_str.find("0\r\n\r\n") >= 0:
+                    for k in range(n):
+                        remainders[i].append(read_buf[k])
+                    var is_ended = _process_stream_buffer(
+                        remainders[i], now, latencies
+                    )
+                    if is_ended:
                         stream_finished[i] = True
                         finished_streams += 1
                 elif n == 0:
+                    _ = _process_stream_buffer(remainders[i], now, latencies)
                     stream_finished[i] = True
                     finished_streams += 1
             except e:
                 if e.kind == NetErrorKind.closed():
+                    _ = _process_stream_buffer(remainders[i], now, latencies)
                     stream_finished[i] = True
                     finished_streams += 1
                 elif e.kind == NetErrorKind.timeout():

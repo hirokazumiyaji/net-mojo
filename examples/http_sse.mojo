@@ -86,9 +86,10 @@ struct SseHandler(Handler):
             if Int(ctx_ptr) == 0:
                 raise Error("malloc failed for SSE context")
 
+            var sender_addr = sender._take()
             ctx_ptr.unsafe_write(
                 _SseWorkerContext(
-                    sender_addr=sender._take(),
+                    sender_addr=sender_addr,
                     event_count=3,
                     interval_seconds=1.0,
                     completed=False,
@@ -104,7 +105,10 @@ struct SseHandler(Handler):
                 ctx_ptr.unsafe_bitcast[Byte](),
             )
             if Int(rc) != 0:
+                var s = ResponseSender(sender_addr)
+                s.abort()
                 external_call["free", NoneType](ctx_ptr)
+                self.worker_ctx_box[] = 0
                 raise Error("pthread_create failed")
             self.thread_handle_box[] = handle
         else:
