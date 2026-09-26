@@ -372,3 +372,174 @@ def encode_error(
     if not is_head:
         _append_string(out, body)
     return out^
+
+
+def _append_hex(mut out: List[Byte], val: Int):
+    if val <= 0:
+        out.append(Byte(ord("0")))
+        return
+    var buf = InlineArray[Byte, 16](fill=0)
+    var count = 0
+    var v = val
+    while v > 0:
+        var rem = v & 0xF
+        if rem < 10:
+            buf[count] = Byte(ord("0") + rem)
+        else:
+            buf[count] = Byte(ord("a") + rem - 10)
+        v = v >> 4
+        count += 1
+    for i in range(count - 1, -1, -1):
+        out.append(buf[i])
+
+
+def encode_chunked_start(
+    writer: ResponseWriter,
+    is_head: Bool,
+    date: StringSlice,
+    max_headers: Int,
+    max_bytes: Int,
+) raises NetError -> List[Byte]:
+    """Renders the status line and headers for a chunked response.
+
+    Framing rules:
+    - Status must be a 3-digit code (100-999).
+    - Content-Length is prohibited with chunked transfer coding (RFC 9112 §6.1).
+    - Transfer-Encoding header is managed by this encoder; caller-supplied is rejected.
+    - Status 1xx, 204, 205, 304 omit Transfer-Encoding: chunked.
+    - HEAD advertises Transfer-Encoding: chunked (if status allows body) but omits chunk bodies.
+    """
+    if writer.status < 100 or writer.status > 999:
+        raise NetError(
+            NetErrorKind.invalid_argument(),
+            "encode chunked start",
+            None,
+            "response status is not a three-digit code",
+        )
+    if len(writer.headers) > max_headers:
+        raise NetError(
+            NetErrorKind.invalid_argument(),
+            "encode chunked start",
+            None,
+            "too many response headers",
+        )
+    var header_bytes = 0
+    for i in range(len(writer.headers)):
+        header_bytes += writer.headers.name_at(i).byte_length()
+        header_bytes += writer.headers.value_byte_length(i)
+        header_bytes += 4
+    if header_bytes > max_bytes:
+        raise NetError(
+            NetErrorKind.invalid_argument(),
+            "encode chunked start",
+            None,
+            "response headers too large",
+        )
+    if writer.headers.get_first("Content-Length"):
+        raise NetError(
+            NetErrorKind.invalid_argument(),
+            "encode chunked start",
+            None,
+            "Content-Length is not permitted with chunked Transfer-Encoding",
+        )
+    if writer.headers.get_first("Transfer-Encoding"):
+        raise NetError(
+            NetErrorKind.invalid_argument(),
+            "encode chunked start",
+            None,
+            "Transfer-Encoding header is managed by chunked encoder",
+        )
+
+    var emit_transfer_encoding = True
+    if (
+        (writer.status >= 100 and writer.status <= 199)
+        or writer.status == 204
+        or writer.status == 205
+        or writer.status == 304
+    ):
+        emit_transfer_encoding = False
+
+    var out = List[Byte]()
+    _append_string(
+        out,
+        String("HTTP/1.1 ")
+        + String(writer.status)
+        + String(" ")
+        + _status_reason(writer.status)
+        + String("\r\n"),
+    )
+    for i in range(len(writer.headers)):
+        var name = writer.headers.name_at(i)
+        var value = writer.headers.value_bytes_at(i)
+        var name_bytes = name.as_bytes()
+        var value_bytes = Span(value)
+        for k in range(len(name_bytes)):
+            if name_bytes[k] == Byte(ord("\r")) or name_bytes[k] == Byte(
+                ord("\n")
+            ):
+                raise NetError(
+                    NetErrorKind.invalid_argument(),
+                    "encode chunked start",
+                    None,
+                    "response header contains CR or LF",
+                )
+        for k in range(len(value_bytes)):
+            if value_bytes[k] == Byte(ord("\r")) or value_bytes[k] == Byte(
+                ord("\n")
+            ):
+                raise NetError(
+                    NetErrorKind.invalid_argument(),
+                    "encode chunked start",
+                    None,
+                    "response header contains CR or LF",
+                )
+        _append_string(out, name + String(": "))
+        for k in range(len(value_bytes)):
+            out.append(value_bytes[k])
+        _append_string(out, String("\r\n"))
+
+    if not writer.headers.get_first("Date"):
+        _reject_response_injection("Date", date)
+        _append_string(out, String("Date: ") + String(date) + String("\r\n"))
+
+    if emit_transfer_encoding:
+        _append_string(out, String("Transfer-Encoding: chunked\r\n"))
+
+    if writer.should_close:
+        var connection = writer.headers.get_first("Connection")
+        var has_close = False
+        if connection:
+            has_close = _has_close_token(connection.value())
+        if not has_close:
+            _append_string(out, String("Connection: close\r\n"))
+
+    _append_string(out, String("\r\n"))
+    return out^
+
+
+def encode_chunk[origin: ImmOrigin](data: Span[Byte, origin]) -> List[Byte]:
+    """Encodes a single chunk with hex length prefix and CRLF delimiters."""
+    var out = List[Byte]()
+    if len(data) == 0:
+        return out^
+    _append_hex(out, len(data))
+    out.append(Byte(ord("\r")))
+    out.append(Byte(ord("\n")))
+    out.reserve(len(out) + len(data) + 2)
+    for i in range(len(data)):
+        out.append(data[i])
+    out.append(Byte(ord("\r")))
+    out.append(Byte(ord("\n")))
+    return out^
+
+
+def encode_chunk_end() -> List[Byte]:
+    """Encodes the terminal 0-length chunk marking the end of chunked body."""
+    var out = List[Byte]()
+    out.reserve(5)
+    out.append(Byte(ord("0")))
+    out.append(Byte(ord("\r")))
+    out.append(Byte(ord("\n")))
+    out.append(Byte(ord("\r")))
+    out.append(Byte(ord("\n")))
+    return out^

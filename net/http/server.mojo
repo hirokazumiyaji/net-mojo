@@ -42,11 +42,15 @@ from ._connection import (
     STATE_READING,
     STATE_SENDING,
     STATE_SENDING_100,
+    STATE_STREAMING,
 )
 from ._deadline import NO_DEADLINE, deadline_from_now, now_ns
 from ._detach import (
     MSG_KIND_ABORT,
+    MSG_KIND_CHUNK,
+    MSG_KIND_FINISH,
     MSG_KIND_RESPOND,
+    MSG_KIND_START,
     _release_detach_state,
     _SharedDetachState,
     DetachMessage,
@@ -54,6 +58,9 @@ from ._detach import (
 from ._encoder import (
     current_http_date,
     encode_100_continue,
+    encode_chunk,
+    encode_chunk_end,
+    encode_chunked_start,
     encode_error,
     encode_response,
 )
@@ -61,7 +68,7 @@ from ._parser import ParseResult, parse_head, parse_one
 from .config import ServerConfig
 from .handler import Handler
 from .headers import Headers
-from .response import ResponseWriter
+from .response import ResponseWriter, has_body_for_status
 
 
 comptime _TICK_POLL_CAP_MS: Int = 100
@@ -394,6 +401,10 @@ struct Server(Movable):
             return NO_DEADLINE
         if self._conns[idx].state == STATE_DETACHED:
             return self._conns[idx].detach_at
+        if self._conns[idx].state == STATE_STREAMING:
+            if self._conns[idx].write_at != NO_DEADLINE:
+                return self._conns[idx].write_at
+            return self._conns[idx].detach_at
         if self._conns[idx].state == STATE_READING:
             if self._conns[idx].buffered_len() > 0:
                 var best = NO_DEADLINE
@@ -502,6 +513,9 @@ struct Server(Movable):
             if mark == NO_DEADLINE or mark > now:
                 continue
             if self._conns[idx].state == STATE_DETACHED:
+                self._handle_detached_timeout(idx)
+                continue
+            if self._conns[idx].state == STATE_STREAMING:
                 self._handle_detached_timeout(idx)
                 continue
             self._close_conn(idx)
@@ -682,11 +696,15 @@ struct Server(Movable):
         if (
             self._conns[idx].state == STATE_SENDING
             or self._conns[idx].state == STATE_SENDING_100
+            or self._conns[idx].state == STATE_STREAMING
         ):
             self._pump_send(idx, writable)
             if not self._conns[idx].active:
                 return
-        if self._conns[idx].state == STATE_DETACHED:
+        if (
+            self._conns[idx].state == STATE_DETACHED
+            or self._conns[idx].state == STATE_STREAMING
+        ):
             if readable:
                 self._pump_read(idx, readable, now)
                 if not self._conns[idx].active:
@@ -986,6 +1004,7 @@ struct Server(Movable):
             slot=idx,
             generation=self._conns[idx].token.generation,
             wakeup_fd=self._wakeup_channel.write_fd(),
+            queue_limit=self.config.stream_queue_limit,
         )
         # The wire must advertise close whenever the connection will not
         # persist, even when the handler leaves the writer untouched.
@@ -1077,10 +1096,44 @@ struct Server(Movable):
             self.config.write_deadline
         )
 
+    def _complete_stream(mut self, idx: Int) raises NetError:
+        self._cleanup_detached_state(idx)
+        self._remove_detached_conn(idx)
+        self._conns[idx].stream_finished = False
+        self._conns[idx].stream_has_body = False
+        self._conns[idx].detach_at = NO_DEADLINE
+        self._conns[idx].requests_served += 1
+        if self._conns[idx].should_close or self._shutdown_at != NO_DEADLINE:
+            self._close_conn(idx)
+            return
+        self._conns[idx].state = STATE_READING
+        self._conns[idx].is_head = False
+        self._conns[idx].sent_100 = False
+        self._conns[idx].body_at = NO_DEADLINE
+        self._conns[idx].write_at = NO_DEADLINE
+        if self._conns[idx].buffered_len() > 0:
+            self._conns[idx].header_at = deadline_from_now(
+                self.config.header_deadline
+            )
+            self._conns[idx].idle_at = deadline_from_now(
+                self.config.idle_timeout
+            )
+            self._push_urgent(idx)
+        else:
+            self._conns[idx].header_at = NO_DEADLINE
+            self._conns[idx].idle_at = deadline_from_now(
+                self.config.idle_timeout
+            )
+
     def _pump_send(mut self, idx: Int, event: Bool) raises NetError:
         if not self._conns[idx].active:
             return
         if self._conns[idx].pending_remaining() == 0:
+            if (
+                self._conns[idx].state == STATE_STREAMING
+                and self._conns[idx].stream_finished
+            ):
+                self._complete_stream(idx)
             return
         if not event:
             return
@@ -1108,10 +1161,20 @@ struct Server(Movable):
         var sent = len(self._conns[idx].pending)
         self._budget.release(sent)
         var was_100 = self._conns[idx].state == STATE_SENDING_100
+        var was_streaming = self._conns[idx].state == STATE_STREAMING
         self._conns[idx].clear_pending()
         if was_100:
             self._conns[idx].state = STATE_READING
             self._conns[idx].sent_100 = True
+            return
+        if was_streaming:
+            if not self._conns[idx].stream_finished:
+                self._conns[idx].write_at = NO_DEADLINE
+                self._conns[idx].detach_at = deadline_from_now(
+                    self.config.stream_idle_timeout
+                )
+                return
+            self._complete_stream(idx)
             return
         self._conns[idx].requests_served += 1
         if self._conns[idx].should_close or self._shutdown_at != NO_DEADLINE:
@@ -1169,6 +1232,12 @@ struct Server(Movable):
                 break
 
     def _handle_detached_timeout(mut self, idx: Int) raises NetError:
+        if self._conns[idx].state == STATE_STREAMING:
+            self._mark_detached_cancelled(idx)
+            self._cleanup_detached_state(idx)
+            self._remove_detached_conn(idx)
+            self._close_conn(idx)
+            return
         var is_head = self._conns[idx].is_head
         self._mark_detached_cancelled(idx)
         self._cleanup_detached_state(idx)
@@ -1186,7 +1255,10 @@ struct Server(Movable):
                 idx < 0
                 or idx >= len(self._conns)
                 or not self._conns[idx].active
-                or self._conns[idx].state != STATE_DETACHED
+                or (
+                    self._conns[idx].state != STATE_DETACHED
+                    and self._conns[idx].state != STATE_STREAMING
+                )
             ):
                 if (
                     idx >= 0
@@ -1227,39 +1299,63 @@ struct Server(Movable):
             var msgs = List[DetachMessage]()
             while len(s_ptr[].messages) > 0:
                 msgs.append(s_ptr[].messages.pop(0))
+            s_ptr[].queued_bytes = 0
             s_ptr[].mutex.unlock()
 
-            # Phase B processes exactly one terminal message (MSG_KIND_RESPOND or MSG_KIND_ABORT).
-            # Streaming chunk messages will be processed iteratively in Phase C.
-            var handled = False
             while len(msgs) > 0:
                 var msg = msgs.pop(0)
-                if msg.kind == MSG_KIND_RESPOND:
-                    if self._conns[idx].token.generation == s_ptr[].generation:
-                        self._handle_detached_respond(idx, msg)
-                    else:
-                        self._mark_detached_cancelled(idx)
-                        self._cleanup_detached_state(idx)
-                        self._close_conn(idx)
-                    handled = True
+                if not self._conns[idx].active:
                     break
+                if self._conns[idx].token.generation != s_ptr[].generation:
+                    self._mark_detached_cancelled(idx)
+                    self._cleanup_detached_state(idx)
+                    self._close_conn(idx)
+                    break
+                if msg.kind == MSG_KIND_RESPOND:
+                    self._handle_detached_respond(idx, msg)
+                    break
+                elif msg.kind == MSG_KIND_START:
+                    self._handle_detached_start(idx, msg)
+                elif msg.kind == MSG_KIND_CHUNK:
+                    self._handle_detached_chunk(idx, msg)
+                elif msg.kind == MSG_KIND_FINISH:
+                    self._handle_detached_finish(idx)
                 elif msg.kind == MSG_KIND_ABORT:
                     self._handle_detached_abort(idx)
-                    handled = True
                     break
                 else:
                     self._handle_detached_abort(idx)
-                    handled = True
                     break
 
-            if handled:
+            if not self._conns[idx].active:
                 if (
                     i < len(self._detached_conns)
                     and self._detached_conns[i] == idx
                 ):
                     _ = self._detached_conns.pop(i)
-            else:
-                i += 1
+                continue
+
+            self._sync_interests(idx)
+            self._pump_send(idx, True)
+            if self._conns[idx].active:
+                self._sync_interests(idx)
+                self._arm_deadline(idx)
+                if (
+                    self._conns[idx].state == STATE_READING
+                    and self._conns[idx].buffered_len() > 0
+                ):
+                    self._push_urgent(idx)
+
+            if i < len(self._detached_conns) and self._detached_conns[i] == idx:
+                if (
+                    not self._conns[idx].active
+                    or self._conns[idx].detach_state_addr == 0
+                    or self._conns[idx].state == STATE_READING
+                    or self._conns[idx].state == STATE_SENDING
+                ):
+                    _ = self._detached_conns.pop(i)
+                else:
+                    i += 1
 
     def _handle_detached_respond(
         mut self, idx: Int, mut msg: DetachMessage
@@ -1331,7 +1427,127 @@ struct Server(Movable):
             ):
                 self._push_urgent(idx)
 
+    def _handle_detached_start(
+        mut self, idx: Int, mut msg: DetachMessage
+    ) raises NetError:
+        var is_head = self._conns[idx].is_head
+        var req_close = self._conns[idx].req_close or msg.should_close
+        var rw = ResponseWriter(self.config.max_response_body)
+        rw.status = msg.status
+        var h = msg.headers^
+        msg.headers = Headers()
+        rw.headers = h^
+        rw.set_should_close(req_close or (self._shutdown_at != NO_DEADLINE))
+
+        var wire: List[Byte]
+        try:
+            wire = encode_chunked_start(
+                rw,
+                is_head,
+                self._tick_date,
+                self.config.max_response_headers_count,
+                self.config.max_response_headers_bytes,
+            )
+        except e:
+            _ = e
+            self._mark_detached_cancelled(idx)
+            self._cleanup_detached_state(idx)
+            self._send_error(idx, 500, is_head=is_head)
+            self._arm_deadline(idx)
+            return
+
+        if not self._budget.try_reserve(len(wire)):
+            self._mark_detached_cancelled(idx)
+            self._cleanup_detached_state(idx)
+            self._send_error(idx, 500, is_head=is_head)
+            self._arm_deadline(idx)
+            return
+
+        self._conns[idx].state = STATE_STREAMING
+        self._conns[idx].stream_finished = False
+        self._conns[idx].stream_has_body = (
+            not is_head
+        ) and has_body_for_status(msg.status, False)
+        self._conns[idx].append_pending(wire^)
+        self._conns[idx].should_close = (
+            rw.should_close
+            or (
+                self._conns[idx].read_eof
+                and self._conns[idx].buffered_len() == 0
+            )
+            or (self._shutdown_at != NO_DEADLINE)
+        )
+        self._conns[idx].write_at = deadline_from_now(
+            self.config.write_deadline
+        )
+        self._conns[idx].detach_at = deadline_from_now(
+            self.config.stream_idle_timeout
+        )
+
+    def _handle_detached_chunk(
+        mut self, idx: Int, mut msg: DetachMessage
+    ) raises NetError:
+        if not self._conns[idx].active:
+            return
+        if self._conns[idx].state != STATE_STREAMING:
+            return
+        if self._conns[idx].stream_finished:
+            return
+        if len(msg.body) == 0:
+            return
+        if not self._conns[idx].stream_has_body:
+            return
+
+        var wire = encode_chunk(Span(msg.body))
+        if not self._budget.try_reserve(len(wire)):
+            self._mark_detached_cancelled(idx)
+            self._cleanup_detached_state(idx)
+            self._remove_detached_conn(idx)
+            self._close_conn(idx)
+            return
+
+        self._conns[idx].append_pending(wire^)
+        self._conns[idx].write_at = deadline_from_now(
+            self.config.write_deadline
+        )
+        self._conns[idx].detach_at = deadline_from_now(
+            self.config.stream_idle_timeout
+        )
+
+    def _handle_detached_finish(mut self, idx: Int) raises NetError:
+        if not self._conns[idx].active:
+            return
+        if self._conns[idx].state != STATE_STREAMING:
+            return
+        if self._conns[idx].stream_finished:
+            return
+        self._conns[idx].stream_finished = True
+        if not self._conns[idx].stream_has_body:
+            return
+
+        var wire = encode_chunk_end()
+        if not self._budget.try_reserve(len(wire)):
+            self._mark_detached_cancelled(idx)
+            self._cleanup_detached_state(idx)
+            self._remove_detached_conn(idx)
+            self._close_conn(idx)
+            return
+
+        self._conns[idx].append_pending(wire^)
+        self._conns[idx].write_at = deadline_from_now(
+            self.config.write_deadline
+        )
+        self._conns[idx].detach_at = deadline_from_now(
+            self.config.stream_idle_timeout
+        )
+
     def _handle_detached_abort(mut self, idx: Int) raises NetError:
+        if self._conns[idx].state == STATE_STREAMING:
+            self._mark_detached_cancelled(idx)
+            self._cleanup_detached_state(idx)
+            self._remove_detached_conn(idx)
+            self._close_conn(idx)
+            return
         self._cleanup_detached_state(idx)
         self._send_error(idx, 500)
         self._arm_deadline(idx)

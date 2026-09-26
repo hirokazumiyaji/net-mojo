@@ -270,6 +270,8 @@ def test_server_config_defaults_match_design_table() raises:
     assert_equal(config.max_response_headers_count, 100)
     assert_equal(config.total_buffer_budget, 268435456)
     assert_equal(config.detached_response_timeout, Timeout.seconds(30))
+    assert_equal(config.stream_queue_limit, 1048576)
+    assert_equal(config.stream_idle_timeout, Timeout.seconds(300))
     assert_equal(config.max_accept_per_tick, 64)
     assert_equal(config.max_bytes_per_tick, 65536)
     assert_equal(config.max_requests_per_tick, 16)

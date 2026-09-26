@@ -28,6 +28,8 @@ struct ServerConfig(Copyable, Movable):
     var idle_timeout: Timeout
     var shutdown_grace: Timeout
     var detached_response_timeout: Timeout
+    var stream_queue_limit: Int
+    var stream_idle_timeout: Timeout
     var max_accept_per_tick: Int
     var max_bytes_per_tick: Int
     var max_requests_per_tick: Int
@@ -53,6 +55,8 @@ struct ServerConfig(Copyable, Movable):
             idle_timeout=Timeout.seconds(60),
             shutdown_grace=Timeout.seconds(30),
             detached_response_timeout=Timeout.seconds(30),
+            stream_queue_limit=1048576,
+            stream_idle_timeout=Timeout.seconds(300),
             max_accept_per_tick=64,
             max_bytes_per_tick=65536,
             max_requests_per_tick=16,
