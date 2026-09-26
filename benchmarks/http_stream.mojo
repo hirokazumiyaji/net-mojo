@@ -9,7 +9,7 @@ Measures:
 Run: `pixi run benchmark-http-stream`.
 """
 
-from std.ffi import c_int, c_size_t, c_ulong, external_call
+from std.ffi import c_int, c_long, c_size_t, c_ulong, external_call
 from std.sys import size_of
 from std.time import perf_counter_ns, sleep
 
@@ -71,9 +71,11 @@ def _bench_stream_worker_thread(
         headers.add(String("Cache-Control"), String("no-cache"))
         sender.start(200, headers^)
 
+        var cancelled = False
         for _ in range(ctx[].events_to_send):
             sleep(ctx[].interval_seconds)
             if sender.is_cancelled():
+                cancelled = True
                 break
 
             var now_ns = Int(perf_counter_ns())
@@ -82,10 +84,12 @@ def _bench_stream_worker_thread(
             )
             var ok = sender.send(msg.as_bytes())
             if not ok:
+                cancelled = True
                 break
             ctx[].success_count += 1
 
-        sender.finish()
+        if not cancelled and not sender.is_cancelled():
+            sender.finish()
         ctx[].done = True
     except:
         ctx[].done = False
@@ -137,7 +141,7 @@ def _process_stream_buffer(
     var has_stream_end = False
 
     var s = String(from_utf8_lossy=Span(buf))
-    if s.find("\r\n0\r\n\r\n") >= 0 or s.endswith("0\r\n\r\n"):
+    if s.find("\r\n0\r\n\r\n") >= 0:
         has_stream_end = True
 
     var j = 0
@@ -280,7 +284,7 @@ def main() raises:
     for i in range(num_streams):
         _get_ptr(threads, i).unsafe_write(0)
 
-    var cpu_start = external_call["clock", c_ulong]()
+    var cpu_start = external_call["clock", c_long]()
     var bench_start = perf_counter_ns()
 
     for i in range(num_streams):
@@ -393,7 +397,7 @@ def main() raises:
             break
 
     var bench_end = perf_counter_ns()
-    var cpu_end = external_call["clock", c_ulong]()
+    var cpu_end = external_call["clock", c_long]()
 
     # Join all threads
     for i in range(num_streams):
@@ -417,7 +421,9 @@ def main() raises:
         raise Error(loop_error_msg)
 
     var wall_seconds = Float64(Int(bench_end) - Int(bench_start)) / 1e9
-    var cpu_seconds = Float64(Int(cpu_end) - Int(cpu_start)) / 1000000.0
+    var cpu_seconds: Float64 = 0.0
+    if Int(cpu_start) >= 0 and Int(cpu_end) >= Int(cpu_start):
+        cpu_seconds = Float64(Int(cpu_end) - Int(cpu_start)) / 1000000.0
     var cpu_percent = (cpu_seconds / wall_seconds) * 100.0
     var total_events = len(latencies)
     var throughput = Float64(total_events) / wall_seconds

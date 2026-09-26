@@ -44,9 +44,11 @@ def _sse_worker_thread(
 
         sender.start(200, headers^)
 
+        var cancelled = False
         for i in range(ctx[].event_count):
             sleep(ctx[].interval_seconds)
             if sender.is_cancelled():
+                cancelled = True
                 break
 
             var event = (
@@ -56,9 +58,11 @@ def _sse_worker_thread(
             )
             var sent = sender.send(event.as_bytes())
             if not sent:
+                cancelled = True
                 break
 
-        sender.finish()
+        if not cancelled and not sender.is_cancelled():
+            sender.finish()
         ctx[].completed = True
     except:
         ctx[].completed = False
