@@ -23,8 +23,17 @@ struct ResponseWriter(Movable, Sized):
     var _limit: Int
     var _detached: Bool
     var _detach_state_addr: Int
+    var _slot: Int
+    var _generation: UInt64
+    var _wakeup_fd: Int32
 
-    def __init__(out self, body_limit: Int):
+    def __init__(
+        out self,
+        body_limit: Int,
+        slot: Int = -1,
+        generation: UInt64 = 0,
+        wakeup_fd: Int32 = -1,
+    ):
         self.status = 200
         self.headers = Headers()
         self.body = List[Byte]()
@@ -32,6 +41,12 @@ struct ResponseWriter(Movable, Sized):
         self._limit = body_limit
         self._detached = False
         self._detach_state_addr = 0
+        self._slot = slot
+        self._generation = generation
+        # Note on _wakeup_fd: raw descriptor borrowed from Server._wakeup_channel.
+        # The channel owns descriptor lifecycle; DetachState.cancelled guards
+        # against late signaling if Server deinitializes.
+        self._wakeup_fd = wakeup_fd
 
     def __init__(out self, *, deinit move: Self):
         self.status = move.status
@@ -41,6 +56,9 @@ struct ResponseWriter(Movable, Sized):
         self._limit = move._limit
         self._detached = move._detached
         self._detach_state_addr = move._detach_state_addr
+        self._slot = move._slot
+        self._generation = move._generation
+        self._wakeup_fd = move._wakeup_fd
 
     def is_detached(self) -> Bool:
         return self._detached
@@ -52,8 +70,8 @@ struct ResponseWriter(Movable, Sized):
         """Detaches the response from the synchronous handler flow.
 
         Returns a `ResponseSender` that can be transferred across threads to
-        complete or stream the response asynchronously. Once detached, the handler
-        must not write further data directly to `ResponseWriter`.
+        complete the response asynchronously (response streaming is planned for Phase C).
+        Once detached, the handler must not write further data directly to `ResponseWriter`.
         """
         if self._detached:
             raise NetError(
@@ -65,8 +83,11 @@ struct ResponseWriter(Movable, Sized):
         self._detached = True
         if self._detach_state_addr != 0:
             return ResponseSender(self._detach_state_addr)
-        # Fallback for standalone or probe usage without an active server connection:
-        var addr = _create_detach_state(-1, 0)
+        var addr = _create_detach_state(
+            slot=self._slot,
+            generation=self._generation,
+            wakeup_fd=self._wakeup_fd,
+        )
         self._detach_state_addr = addr
         return ResponseSender(addr)
 

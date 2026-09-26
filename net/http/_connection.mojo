@@ -12,6 +12,7 @@ from net.error import NetError
 comptime STATE_READING: UInt8 = 0
 comptime STATE_SENDING: UInt8 = 1
 comptime STATE_SENDING_100: UInt8 = 2
+comptime STATE_DETACHED: UInt8 = 3
 
 
 struct HttpConnection(Movable):
@@ -28,6 +29,10 @@ struct HttpConnection(Movable):
     var body_at: Int
     var write_at: Int
     var idle_at: Int
+    var detach_at: Int
+    var detach_state_addr: Int
+    var is_head: Bool
+    var req_close: Bool
     var requests_served: Int
     var bytes_this_tick: Int
     var requests_this_tick: Int
@@ -35,6 +40,7 @@ struct HttpConnection(Movable):
     var scanned_len: Int
     var more_work: Bool
     var active: Bool
+    var _no_deadline: Int
 
     def __init__(
         out self,
@@ -52,10 +58,15 @@ struct HttpConnection(Movable):
         self.should_close = False
         self.sent_100 = False
         self.read_eof = False
+        self._no_deadline = no_deadline
         self.header_at = no_deadline
         self.body_at = no_deadline
         self.write_at = no_deadline
         self.idle_at = idle_at
+        self.detach_at = no_deadline
+        self.detach_state_addr = 0
+        self.is_head = False
+        self.req_close = False
         self.requests_served = 0
         self.bytes_this_tick = 0
         self.requests_this_tick = 0
@@ -65,7 +76,15 @@ struct HttpConnection(Movable):
         self.active = True
 
     def wants_read(self) -> Bool:
-        return self.active and self.state == STATE_READING and not self.read_eof
+        if not self.active or self.read_eof:
+            return False
+        if self.state == STATE_READING:
+            return True
+        if self.state == STATE_DETACHED:
+            # While detached, only read if buffer is empty, so pipelined
+            # data does not consume the shared buffer budget unparsed.
+            return self.buffered_len() == 0
+        return False
 
     def wants_write(self) -> Bool:
         return (
@@ -152,6 +171,12 @@ struct HttpConnection(Movable):
         return self.conn.raw_fd()
 
     def close(mut self) raises NetError:
+        """Closes the underlying connection and releases socket allocations.
+
+        Note on detach state ownership: if `detach_state_addr` is non-zero,
+        the caller (e.g. Server._close_conn) must cancel and release the
+        shared state reference prior to calling `close()`.
+        """
         self.active = False
         # Drop the allocations instead of clearing: clear() would retain
         # capacity on a free-listed slot, hoarding memory the budget no
@@ -160,4 +185,7 @@ struct HttpConnection(Movable):
         self.pending = List[Byte]()
         self.pending_offset = 0
         self.reserved = 0
+        self.detach_state_addr = 0
+        self.detach_at = self._no_deadline
+        self.is_head = False
         self.conn.close()

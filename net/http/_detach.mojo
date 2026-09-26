@@ -8,8 +8,9 @@ Architecture (Erlang-inspired Actor / Message-Passing):
 - The connection actor on the event loop remains the exclusive owner of the socket,
   buffer budget, and reactor interests.
 - `ResponseSender` acts as a movable actor endpoint / proxy.
-- Detached operations (`respond`, `start`, `send`, `finish`, `abort`) enqueue
-  structured messages into a thread-safe mailbox protected by a POSIX mutex.
+- Detached operations in Phase B (`respond`, `abort`) enqueue
+  structured messages into a thread-safe mailbox protected by a POSIX mutex
+  (streaming operations `start`, `send`, `finish` are planned for Phase C).
 - A non-blocking wakeup file descriptor (via `socketpair`) notifies the reactor
   to awaken the event loop without polling latency.
 - Generation checks guard against stale writes if a connection is closed and
@@ -266,7 +267,8 @@ struct ResponseSender(Movable):
     ) raises NetError:
         """Sends a deferred response with headers and full body.
 
-        Raises `NetError` if called after a response was already started or completed.
+        Raises `NetError` if called after a response was already started or completed,
+        or if the connection has been cancelled (client disconnect, timeout, or shutdown).
         """
         if self._addr == 0:
             raise NetError(
@@ -280,6 +282,16 @@ struct ResponseSender(Movable):
         )
         var s_ptr = ptr.unsafe_bitcast[_SharedDetachState]()
         s_ptr[].mutex.lock()
+        if s_ptr[].cancelled:
+            s_ptr[].responded = True
+            s_ptr[].finished = True
+            s_ptr[].mutex.unlock()
+            raise NetError(
+                NetErrorKind.closed(),
+                "respond",
+                None,
+                "response was cancelled (client disconnect, timeout, or shutdown)",
+            )
         if s_ptr[].responded or s_ptr[].finished:
             s_ptr[].mutex.unlock()
             raise NetError(
@@ -303,77 +315,32 @@ struct ResponseSender(Movable):
         var headers: Headers = Headers(),
     ) raises NetError:
         """Starts response streaming by sending the HTTP status and headers."""
-        if self._addr == 0:
-            raise NetError(
-                NetErrorKind.invalid_state(),
-                "start",
-                None,
-                "ResponseSender is inactive",
-            )
-        var ptr = Pointer[Byte, MutUntrackedOrigin](
-            unsafe_from_address=self._addr
+        raise NetError(
+            NetErrorKind.unsupported(),
+            "start",
+            None,
+            "response streaming not supported in Phase B (planned for Phase C)",
         )
-        var s_ptr = ptr.unsafe_bitcast[_SharedDetachState]()
-        s_ptr[].mutex.lock()
-        if s_ptr[].responded or s_ptr[].finished:
-            s_ptr[].mutex.unlock()
-            raise NetError(
-                NetErrorKind.invalid_state(),
-                "start",
-                None,
-                "response already started or finished",
-            )
-        s_ptr[].responded = True
-        s_ptr[].messages.append(DetachMessage.start(status, headers^))
-        var wakeup_fd = s_ptr[].wakeup_fd
-        s_ptr[].mutex.unlock()
-        signal_wakeup_fd(wakeup_fd)
 
     def send[
         origin: ImmOrigin
     ](mut self, data: Span[Byte, origin]) raises NetError -> Bool:
-        """Enqueues a body chunk for response streaming.
-
-        Returns False if the stream has been cancelled (client disconnect, deadline,
-        or shutdown).
-        """
-        if self._addr == 0:
-            return False
-        var ptr = Pointer[Byte, MutUntrackedOrigin](
-            unsafe_from_address=self._addr
+        """Enqueues a body chunk for response streaming (planned for Phase C)."""
+        raise NetError(
+            NetErrorKind.unsupported(),
+            "send",
+            None,
+            "response streaming not supported in Phase B (planned for Phase C)",
         )
-        var s_ptr = ptr.unsafe_bitcast[_SharedDetachState]()
-        s_ptr[].mutex.lock()
-        if s_ptr[].cancelled or s_ptr[].finished or not s_ptr[].responded:
-            s_ptr[].mutex.unlock()
-            return False
-        var chunk = List[Byte]()
-        chunk.reserve(len(data))
-        for i in range(len(data)):
-            chunk.append(data[i])
-        s_ptr[].messages.append(DetachMessage.chunk(chunk^))
-        var wakeup_fd = s_ptr[].wakeup_fd
-        s_ptr[].mutex.unlock()
-        signal_wakeup_fd(wakeup_fd)
-        return True
 
     def finish(mut self) raises NetError:
         """Finishes the streaming response."""
-        if self._addr == 0:
-            return
-        var ptr = Pointer[Byte, MutUntrackedOrigin](
-            unsafe_from_address=self._addr
+        raise NetError(
+            NetErrorKind.unsupported(),
+            "finish",
+            None,
+            "response streaming not supported in Phase B (planned for Phase C)",
         )
-        var s_ptr = ptr.unsafe_bitcast[_SharedDetachState]()
-        s_ptr[].mutex.lock()
-        if s_ptr[].finished or not s_ptr[].responded:
-            s_ptr[].mutex.unlock()
-            return
-        s_ptr[].finished = True
-        s_ptr[].messages.append(DetachMessage.finish())
-        var wakeup_fd = s_ptr[].wakeup_fd
-        s_ptr[].mutex.unlock()
-        signal_wakeup_fd(wakeup_fd)
 
     def abort(mut self):
         """Aborts the response, causing the server to close or 500 the connection.
@@ -385,7 +352,7 @@ struct ResponseSender(Movable):
         )
         var s_ptr = ptr.unsafe_bitcast[_SharedDetachState]()
         s_ptr[].mutex.lock()
-        if s_ptr[].finished:
+        if s_ptr[].cancelled or s_ptr[].finished:
             s_ptr[].mutex.unlock()
             return
         s_ptr[].finished = True

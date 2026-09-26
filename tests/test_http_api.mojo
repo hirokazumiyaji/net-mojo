@@ -1,5 +1,6 @@
 from std.testing import assert_equal, assert_false, assert_true, TestSuite
 
+from net import Timeout
 from net.error import NetErrorKind
 from net.http import (
     Handler,
@@ -268,6 +269,7 @@ def test_server_config_defaults_match_design_table() raises:
     assert_equal(config.max_response_headers_bytes, 32768)
     assert_equal(config.max_response_headers_count, 100)
     assert_equal(config.total_buffer_budget, 268435456)
+    assert_equal(config.detached_response_timeout, Timeout.seconds(30))
     assert_equal(config.max_accept_per_tick, 64)
     assert_equal(config.max_bytes_per_tick, 65536)
     assert_equal(config.max_requests_per_tick, 16)
