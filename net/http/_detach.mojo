@@ -294,7 +294,10 @@ struct ResponseSender(Movable):
                 NetErrorKind.closed(),
                 "respond",
                 None,
-                "response was cancelled (client disconnect, timeout, or shutdown)",
+                (
+                    "response was cancelled (client disconnect, timeout, or"
+                    " shutdown)"
+                ),
             )
         if s_ptr[].responded or s_ptr[].started or s_ptr[].finished:
             s_ptr[].mutex.unlock()
@@ -346,7 +349,10 @@ struct ResponseSender(Movable):
                 NetErrorKind.closed(),
                 "start",
                 None,
-                "response was cancelled (client disconnect, timeout, or shutdown)",
+                (
+                    "response was cancelled (client disconnect, timeout, or"
+                    " shutdown)"
+                ),
             )
         if s_ptr[].responded or s_ptr[].started or s_ptr[].finished:
             s_ptr[].mutex.unlock()
@@ -436,7 +442,10 @@ struct ResponseSender(Movable):
                 NetErrorKind.closed(),
                 "finish",
                 None,
-                "response was cancelled (client disconnect, timeout, or shutdown)",
+                (
+                    "response was cancelled (client disconnect, timeout, or"
+                    " shutdown)"
+                ),
             )
         if not s_ptr[].started or s_ptr[].finished or s_ptr[].responded:
             s_ptr[].mutex.unlock()

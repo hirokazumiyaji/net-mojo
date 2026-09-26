@@ -285,7 +285,9 @@ def _split_responses(buf: List[Byte]) -> List[List[Byte]]:
     return res^
 
 
-def _tick_until_detached[H: Handler](
+def _tick_until_detached[
+    H: Handler
+](
     mut server: Server,
     mut handler: H,
     box: Pointer[Int, MutUntrackedOrigin],
@@ -297,7 +299,9 @@ def _tick_until_detached[H: Handler](
         _ = server.tick(handler, Timeout.nanoseconds(0))
 
 
-def _tick_and_read[H: Handler](
+def _tick_and_read[
+    H: Handler
+](
     mut server: Server,
     mut handler: H,
     mut client: TCPConn,
@@ -335,7 +339,9 @@ def _chunked_response_complete(buf: List[Byte]) -> Bool:
     return s.find("0\r\n\r\n") >= 0
 
 
-def _tick_and_read_chunked[H: Handler](
+def _tick_and_read_chunked[
+    H: Handler
+](
     mut server: Server,
     mut handler: H,
     mut client: TCPConn,
@@ -485,7 +491,9 @@ def test_detached_sender_drop_without_respond_closes_connection() raises:
                 eof_seen = True
                 break
         sleep(0.002)
-    assert_true(eof_seen, "server must close socket after aborted detached response")
+    assert_true(
+        eof_seen, "server must close socket after aborted detached response"
+    )
 
     client.close()
 
@@ -690,7 +698,8 @@ def test_detached_concurrent_connections_no_spurious_untracking() raises:
         String("127.0.0.1:") + String(port), Timeout.seconds(2)
     )
     client1.write_all(
-        "GET /c1 HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n".as_bytes(),
+        "GET /c1 HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n"
+        .as_bytes(),
         Timeout.seconds(2),
     )
 
@@ -956,7 +965,8 @@ def test_detached_client_disconnect_cancels_early() raises:
         sleep(0.002)
 
     assert_true(
-        sender.is_cancelled(), "early peer disconnect must mark sender cancelled"
+        sender.is_cancelled(),
+        "early peer disconnect must mark sender cancelled",
     )
     external_call["free", NoneType](box)
 
@@ -1146,7 +1156,9 @@ def test_detached_response_streaming_chunks() raises:
     assert_equal(_status_of(resp), 200)
     var raw = String(from_utf8_lossy=Span(resp))
     assert_true(raw.find("Transfer-Encoding: chunked") >= 0)
-    assert_equal(_body_of(resp), "5\r\nalpha\r\n4\r\nbeta\r\n5\r\ngamma\r\n0\r\n\r\n")
+    assert_equal(
+        _body_of(resp), "5\r\nalpha\r\n4\r\nbeta\r\n5\r\ngamma\r\n0\r\n\r\n"
+    )
 
     # Keep-alive check: subsequent request on same connection succeeds
     client.write_all(
@@ -1593,7 +1605,9 @@ def test_detached_streaming_write_deadline_cancels() raises:
             break
         sleep(0.002)
 
-    assert_true(sender.is_cancelled(), "write deadline expiry must cancel sender")
+    assert_true(
+        sender.is_cancelled(), "write deadline expiry must cancel sender"
+    )
     assert_false(sender.send(String("chunk").as_bytes()))
 
     client.close()
@@ -1684,7 +1698,9 @@ def test_detached_streaming_graceful_shutdown_exceeded_grace_cancels() raises:
             break
         sleep(0.002)
 
-    assert_true(sender.is_cancelled(), "grace expiry must cancel unfinished stream")
+    assert_true(
+        sender.is_cancelled(), "grace expiry must cancel unfinished stream"
+    )
     assert_false(sender.send(String("late-chunk").as_bytes()))
 
     client.close()
@@ -1759,6 +1775,128 @@ def test_detached_streaming_slot_reuse_generation_mismatch() raises:
     client2.close()
     external_call["free", NoneType](box)
     external_call["free", NoneType](second_served)
+
+
+@fieldwise_init
+struct _WorkerStreamHundredsContext:
+    var sender_addr: Int
+    var num_chunks: Int
+    var success_count: Int
+    var done: Bool
+
+
+def _worker_stream_hundreds_thread(
+    arg: Pointer[Byte, MutUntrackedOrigin],
+) -> Pointer[Byte, MutUntrackedOrigin]:
+    var ctx = arg.unsafe_bitcast[_WorkerStreamHundredsContext]()
+    # Brief sleep to ensure the server event loop has entered a blocking tick (poll)
+    sleep(0.04)
+    var sender = ResponseSender(ctx[].sender_addr)
+    var h = Headers()
+    try:
+        sender.start(200, h^)
+
+        for i in range(ctx[].num_chunks):
+            var chunk = String("event-") + String(i) + String("\n")
+            var sent = sender.send(chunk.as_bytes())
+            if not sent:
+                break
+            ctx[].success_count += 1
+
+        sender.finish()
+        ctx[].done = True
+    except:
+        ctx[].done = False
+    return arg
+
+
+def test_cross_thread_streaming_hundreds_chunks_and_wakeup() raises:
+    var server = Server(ServerConfig.default())
+    server.add_listener(listen_tcp("127.0.0.1:0"))
+    var port = server.local_address().port
+
+    var box = external_call["malloc", Pointer[Int, MutUntrackedOrigin]](
+        c_size_t(size_of[Int]())
+    )
+    assert_true(Int(box) != 0)
+    box.unsafe_write(0)
+
+    var handler = _DeferredHandler(box)
+    var client = dial_tcp(
+        String("127.0.0.1:") + String(port), Timeout.seconds(2)
+    )
+    client.write_all(
+        "GET /stream HTTP/1.1\r\nHost: localhost\r\n\r\n".as_bytes(),
+        Timeout.seconds(2),
+    )
+
+    _tick_until_detached(server, handler, box)
+    var sender_addr = box[]
+    assert_true(sender_addr != 0)
+    box.unsafe_write(0)
+
+    var num_chunks = 200
+    var ctx_ptr = external_call[
+        "malloc", Pointer[_WorkerStreamHundredsContext, MutUntrackedOrigin]
+    ](c_size_t(size_of[_WorkerStreamHundredsContext]()))
+    assert_true(Int(ctx_ptr) != 0)
+    ctx_ptr.unsafe_write(
+        _WorkerStreamHundredsContext(
+            sender_addr=sender_addr,
+            num_chunks=num_chunks,
+            success_count=0,
+            done=False,
+        )
+    )
+
+    var handle: UInt64 = 0
+    var rc = external_call["pthread_create", c_int](
+        Pointer(to=handle),
+        Optional[Pointer[Byte, MutUntrackedOrigin]](None),
+        _worker_stream_hundreds_thread,
+        ctx_ptr.unsafe_bitcast[Byte](),
+    )
+    assert_equal(Int(rc), 0)
+
+    # Calling tick with a 3-second timeout will wake up promptly (~40ms)
+    # when the worker thread signals wakeup_fd for start/send, rather than waiting 3 seconds.
+    _ = server.tick(handler, Timeout.seconds(3))
+
+    # Read the full chunked stream across multiple ticks
+    var resp = _tick_and_read_chunked(server, handler, client, max_ticks=500)
+    _join_thread(handle)
+
+    var done = ctx_ptr[].done
+    var success_count = ctx_ptr[].success_count
+    external_call["free", NoneType](ctx_ptr)
+
+    assert_true(done)
+    assert_equal(success_count, num_chunks)
+    assert_equal(_status_of(resp), 200)
+
+    var raw = String(from_utf8_lossy=Span(resp))
+    assert_true(raw.find("Transfer-Encoding: chunked") >= 0)
+    var body_str = _body_of(resp)
+
+    # Verify that all hundreds of chunks arrived intact and in exact order
+    var last_pos = 0
+    for i in range(num_chunks):
+        var expected_chunk = String("event-") + String(i) + String("\n")
+        var pos = body_str.find(expected_chunk)
+        assert_true(pos >= last_pos)
+        last_pos = pos
+
+    # Verify connection remains valid for keep-alive request
+    client.write_all(
+        "GET /second HTTP/1.1\r\nHost: localhost\r\n\r\n".as_bytes(),
+        Timeout.seconds(2),
+    )
+    var resp2 = _tick_and_read(server, handler, client)
+    assert_equal(_status_of(resp2), 200)
+    assert_equal(_body_of(resp2), "second-response")
+
+    client.close()
+    external_call["free", NoneType](box)
 
 
 def main() raises:
