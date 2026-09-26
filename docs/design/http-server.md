@@ -568,5 +568,14 @@ handler をイベントループ上でブロックさせると全接続が停止
   - `STATE_STREAMING` 中のタイムアウト・abort 時における即時接続クローズ（ヘッダー送出後の不正な 500/503 送出による HTTP フレーミング破壊の防止）。
   - `STATE_STREAMING` 中の早期切断（EOF）検知とワーカーへの `cancelled = True` 伝播。
   - `tests/test_http_detach.mojo` に Phase C 契約テストを追加（start -> send x 3 -> finish の chunked 復元、keep-alive 継続、Content-Length 指定エラー、queue_limit 超過時の中断、HEAD/204 でのチャンク省略、早期切断時のキャンセル）。
-- **Phase D**: キャンセルと停止。切断検知、stream deadline、graceful shutdown、generation 検証。
+- **Phase D**: キャンセルと停止（実装完了）。
+  - `ResponseSender.send(...) -> Bool` のキャンセル時戻り値を仕様（`docs/design/http-server.md` 表記）通り `False` に統一し、例外送出を解消（生成ワーカーでの自然なループ脱出を実現）。
+  - サーバーイベントループ（`_process_detached_messages`）での世代（generation）不一致時の安全な処理（再利用先のアクティブ接続を巻き添えクローズせず、古い状態のみを安全に破棄）。
+  - `tests/test_http_detach.mojo` に Phase D 契約テストを追加：
+    - クライアント早期切断時のキャンセル検知と後続 `send` の `False` 返却（`test_detached_streaming_client_disconnect_cancels`）。
+    - `stream_idle_timeout` 満了による自動キャンセルと接続クローズ（`test_detached_streaming_idle_timeout_cancels`）。
+    - `write_deadline` 満了による自動キャンセルと接続クローズ（`test_detached_streaming_write_deadline_cancels`）。
+    - graceful shutdown 中の猶予内 `finish` による正常送出とクリーンシャットダウン（`test_detached_streaming_graceful_shutdown_finishes_within_grace`）。
+    - graceful shutdown 猶予超過によるストリーム強制キャンセル（`test_detached_streaming_graceful_shutdown_exceeded_grace_cancels`）。
+    - ストリーム切断後のスロット再利用と世代不一致メッセージの安全な破棄（`test_detached_streaming_slot_reuse_generation_mismatch`）。
 - **Phase E**: 別スレッドからの実送受信とドキュメント。pthread からの連続送信テスト、`examples/http_sse.mojo`、ベンチマーク。
