@@ -113,12 +113,14 @@ def main() raises:
 
 Constraints (see `docs/design/http-server.md` for the full contract):
 
-- The handler runs synchronously on the loop thread. Blocking I/O or
-  long CPU work inside `handle` stalls every connection.
-- Bounded buffered requests only: the full body (up to
+- The handler runs synchronously on the loop thread by default. Blocking
+  I/O or heavy computation can be offloaded to background threads using
+  `writer.detach()`.
+- Bounded buffered request body: the full request body (up to
   `max_body_bytes`, default 1 MiB) is received before `handle` runs.
-  Request streaming, response streaming, `Flush`, routers, and
-  middleware are not included.
+  Response streaming and deferred responses are supported via
+  `ResponseWriter.detach()` and `ResponseSender`; request body streaming,
+  routers, and middleware frameworks are not included.
 - `Request` views and `ResponseWriter` are valid only during the
   `handle` call. Copy values you want to keep; the server owns the
   receive buffer and the queued response.
@@ -127,6 +129,37 @@ Constraints (see `docs/design/http-server.md` for the full contract):
   Phases 6-10).
 - No client, no HTTP/1.0, no WebSocket/CONNECT/Upgrade switching, no
   multipart helpers, no body compression, no static file serving.
+
+### Response streaming and deferred responses
+
+For long-running tasks (such as LLM token generation or async workers),
+call `writer.detach()` to decouple the response from the event loop.
+The returned `ResponseSender` is `Movable` and thread-safe, backed by an
+Erlang-inspired actor/message-passing architecture:
+
+```mojo
+from net.http import Handler, Request, ResponseSender, ResponseWriter
+
+struct SseHandler(Handler):
+    def handle(mut self, req: Request, mut writer: ResponseWriter) raises:
+        if req.path == "/events":
+            var sender = writer.detach() # Connection enters detached state
+            # Hand off sender to background thread (e.g. pthread)
+            # worker: sender.start(200, headers) -> sender.send(data) -> sender.finish()
+```
+
+- **Deferred response**: `sender.respond(status, headers, body)` sends a
+  standard Content-Length response asynchronously.
+- **Streaming response**: `sender.start(status, headers)` begins chunked
+  streaming, `sender.send(chunk)` pushes chunks, and `sender.finish()`
+  completes the stream.
+- **Cancellation**: `sender.send(...)` returns `False` immediately upon
+  client disconnect, deadline expiry, or shutdown.
+- **Thread safety**: Background threads never touch socket descriptors
+  directly; messages are queued and the event loop wakes up via a
+  nonblocking wakeup channel (`socketpair`).
+
+See `examples/http_sse.mojo` for a complete runnable Server-Sent Events example.
 
 Resource bounds default to `max_connections=10,000`,
 request line 8 KiB, headers 32 KiB / 100 entries, body 1 MiB,
@@ -172,9 +205,9 @@ pixi run example-unix
 ```
 
 Run the whole test suite with `pixi run test` (and memory sanitizers with `pixi run sanitize`), or a focused module with `pixi run test-tcp` and the analogous `test-core`, `test-ip`, `test-address`, `test-sys`, `test-udp`, `test-unix`, `test-poll`, `test-reactor`, `test-http-api`, `test-http-parser`, `test-http-response`, `test-http-server`, `test-http-detach`, and `test-actor` tasks.
-Run benchmarks with `pixi run benchmark-ip`, `pixi run benchmark-loopback`, `pixi run benchmark-http-parse`, and `pixi run benchmark-http-server`.
+Run benchmarks with `pixi run benchmark-ip`, `pixi run benchmark-loopback`, `pixi run benchmark-http-parse`, `pixi run benchmark-http-server`, and `pixi run benchmark-http-stream`.
 Benchmarks report measurements and do not define pass or fail thresholds.
-HTTP examples: `pixi run example-http-hello`, `pixi run example-http-json`.
+HTTP examples: `pixi run example-http-hello`, `pixi run example-http-json`, `pixi run example-http-sse`.
 
 ## Development and CI
 
@@ -198,7 +231,7 @@ Windows、32-bit ABI、表にない target は対象外です。
 test は全体を `pixi run test`、個別を `pixi run test-tcp` のように実行します。
 examples は loopback だけを使い、benchmarks は閾値を持たない測定プログラムです。
 HTTP/1.1 origin server は `net.http` から利用します（`pixi run example-http-hello`）。
-handler は loop 上で同期実行されるため、blocking 処理は入れません。
+handler は loop 上で同期実行されますが、`writer.detach()` を呼ぶことで別スレッドへの応答切り離し（遅延応答・SSE レスポンスストリーミング）が可能です（`pixi run example-http-sse`）。
 詳細は [docs/design/http-server.md](docs/design/http-server.md) を参照してください。
 
 hostname は OS の同期 `getaddrinfo` で解決されます。
