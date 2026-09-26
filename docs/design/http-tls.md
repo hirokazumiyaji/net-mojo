@@ -16,6 +16,9 @@ dynamic-library calls, but a small C shim is preferable for OpenSSL's opaque
 types, macros, and error queue. [Mojo C FFI](https://mojolang.org/docs/manual/c-ffi/)
 documents both interop paths and their linking differences.
 
+The provider requires OpenSSL 3.2 or newer at build time and runtime. The
+comma-separated ALPN list is limited to 255 bytes in its encoded wire form.
+
 ## Alternatives
 
 | Provider | Strengths | Why it is not selected |
@@ -38,6 +41,9 @@ transport and HTTP/3 framing implementation or a selected engine.
 - Treat `WANT_READ` and `WANT_WRITE` as interest changes, not connection
   failures. Preserve the operation across retries and retain the existing
   absolute handshake deadline.
+- A successful partial write consumes the returned byte count. A write that
+  reports `WANT_READ` or `WANT_WRITE` consumes no bytes and must be retried with
+  the same payload and length.
 - Configure certificate/key inputs on the server context and configure ALPN
   from the enabled HTTP protocols. A connection with no mutually supported
   protocol must fail explicitly; do not retry in plaintext.

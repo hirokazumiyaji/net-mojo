@@ -1,6 +1,7 @@
 #include <limits.h>
 #include <stddef.h>
 #include <stdint.h>
+#include <stdatomic.h>
 #include <string.h>
 
 #include <openssl/err.h>
@@ -19,7 +20,7 @@ enum {
 
 struct net_tls_context {
     SSL_CTX *ssl;
-    unsigned int references;
+    atomic_uint references;
     unsigned char alpn[255];
     unsigned int alpn_length;
 };
@@ -30,7 +31,7 @@ struct net_tls_connection {
 };
 
 static void net_tls_context_release(struct net_tls_context *context) {
-    if (--context->references == 0) {
+    if (atomic_fetch_sub_explicit(&context->references, 1, memory_order_acq_rel) == 1) {
         SSL_CTX_free(context->ssl);
         OPENSSL_free(context);
     }
@@ -58,6 +59,9 @@ static int net_tls_select_alpn(SSL *ssl, const unsigned char **out,
 void *net_tls_context_server(const char *certificate, const char *private_key,
                              const char *protocols) {
     ERR_clear_error();
+    if (OpenSSL_version_num() < 0x30200000L) {
+        return NULL;
+    }
     struct net_tls_context *context = OPENSSL_zalloc(sizeof(*context));
     if (context == NULL) {
         return NULL;
@@ -100,7 +104,7 @@ void *net_tls_context_server(const char *certificate, const char *private_key,
         return NULL;
     }
 
-    context->references = 1;
+    atomic_init(&context->references, 1);
     SSL_CTX_set_alpn_select_cb(context->ssl, net_tls_select_alpn, context);
     return context;
 }
@@ -118,18 +122,22 @@ void *net_tls_connection_new(void *opaque, int fd) {
     if (connection == NULL) {
         return NULL;
     }
+    atomic_fetch_add_explicit(&context->references, 1, memory_order_relaxed);
     connection->ssl = SSL_new(context->ssl);
     if (connection->ssl == NULL) {
         OPENSSL_free(connection);
+        net_tls_context_release(context);
         return NULL;
     }
     if (SSL_set_fd(connection->ssl, fd) != 1) {
         SSL_free(connection->ssl);
         OPENSSL_free(connection);
+        net_tls_context_release(context);
         return NULL;
     }
-    context->references++;
     connection->context = context;
+    SSL_set_mode(connection->ssl,
+                 SSL_MODE_ENABLE_PARTIAL_WRITE | SSL_MODE_ACCEPT_MOVING_WRITE_BUFFER);
     SSL_set_accept_state(connection->ssl);
     return connection;
 }

@@ -74,6 +74,8 @@ jobs:
         run: pixi run test-http-server
       - name: Test optional TLS provider
         run: pixi run -e tls tls-test
+      - name: Verify TLS test task is defined
+        run: rg -q '^tls-test = ' pixi.toml
       - name: Test HTTP detach
         run: pixi run test-http-detach
       - name: Test actor primitives

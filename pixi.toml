@@ -69,7 +69,6 @@ benchmark-http-stream = "mojo run --Werror -I . benchmarks/http_stream.mojo"
 
 [feature.tls.dependencies]
 c-compiler = "*"
-mojo = "==1.0.0"
 openssl = ">=3.2,<4"
 pkg-config = "*"
 
