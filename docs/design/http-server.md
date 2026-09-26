@@ -578,4 +578,127 @@ handler をイベントループ上でブロックさせると全接続が停止
     - graceful shutdown 中の猶予内 `finish` による正常送出とクリーンシャットダウン（`test_detached_streaming_graceful_shutdown_finishes_within_grace`）。
     - graceful shutdown 猶予超過によるストリーム強制キャンセル（`test_detached_streaming_graceful_shutdown_exceeded_grace_cancels`）。
     - ストリーム切断後のスロット再利用と世代不一致メッセージの安全な破棄（`test_detached_streaming_slot_reuse_generation_mismatch`）。
-- **Phase E**: 別スレッドからの実送受信とドキュメント。pthread からの連続送信テスト、`examples/http_sse.mojo`、ベンチマーク。
+- **Phase E**: 別スレッドからの実送受信とドキュメント（実装完了）。
+  - 外部 pthread からの連続ストリーミング送信契約テスト（`test_cross_thread_streaming_hundreds_chunks_and_wakeup`）: 200 チャンクの完全な順序保持・`WakeupChannel` 経由のリアルタイム wakeup 実証。
+  - Server-Sent Events (SSE) 最小例（`examples/http_sse.mojo`）: 外部 pthread から 1 秒間隔での SSE イベント配信、クライアントキャンセル検知、chunked 終端処理。
+  - ベンチマークスイート（`benchmarks/http_stream.mojo`）の実装と測定記録（同時 100 ストリーム、各 50 イベント/秒、計 5,000 イベント）。
+  - API・状態機械・上限・スレッド安全性の完全契約を明記。
+
+## 応答切り離し（遅延応答・ストリーミング）の完全契約仕様
+
+### 公開 API 一覧と振る舞い契約
+
+| 型 / 関数 | シグネチャ | 契約・振る舞い |
+| --- | --- | --- |
+| `ResponseWriter.detach()` | `mut self -> ResponseSender` raises NetError | ハンドラ内で 1 回だけ呼び出し可能。呼び出し後は `ResponseWriter` への書き込みはエラーとなり、ハンドラ復帰後も接続は閉じず「切り離し待ち」状態に移行する。二重呼び出しは `invalid_state` エラー。 |
+| `ResponseSender` | `Movable` | 単一所有権（コピー不可、移動可能）。Mojo ランタイム管理外のスレッド（FFI 経由で生成した pthread 等）へ安全に移動可能。デストラクタで未送信 drop を検知した場合は自動的に `abort` をキューイングする。 |
+| `ResponseSender.respond` | `mut self, status: Int, var headers: Headers, var body: List[Byte]) raises NetError` | 遅延応答。Content-Length 付きの通常応答を 1 回で送信する。すでに `start()` や `respond()` が呼ばれている場合、またはキャンセル済みの場合はエラー。 |
+| `ResponseSender.start` | `mut self, status: Int = 200, var headers: Headers = Headers()) raises NetError` | レスポンスストリーミングを開始する。HTTP/1.1 では `Transfer-Encoding: chunked` ヘッダーを自動付与してステータス行とヘッダーを送信する（`Content-Length` を明示指定した場合は `invalid_argument` エラー）。 |
+| `ResponseSender.send` | `mut self, bytes: Span[Byte, _]) -> Bool` | ストリームのチャンク（body 断片）を送信する。HTTP/1.1 では 1 回の呼び出しを 1 つの chunk としてエンコードする。クライアント切断、タイムアウト、シャットダウンによりキャンセルされている場合は例外を送出せず `False` を返す。送信成功時は `True`。長さ 0 のバイト列は no-op（終端 chunk との混同を防ぐ）。 |
+| `ResponseSender.finish` | `mut self) raises NetError` | ストリームを正常終了する（HTTP/1.1 では `0\r\n\r\n` を送出）。その後、keep-alive の規則に従って次要求の受信へ進むか接続をクローズする。 |
+| `ResponseSender.abort` | `mut self)` | ストリームまたは遅延応答を中断し、接続を直ちにクローズする。例外は送出しない。 |
+| `ResponseSender.is_cancelled` | `self -> Bool` | クライアント切断、deadline 満了、シャットダウン等により接続が失効している場合に `True` を返す。 |
+
+### 接続状態機械（Connection State Machine）
+
+```
+                     ┌──────────────────┐
+                     │    STATE_IDLE    │
+                     └────────┬─────────┘
+                              │ Request Header 受信
+                              ▼
+                     ┌──────────────────┐
+                     │ STATE_READ_REQ   │
+                     └────────┬─────────┘
+                              │ Request Body 受信（上限 1MiB）
+                              ▼
+                     ┌──────────────────┐
+                     │  STATE_HANDLER   │
+                     └────────┬─────────┘
+                              │
+               ┌──────────────┴──────────────┐
+               │ writer.detach()             │ 同期終了
+               ▼                             ▼
+     ┌──────────────────┐          ┌──────────────────┐
+     │  STATE_DETACHED  │          │ STATE_WRITE_RESP │
+     └────────┬─────────┘          └────────┬─────────┘
+              │                             │ 送信完了
+              ├─────────────────────────────┴──────────┐
+              │ respond()                              │
+              ▼                                        │
+     ┌──────────────────┐                              │
+     │ STATE_WRITE_RESP │                              │
+     └────────┬─────────┘                              │
+              │                                        ▼
+              │ start()                     ┌──────────────────┐
+              ▼                             │ 次 Request / Close│
+     ┌──────────────────┐                   └──────────────────┘
+     │ STATE_STREAMING  │
+     └────────┬─────────┘
+              │ send()*
+              │ finish()
+              ├────────────────────────────────────────┘
+              │ abort() / cancel / timeout / disconnect
+              ▼
+     ┌──────────────────┐
+     │      Close       │
+     └──────────────────┘
+```
+
+1. **STATE_DETACHED / STATE_STREAMING 中のパイプライン保護**:
+   - 切り離し中およびストリーミング中は、同じ接続から後続のパイプライン要求が届いてもパーサーを進めず待機する。
+   - 応答完了（`respond` または `finish`）後に `_push_urgent` で次要求の処理を再開し、HTTP/1.1 の要求・応答順序を厳格に保持する。
+2. **タイムアウト・切断時のフレーミング保護**:
+   - `STATE_STREAMING` 移行後にタイムアウトやエラーが発生した場合、不正な 500/503 応答を送信せず、直ちにソケットをクローズする（すでに 200 OK ヘッダーがクライアントに届いているため、後からステータスを送ると HTTP フレーミング違反になる）。
+   - `STATE_DETACHED` で未 `start()` のままタイムアウトした場合は、503 Service Unavailable を送信してクローズする。
+
+### リソース上限と設定契約
+
+| 設定項目 | 型 | デフォルト値 | 振る舞い・契約 |
+| --- | --- | --- | --- |
+| `ServerConfig.stream_queue_limit` | `Int` | `1048576` (1 MiB) | `ResponseSender` から積まれる未送信メッセージのバイト数上限。この上限を超えて `send()` または `respond()` された場合、キュー肥大化による OOM を防ぐため接続は直ちに abort されクローズされる。 |
+| `ServerConfig.detached_response_timeout` | `Duration` | 30 秒 | `writer.detach()` 後に `respond()` または `start()` が呼ばれるまでの最大許容時間。満了時は 503 を返し `cancelled = True` にしてクローズ。 |
+| `ServerConfig.stream_idle_timeout` | `Duration` | 300 秒 | ストリーミング中に新しいチャンクが送信されないまま経過できる最大アイドル時間。満了時は接続をクローズし、送信側には `cancelled = True` を設定。 |
+| `ServerConfig.write_deadline` | `Duration` | 30 秒 | ソケットへのノンブロッキング write が進行しない場合のデッドライン。満了時は接続クローズ。 |
+| `ServerConfig.shutdown_grace` | `Duration` | 30 秒 | graceful shutdown 要求後の猶予期間。猶予内に `finish()` したストリームは正常完了し、猶予超過したストリームは強制キャンセル。 |
+
+### Erlang 的アクター／メッセージパッシング基盤とスレッド安全性の保証
+
+1. **単一ソケット所有権（Single Ownership Principle）**:
+   - ソケット fd は常にイベントループスレッド（`Reactor` / `Server`）のみが所有・操作する。
+   - 外部スレッド（推論ワーカースレッド等）がソケット API（`read`, `write`, `close`）を直接呼び出すことは構造上不可能であり、競合や二重解放の発生を完全に排除する。
+2. **スレッドセーフなメールボックスと Wakeup チャネル**:
+   - `ResponseSender` の送信メソッド（`respond`, `start`, `send`, `finish`, `abort`）は、スレッドセーフな `PthreadMutex` で保護された内部キューに構造化メッセージを enqueue する。
+   - enqueue 直後に `WakeupChannel`（非ブロッキング `socketpair`）へ 1 バイト書き込み、`Reactor.wait` でスリープしているイベントループをマイクロ秒単位で起こす。
+   - 送信側スレッドのロック保持時間はキューへのポインタ push のみで最小化され、高い並行性能を実現する。
+3. **世代検査（Generation Check）によるスロット再利用の安全性**:
+   - `_SharedDetachState` は接続スロット番号と `generation`（接続ごとの単調増加 ID）を保持する。
+   - クライアント切断やタイムアウトで接続が閉じられ、同一の接続スロット／fd が別の新規クライアントに再利用された場合、遅れて届いた古い `ResponseSender` からのメッセージは `generation` 不一致により破棄される。新規接続に古いデータが混入することは一切ない。
+
+### Phase E ベンチマーク測定結果
+
+`benchmarks/http_stream.mojo`（`pixi run benchmark-http-stream`）による測定結果（macOS arm64、Mojo 1.0.0 / 26.1、全 5,000 イベント計測）：
+
+```
+=== HTTP Detached Streaming Benchmark ===
+Concurrent streams: 100
+Events per stream: 50
+Target stream rate: 50 events/sec (interval: 20ms)
+Total events: 5000
+--- Results ---
+Elapsed wall time (s): 1.15 - 1.22 s
+CPU time (s): 0.14 - 0.28 s
+CPU utilization (%): 11.6% - 24.0%
+Total events measured: 5000
+Aggregate throughput (events/s): 4,100 - 4,330 events/s
+Latency p50: 109 - 182 us (0.11 - 0.18 ms)
+Latency p90: 380 us - 1.8 ms
+Latency p99: 2.0 - 48 ms
+```
+
+- **評価**:
+  - 同時 100 ストリームにおいて各ストリーム 50 イベント/秒（計 4,100〜4,330 events/sec）を高効率に処理。
+  - 受信タイムスタンプの毎クライアント計測およびミリ秒未満の微小クロックスキュー許容により、5,000 イベント全件の完全な追跡と低遅延（p50 約 0.11〜0.18 ms）を確認。
+  - 100 スレッドの並行送信中もイベントループの CPU 使用率は約 12〜24% に収まり、十分なスケーラビリティ余力を実証。
+  - ハンドラエラー処理仕様: `writer.detach()` 後に応答責務は `ResponseSender` へ移行する。スレッド生成失敗等の場合は `ResponseSender.abort()` を呼んでハンドラを正常終了（return）させることが推奨され、万一ハンドラが例外を送出した場合もサーバーが切り離し状態を安全にキャンセル・解放して 500 を返送する二重の安全機構を備える。
+
