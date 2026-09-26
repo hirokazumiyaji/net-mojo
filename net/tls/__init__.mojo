@@ -172,6 +172,8 @@ struct TLSConnection(Movable):
     def try_read[
         origin: MutOrigin
     ](mut self, buffer: Span[mut=True, Byte, origin]) raises -> TLSIOResult:
+        if len(buffer) == 0:
+            return TLSIOResult(progress=TLSProgress.complete(), count=0)
         var result = Int32(
             self._library.call["net_tls_read", c_int](
                 self._session, buffer.unsafe_ptr(), c_size_t(len(buffer))
@@ -182,6 +184,8 @@ struct TLSConnection(Movable):
     def try_write[
         origin: ImmOrigin
     ](mut self, buffer: Span[Byte, origin]) raises -> TLSIOResult:
+        if len(buffer) == 0:
+            return TLSIOResult(progress=TLSProgress.complete(), count=0)
         var result = Int32(
             self._library.call["net_tls_write", c_int](
                 self._session, buffer.unsafe_ptr(), c_size_t(len(buffer))

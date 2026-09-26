@@ -74,6 +74,14 @@ def test_tls_handshake_waits_for_input_and_rejects_non_tls_bytes() raises:
     var server = pair.take_server()
     var tls = context.accept(server^)
 
+    var empty = Array[Byte, 0](fill=0)
+    var empty_read = tls.try_read(Span(empty))
+    var empty_write = tls.try_write(Span(empty))
+    assert_true(empty_read.progress.is_complete())
+    assert_true(empty_write.progress.is_complete())
+    assert_true(empty_read.count == 0)
+    assert_true(empty_write.count == 0)
+
     var progress = tls.handshake()
     assert_true(progress.is_wants_read())
 

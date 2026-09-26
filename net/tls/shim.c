@@ -175,22 +175,28 @@ int net_tls_handshake(void *opaque) {
 
 int net_tls_read(void *opaque, unsigned char *buffer, size_t length) {
     struct net_tls_connection *connection = opaque;
+    if (length > (size_t)INT_MAX) {
+        return NET_TLS_ERROR;
+    }
     ERR_clear_error();
     size_t read_length = 0;
     int result = SSL_read_ex(connection->ssl, buffer, length, &read_length);
     if (result == 1) {
-        return read_length > INT_MAX ? NET_TLS_ERROR : (int)read_length;
+        return (int)read_length;
     }
     return net_tls_result(connection, result);
 }
 
 int net_tls_write(void *opaque, const unsigned char *buffer, size_t length) {
     struct net_tls_connection *connection = opaque;
+    if (length > (size_t)INT_MAX) {
+        return NET_TLS_ERROR;
+    }
     ERR_clear_error();
     size_t written_length = 0;
     int result = SSL_write_ex(connection->ssl, buffer, length, &written_length);
     if (result == 1) {
-        return written_length > INT_MAX ? NET_TLS_ERROR : (int)written_length;
+        return (int)written_length;
     }
     return net_tls_result(connection, result);
 }
