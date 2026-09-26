@@ -481,3 +481,60 @@ method・status の意味は RFC 9110 による。Phase 1 で節番号付き tab
 Go `go1.26.4`、`/fixed` 64 B・`/json` 1024 B・`/echo` 上限 1 MiB を検証済み。
 `GOMAXPROCS=1`、別 CPU/別 host 負荷、warmup 10 s・測定 30 s x 5 回、req/s・p50/p95/p99・CPU・RSS・fd を記録。
 暫定目標は 64/1024 接続で Go の 90% throughput、非飽和 p99 1.2 倍以内（未検証）。
+
+## 応答の切り離し（遅延応答・レスポンスストリーミング）と Erlang 的アクター／メッセージパッシング方式
+
+Issue #51 に基づき、同期 handler 終了後に別スレッドから応答を送信する仕組み（遅延応答・レスポンスストリーミング）を提供する。
+
+### 背景と目的
+
+LLM 推論エンジン（hirokazumiyaji/llm-serve）等では、推論処理を専用スレッド（GPU worker / pthread）で実行し、生成されたトークンを SSE（Server-Sent Events）で順次クライアントへストリーミング送信する。また非ストリーミング時も推論完了後に status・headers・body をまとめて返す。
+handler をイベントループ上でブロックさせると全接続が停止するため、応答の生成・送信を handler から切り離す（detach）必要がある。
+
+### アーキテクチャ: Erlang 的アクター／メッセージパッシング方式
+
+ソケットの直接操作を別スレッドに移す方式は採用せず、**Erlang のプロセス／アクターモデルに着想を得たメッセージパッシング方式**を採用する。
+
+1. **接続アクターの単一所有権と安定性**:
+   - イベントループ上の各接続（`HttpConnection`）は独立したアクター（ステートマシン）として振る舞い、ソケット、reactor 登録、deadline、全体 buffer budget を排他的に所有・管理する。
+   - 別スレッド（送信側）が直接ソケットに write することは一切ない。これにより、ソケットの二重クローズ、partial write の競合、reactor interest の不整合を完全に防止し、高い安定性を担保する。
+
+2. **ResponseSender によるメッセージパッシング**:
+   - `writer.detach()` によって発行される `ResponseSender` は、該当接続アクター宛のメッセージ送信プロキシ（Mailbox endpoint）である。
+   - `ResponseSender` は `Movable` であり、Mojo 管理外の外部 pthread 等へ自由に所有権を移動できる。
+   - 送信操作（`respond`, `start`, `send`, `finish`, `abort`）は構造化メッセージ（`DetachMessage`）を作成し、スレッドセーフな受信メールボックス（キュー）に enqueue する。
+
+3. **Wakeup 機構（レイテンシの最小化と高速化）**:
+   - キューへの enqueue 後、送信側は非ブロッキング wakeup fd（`socketpair`）へ 1 バイト書き込んでイベントループを起こす。
+   - イベントループは `Reactor.wait`（kqueue / epoll）で即座に目覚め、メールボックスからメッセージを取り出してソケットへノンブロッキング送信する。
+   - 送信スレッド側はキューイングと wakeup だけで即座に復帰するためロック保持時間が極めて短く、ループ側ではバッチ処理による高スループット送信が可能となる。
+
+4. **マルチコア・将来のスケーリングへの適合**:
+   - 将来的にマルチイベントループ（worker モデル）へ拡張する際も、各 worker が専用のメールボックスと wakeup 機構を持つことで、スレッド間でソケットを渡すことなくメッセージパッシングのみでスケールできる。
+
+### 共有状態と同期仕様
+
+- **共有状態構造体 (`_SharedDetachState`)**:
+  - ヒープに割り当てられ、接続アクターと `ResponseSender` の双方から参照カウント（`ref_count`）で管理される。
+  - POSIX mutex (`pthread_mutex_t`) によりキューと状態フラグを排他制御する。
+  - どちらが先に破棄（drop / close）されても参照カウントが 0 になった時点で安全に deinit / free され、メモリリークや use-after-free を防ぐ。
+- **未送信 drop 時のフェイルセーフ**:
+  - `ResponseSender` が `respond()` や `start()` を呼ばずに drop された場合、デストラクタが自動的に `abort` メッセージをキューイングして wakeup を行い、接続を 500 またはクローズしてリソース解放を完了させる。
+
+### Generation 検査とキャンセル契約
+
+- **Generation 検査による fd 再利用耐性**:
+  - `_SharedDetachState` に接続スロットと generation（`ReactorToken`）を記録する。
+  - タイムアウト等で接続が閉じられた後に同一スロット／fd が別接続に再利用された場合、古い `ResponseSender` からのメッセージは generation 不一致により破棄され、別接続にデータが混ざらない。
+- **キャンセル契約**:
+  - クライアントの切断、write deadline 満了、サーバーシャットダウン等が発生した場合、接続アクターは共有状態の `cancelled` フラグをセットする。
+  - `ResponseSender.is_cancelled() -> Bool` により送信側は随時キャンセルを検知できる。
+  - `ResponseSender.send(...) -> Bool` は、キャンセル済みまたは終了済みの場合は `False` を返す。送信側（推論スレッド）は `False` を確認したら直ちに生成処理を打ち切る。
+
+### 実装ロードマップ
+
+- **Phase A (本PR)**: compile probe と共有状態。`ResponseSender` の `Movable` 性、pthread からの呼び出し可能性、Mutex とメッセージキュー基盤の検証、`tests/test_http_detach.mojo` の契約テスト。
+- **Phase B**: 遅延応答。`writer.detach()` と `sender.respond()` のサーバー側統合、keep-alive・pipelining・timeout 処理。
+- **Phase C**: レスポンスストリーミング。`start / send / finish / abort` と HTTP/1.1 chunked encoding、flow control と `stream_queue_limit`。
+- **Phase D**: キャンセルと停止。切断検知、stream deadline、graceful shutdown、generation 検証。
+- **Phase E**: 別スレッドからの実送受信とドキュメント。pthread からの連続送信テスト、`examples/http_sse.mojo`、ベンチマーク。

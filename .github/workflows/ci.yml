@@ -55,6 +55,8 @@ jobs:
         run: pixi run test-http-response
       - name: Test HTTP server
         run: pixi run test-http-server
+      - name: Test HTTP detach
+        run: pixi run test-http-detach
       - name: Package precompiled artifact
         run: pixi run package
       - name: Verify packaged artifact

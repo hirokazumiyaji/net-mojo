@@ -9,6 +9,7 @@ of borrowed into a send queue.
 
 from net.error import NetError, NetErrorKind
 
+from ._detach import ResponseSender, _create_detach_state
 from .headers import Headers
 
 
@@ -20,6 +21,8 @@ struct ResponseWriter(Movable, Sized):
     var body: List[Byte]
     var should_close: Bool
     var _limit: Int
+    var _detached: Bool
+    var _detach_state_addr: Int
 
     def __init__(out self, body_limit: Int):
         self.status = 200
@@ -27,6 +30,45 @@ struct ResponseWriter(Movable, Sized):
         self.body = List[Byte]()
         self.should_close = False
         self._limit = body_limit
+        self._detached = False
+        self._detach_state_addr = 0
+
+    def __init__(out self, *, deinit move: Self):
+        self.status = move.status
+        self.headers = move.headers^
+        self.body = move.body^
+        self.should_close = move.should_close
+        self._limit = move._limit
+        self._detached = move._detached
+        self._detach_state_addr = move._detach_state_addr
+
+    def is_detached(self) -> Bool:
+        return self._detached
+
+    def set_detach_state(mut self, addr: Int):
+        self._detach_state_addr = addr
+
+    def detach(mut self) raises NetError -> ResponseSender:
+        """Detaches the response from the synchronous handler flow.
+
+        Returns a `ResponseSender` that can be transferred across threads to
+        complete or stream the response asynchronously. Once detached, the handler
+        must not write further data directly to `ResponseWriter`.
+        """
+        if self._detached:
+            raise NetError(
+                NetErrorKind.invalid_state(),
+                "detach",
+                None,
+                "response already detached",
+            )
+        self._detached = True
+        if self._detach_state_addr != 0:
+            return ResponseSender(self._detach_state_addr)
+        # Fallback for standalone or probe usage without an active server connection:
+        var addr = _create_detach_state(-1, 0)
+        self._detach_state_addr = addr
+        return ResponseSender(addr)
 
     def __len__(self) -> Int:
         return len(self.body)

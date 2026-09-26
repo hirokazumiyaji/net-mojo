@@ -7,6 +7,7 @@ from net.http import (
     HttpError,
     HttpVersion,
     Request,
+    ResponseSender,
     ResponseWriter,
     Server,
     ServerConfig,
@@ -316,6 +317,15 @@ def test_http_error_status_mapping() raises:
     assert_equal(internal.status, 500)
     var busy = HttpError.unavailable(String("budget"))
     assert_equal(busy.status, 503)
+
+
+def test_response_writer_detach_api() raises:
+    var writer = ResponseWriter(1024)
+    assert_false(writer.is_detached())
+    var sender = writer.detach()
+    assert_true(writer.is_detached())
+    assert_true(sender.is_active())
+    assert_false(sender.is_cancelled())
 
 
 def main() raises:

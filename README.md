@@ -171,7 +171,7 @@ pixi run example-udp
 pixi run example-unix
 ```
 
-Run the whole test suite with `pixi run test`, or a focused module with `pixi run test-tcp` and the analogous `test-core`, `test-ip`, `test-address`, `test-sys`, `test-udp`, `test-unix`, `test-poll`, `test-reactor`, `test-http-api`, `test-http-parser`, `test-http-response`, and `test-http-server` tasks.
+Run the whole test suite with `pixi run test`, or a focused module with `pixi run test-tcp` and the analogous `test-core`, `test-ip`, `test-address`, `test-sys`, `test-udp`, `test-unix`, `test-poll`, `test-reactor`, `test-http-api`, `test-http-parser`, `test-http-response`, `test-http-server`, and `test-http-detach` tasks.
 Run benchmarks with `pixi run benchmark-ip`, `pixi run benchmark-loopback`, `pixi run benchmark-http-parse`, and `pixi run benchmark-http-server`.
 Benchmarks report measurements and do not define pass or fail thresholds.
 HTTP examples: `pixi run example-http-hello`, `pixi run example-http-json`.
