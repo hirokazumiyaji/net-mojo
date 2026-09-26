@@ -168,9 +168,11 @@ def _process_stream_buffer(
                     else:
                         valid_digits = False
                         break
-                if valid_digits and val > 0 and val <= now_ns:
+                if valid_digits and val > 0:
                     var lat_us = (now_ns - val) // 1000
-                    if lat_us >= 0 and lat_us < 10000000:
+                    if lat_us < 0:
+                        lat_us = 0
+                    if lat_us < 10000000:
                         latencies.append(lat_us)
                 j = num_end + 1
                 consumed_to = j
@@ -247,6 +249,10 @@ def main() raises:
         detach_ticks += 1
 
     if idx_ptr[] < num_streams:
+        for c_i in range(len(clients)):
+            clients[c_i].close()
+        external_call["free", NoneType](sender_boxes)
+        external_call["free", NoneType](idx_ptr)
         raise Error("Failed to detach all connections")
 
     # Prepare thread contexts and spawn 100 worker threads
@@ -254,12 +260,21 @@ def main() raises:
         "malloc", Pointer[_BenchWorkerContext, MutUntrackedOrigin]
     ](c_size_t(num_streams * size_of[_BenchWorkerContext]()))
     if Int(ctx_array) == 0:
+        for c_i in range(num_streams):
+            clients[c_i].close()
+        external_call["free", NoneType](sender_boxes)
+        external_call["free", NoneType](idx_ptr)
         raise Error("malloc failed for ctx_array")
 
     var threads = external_call["malloc", Pointer[UInt64, MutUntrackedOrigin]](
         c_size_t(num_streams * size_of[UInt64]())
     )
     if Int(threads) == 0:
+        for c_i in range(num_streams):
+            clients[c_i].close()
+        external_call["free", NoneType](sender_boxes)
+        external_call["free", NoneType](idx_ptr)
+        external_call["free", NoneType](ctx_array)
         raise Error("malloc failed for threads")
 
     for i in range(num_streams):
@@ -303,6 +318,12 @@ def main() raises:
                 if rem_addr != 0:
                     var rem_s = ResponseSender(rem_addr)
                     rem_s.abort()
+            for c_i in range(num_streams):
+                clients[c_i].close()
+            external_call["free", NoneType](sender_boxes)
+            external_call["free", NoneType](idx_ptr)
+            external_call["free", NoneType](ctx_array)
+            external_call["free", NoneType](threads)
             raise Error("pthread_create failed")
         _get_ptr(threads, i).unsafe_write(handle)
 
@@ -319,46 +340,57 @@ def main() raises:
     var bench_deadline_ns = (
         Int(perf_counter_ns()) + 30 * 1000 * 1000 * 1000
     )  # 30 second deadline
+    var loop_error_msg = String()
 
     while finished_streams < num_streams:
         if Int(perf_counter_ns()) > bench_deadline_ns:
-            raise Error(
+            loop_error_msg = (
                 "Benchmark timed out after 30 seconds waiting for all streams"
                 " to finish"
             )
+            break
 
         # Tick the event loop to flush detached sender messages to sockets
         _ = server.tick(handler, Timeout.milliseconds(2))
 
-        var now = Int(perf_counter_ns())
         for i in range(num_streams):
             if stream_finished[i]:
                 continue
 
             try:
                 var n = clients[i].try_read(Span(read_buf))
+                var read_time = Int(perf_counter_ns())
                 if n > 0:
                     for k in range(n):
                         remainders[i].append(read_buf[k])
                     var is_ended = _process_stream_buffer(
-                        remainders[i], now, latencies
+                        remainders[i], read_time, latencies
                     )
                     if is_ended:
                         stream_finished[i] = True
                         finished_streams += 1
                 elif n == 0:
-                    _ = _process_stream_buffer(remainders[i], now, latencies)
+                    _ = _process_stream_buffer(
+                        remainders[i], read_time, latencies
+                    )
                     stream_finished[i] = True
                     finished_streams += 1
             except e:
                 if e.kind == NetErrorKind.closed():
-                    _ = _process_stream_buffer(remainders[i], now, latencies)
+                    var read_time = Int(perf_counter_ns())
+                    _ = _process_stream_buffer(
+                        remainders[i], read_time, latencies
+                    )
                     stream_finished[i] = True
                     finished_streams += 1
                 elif e.kind == NetErrorKind.timeout():
                     pass
                 else:
-                    raise e
+                    loop_error_msg = String(e)
+                    break
+
+        if loop_error_msg.byte_length() > 0:
+            break
 
     var bench_end = perf_counter_ns()
     var cpu_end = external_call["clock", c_ulong]()
@@ -371,6 +403,18 @@ def main() raises:
                 c_ulong(handle),
                 Optional[Pointer[Byte, MutUntrackedOrigin]](None),
             )
+
+    # Cleanup clients and memory
+    for i in range(num_streams):
+        clients[i].close()
+
+    external_call["free", NoneType](sender_boxes)
+    external_call["free", NoneType](idx_ptr)
+    external_call["free", NoneType](ctx_array)
+    external_call["free", NoneType](threads)
+
+    if loop_error_msg.byte_length() > 0:
+        raise Error(loop_error_msg)
 
     var wall_seconds = Float64(Int(bench_end) - Int(bench_start)) / 1e9
     var cpu_seconds = Float64(Int(cpu_end) - Int(cpu_start)) / 1000000.0
@@ -399,13 +443,4 @@ def main() raises:
     print("Latency p99 (us):", p99)
     print("Latency p50 (ms):", Float64(p50) / 1000.0)
     print("Latency p99 (ms):", Float64(p99) / 1000.0)
-
-    # Cleanup
-    for i in range(num_streams):
-        clients[i].close()
-
-    external_call["free", NoneType](sender_boxes)
-    external_call["free", NoneType](idx_ptr)
-    external_call["free", NoneType](ctx_array)
-    external_call["free", NoneType](threads)
     print("Benchmark completed successfully.")

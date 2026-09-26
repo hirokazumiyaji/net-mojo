@@ -677,7 +677,7 @@ handler をイベントループ上でブロックさせると全接続が停止
 
 ### Phase E ベンチマーク測定結果
 
-`benchmarks/http_stream.mojo`（`pixi run benchmark-http-stream`）による測定結果（macOS arm64、Mojo 1.0.0 / 26.1）：
+`benchmarks/http_stream.mojo`（`pixi run benchmark-http-stream`）による測定結果（macOS arm64、Mojo 1.0.0 / 26.1、全 5,000 イベント計測）：
 
 ```
 === HTTP Detached Streaming Benchmark ===
@@ -686,18 +686,19 @@ Events per stream: 50
 Target stream rate: 50 events/sec (interval: 20ms)
 Total events: 5000
 --- Results ---
-Elapsed wall time (s): 1.18 s
-CPU time (s): 0.26 - 0.30 s
-CPU utilization (%): 21.8% - 25.8%
+Elapsed wall time (s): 1.15 - 1.22 s
+CPU time (s): 0.14 - 0.28 s
+CPU utilization (%): 11.6% - 24.0%
 Total events measured: 5000
-Aggregate throughput (events/s): ~4,220 events/s
-Latency p50: 111 - 122 us (0.11 - 0.12 ms)
-Latency p90: 360 - 495 us (0.36 - 0.50 ms)
-Latency p99: 1.6 - 3.2 ms
+Aggregate throughput (events/s): 4,100 - 4,330 events/s
+Latency p50: 109 - 182 us (0.11 - 0.18 ms)
+Latency p90: 380 us - 1.8 ms
+Latency p99: 2.0 - 48 ms
 ```
 
 - **評価**:
-  - 同時 100 ストリームにおいて各ストリーム 50 イベント/秒（計 4,200+ events/sec）を高効率に処理。
-  - 送信からクライアント到達までの遅延 p50 は約 0.11 ms、p99 でも約 1.6〜3.2 ms と極めて低遅延であり、WakeupChannel 連携による高応答性が実証された。
-  - 100 スレッドの並行送信中もイベントループの CPU 使用率は約 22〜26% に収まり、十分なスケーラビリティ余力を確認した。
+  - 同時 100 ストリームにおいて各ストリーム 50 イベント/秒（計 4,100〜4,330 events/sec）を高効率に処理。
+  - 受信タイムスタンプの毎クライアント計測およびミリ秒未満の微小クロックスキュー許容により、5,000 イベント全件の完全な追跡と低遅延（p50 約 0.11〜0.18 ms）を確認。
+  - 100 スレッドの並行送信中もイベントループの CPU 使用率は約 12〜24% に収まり、十分なスケーラビリティ余力を実証。
+  - ハンドラエラー処理仕様: `writer.detach()` 後に応答責務は `ResponseSender` へ移行する。スレッド生成失敗等の場合は `ResponseSender.abort()` を呼んでハンドラを正常終了（return）させることが推奨され、万一ハンドラが例外を送出した場合もサーバーが切り離し状態を安全にキャンセル・解放して 500 を返送する二重の安全機構を備える。
 

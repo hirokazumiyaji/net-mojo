@@ -109,7 +109,7 @@ struct SseHandler(Handler):
                 s.abort()
                 external_call["free", NoneType](ctx_ptr)
                 self.worker_ctx_box[] = 0
-                raise Error("pthread_create failed")
+                return
             self.thread_handle_box[] = handle
         else:
             writer.set_status(404)
@@ -172,13 +172,25 @@ def main() raises:
     var client = dial_tcp(
         String("127.0.0.1:") + String(port), Timeout.seconds(5)
     )
-    client.write_all(
-        String("GET /events HTTP/1.1\r\nHost: localhost\r\n\r\n").as_bytes(),
-        Timeout.seconds(5),
-    )
+    var resp_str = String()
+    var run_error_msg = String()
 
-    var raw_resp = _read_sse_stream(server, handler, client)
-    var resp_str = String(from_utf8_lossy=Span(raw_resp))
+    try:
+        client.write_all(
+            String(
+                "GET /events HTTP/1.1\r\nHost: localhost\r\n\r\n"
+            ).as_bytes(),
+            Timeout.seconds(5),
+        )
+    except e:
+        run_error_msg = String(e)
+
+    if run_error_msg.byte_length() == 0:
+        try:
+            var raw_resp = _read_sse_stream(server, handler, client)
+            resp_str = String(from_utf8_lossy=Span(raw_resp))
+        except e:
+            run_error_msg = String(e)
 
     # Join worker thread and cleanup allocations
     var join_failed = False
@@ -203,6 +215,8 @@ def main() raises:
     external_call["free", NoneType](ctx_box)
     client.close()
 
+    if run_error_msg.byte_length() > 0:
+        raise Error(run_error_msg)
     if join_failed:
         raise Error("pthread_join failed")
     if not worker_completed:
