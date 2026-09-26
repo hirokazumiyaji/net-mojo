@@ -1,5 +1,11 @@
 from net import Timeout, dial_tcp, listen_tcp
-from net.http import Headers, ServerConfig, has_body_for_status
+from net.http import (
+    Headers,
+    ResponseSender,
+    ResponseWriter,
+    ServerConfig,
+    has_body_for_status,
+)
 from net.http._parser import parse_one
 
 
@@ -31,6 +37,12 @@ def _check_http_codec() raises:
         raise Error("packaged net.http body rule mismatch")
     if has_body_for_status(204, False):
         raise Error("packaged net.http 204 rule mismatch")
+    var writer = ResponseWriter(1024)
+    var sender = writer.detach()
+    if not writer.is_detached():
+        raise Error("packaged ResponseWriter is_detached mismatch")
+    if not sender.is_active():
+        raise Error("packaged ResponseSender is_active mismatch")
 
 
 def main() raises:

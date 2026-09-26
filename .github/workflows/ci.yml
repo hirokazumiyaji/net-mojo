@@ -2,7 +2,13 @@ name: CI
 
 on:
   push:
+    branches:
+      - main
   pull_request:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
 
 permissions:
   contents: read
@@ -11,6 +17,7 @@ jobs:
   test:
     name: Test (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
     strategy:
       fail-fast: false
       matrix:
@@ -29,6 +36,16 @@ jobs:
         run: pixi run format
       - name: Verify formatting
         run: git diff --exit-code
+      - name: Verify test tasks mirror pixi
+        run: |
+          diff -u \
+            <(grep -oE '^test-[a-z0-9-]+' pixi.toml | sort -u) \
+            <(grep -oE 'pixi run test-[^ ]+' .github/workflows/ci.yml | awk '{print $3}' | sort -u)
+          for t in $(grep -oE '^test-[a-z0-9-]+' pixi.toml | sort -u); do
+            [ "$t" = "test-package" ] && continue
+            grep -q "\"$t\"," pixi.toml || { echo "$t missing from 'test' aggregate"; exit 1; }
+          done
+      # Individual test steps match `pixi run test` in pixi.toml for step-level triage.
       - name: Test core
         run: pixi run test-core
       - name: Test IP addresses
@@ -55,10 +72,42 @@ jobs:
         run: pixi run test-http-response
       - name: Test HTTP server
         run: pixi run test-http-server
+      - name: Test HTTP detach
+        run: pixi run test-http-detach
+      - name: Test actor primitives
+        run: pixi run test-actor
       - name: Package precompiled artifact
         run: pixi run package
       - name: Verify packaged artifact
         run: pixi run test-package
+
+  sanitize:
+    name: Sanitize (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+          - macos-14
+          - ubuntu-24.04
+          - ubuntu-24.04-arm
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      - name: Install pixi
+        uses: prefix-dev/setup-pixi@f00437f565399d418b0acc85936d12c1fb668347
+        with:
+          frozen: true
+      - name: Verify sanitize tasks mirror pixi
+        run: |
+          diff -u \
+            <(grep -oE '^sanitize-[a-z0-9-]+' pixi.toml | sort -u) \
+            <(grep -oE 'pixi run sanitize-[^ ]+' .github/workflows/ci.yml | awk '{print $3}' | sort -u)
+          for t in $(grep -oE '^sanitize-[a-z0-9-]+' pixi.toml | sort -u); do
+            grep -q "\"$t\"," pixi.toml || { echo "$t missing from 'sanitize' aggregate"; exit 1; }
+          done
+      # Individual sanitize steps match `pixi run sanitize` in pixi.toml for step-level triage.
       - name: Sanitize system bindings
         run: pixi run sanitize-sys
       - name: Sanitize TCP
@@ -67,3 +116,7 @@ jobs:
         run: pixi run sanitize-udp
       - name: Sanitize Unix sockets
         run: pixi run sanitize-unix
+      - name: Sanitize actor primitives
+        run: pixi run sanitize-actor
+      - name: Sanitize HTTP detach
+        run: pixi run sanitize-http-detach

@@ -19,10 +19,23 @@ test-http-api = "mojo run --Werror -I . tests/test_http_api.mojo"
 test-http-parser = "mojo run --Werror -I . tests/test_http_parser.mojo"
 test-http-response = "mojo run --Werror -I . tests/test_http_response.mojo"
 test-http-server = "mojo run --Werror -I . tests/test_http_server.mojo"
+test-http-detach = "mojo run --Werror -I . tests/test_http_detach.mojo"
+test-actor = "mojo run --Werror -I . tests/test_actor.mojo"
 sanitize-sys = "mojo run --sanitize address -I . tests/test_sys.mojo"
 sanitize-tcp = "mojo run --sanitize address -I . tests/test_tcp.mojo"
 sanitize-udp = "mojo run --sanitize address -I . tests/test_udp.mojo"
 sanitize-unix = "mojo run --sanitize address -I . tests/test_unix.mojo"
+sanitize-actor = "mojo run --sanitize address -I . tests/test_actor.mojo"
+sanitize-http-detach = "mojo run --sanitize address -I . tests/test_http_detach.mojo"
+# Note: pixi runs depends-on tasks concurrently. To avoid high memory from parallel ASan runs, invoke individual tasks sequentially.
+sanitize = { depends-on = [
+  "sanitize-sys",
+  "sanitize-tcp",
+  "sanitize-udp",
+  "sanitize-unix",
+  "sanitize-actor",
+  "sanitize-http-detach",
+] }
 test = { depends-on = [
   "test-core",
   "test-ip",
@@ -37,6 +50,8 @@ test = { depends-on = [
   "test-http-parser",
   "test-http-response",
   "test-http-server",
+  "test-http-detach",
+  "test-actor",
 ] }
 example-tcp = "mojo run --Werror -I . examples/tcp_echo.mojo"
 example-udp = "mojo run --Werror -I . examples/udp_echo.mojo"

@@ -16,7 +16,7 @@ from .error import HttpError, _status_reason
 from .handler import Handler
 from .headers import Headers
 from .request import HttpVersion, Request, split_path_query
-from .response import ResponseWriter, has_body_for_status
+from .response import ResponseSender, ResponseWriter, has_body_for_status
 from .server import (
     Server,
     ServerControl,
