@@ -14,6 +14,8 @@ underscore (see README "Versioning and compatibility"). Anything under
 
 ### Added
 
+- Optional OpenSSL-backed nonblocking TLS server transport in the Pixi `tls`
+  environment. HTTP server integration follows separately.
 - `net.http` plaintext HTTP/1.1 origin server (single event loop, epoll
   on Linux / kqueue on macOS): `Handler`, `Request`, `Headers`,
   `ResponseWriter`, `Server`, `ServerConfig`, `ServerControl`,

@@ -67,5 +67,20 @@ benchmark-http-parse = "mojo run --Werror -I . benchmarks/http_parse.mojo"
 benchmark-http-server = "mojo run --Werror -I . benchmarks/http_server.mojo"
 benchmark-http-stream = "mojo run --Werror -I . benchmarks/http_stream.mojo"
 
+[feature.tls.dependencies]
+c-compiler = "*"
+mojo = "==1.0.0"
+openssl = ">=3.2,<4"
+pkg-config = "*"
+
+[feature.tls.tasks]
+tls-build = "bash scripts/build_tls_shim.sh"
+tls-test = { cmd = "mojo run --Werror -I . tests/test_tls.mojo", depends-on = [
+  "tls-build",
+] }
+
 [dependencies]
 mojo = ">=1.0.0,<2"
+
+[environments]
+tls = ["tls"]

@@ -211,7 +211,7 @@ Phase 6〜9 はそれぞれ実装前に詳細仕様と PR 単位の計画を作�
 
 ### Phase 6: TLS と ALPN の実装
 
-- [ ] `docs/design/http-tls.md` で TLS provider を比較し、Mojo FFI、対応 OS、ライセンス、配布、更新方針、QUIC handshake API の有無を検証して採用する provider を固定する。
+- [x] `docs/design/http-tls.md` で TLS provider を比較し、Mojo FFI、対応 OS、ライセンス、配布、更新方針、QUIC handshake API の有無を検証して採用する provider を固定する。
 - [ ] `net/tls/` に非ブロッキング handshake、暗号化 I/O、証明書設定、ALPN、close を実装し、reactor の read/write interest と連携する。暗号 primitive を独自実装しない。
 - [ ] core `net` は既存の std/libc 依存を維持する。HTTPS と QUIC 用の依存を明示した build/package 構成を作り、暗黙の平文 downgrade を行わない。
 - [ ] `tests/test_tls.mojo` と `examples/https_hello.mojo` で handshake 分割、handshake timeout、不正 handshake、ALPN の選択、shutdown、fd／buffer 解放を確認する。テスト専用証明書を使用する。
@@ -701,4 +701,3 @@ Latency p99: 2.0 - 48 ms
   - 受信タイムスタンプの毎クライアント計測およびミリ秒未満の微小クロックスキュー許容により、5,000 イベント全件の完全な追跡と低遅延（p50 約 0.11〜0.18 ms）を確認。
   - 100 スレッドの並行送信中もイベントループの CPU 使用率は約 12〜24% に収まり、十分なスケーラビリティ余力を実証。
   - ハンドラエラー処理仕様: `writer.detach()` 後に応答責務は `ResponseSender` へ移行する。スレッド生成失敗等の場合は `ResponseSender.abort()` を呼んでハンドラを正常終了（return）させることが推奨され、万一ハンドラが例外を送出した場合もサーバーが切り離し状態を安全にキャンセル・解放して 500 を返送する二重の安全機構を備える。
-

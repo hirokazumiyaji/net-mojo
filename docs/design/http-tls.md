@@ -55,19 +55,18 @@ The first implementation should use a pinned OpenSSL 3.x build for CI and
 document how downstream builds provide the same ABI; silently loading an
 arbitrary system library at runtime would make behavior depend on the host.
 
-Before implementing the Mojo wrapper, add a compile/link probe for the chosen
-OpenSSL build on macOS arm64, Linux x86_64, and Linux aarch64. The probe must
-cover context creation, server ALPN selection, nonblocking handshake return
-states, read/write, and orderly shutdown. That check also confirms whether the
-selected package exposes QUIC TLS symbols on each target. If it does not, keep
-TCP TLS on OpenSSL and select a QUIC engine with its own supported TLS
-integration in Phase 8.
+The opt-in TLS tests must compile and link the shim on macOS arm64, Linux
+x86_64, and Linux aarch64. They must cover context creation, server ALPN
+selection, nonblocking handshake return states, read/write, and orderly
+shutdown. The QUIC engine selection must separately confirm whether this
+OpenSSL package exposes the required QUIC TLS symbols on each target. If it does
+not, keep TCP TLS on OpenSSL and select a QUIC engine with its own supported
+TLS integration in Phase 8.
 
 ## Phase 6 implementation boundary
 
-The next implementation PR should add only the C shim and Mojo TLS ownership
-wrapper, then exercise it with a loopback TLS handshake over the existing
-reactor. HTTP server protocol dispatch and HTTP/2 remain separate PRs. The
-contract tests must cover a handshake that alternates read/write readiness,
-invalid certificates or handshake bytes, ALPN selection, deadline expiry, and
-resource release after close.
+Phase 6 is split into small PRs. The first transport PR adds the C shim and
+Mojo TLS ownership wrapper, then exercises nonblocking handshake readiness,
+certificate/key validation, and malformed handshake bytes. A later PR connects
+the wrapper to the HTTP server and its absolute handshake deadline, then adds
+HTTPS serving and successful ALPN interoperability. HTTP/2 remains separate.
