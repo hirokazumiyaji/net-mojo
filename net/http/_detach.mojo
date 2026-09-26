@@ -16,52 +16,12 @@ Architecture (Erlang-inspired Actor / Message-Passing):
   its slot / descriptor is recycled.
 """
 
-from std.ffi import c_int, c_size_t, c_ssize_t, external_call, get_errno
-from std.sys import CompilationTarget, size_of
+from std.ffi import c_int, c_size_t, external_call
+from std.sys import size_of
 
-from net._sys.common import (
-    AF_UNIX,
-    EINTR,
-    SOCK_STREAM,
-    _close,
-    _set_nonblocking_cloexec,
-    _system_error,
-)
+from net._actor import PthreadMutex, signal_wakeup_fd
 from net.error import NetError, NetErrorKind
 from net.http.headers import Headers
-
-
-comptime _IS_DARWIN = CompilationTarget.is_macos()
-
-
-# Darwin: sizeof(pthread_mutex_t) = 64, align = 8.
-# Linux:  sizeof(pthread_mutex_t) = 40 (glibc), align = 8.
-# 64 bytes (8 x UInt64) safely covers both targets with 8-byte alignment.
-@fieldwise_init
-struct PthreadMutex(Movable):
-    var _storage: Array[UInt64, 8]
-
-    def __init__(out self):
-        self._storage = Array[UInt64, 8](fill=0)
-        var ptr = Pointer(to=self._storage).unsafe_bitcast[Byte]()
-        var rc = external_call["pthread_mutex_init", c_int](
-            ptr, Optional[Pointer[Byte, MutUntrackedOrigin]](None)
-        )
-        if Int(rc) != 0:
-            # Fatal if mutex initialization fails.
-            pass
-
-    def lock(mut self):
-        var ptr = Pointer(to=self._storage).unsafe_bitcast[Byte]()
-        _ = external_call["pthread_mutex_lock", c_int](ptr)
-
-    def unlock(mut self):
-        var ptr = Pointer(to=self._storage).unsafe_bitcast[Byte]()
-        _ = external_call["pthread_mutex_unlock", c_int](ptr)
-
-    def destroy(mut self):
-        var ptr = Pointer(to=self._storage).unsafe_bitcast[Byte]()
-        _ = external_call["pthread_mutex_destroy", c_int](ptr)
 
 
 comptime MSG_KIND_NONE: UInt8 = 0
@@ -194,26 +154,6 @@ struct _SharedDetachState:
         self.messages = List[DetachMessage]()
 
 
-def _signal_wakeup(wakeup_fd: Int32):
-    """Writes a 1-byte notification to the wakeup socket descriptor."""
-    if wakeup_fd < 0:
-        return
-    var b: Byte = 1
-    while True:
-        var rc = external_call["send", c_ssize_t](
-            c_int(wakeup_fd),
-            Pointer(to=b).unsafe_bitcast[Byte](),
-            c_size_t(1),
-            c_int(0),
-        )
-        if rc >= 0:
-            break
-        var errno = get_errno().value
-        if errno == EINTR:
-            continue
-        break
-
-
 def _create_detach_state(
     slot: Int,
     generation: UInt64,
@@ -267,7 +207,7 @@ def _release_detach_state(addr: Int, from_sender: Bool):
     s_ptr[].mutex.unlock()
 
     if needs_wakeup:
-        _signal_wakeup(wakeup_fd)
+        signal_wakeup_fd(wakeup_fd)
 
     if should_free:
         s_ptr[].mutex.destroy()
@@ -355,7 +295,7 @@ struct ResponseSender(Movable):
         )
         var wakeup_fd = s_ptr[].wakeup_fd
         s_ptr[].mutex.unlock()
-        _signal_wakeup(wakeup_fd)
+        signal_wakeup_fd(wakeup_fd)
 
     def start(
         mut self,
@@ -387,7 +327,7 @@ struct ResponseSender(Movable):
         s_ptr[].messages.append(DetachMessage.start(status, headers^))
         var wakeup_fd = s_ptr[].wakeup_fd
         s_ptr[].mutex.unlock()
-        _signal_wakeup(wakeup_fd)
+        signal_wakeup_fd(wakeup_fd)
 
     def send[
         origin: ImmOrigin
@@ -414,7 +354,7 @@ struct ResponseSender(Movable):
         s_ptr[].messages.append(DetachMessage.chunk(chunk^))
         var wakeup_fd = s_ptr[].wakeup_fd
         s_ptr[].mutex.unlock()
-        _signal_wakeup(wakeup_fd)
+        signal_wakeup_fd(wakeup_fd)
         return True
 
     def finish(mut self) raises NetError:
@@ -433,7 +373,7 @@ struct ResponseSender(Movable):
         s_ptr[].messages.append(DetachMessage.finish())
         var wakeup_fd = s_ptr[].wakeup_fd
         s_ptr[].mutex.unlock()
-        _signal_wakeup(wakeup_fd)
+        signal_wakeup_fd(wakeup_fd)
 
     def abort(mut self):
         """Aborts the response, causing the server to close or 500 the connection.
@@ -452,4 +392,4 @@ struct ResponseSender(Movable):
         s_ptr[].messages.append(DetachMessage.abort())
         var wakeup_fd = s_ptr[].wakeup_fd
         s_ptr[].mutex.unlock()
-        _signal_wakeup(wakeup_fd)
+        signal_wakeup_fd(wakeup_fd)

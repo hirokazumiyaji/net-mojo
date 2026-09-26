@@ -512,6 +512,15 @@ handler をイベントループ上でブロックさせると全接続が停止
 4. **マルチコア・将来のスケーリングへの適合**:
    - 将来的にマルチイベントループ（worker モデル）へ拡張する際も、各 worker が専用のメールボックスと wakeup 機構を持つことで、スレッド間でソケットを渡すことなくメッセージパッシングのみでスケールできる。
 
+5. **アクター基盤の分離 (`net/_actor.mojo`) と独立ライブラリ化への布石**:
+   - HTTP 固有のメッセージングロジックと汎用アクター／並行処理プリミティブを明確に分離。
+   - `net/_actor.mojo` に以下の汎用プリミティブを提供：
+     - `PthreadMutex`: POSIX `pthread_mutex_t`（Darwin 64B / Linux 64bit 40B 両対応）の薄いラッパー。
+     - `WakeupChannel`: `socketpair(AF_UNIX, SOCK_STREAM, 0)` によるスレッド間イベント通知チャネル（read/write 側の分離、drain、close）。
+     - `Mailbox[T: Movable & Deinitable]`: スレッドセーフな FIFO メッセージキュー（push, pop_all, close, is_closed, count）。
+     - `signal_wakeup_fd`: 非ブロッキング 1 バイト通知関数。
+   - 将来的に `actor-mojo` 等の独立ライブラリとして切り出し可能な疎結合設計とし、HTTP 層はこれらのプリミティブを利用して `_SharedDetachState` や `ResponseSender` を構築する。
+
 ### 共有状態と同期仕様
 
 - **共有状態構造体 (`_SharedDetachState`)**:
