@@ -542,8 +542,18 @@ handler をイベントループ上でブロックさせると全接続が停止
 
 ### 実装ロードマップ
 
-- **Phase A (本PR)**: compile probe と共有状態。`ResponseSender` の `Movable` 性、pthread からの呼び出し可能性、Mutex とメッセージキュー基盤の検証、`tests/test_http_detach.mojo` の契約テスト。
-- **Phase B**: 遅延応答。`writer.detach()` と `sender.respond()` のサーバー側統合、keep-alive・pipelining・timeout 処理。
+- **Phase A (PR #52 で実装済み)**: compile probe と共有状態。`ResponseSender` の `Movable` 性、pthread からの呼び出し可能性、Mutex とメッセージキュー基盤の検証、`tests/test_http_detach.mojo` の契約テスト。
+- **Phase B (本PR)**: 遅延応答（Deferred Response）。
+  - `Server` への `WakeupChannel`（`socketpair`）の統合と reactor 登録。
+  - `ResponseWriter.detach()` と `_SharedDetachState` 連携（接続 slot、generation、wakeup_fd の引き渡し）。
+  - `STATE_DETACHED` 状態機械の導入、パイプライン要求の順序保存（detach 中は次要求の parse を保留、完了後に `_push_urgent` で順次再開、バッファ空時のみ読み込み許可によるバッファバジェット保護）。
+  - クライアントのハーフクローズ（`shutdown(SHUT_WR)`）耐性と正常応答・クローズ遷移。
+  - `ServerConfig.detached_response_timeout` による厳格なタイムアウト処理（503 Service Unavailable と close、共有状態への `cancelled = True` 設定）。
+  - ハンドラが `detach()` 後に例外送出した際の状態キャンセル・解放と 500 送信（メモリリーク防止）。
+  - 複数接続同時 detach 時の多重 pop 防止、generation 不一致時の安全な無効化、完了・タイムアウト・中断時の確実な deadline 再登録。
+  - RFC 9110 に準拠した `HEAD` 要求でのエラー・遅延応答時のボディ省略（Content-Length は維持）。
+  - 未応答 drop 時の自動 500 / close 処理。
+  - `tests/test_http_detach.mojo` による契約テスト（遅延応答、keep-alive、abort 時クローズ、pipelining 順序保存、タイムアウト・キャンセル検知、複数同時 detach、ハンドラ例外時クリーンアップ、HEAD 要求ボディ省略、pthread 外部スレッドからの wakeup 連携）。
 - **Phase C**: レスポンスストリーミング。`start / send / finish / abort` と HTTP/1.1 chunked encoding、flow control と `stream_queue_limit`。
 - **Phase D**: キャンセルと停止。切断検知、stream deadline、graceful shutdown、generation 検証。
 - **Phase E**: 別スレッドからの実送受信とドキュメント。pthread からの連続送信テスト、`examples/http_sse.mojo`、ベンチマーク。

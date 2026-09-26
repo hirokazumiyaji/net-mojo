@@ -340,7 +340,10 @@ def encode_100_continue() -> List[Byte]:
 
 
 def encode_error(
-    status: Int, should_close: Bool, date: StringSlice
+    status: Int,
+    should_close: Bool,
+    date: StringSlice,
+    is_head: Bool = False,
 ) -> List[Byte]:
     """Minimal error response with a fixed small body. Never fails:
     used on paths where only a static buffer is available."""
@@ -366,5 +369,6 @@ def encode_error(
     if should_close:
         _append_string(out, String("Connection: close\r\n"))
     _append_string(out, String("\r\n"))
-    _append_string(out, body)
+    if not is_head:
+        _append_string(out, body)
     return out^
