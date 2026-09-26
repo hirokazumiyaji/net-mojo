@@ -181,27 +181,32 @@ def main() raises:
     var resp_str = String(from_utf8_lossy=Span(raw_resp))
 
     # Join worker thread and cleanup allocations
+    var join_failed = False
     var handle = thread_box[]
     if handle != 0:
         var rc = external_call["pthread_join", c_int](
             c_ulong(handle), Optional[Pointer[Byte, MutUntrackedOrigin]](None)
         )
         if Int(rc) != 0:
-            raise Error("pthread_join failed")
+            join_failed = True
 
+    var worker_completed = True
     var ctx_addr = ctx_box[]
     if ctx_addr != 0:
         var ctx_ptr = Pointer[Byte, MutUntrackedOrigin](
             unsafe_from_address=ctx_addr
         ).unsafe_bitcast[_SseWorkerContext]()
-        var completed = ctx_ptr[].completed
+        worker_completed = ctx_ptr[].completed
         external_call["free", NoneType](ctx_ptr)
-        if not completed:
-            raise Error("SSE worker did not complete cleanly")
 
     external_call["free", NoneType](thread_box)
     external_call["free", NoneType](ctx_box)
     client.close()
+
+    if join_failed:
+        raise Error("pthread_join failed")
+    if not worker_completed:
+        raise Error("SSE worker did not complete cleanly")
 
     if resp_str.find("HTTP/1.1 200 OK") < 0:
         raise Error("Expected 200 OK, got: " + resp_str)

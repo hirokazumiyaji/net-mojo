@@ -137,7 +137,7 @@ def _process_stream_buffer(
     var has_stream_end = False
 
     var s = String(from_utf8_lossy=Span(buf))
-    if s.find("0\r\n\r\n") >= 0:
+    if s.find("\r\n0\r\n\r\n") >= 0 or s.endswith("0\r\n\r\n"):
         has_stream_end = True
 
     var j = 0
@@ -159,10 +159,16 @@ def _process_stream_buffer(
 
             if num_end < len(buf):
                 var val: Int = 0
+                var valid_digits = True
+                if num_end == num_start:
+                    valid_digits = False
                 for p in range(num_start, num_end):
                     if buf[p] >= Byte(ord("0")) and buf[p] <= Byte(ord("9")):
                         val = val * 10 + Int(buf[p] - Byte(ord("0")))
-                if val > 0 and val <= now_ns:
+                    else:
+                        valid_digits = False
+                        break
+                if valid_digits and val > 0 and val <= now_ns:
                     var lat_us = (now_ns - val) // 1000
                     if lat_us >= 0 and lat_us < 10000000:
                         latencies.append(lat_us)
@@ -351,6 +357,8 @@ def main() raises:
                     finished_streams += 1
                 elif e.kind == NetErrorKind.timeout():
                     pass
+                else:
+                    raise e
 
     var bench_end = perf_counter_ns()
     var cpu_end = external_call["clock", c_ulong]()

@@ -1789,7 +1789,7 @@ def _worker_stream_hundreds_thread(
     arg: Pointer[Byte, MutUntrackedOrigin],
 ) -> Pointer[Byte, MutUntrackedOrigin]:
     var ctx = arg.unsafe_bitcast[_WorkerStreamHundredsContext]()
-    # Brief sleep to ensure the server event loop has entered a blocking tick (poll)
+    # Brief delay so the main thread enters tick; wakeup works whether the loop is sleeping or not
     sleep(0.04)
     var sender = ResponseSender(ctx[].sender_addr)
     var h = Headers()
