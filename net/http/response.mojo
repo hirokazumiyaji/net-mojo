@@ -26,6 +26,7 @@ struct ResponseWriter(Movable, Sized):
     var _slot: Int
     var _generation: UInt64
     var _wakeup_fd: Int32
+    var _queue_limit: Int
 
     def __init__(
         out self,
@@ -33,6 +34,7 @@ struct ResponseWriter(Movable, Sized):
         slot: Int = -1,
         generation: UInt64 = 0,
         wakeup_fd: Int32 = -1,
+        queue_limit: Int = 1048576,
     ):
         self.status = 200
         self.headers = Headers()
@@ -47,6 +49,7 @@ struct ResponseWriter(Movable, Sized):
         # The channel owns descriptor lifecycle; DetachState.cancelled guards
         # against late signaling if Server deinitializes.
         self._wakeup_fd = wakeup_fd
+        self._queue_limit = queue_limit
 
     def __init__(out self, *, deinit move: Self):
         self.status = move.status
@@ -59,6 +62,7 @@ struct ResponseWriter(Movable, Sized):
         self._slot = move._slot
         self._generation = move._generation
         self._wakeup_fd = move._wakeup_fd
+        self._queue_limit = move._queue_limit
 
     def is_detached(self) -> Bool:
         return self._detached
@@ -70,7 +74,7 @@ struct ResponseWriter(Movable, Sized):
         """Detaches the response from the synchronous handler flow.
 
         Returns a `ResponseSender` that can be transferred across threads to
-        complete the response asynchronously (response streaming is planned for Phase C).
+        complete or stream the response asynchronously.
         Once detached, the handler must not write further data directly to `ResponseWriter`.
         """
         if self._detached:
@@ -87,6 +91,7 @@ struct ResponseWriter(Movable, Sized):
             slot=self._slot,
             generation=self._generation,
             wakeup_fd=self._wakeup_fd,
+            queue_limit=self._queue_limit,
         )
         self._detach_state_addr = addr
         return ResponseSender(addr)

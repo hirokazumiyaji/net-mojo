@@ -554,6 +554,19 @@ handler をイベントループ上でブロックさせると全接続が停止
   - RFC 9110 に準拠した `HEAD` 要求でのエラー・遅延応答時のボディ省略（Content-Length は維持）。
   - 未応答 drop 時の自動 500 / close 処理。
   - `tests/test_http_detach.mojo` による契約テスト（遅延応答、keep-alive、abort 時クローズ、pipelining 順序保存、タイムアウト・キャンセル検知、複数同時 detach、ハンドラ例外時クリーンアップ、HEAD 要求ボディ省略、pthread 外部スレッドからの wakeup 連携）。
-- **Phase C**: レスポンスストリーミング。`start / send / finish / abort` と HTTP/1.1 chunked encoding、flow control と `stream_queue_limit`。
+- **Phase C**: レスポンスストリーミング（実装完了）。
+  - `ResponseSender` の `start(status, headers)`、`send(data)`、`finish()`、`abort()` 実装。
+  - HTTP/1.1 chunked encoding（`encode_chunked_start`, `encode_chunk`, `encode_chunk_end`）。ゼロアロケーション hex 長さエンコード（`_append_hex`）。
+  - RFC 9112 / RFC 9110 フレーミング規則の厳格な準拠：
+    - `start()` での `Content-Length` 指定拒否（`invalid_argument`）。
+    - 1xx, 204, 205, 304 での `Transfer-Encoding: chunked` およびボディチャンク除外。
+    - HEAD 要求における `Transfer-Encoding: chunked` ヘッダー出力とボディチャンク・終端チャンク省略。
+    - 長さ 0 の `send()` の no-op（終端と誤認される 0 チャンク送出の防止）。
+  - 接続状態マシンへの `STATE_STREAMING`（`UInt8 = 4`）と `stream_finished`、`stream_has_body` 統合。
+  - `ServerConfig.stream_queue_limit`（デフォルト 1MiB）によるバッファ肥大化防止（上限超過時の即時 abort と `invalid_argument` 送出）。
+  - `ServerConfig.stream_idle_timeout`（デフォルト 300 秒）によるストリームアイドルタイムアウト管理。
+  - `STATE_STREAMING` 中のタイムアウト・abort 時における即時接続クローズ（ヘッダー送出後の不正な 500/503 送出による HTTP フレーミング破壊の防止）。
+  - `STATE_STREAMING` 中の早期切断（EOF）検知とワーカーへの `cancelled = True` 伝播。
+  - `tests/test_http_detach.mojo` に Phase C 契約テストを追加（start -> send x 3 -> finish の chunked 復元、keep-alive 継続、Content-Length 指定エラー、queue_limit 超過時の中断、HEAD/204 でのチャンク省略、早期切断時のキャンセル）。
 - **Phase D**: キャンセルと停止。切断検知、stream deadline、graceful shutdown、generation 検証。
 - **Phase E**: 別スレッドからの実送受信とドキュメント。pthread からの連続送信テスト、`examples/http_sse.mojo`、ベンチマーク。

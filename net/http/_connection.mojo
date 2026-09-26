@@ -13,6 +13,7 @@ comptime STATE_READING: UInt8 = 0
 comptime STATE_SENDING: UInt8 = 1
 comptime STATE_SENDING_100: UInt8 = 2
 comptime STATE_DETACHED: UInt8 = 3
+comptime STATE_STREAMING: UInt8 = 4
 
 
 struct HttpConnection(Movable):
@@ -25,6 +26,8 @@ struct HttpConnection(Movable):
     var should_close: Bool
     var sent_100: Bool
     var read_eof: Bool
+    var stream_finished: Bool
+    var stream_has_body: Bool
     var header_at: Int
     var body_at: Int
     var write_at: Int
@@ -58,6 +61,8 @@ struct HttpConnection(Movable):
         self.should_close = False
         self.sent_100 = False
         self.read_eof = False
+        self.stream_finished = False
+        self.stream_has_body = False
         self._no_deadline = no_deadline
         self.header_at = no_deadline
         self.body_at = no_deadline
@@ -80,16 +85,17 @@ struct HttpConnection(Movable):
             return False
         if self.state == STATE_READING:
             return True
-        if self.state == STATE_DETACHED:
-            # While detached, only read if buffer is empty, so pipelined
+        if self.state == STATE_DETACHED or self.state == STATE_STREAMING:
+            # While detached or streaming, only read if buffer is empty, so pipelined
             # data does not consume the shared buffer budget unparsed.
+            # Reading when buffer is empty allows detecting peer disconnect (EOF).
             return self.buffered_len() == 0
         return False
 
     def wants_write(self) -> Bool:
         return (
             self.active
-            and self.state == STATE_SENDING
+            and (self.state == STATE_SENDING or self.state == STATE_STREAMING)
             and self.pending_offset < len(self.pending)
         )
 
@@ -123,6 +129,24 @@ struct HttpConnection(Movable):
         self.pending = bytes^
         self.pending_offset = 0
         self.state = STATE_SENDING
+
+    def append_pending(mut self, var bytes: List[Byte]):
+        if self.pending_offset >= len(self.pending):
+            self.pending = bytes^
+            self.pending_offset = 0
+        elif self.pending_offset > 0:
+            var rest = List[Byte]()
+            rest.reserve(self.pending_remaining() + len(bytes))
+            for i in range(self.pending_offset, len(self.pending)):
+                rest.append(self.pending[i])
+            for i in range(len(bytes)):
+                rest.append(bytes[i])
+            self.pending = rest^
+            self.pending_offset = 0
+        else:
+            self.pending.reserve(len(self.pending) + len(bytes))
+            for i in range(len(bytes)):
+                self.pending.append(bytes[i])
 
     def pending_span(self) -> Span[Byte, origin_of(self.pending)]:
         return Span(self.pending)[self.pending_offset :]
@@ -188,4 +212,6 @@ struct HttpConnection(Movable):
         self.detach_state_addr = 0
         self.detach_at = self._no_deadline
         self.is_head = False
+        self.stream_finished = False
+        self.stream_has_body = False
         self.conn.close()

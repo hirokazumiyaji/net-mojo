@@ -327,6 +327,43 @@ def _tick_and_read[H: Handler](
     return out^
 
 
+def _chunked_response_complete(buf: List[Byte]) -> Bool:
+    var end = _header_end(buf)
+    if end < 0:
+        return False
+    var s = String(from_utf8_lossy=Span(buf)[end:])
+    return s.find("0\r\n\r\n") >= 0
+
+
+def _tick_and_read_chunked[H: Handler](
+    mut server: Server,
+    mut handler: H,
+    mut client: TCPConn,
+    max_ticks: Int = 100,
+) raises -> List[Byte]:
+    var out = List[Byte]()
+    var tmp = Array[Byte, 8192](fill=0)
+    for _ in range(max_ticks):
+        _ = server.tick(handler, Timeout.nanoseconds(0))
+        try:
+            var n = client.try_read(Span(tmp))
+            if n == 0:
+                break
+            for i in range(n):
+                out.append(tmp[i])
+            if _chunked_response_complete(out):
+                break
+        except e:
+            if e.kind == NetErrorKind.timeout():
+                pass
+            elif e.kind == NetErrorKind.closed():
+                break
+            else:
+                raise e
+        sleep(0.002)
+    return out^
+
+
 struct _DeferredHandler(Handler):
     var sender_box: Pointer[Int, MutUntrackedOrigin]
 
@@ -334,7 +371,11 @@ struct _DeferredHandler(Handler):
         self.sender_box = box
 
     def handle(mut self, req: Request, mut writer: ResponseWriter) raises:
-        if req.path == "/deferred":
+        if (
+            req.path == "/deferred"
+            or req.path == "/stream"
+            or req.path == "/stream-204"
+        ):
             var s = writer.detach()
             self.sender_box[] = s._take()
         elif req.path == "/second":
@@ -961,34 +1002,314 @@ def test_detached_oversized_response_body_cancels_sender() raises:
     external_call["free", NoneType](box)
 
 
-def test_detached_streaming_methods_raise_unsupported_in_phase_b() raises:
+def test_streaming_lifecycle_validation() raises:
     var writer = ResponseWriter(1024)
     var sender = writer.detach()
 
-    var start_failed = False
-    try:
-        sender.start()
-    except e:
-        if e.kind == NetErrorKind.unsupported():
-            start_failed = True
-    assert_true(start_failed)
-
-    var finish_failed = False
-    try:
-        sender.finish()
-    except e:
-        if e.kind == NetErrorKind.unsupported():
-            finish_failed = True
-    assert_true(finish_failed)
-
+    # send() before start() must fail
     var dummy = Array[Byte, 4](fill=0)
-    var send_failed = False
+    var send_before_start = False
     try:
         _ = sender.send(Span(dummy))
     except e:
-        if e.kind == NetErrorKind.unsupported():
+        if e.kind == NetErrorKind.invalid_state():
+            send_before_start = True
+    assert_true(send_before_start)
+
+    # finish() before start() must fail
+    var finish_before_start = False
+    try:
+        sender.finish()
+    except e:
+        if e.kind == NetErrorKind.invalid_state():
+            finish_before_start = True
+    assert_true(finish_before_start)
+
+    # start() succeeds
+    sender.start(200)
+
+    # second start() must fail
+    var second_start = False
+    try:
+        sender.start(200)
+    except e:
+        if e.kind == NetErrorKind.invalid_state():
+            second_start = True
+    assert_true(second_start)
+
+    # respond() after start() must fail
+    var respond_after_start = False
+    try:
+        var h = Headers()
+        var b = List[Byte]()
+        sender.respond(200, h^, b^)
+    except e:
+        if e.kind == NetErrorKind.invalid_state():
+            respond_after_start = True
+    assert_true(respond_after_start)
+
+    # 0-length send is a no-op returning True
+    var empty_list = List[Byte]()
+    assert_true(sender.send(Span(empty_list)))
+
+    # normal send succeeds
+    assert_true(sender.send(Span(dummy)))
+
+    # finish() succeeds
+    sender.finish()
+
+    # send() after finish() must fail
+    var send_after_finish = False
+    try:
+        _ = sender.send(Span(dummy))
+    except e:
+        if e.kind == NetErrorKind.invalid_state():
+            send_after_finish = True
+    assert_true(send_after_finish)
+
+    # second finish() must fail
+    var second_finish = False
+    try:
+        sender.finish()
+    except e:
+        if e.kind == NetErrorKind.invalid_state():
+            second_finish = True
+    assert_true(second_finish)
+
+
+def test_streaming_rejects_content_length() raises:
+    var writer = ResponseWriter(1024)
+    var sender = writer.detach()
+    var h = Headers()
+    h.add(String("Content-Length"), String("42"))
+    var rejected = False
+    try:
+        sender.start(200, h^)
+    except e:
+        if e.kind == NetErrorKind.invalid_argument():
+            rejected = True
+    assert_true(rejected)
+
+
+def test_streaming_queue_limit_exceeded() raises:
+    var writer = ResponseWriter(1024, queue_limit=16)
+    var sender = writer.detach()
+    sender.start(200)
+
+    var large_chunk = List[Byte]()
+    for _ in range(32):
+        large_chunk.append(Byte(ord("a")))
+
+    var exceeded = False
+    try:
+        _ = sender.send(Span(large_chunk))
+    except e:
+        if e.kind == NetErrorKind.invalid_argument():
+            exceeded = True
+    assert_true(exceeded)
+    assert_true(sender.is_cancelled())
+
+
+def test_detached_response_streaming_chunks() raises:
+    var server = Server(ServerConfig.default())
+    server.add_listener(listen_tcp("127.0.0.1:0"))
+    var port = server.local_address().port
+
+    var box = external_call["malloc", Pointer[Int, MutUntrackedOrigin]](
+        c_size_t(size_of[Int]())
+    )
+    assert_true(Int(box) != 0)
+    box.unsafe_write(0)
+
+    var handler = _DeferredHandler(box)
+    var client = dial_tcp(
+        String("127.0.0.1:") + String(port), Timeout.seconds(2)
+    )
+    client.write_all(
+        "GET /stream HTTP/1.1\r\nHost: localhost\r\n\r\n".as_bytes(),
+        Timeout.seconds(2),
+    )
+
+    _tick_until_detached(server, handler, box)
+    var sender_addr = box[]
+    assert_true(sender_addr != 0)
+    box.unsafe_write(0)
+
+    var sender = ResponseSender(sender_addr)
+    sender.start(200)
+    _ = sender.send(String("alpha").as_bytes())
+    _ = sender.send(String("beta").as_bytes())
+    _ = sender.send(String("gamma").as_bytes())
+    sender.finish()
+
+    var resp = _tick_and_read_chunked(server, handler, client)
+    assert_equal(_status_of(resp), 200)
+    var raw = String(from_utf8_lossy=Span(resp))
+    assert_true(raw.find("Transfer-Encoding: chunked") >= 0)
+    assert_equal(_body_of(resp), "5\r\nalpha\r\n4\r\nbeta\r\n5\r\ngamma\r\n0\r\n\r\n")
+
+    # Keep-alive check: subsequent request on same connection succeeds
+    client.write_all(
+        "GET /second HTTP/1.1\r\nHost: localhost\r\n\r\n".as_bytes(),
+        Timeout.seconds(2),
+    )
+    var resp2 = _tick_and_read(server, handler, client)
+    assert_equal(_status_of(resp2), 200)
+    assert_equal(_body_of(resp2), "second-response")
+
+    client.close()
+    external_call["free", NoneType](box)
+
+
+def test_detached_streaming_head_omits_chunks() raises:
+    var server = Server(ServerConfig.default())
+    server.add_listener(listen_tcp("127.0.0.1:0"))
+    var port = server.local_address().port
+
+    var box = external_call["malloc", Pointer[Int, MutUntrackedOrigin]](
+        c_size_t(size_of[Int]())
+    )
+    assert_true(Int(box) != 0)
+    box.unsafe_write(0)
+
+    var handler = _DeferredHandler(box)
+    var client = dial_tcp(
+        String("127.0.0.1:") + String(port), Timeout.seconds(2)
+    )
+    client.write_all(
+        "HEAD /stream HTTP/1.1\r\nHost: localhost\r\n\r\n".as_bytes(),
+        Timeout.seconds(2),
+    )
+
+    _tick_until_detached(server, handler, box)
+    var sender_addr = box[]
+    assert_true(sender_addr != 0)
+    box.unsafe_write(0)
+
+    var sender = ResponseSender(sender_addr)
+    sender.start(200)
+    _ = sender.send(String("hidden-payload").as_bytes())
+    sender.finish()
+
+    var resp = _tick_and_read(server, handler, client, expect_body=False)
+    assert_equal(_status_of(resp), 200)
+    var raw = String(from_utf8_lossy=Span(resp))
+    assert_true(raw.find("Transfer-Encoding: chunked") >= 0)
+    assert_equal(_body_of(resp), "")
+
+    # Keep-alive check
+    client.write_all(
+        "GET /second HTTP/1.1\r\nHost: localhost\r\n\r\n".as_bytes(),
+        Timeout.seconds(2),
+    )
+    var resp2 = _tick_and_read(server, handler, client)
+    assert_equal(_status_of(resp2), 200)
+    assert_equal(_body_of(resp2), "second-response")
+
+    client.close()
+    external_call["free", NoneType](box)
+
+
+def test_detached_streaming_no_body_status() raises:
+    var server = Server(ServerConfig.default())
+    server.add_listener(listen_tcp("127.0.0.1:0"))
+    var port = server.local_address().port
+
+    var box = external_call["malloc", Pointer[Int, MutUntrackedOrigin]](
+        c_size_t(size_of[Int]())
+    )
+    assert_true(Int(box) != 0)
+    box.unsafe_write(0)
+
+    var handler = _DeferredHandler(box)
+    var client = dial_tcp(
+        String("127.0.0.1:") + String(port), Timeout.seconds(2)
+    )
+    client.write_all(
+        "GET /stream-204 HTTP/1.1\r\nHost: localhost\r\n\r\n".as_bytes(),
+        Timeout.seconds(2),
+    )
+
+    _tick_until_detached(server, handler, box)
+    var sender_addr = box[]
+    assert_true(sender_addr != 0)
+    box.unsafe_write(0)
+
+    var sender = ResponseSender(sender_addr)
+    sender.start(204)
+    _ = sender.send(String("dropped-payload").as_bytes())
+    sender.finish()
+
+    var resp = _tick_and_read(server, handler, client, expect_body=False)
+    assert_equal(_status_of(resp), 204)
+    var raw = String(from_utf8_lossy=Span(resp))
+    # 204 must NOT emit Transfer-Encoding header
+    assert_true(raw.find("Transfer-Encoding") < 0)
+    assert_equal(_body_of(resp), "")
+
+    # Keep-alive check
+    client.write_all(
+        "GET /second HTTP/1.1\r\nHost: localhost\r\n\r\n".as_bytes(),
+        Timeout.seconds(2),
+    )
+    var resp2 = _tick_and_read(server, handler, client)
+    assert_equal(_status_of(resp2), 200)
+    assert_equal(_body_of(resp2), "second-response")
+
+    client.close()
+    external_call["free", NoneType](box)
+
+
+def test_detached_streaming_client_disconnect_cancels() raises:
+    var server = Server(ServerConfig.default())
+    server.add_listener(listen_tcp("127.0.0.1:0"))
+    var port = server.local_address().port
+
+    var box = external_call["malloc", Pointer[Int, MutUntrackedOrigin]](
+        c_size_t(size_of[Int]())
+    )
+    assert_true(Int(box) != 0)
+    box.unsafe_write(0)
+
+    var handler = _DeferredHandler(box)
+    var client = dial_tcp(
+        String("127.0.0.1:") + String(port), Timeout.seconds(2)
+    )
+    client.write_all(
+        "GET /stream HTTP/1.1\r\nHost: localhost\r\n\r\n".as_bytes(),
+        Timeout.seconds(2),
+    )
+
+    _tick_until_detached(server, handler, box)
+    var sender_addr = box[]
+    assert_true(sender_addr != 0)
+    var sender = ResponseSender(sender_addr)
+
+    sender.start(200)
+    # Server flushes start headers
+    _ = server.tick(handler, Timeout.nanoseconds(0))
+
+    # Client disconnects early
+    client.close()
+
+    # Server tick observes EOF and cancels detached state
+    for _ in range(10):
+        _ = server.tick(handler, Timeout.nanoseconds(0))
+        if sender.is_cancelled():
+            break
+        sleep(0.002)
+
+    assert_true(sender.is_cancelled())
+
+    var send_failed = False
+    try:
+        _ = sender.send(String("chunk").as_bytes())
+    except e:
+        if e.kind == NetErrorKind.closed():
             send_failed = True
     assert_true(send_failed)
+
+    external_call["free", NoneType](box)
 
 
 def test_detached_server_shutdown_cancels_live_connections() raises:
