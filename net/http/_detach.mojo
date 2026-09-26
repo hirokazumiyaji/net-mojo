@@ -382,12 +382,7 @@ struct ResponseSender(Movable):
         s_ptr[].mutex.lock()
         if s_ptr[].cancelled:
             s_ptr[].mutex.unlock()
-            raise NetError(
-                NetErrorKind.closed(),
-                "send",
-                None,
-                "response was cancelled (client disconnect, timeout, or shutdown)",
-            )
+            return False
         if not s_ptr[].started or s_ptr[].finished or s_ptr[].responded:
             s_ptr[].mutex.unlock()
             raise NetError(

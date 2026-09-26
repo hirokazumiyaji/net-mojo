@@ -1307,9 +1307,11 @@ struct Server(Movable):
                 if not self._conns[idx].active:
                     break
                 if self._conns[idx].token.generation != s_ptr[].generation:
-                    self._mark_detached_cancelled(idx)
-                    self._cleanup_detached_state(idx)
-                    self._close_conn(idx)
+                    s_ptr[].mutex.lock()
+                    s_ptr[].cancelled = True
+                    s_ptr[].mutex.unlock()
+                    if self._conns[idx].detach_state_addr == addr:
+                        self._cleanup_detached_state(idx)
                     break
                 if msg.kind == MSG_KIND_RESPOND:
                     self._handle_detached_respond(idx, msg)

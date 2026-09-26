@@ -1300,14 +1300,7 @@ def test_detached_streaming_client_disconnect_cancels() raises:
         sleep(0.002)
 
     assert_true(sender.is_cancelled())
-
-    var send_failed = False
-    try:
-        _ = sender.send(String("chunk").as_bytes())
-    except e:
-        if e.kind == NetErrorKind.closed():
-            send_failed = True
-    assert_true(send_failed)
+    assert_false(sender.send(String("chunk").as_bytes()))
 
     external_call["free", NoneType](box)
 
@@ -1496,6 +1489,268 @@ def test_detached_generation_mismatch_and_slot_reuse_isolated() raises:
         pass
 
     # Verify Client 2 receives its own response normally and is untouched by sender 1
+    var resp2 = _tick_and_read(server, handler, client2)
+    assert_true(second_served[])
+    assert_equal(_status_of(resp2), 200)
+    assert_equal(_body_of(resp2), "second-conn-ok")
+
+    client2.close()
+    external_call["free", NoneType](box)
+    external_call["free", NoneType](second_served)
+
+
+def test_detached_streaming_idle_timeout_cancels() raises:
+    var cfg = ServerConfig.default()
+    cfg.stream_idle_timeout = Timeout.milliseconds(50)
+    var server = Server(cfg^)
+    server.add_listener(listen_tcp("127.0.0.1:0"))
+    var port = server.local_address().port
+
+    var box = external_call["malloc", Pointer[Int, MutUntrackedOrigin]](
+        c_size_t(size_of[Int]())
+    )
+    assert_true(Int(box) != 0)
+    box.unsafe_write(0)
+
+    var handler = _DeferredHandler(box)
+    var client = dial_tcp(
+        String("127.0.0.1:") + String(port), Timeout.seconds(2)
+    )
+    client.write_all(
+        "GET /stream HTTP/1.1\r\nHost: localhost\r\n\r\n".as_bytes(),
+        Timeout.seconds(2),
+    )
+
+    _tick_until_detached(server, handler, box)
+    var sender_addr = box[]
+    assert_true(sender_addr != 0)
+    var sender = ResponseSender(sender_addr)
+
+    sender.start(200)
+    _ = server.tick(handler, Timeout.nanoseconds(0))
+    assert_false(sender.is_cancelled())
+
+    # Wait out the 50ms stream idle timeout
+    sleep(0.08)
+
+    # Server tick expires the idle deadline
+    for _ in range(10):
+        _ = server.tick(handler, Timeout.nanoseconds(0))
+        if sender.is_cancelled():
+            break
+        sleep(0.002)
+
+    assert_true(sender.is_cancelled(), "stream idle timeout must cancel sender")
+    assert_false(sender.send(String("chunk").as_bytes()))
+
+    client.close()
+    external_call["free", NoneType](box)
+
+
+def test_detached_streaming_write_deadline_cancels() raises:
+    var cfg = ServerConfig.default()
+    cfg.write_deadline = Timeout.milliseconds(50)
+    var server = Server(cfg^)
+    server.add_listener(listen_tcp("127.0.0.1:0"))
+    var port = server.local_address().port
+
+    var box = external_call["malloc", Pointer[Int, MutUntrackedOrigin]](
+        c_size_t(size_of[Int]())
+    )
+    assert_true(Int(box) != 0)
+    box.unsafe_write(0)
+
+    var handler = _DeferredHandler(box)
+    var client = dial_tcp(
+        String("127.0.0.1:") + String(port), Timeout.seconds(2)
+    )
+    client.write_all(
+        "GET /stream HTTP/1.1\r\nHost: localhost\r\n\r\n".as_bytes(),
+        Timeout.seconds(2),
+    )
+
+    _tick_until_detached(server, handler, box)
+    var sender_addr = box[]
+    assert_true(sender_addr != 0)
+    var sender = ResponseSender(sender_addr)
+
+    sender.start(200)
+    var chunk = List[Byte]()
+    for _ in range(512):
+        chunk.append(Byte(ord("x")))
+    _ = sender.send(Span(chunk))
+
+    # Process detached messages to arm write_at deadline
+    _ = server.tick(handler, Timeout.nanoseconds(0))
+
+    # Sleep past write deadline (50ms)
+    sleep(0.08)
+
+    # Server tick expires write deadline
+    for _ in range(10):
+        _ = server.tick(handler, Timeout.nanoseconds(0))
+        if sender.is_cancelled():
+            break
+        sleep(0.002)
+
+    assert_true(sender.is_cancelled(), "write deadline expiry must cancel sender")
+    assert_false(sender.send(String("chunk").as_bytes()))
+
+    client.close()
+    external_call["free", NoneType](box)
+
+
+def test_detached_streaming_graceful_shutdown_finishes_within_grace() raises:
+    var cfg = ServerConfig.default()
+    cfg.shutdown_grace = Timeout.milliseconds(500)
+    var server = Server(cfg^)
+    server.add_listener(listen_tcp("127.0.0.1:0"))
+    var port = server.local_address().port
+
+    var box = external_call["malloc", Pointer[Int, MutUntrackedOrigin]](
+        c_size_t(size_of[Int]())
+    )
+    assert_true(Int(box) != 0)
+    box.unsafe_write(0)
+
+    var handler = _DeferredHandler(box)
+    var client = dial_tcp(
+        String("127.0.0.1:") + String(port), Timeout.seconds(2)
+    )
+    client.write_all(
+        "GET /stream HTTP/1.1\r\nHost: localhost\r\n\r\n".as_bytes(),
+        Timeout.seconds(2),
+    )
+
+    _tick_until_detached(server, handler, box)
+    var sender_addr = box[]
+    assert_true(sender_addr != 0)
+    var sender = ResponseSender(sender_addr)
+
+    # Request shutdown while stream is detached
+    server.request_shutdown()
+
+    # Stream sends chunks and finishes cleanly within grace period
+    sender.start(200)
+    assert_true(sender.send(String("graceful-stream").as_bytes()))
+    sender.finish()
+
+    var resp = _tick_and_read_chunked(server, handler, client)
+    assert_equal(_status_of(resp), 200)
+    var raw = String(from_utf8_lossy=Span(resp))
+    assert_true(raw.find("Transfer-Encoding: chunked") >= 0)
+    assert_true(raw.find("graceful-stream") >= 0)
+
+    client.close()
+    external_call["free", NoneType](box)
+
+
+def test_detached_streaming_graceful_shutdown_exceeded_grace_cancels() raises:
+    var cfg = ServerConfig.default()
+    cfg.shutdown_grace = Timeout.milliseconds(50)
+    var server = Server(cfg^)
+    server.add_listener(listen_tcp("127.0.0.1:0"))
+    var port = server.local_address().port
+
+    var box = external_call["malloc", Pointer[Int, MutUntrackedOrigin]](
+        c_size_t(size_of[Int]())
+    )
+    assert_true(Int(box) != 0)
+    box.unsafe_write(0)
+
+    var handler = _DeferredHandler(box)
+    var client = dial_tcp(
+        String("127.0.0.1:") + String(port), Timeout.seconds(2)
+    )
+    client.write_all(
+        "GET /stream HTTP/1.1\r\nHost: localhost\r\n\r\n".as_bytes(),
+        Timeout.seconds(2),
+    )
+
+    _tick_until_detached(server, handler, box)
+    var sender_addr = box[]
+    assert_true(sender_addr != 0)
+    var sender = ResponseSender(sender_addr)
+    sender.start(200)
+    _ = server.tick(handler, Timeout.nanoseconds(0))
+
+    # Request shutdown and wait past the grace period (50ms) without calling finish()
+    server.request_shutdown()
+    sleep(0.08)
+
+    for _ in range(20):
+        _ = server.tick(handler, Timeout.nanoseconds(0))
+        if sender.is_cancelled():
+            break
+        sleep(0.002)
+
+    assert_true(sender.is_cancelled(), "grace expiry must cancel unfinished stream")
+    assert_false(sender.send(String("late-chunk").as_bytes()))
+
+    client.close()
+    external_call["free", NoneType](box)
+
+
+def test_detached_streaming_slot_reuse_generation_mismatch() raises:
+    var server = Server(ServerConfig.default())
+    server.add_listener(listen_tcp("127.0.0.1:0"))
+    var port = server.local_address().port
+
+    var box = external_call["malloc", Pointer[Int, MutUntrackedOrigin]](
+        c_size_t(size_of[Int]())
+    )
+    assert_true(Int(box) != 0)
+    box.unsafe_write(0)
+
+    var second_served = external_call[
+        "malloc", Pointer[Bool, MutUntrackedOrigin]
+    ](c_size_t(size_of[Bool]()))
+    assert_true(Int(second_served) != 0)
+    second_served.unsafe_write(False)
+
+    var handler = _SlotReuseHandler(box, second_served)
+
+    # Client 1 connects and detaches
+    var client1 = dial_tcp(
+        String("127.0.0.1:") + String(port), Timeout.seconds(2)
+    )
+    client1.write_all(
+        "GET /detach-first HTTP/1.1\r\nHost: localhost\r\n\r\n".as_bytes(),
+        Timeout.seconds(2),
+    )
+    _tick_until_detached(server, handler, box)
+    var sender1_addr = box[]
+    assert_true(sender1_addr != 0)
+    var sender1 = ResponseSender(sender1_addr)
+    sender1.start(200)
+    _ = server.tick(handler, Timeout.nanoseconds(0))
+
+    # Client 1 disconnects early; server closes slot
+    client1.close()
+    for _ in range(10):
+        _ = server.tick(handler, Timeout.nanoseconds(0))
+        if sender1.is_cancelled():
+            break
+        sleep(0.002)
+    assert_true(sender1.is_cancelled())
+
+    # Client 2 connects, reusing the slot
+    var client2 = dial_tcp(
+        String("127.0.0.1:") + String(port), Timeout.seconds(2)
+    )
+    client2.write_all(
+        "GET /second-conn HTTP/1.1\r\nHost: localhost\r\n\r\n".as_bytes(),
+        Timeout.seconds(2),
+    )
+
+    # Stale sender 1 attempts to send chunks and finish after cancellation
+    assert_false(sender1.send(String("stale-chunk").as_bytes()))
+    try:
+        sender1.finish()
+    except:
+        pass
+
+    # Verify Client 2 receives its own response completely unaffected
     var resp2 = _tick_and_read(server, handler, client2)
     assert_true(second_served[])
     assert_equal(_status_of(resp2), 200)
