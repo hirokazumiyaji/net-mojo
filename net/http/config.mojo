@@ -25,6 +25,7 @@ struct ServerConfig(Copyable, Movable):
     var header_deadline: Timeout
     var body_deadline: Timeout
     var write_deadline: Timeout
+    var tls_handshake_timeout: Timeout
     var idle_timeout: Timeout
     var shutdown_grace: Timeout
     var detached_response_timeout: Timeout
@@ -52,6 +53,7 @@ struct ServerConfig(Copyable, Movable):
             header_deadline=Timeout.seconds(5),
             body_deadline=Timeout.seconds(30),
             write_deadline=Timeout.seconds(30),
+            tls_handshake_timeout=Timeout.seconds(10),
             idle_timeout=Timeout.seconds(60),
             shutdown_grace=Timeout.seconds(30),
             detached_response_timeout=Timeout.seconds(30),

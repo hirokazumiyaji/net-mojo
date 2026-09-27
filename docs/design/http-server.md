@@ -213,8 +213,8 @@ Phase 6〜9 はそれぞれ実装前に詳細仕様と PR 単位の計画を作�
 
 - [x] `docs/design/http-tls.md` で TLS provider を比較し、Mojo FFI、対応 OS、ライセンス、配布、更新方針、QUIC handshake API の有無を検証して採用する provider を固定する。
 - [ ] `net/tls/` に非ブロッキング handshake、暗号化 I/O、証明書設定、ALPN、close を実装し、reactor の read/write interest と連携する。暗号 primitive を独自実装しない。
-- [ ] core `net` は既存の std/libc 依存を維持する。HTTPS と QUIC 用の依存を明示した build/package 構成を作り、暗黙の平文 downgrade を行わない。
-- [ ] `tests/test_tls.mojo` と `examples/https_hello.mojo` で handshake 分割、handshake timeout、不正 handshake、ALPN の選択、shutdown、fd／buffer 解放を確認する。テスト専用証明書を使用する。
+- [x] core `net` は既存の std/libc 依存を維持する。HTTPS と QUIC 用の依存を明示した build/package 構成を作り、暗黙の平文 downgrade を行わない。
+- [x] `tests/test_tls.mojo` と `examples/https_hello.mojo` で handshake 分割、handshake timeout、不正 handshake、ALPN の選択、shutdown、fd／buffer 解放を確認する。テスト専用証明書を使用する。
 
 完了条件: HTTPS の HTTP/1.1 が動作し、Phase 7 の HTTP/2 adapter を選べる ALPN 接続契約が成立する。QUIC では TLS record I/O を流用せず handshake 統合用 API を利用できることを確認する。
 

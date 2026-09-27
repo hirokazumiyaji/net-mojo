@@ -11,6 +11,7 @@ from net.http import (
     ServerConfig,
     ServerControl,
 )
+from tests.support import _tick_n
 
 
 struct _HelloHandler(Handler):
@@ -132,11 +133,6 @@ def _bytes_of(data: StringSlice) -> List[Byte]:
     for i in range(len(bytes)):
         out.append(bytes[i])
     return out^
-
-
-def _tick_n[H: Handler](mut server: Server, mut handler: H, n: Int) raises:
-    for _ in range(n):
-        _ = server.tick(handler, Timeout.nanoseconds(0))
 
 
 def _header_end(buf: List[Byte]) -> Int:
@@ -712,8 +708,8 @@ def test_slow_reader_does_not_block_fast_client() raises:
     # Drain the slow response to completion and verify integrity.
     var out = List[Byte]()
     var tmp = Array[Byte, 65536](fill=0)
-    for _ in range(2000):
-        _ = server.tick(handler, Timeout.nanoseconds(0))
+    for _ in range(10000):
+        _ = server.tick(handler, Timeout.milliseconds(1))
         try:
             var n = slow.try_read(Span(tmp))
             if n == 0:
@@ -1117,7 +1113,7 @@ def test_shutdown_drains_in_flight_and_exits() raises:
     var out = List[Byte]()
     var tmp = Array[Byte, 4096](fill=0)
     for _ in range(2000):
-        var alive = server.tick(handler, Timeout.nanoseconds(0))
+        var alive = server.tick(handler, Timeout.milliseconds(1))
         try:
             var n = busy.try_read(Span(tmp))
             for i in range(n):
