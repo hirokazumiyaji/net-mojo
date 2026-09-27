@@ -72,14 +72,8 @@ jobs:
         run: pixi run test-http-response
       - name: Test HTTP server
         run: pixi run test-http-server
-      - name: Test TLS provider
-        run: pixi run -e tls tls-test
-      - name: Test HTTPS server state
-        run: pixi run -e tls https-state-test
-      - name: Test HTTPS client roundtrip
-        run: pixi run -e tls https-client-test
-      - name: Build HTTPS example
-        run: pixi run -e tls https-example-build
+      - name: Test TLS and HTTPS
+        run: pixi run -e tls tls-suite
       - name: Test HTTP detach
         run: pixi run test-http-detach
       - name: Test actor primitives

@@ -7,7 +7,7 @@ connections, so the table never shares ownership between threads.
 
 from net import TCPConn
 from net._reactor import ReactorToken
-from net.error import NetError
+from net.error import NetError, NetErrorKind
 from net.tls import TLSConnection, TLSIOResult
 
 comptime STATE_READING: UInt8 = 0
@@ -163,9 +163,6 @@ struct HttpConnection(Movable):
             return self.tls.value().pending()
         return 0
 
-    def tls_read_retry_exceeds(self, limit: Int) -> Bool:
-        return self.tls_read_retry_length > limit
-
     def read_ready(self, readable: Bool, writable: Bool) -> Bool:
         return readable or (
             writable and self.tls_read_would_block and self.tls_read_wants_write
@@ -262,7 +259,12 @@ struct HttpConnection(Movable):
                 self.tls_read_would_block = True
                 self.tls_read_wants_write = result.progress.is_wants_write()
                 self.tls_read_retry_length = bound
-                return out^
+                raise NetError(
+                    NetErrorKind.timeout(),
+                    "TLS read",
+                    None,
+                    "OpenSSL is waiting for socket readiness",
+                )
             self.tls_read_would_block = False
             self.tls_read_wants_write = False
             self.tls_read_retry_length = 0

@@ -343,9 +343,7 @@ struct Server(Movable):
         """Runs the event loop until shutdown completes. Takes listener
         ownership."""
         self.add_listener(listener^)
-        while True:
-            if not self.tick(handler, None):
-                break
+        self._run(handler)
 
     def serve_tls[
         H: Handler
@@ -358,10 +356,13 @@ struct Server(Movable):
         """Serves HTTP/1.1 over TLS and takes ownership of listener and context.
         """
         self.add_tls_listener(listener^, tls_context^)
+        self._run(handler)
+        self._tls_context = None
+
+    def _run[H: Handler](mut self, mut handler: H) raises:
         while True:
             if not self.tick(handler, None):
                 break
-        self._tls_context = None
 
     def serve_with_control[
         H: Handler
@@ -747,7 +748,7 @@ struct Server(Movable):
             self._conns[idx].wants_write(),
         )
 
-    def _drive_tls_handshake(mut self, idx: Int, now: Int) raises NetError:
+    def _drive_tls_handshake(mut self, idx: Int) raises NetError:
         try:
             var progress = self._conns[idx].tls.value().handshake()
             if progress.is_complete():
@@ -813,7 +814,7 @@ struct Server(Movable):
             if (self._conns[idx].tls_handshake_wants_read and readable) or (
                 self._conns[idx].tls_handshake_wants_write and writable
             ):
-                self._drive_tls_handshake(idx, now)
+                self._drive_tls_handshake(idx)
             return
         if self._conns[idx].state == STATE_TLS_SHUTDOWN:
             if (self._conns[idx].tls_shutdown_wants_write and writable) or (
@@ -912,13 +913,11 @@ struct Server(Movable):
             if room <= 0:
                 break
             var limit = room if room < READ_BUFFER_SIZE else READ_BUFFER_SIZE
-            if self._conns[idx].tls_read_retry_exceeds(limit):
+            if self._conns[idx].tls_read_retry_length > limit:
                 self._conns[idx].more_work = True
                 break
             try:
                 var chunk = self._conns[idx].try_read_bytes(limit)
-                if self._conns[idx].tls_read_would_block:
-                    break
                 if len(chunk) == 0:
                     self._conns[idx].read_eof = True
                     if (
