@@ -84,15 +84,10 @@ https-state-test = { cmd = "mojo run --Werror -I . tests/test_https_server.mojo"
 https-client-test = { cmd = "python3 scripts/test_https_server.py", depends-on = [
   "tls-build",
 ] }
-https-example-test = { cmd = "bash scripts/check_https_example.sh", depends-on = [
+https-example-build = { cmd = "bash scripts/check_https_example.sh", depends-on = [
   "tls-build",
 ] }
-tls-suite = { depends-on = [
-  "tls-test",
-  "https-state-test",
-  "https-client-test",
-  "https-example-test",
-] }
+tls-suite = { cmd = "pixi run -e tls tls-test && pixi run -e tls https-state-test && pixi run -e tls https-client-test && pixi run -e tls https-example-build" }
 example-https-hello = { cmd = "mojo run --Werror -I . examples/https_hello.mojo", depends-on = [
   "tls-build",
 ] }

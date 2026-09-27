@@ -36,7 +36,7 @@ openssl genpkey -quiet -algorithm RSA -pkeyopt rsa_keygen_bits:2048 \
     -out build/tls/wrong-key.pem
 
 cc -O2 -Wall -Wextra -Werror \
-    -I"$tls_includedir" "${tls_cflags[@]}" tests/test_tls_shim.c net/tls/shim.c \
+    -I. -I"$tls_includedir" "${tls_cflags[@]}" tests/test_tls_shim.c net/tls/shim.c \
     -L"$tls_libdir" "${tls_libs[@]}" "${tls_ldflags[@]}" \
     -o build/tls/test_tls_shim
 build/tls/test_tls_shim build/tls/test-cert.pem build/tls/test-key.pem

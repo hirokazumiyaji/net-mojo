@@ -7,17 +7,11 @@
 #include <openssl/err.h>
 #include <openssl/ssl.h>
 
+#include "shim.h"
+
 #if OPENSSL_VERSION_NUMBER < 0x30200000L
 #error "net TLS requires OpenSSL 3.2 or newer"
 #endif
-
-enum {
-    NET_TLS_WANT_READ = -2,
-    NET_TLS_WANT_WRITE = -3,
-    NET_TLS_CLOSED = -4,
-    NET_TLS_SHUTDOWN_SENT = -5,
-    NET_TLS_ERROR = -1,
-};
 
 struct net_tls_context {
     SSL_CTX *ssl;
