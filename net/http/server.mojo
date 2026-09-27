@@ -1453,6 +1453,8 @@ struct Server(Movable):
                 var msg = msgs.pop(0)
                 if not self._conns[idx].active:
                     break
+                if self._conns[idx].detach_state_addr != addr:
+                    break
                 if self._conns[idx].token.generation != s_ptr[].generation:
                     s_ptr[].mutex.lock()
                     s_ptr[].cancelled = True

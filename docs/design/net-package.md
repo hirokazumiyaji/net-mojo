@@ -269,14 +269,16 @@ exits non-zero on mismatch. Benchmarks report measurements only and define no
 pass/fail thresholds, so they cannot fail CI for timing reasons.
 
 HTTP adds `test_http_api`, `test_http_parser`, `test_http_response`,
-`test_reactor`, `test_http_server`, `test_http_detach`, and `test_actor`
-plus `benchmark-http-parse` and `benchmark-http-server`. Parser coverage includes every-byte-boundary
-splits, a seed-recorded (seed 42) randomized fragmentation case, a
+`test_reactor`, `test_http_server`, `test_http2`, `test_http_detach`, and
+`test_actor` plus `benchmark-http-parse` and `benchmark-http-server`. Parser
+coverage includes splits at every byte boundary, a seed-recorded (seed 42)
+randomized fragmentation case, a
 malformed corpus mapped to 400/413/414/431/505/417, and overflow/limit
 tables. `package_smoke` verifies the precompiled `build/net.mojoc`
 artifact serves both the TCP round-trip and the `net.http` codec.
-Sanitizer steps (`sanitize-sys`, `sanitize-tcp`, `sanitize-udp`,
-`sanitize-unix`, `sanitize-actor`, `sanitize-http-detach`) and fd-leak checks (`test_sys`, `test_reactor`) keep
+Sanitizer steps (`sanitize-sys`, `sanitize-tcp`, `sanitize-udp`, `sanitize-unix`,
+`sanitize-actor`, `sanitize-http2`, `sanitize-http-detach`) and fd-leak checks
+(`test_sys`, `test_reactor`) keep
 running in CI; long RSS/soak runs and formal 30 s x 5 performance
 comparisons stay manual and are recorded in `benchmarks/http/README.md`.
 

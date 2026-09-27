@@ -14,6 +14,9 @@ underscore (see README "Versioning and compatibility"). Anything under
 
 ### Added
 
+- Bounded, socket-independent HTTP/2 frame parsing under `net.http._http2`.
+  This first Phase 7 slice validates the fixed header and configured payload
+  limit; connection state, HPACK, and HTTP/2 serving remain follow-up work.
 - Optional OpenSSL-backed nonblocking TLS server transport in the Pixi `tls`
   environment. HTTP server integration follows separately.
 - `net.http` plaintext HTTP/1.1 origin server (single event loop, epoll
@@ -50,7 +53,9 @@ underscore (see README "Versioning and compatibility"). Anything under
   changes, fd reuse, stale generations, EINTR, leak checks), and
   `test-http-server` (keep-alive, pipeline order, 100-continue,
   partial I/O, EOF, slow clients, budget admission, handler errors,
-  shutdown drain). Long fd/RSS soak tests remain manual follow-up;
+  shutdown drain), plus `test-http2` for incomplete, oversized, unknown,
+  and concatenated frame fixtures. Long fd/RSS soak tests remain manual
+  follow-up;
   timing thresholds are not CI gates.
 
 - `Poller` single-threaded readiness multiplexing over `poll(2)` with

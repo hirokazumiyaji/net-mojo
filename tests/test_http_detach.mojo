@@ -392,6 +392,34 @@ struct _DeferredHandler(Handler):
             writer.write_string("not-found")
 
 
+struct _FailingDetachedStreamHandler(Handler):
+    def handle(mut self, req: Request, mut writer: ResponseWriter) raises:
+        var sender = writer.detach()
+        sender.start(200)
+        _ = sender.send("chunk".as_bytes())
+
+
+def test_detached_start_failure_drops_remaining_batch() raises:
+    var config = ServerConfig.default()
+    config.max_response_headers_bytes = 1
+    var server = Server(config^)
+    server.add_listener(listen_tcp("127.0.0.1:0"))
+    var port = server.local_address().port
+    var handler = _FailingDetachedStreamHandler()
+    var client = dial_tcp(
+        String("127.0.0.1:") + String(port), Timeout.seconds(2)
+    )
+    client.write_all(
+        "GET /stream HTTP/1.1\r\nHost: localhost\r\n\r\n".as_bytes(),
+        Timeout.seconds(2),
+    )
+
+    var response = _tick_and_read(server, handler, client)
+    assert_equal(_status_of(response), 500)
+
+    client.close()
+
+
 def test_detached_respond_success_and_keep_alive() raises:
     var server = Server(ServerConfig.default())
     server.add_listener(listen_tcp("127.0.0.1:0"))

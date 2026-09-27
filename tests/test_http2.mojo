@@ -1,0 +1,101 @@
+from std.testing import assert_equal, assert_true, TestSuite
+
+from net.http._http2.frame import parse_frame
+
+
+def _frame(
+    frame_type: Int,
+    flags: Int,
+    stream_id: Int,
+    payload: List[Byte],
+) -> List[Byte]:
+    var out = List[Byte]()
+    out.append(Byte(len(payload) >> 16))
+    out.append(Byte((len(payload) >> 8) & 0xFF))
+    out.append(Byte(len(payload) & 0xFF))
+    out.append(Byte(frame_type))
+    out.append(Byte(flags))
+    out.append(Byte((stream_id >> 24) & 0xFF))
+    out.append(Byte((stream_id >> 16) & 0xFF))
+    out.append(Byte((stream_id >> 8) & 0xFF))
+    out.append(Byte(stream_id & 0xFF))
+    for i in range(len(payload)):
+        out.append(payload[i])
+    return out^
+
+
+def test_payload_at_configured_frame_limit_is_accepted() raises:
+    var payload = List[Byte]()
+    payload.append(Byte(1))
+    payload.append(Byte(2))
+    payload.append(Byte(3))
+    var wire = _frame(0, 1, 7, payload)
+    var result = parse_frame(Span(wire), 3)
+    assert_true(result.is_complete())
+    assert_equal(result.frame_type, Byte(0))
+    assert_equal(result.flags, Byte(1))
+    assert_equal(result.stream_id, UInt32(7))
+    assert_equal(result.payload_length, 3)
+    assert_equal(result.consumed, 12)
+
+
+def test_partial_header_and_payload_need_more() raises:
+    var payload = List[Byte]()
+    payload.append(Byte(1))
+    payload.append(Byte(2))
+    var wire = _frame(1, 0, 3, payload)
+    var header_only = List[Byte]()
+    for i in range(9):
+        header_only.append(wire[i])
+    assert_true(parse_frame(Span(header_only)).is_need_more())
+    var partial_payload = List[Byte]()
+    for i in range(10):
+        partial_payload.append(wire[i])
+    assert_true(parse_frame(Span(partial_payload)).is_need_more())
+
+    var partial_header = List[Byte]()
+    for i in range(8):
+        partial_header.append(wire[i])
+    assert_true(parse_frame(Span(partial_header)).is_need_more())
+
+
+def test_oversized_payload_is_rejected_from_header() raises:
+    var payload = List[Byte]()
+    var wire = _frame(0, 0, 1, payload)
+    wire[0] = Byte(0)
+    wire[1] = Byte(0)
+    wire[2] = Byte(5)
+    var result = parse_frame(Span(wire), 4)
+    assert_true(result.is_error())
+
+
+def test_negative_frame_limit_is_rejected() raises:
+    var wire = _frame(0, 0, 1, List[Byte]())
+    assert_true(parse_frame(Span(wire), -1).is_error())
+
+
+def test_reserved_stream_bit_is_ignored() raises:
+    var wire = _frame(0, 0, 1, List[Byte]())
+    wire[5] = Byte(0x80)
+    var result = parse_frame(Span(wire))
+    assert_true(result.is_complete())
+    assert_equal(result.stream_id, UInt32(1))
+
+
+def test_unknown_frame_type_and_concatenated_frames() raises:
+    var first = _frame(0xF0, 0xA5, 0, List[Byte]())
+    var second = _frame(6, 1, 0, List[Byte]())
+    for i in range(len(second)):
+        first.append(second[i])
+    var parsed_first = parse_frame(Span(first))
+    assert_true(parsed_first.is_complete())
+    assert_equal(parsed_first.frame_type, Byte(0xF0))
+    assert_equal(parsed_first.consumed, 9)
+    var remainder = Span(first)[parsed_first.consumed :]
+    var parsed_second = parse_frame(remainder)
+    assert_true(parsed_second.is_complete())
+    assert_equal(parsed_second.frame_type, Byte(6))
+
+
+def main() raises:
+    TestSuite.discover_tests[__functions_in_module()]().run()
