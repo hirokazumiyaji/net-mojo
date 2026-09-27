@@ -38,9 +38,10 @@ jobs:
         run: git diff --exit-code
       - name: Verify test tasks mirror pixi
         run: |
+          # Bracket classes keep this mirror check from matching its own grep pattern.
           diff -u \
             <(grep -oE '^test-[a-z0-9-]+' pixi.toml | sort -u) \
-            <(grep -oE 'pixi run test-[^ ]+' .github/workflows/ci.yml | awk '{print $3}' | sort -u)
+            <(grep -oE 'pixi run [t]est-[^ ]+' .github/workflows/ci.yml | awk '{print $3}' | sort -u)
           for t in $(grep -oE '^test-[a-z0-9-]+' pixi.toml | sort -u); do
             [ "$t" = "test-package" ] && continue
             grep -q "\"$t\"," pixi.toml || { echo "$t missing from 'test' aggregate"; exit 1; }
@@ -72,6 +73,8 @@ jobs:
         run: pixi run test-http-response
       - name: Test HTTP server
         run: pixi run test-http-server
+      - name: Test HTTP/2 frame parser
+        run: pixi run test-http2
       - name: Test TLS and HTTPS
         run: pixi run -e tls tls-suite
       - name: Test HTTP detach
@@ -103,9 +106,10 @@ jobs:
           frozen: true
       - name: Verify sanitize tasks mirror pixi
         run: |
+          # Bracket classes keep this mirror check from matching its own grep pattern.
           diff -u \
             <(grep -oE '^sanitize-[a-z0-9-]+' pixi.toml | sort -u) \
-            <(grep -oE 'pixi run sanitize-[^ ]+' .github/workflows/ci.yml | awk '{print $3}' | sort -u)
+            <(grep -oE 'pixi run [s]anitize-[^ ]+' .github/workflows/ci.yml | awk '{print $3}' | sort -u)
           for t in $(grep -oE '^sanitize-[a-z0-9-]+' pixi.toml | sort -u); do
             grep -q "\"$t\"," pixi.toml || { echo "$t missing from 'sanitize' aggregate"; exit 1; }
           done
@@ -120,5 +124,7 @@ jobs:
         run: pixi run sanitize-unix
       - name: Sanitize actor primitives
         run: pixi run sanitize-actor
+      - name: Sanitize HTTP/2 frame parser
+        run: pixi run sanitize-http2
       - name: Sanitize HTTP detach
         run: pixi run sanitize-http-detach
