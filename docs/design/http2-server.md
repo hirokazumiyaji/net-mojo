@@ -19,10 +19,15 @@ unvalidated payload length. Callers own buffering and may pass the next frame
 as trailing input.
 
 This slice does not negotiate SETTINGS, validate frame-type-specific lengths,
-parse the client preface, manage streams, or decode HPACK. Those checks belong
-to the connection layer and subsequent PRs. The parser has one configured
-maximum frame payload; the connection layer will later ensure this stays
-consistent with the negotiated `SETTINGS_MAX_FRAME_SIZE`.
+manage streams, or decode HPACK. Those checks belong to the connection layer
+and subsequent PRs. The frame parser has one configured maximum frame payload;
+the connection layer will later ensure this stays consistent with the
+negotiated `SETTINGS_MAX_FRAME_SIZE`.
+
+The separate client preface parser compares incrementally against the fixed
+24-byte connection preface. It consumes exactly those bytes and leaves any
+following frame bytes with the caller. It does not enforce when the preface is
+required in connection state.
 
 ## Follow-up connection work
 
@@ -41,7 +46,9 @@ operate on stream or connection state as specified by RFC 9113.
 
 ## Verification sequence
 
-The parser slice uses wire fixtures for incomplete headers and payloads,
+The frame parser slice uses wire fixtures for incomplete headers and payloads,
 maximum and oversized payload lengths, ignored reserved stream bits, unknown
-frame types, and multiple concatenated frames. Later connection PRs add protocol
-state, flow-control, shutdown, and independent-client interoperability tests.
+frame types, and multiple concatenated frames. The client preface parser tests
+every incomplete prefix, mismatch rejection, and the consumed byte count. Later
+connection PRs add protocol state, flow-control, shutdown, and independent-client
+interoperability tests.
