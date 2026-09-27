@@ -16,6 +16,9 @@ dynamic-library calls, but a small C shim is preferable for OpenSSL's opaque
 types, macros, and error queue. [Mojo C FFI](https://mojolang.org/docs/manual/c-ffi/)
 documents both interop paths and their linking differences.
 
+The provider requires OpenSSL 3.2 or newer at build time and runtime. The
+comma-separated ALPN list is limited to 255 bytes in its encoded wire form.
+
 ## Alternatives
 
 | Provider | Strengths | Why it is not selected |
@@ -38,6 +41,9 @@ transport and HTTP/3 framing implementation or a selected engine.
 - Treat `WANT_READ` and `WANT_WRITE` as interest changes, not connection
   failures. Preserve the operation across retries and retain the existing
   absolute handshake deadline.
+- A successful partial write consumes the returned byte count. A write that
+  reports `WANT_READ` or `WANT_WRITE` consumes no bytes and must be retried with
+  the same payload and length.
 - Configure certificate/key inputs on the server context and configure ALPN
   from the enabled HTTP protocols. A connection with no mutually supported
   protocol must fail explicitly; do not retry in plaintext.
@@ -55,19 +61,18 @@ The first implementation should use a pinned OpenSSL 3.x build for CI and
 document how downstream builds provide the same ABI; silently loading an
 arbitrary system library at runtime would make behavior depend on the host.
 
-Before implementing the Mojo wrapper, add a compile/link probe for the chosen
-OpenSSL build on macOS arm64, Linux x86_64, and Linux aarch64. The probe must
-cover context creation, server ALPN selection, nonblocking handshake return
-states, read/write, and orderly shutdown. That check also confirms whether the
-selected package exposes QUIC TLS symbols on each target. If it does not, keep
-TCP TLS on OpenSSL and select a QUIC engine with its own supported TLS
-integration in Phase 8.
+The opt-in TLS tests must compile and link the shim on macOS arm64, Linux
+x86_64, and Linux aarch64. They must cover context creation, server ALPN
+selection, nonblocking handshake return states, read/write, and orderly
+shutdown. The QUIC engine selection must separately confirm whether this
+OpenSSL package exposes the required QUIC TLS symbols on each target. If it does
+not, keep TCP TLS on OpenSSL and select a QUIC engine with its own supported
+TLS integration in Phase 8.
 
 ## Phase 6 implementation boundary
 
-The next implementation PR should add only the C shim and Mojo TLS ownership
-wrapper, then exercise it with a loopback TLS handshake over the existing
-reactor. HTTP server protocol dispatch and HTTP/2 remain separate PRs. The
-contract tests must cover a handshake that alternates read/write readiness,
-invalid certificates or handshake bytes, ALPN selection, deadline expiry, and
-resource release after close.
+Phase 6 is split into small PRs. The first transport PR adds the C shim and
+Mojo TLS ownership wrapper, then exercises nonblocking handshake readiness,
+certificate/key validation, and malformed handshake bytes. A later PR connects
+the wrapper to the HTTP server and its absolute handshake deadline, then adds
+HTTPS serving and successful ALPN interoperability. HTTP/2 remains separate.
