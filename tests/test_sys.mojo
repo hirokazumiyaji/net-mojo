@@ -10,7 +10,7 @@ from std.testing import (
 from net.error import NetErrorKind
 from net import dial_tcp, listen_tcp, listen_udp
 from net.timeout import Timeout, _Deadline
-from tests.support import _count_open_fds
+from tests.support import _count_open_fds, _socket_pair
 from net._sys.readiness import (
     _decode_gen_low,
     _decode_slot,
@@ -20,7 +20,6 @@ from net._sys.readiness import (
 )
 from net._sys.common import (
     AF_INET,
-    AF_UNIX,
     EAGAIN,
     EINPROGRESS,
     EINTR,
@@ -40,17 +39,10 @@ from net._sys.common import (
     _recv_from_status,
     _recv_status,
     _send_status,
-    _set_nonblocking_cloexec,
     _socket,
     _wait_readable,
     _wait_writable,
 )
-
-
-@fieldwise_init
-struct _TestSocketPair(Movable):
-    var first: _OwnedFD
-    var second: _OwnedFD
 
 
 def _test_fcntl[
@@ -61,24 +53,8 @@ def _test_fcntl[
     )
 
 
-def _test_socket_pair() raises -> _TestSocketPair:
-    var raw = SIMD[DType.int32, 2](0)
-    var result = external_call["socketpair", c_int](
-        c_int(AF_UNIX),
-        c_int(SOCK_STREAM),
-        c_int(0),
-        Pointer(to=raw).unsafe_bitcast[c_int](),
-    )
-    if result != 0:
-        raise Error("socketpair failed")
-    var pair = _TestSocketPair(first=_OwnedFD(raw[0]), second=_OwnedFD(raw[1]))
-    _set_nonblocking_cloexec(pair.first.raw())
-    _set_nonblocking_cloexec(pair.second.raw())
-    return pair^
-
-
 def test_descriptor_lifecycle_and_readiness() raises:
-    var pair = _test_socket_pair()
+    var pair = _socket_pair()
     assert_true(pair.first.is_valid())
     assert_true(pair.second.is_valid())
     assert_true(
@@ -116,7 +92,7 @@ def test_take_invalidates_source() raises:
 
 
 def test_double_close_reports_closed() raises:
-    var pair = _test_socket_pair()
+    var pair = _socket_pair()
     pair.first.close()
     try:
         pair.first.close()
@@ -136,7 +112,7 @@ def test_socket_sets_close_on_exec() raises:
 
 
 def test_sent_byte_makes_peer_readable() raises:
-    var pair = _test_socket_pair()
+    var pair = _socket_pair()
     var payload = Array[Byte, 1](fill=42)
     var send_status = _send_status(pair.first.raw(), Span(payload))
     assert_equal(send_status.error_number, 0)
@@ -156,7 +132,7 @@ def test_sent_byte_makes_peer_readable() raises:
 
 
 def test_poll_timeout_uses_remaining_deadline() raises:
-    var pair = _test_socket_pair()
+    var pair = _socket_pair()
     var deadline = _Deadline.from_timeout(Timeout.milliseconds(5))
     assert_false(_wait_readable(pair.first.raw(), deadline))
     assert_true(deadline.remaining_milliseconds() <= 1)
@@ -177,7 +153,7 @@ def test_connect_attempt_allows_only_the_first_expired_attempt() raises:
 
 
 def test_nonblocking_recv_returns_errno_status_without_throwing() raises:
-    var pair = _test_socket_pair()
+    var pair = _socket_pair()
     var buffer = Array[Byte, 1](fill=0)
     var status = _recv_status(pair.first.raw(), Span(buffer))
     assert_true(pair.first.is_valid())

@@ -7,6 +7,8 @@
 
 #include <openssl/ssl.h>
 
+#include "net/tls/shim.h"
+
 void *net_tls_context_server(const char *, const char *, const char *);
 void net_tls_context_free(void *);
 void *net_tls_connection_new(void *, int);
@@ -15,9 +17,11 @@ int net_tls_handshake(void *);
 int net_tls_read(void *, unsigned char *, size_t);
 int net_tls_write(void *, const unsigned char *, size_t);
 int net_tls_selected_alpn(void *, unsigned char *, size_t);
+int net_tls_pending(void *);
+int net_tls_shutdown(void *);
 
 static int is_would_block(int result) {
-    return result == -2 || result == -3;
+    return result == NET_TLS_WANT_READ || result == NET_TLS_WANT_WRITE;
 }
 
 int main(int argc, char **argv) {
@@ -81,13 +85,32 @@ int main(int argc, char **argv) {
     assert(received_length == sizeof(response) - 1);
     assert(memcmp(received, response, received_length) == 0);
 
-    const unsigned char request[] = "ping";
+    const unsigned char request[] = "pingpong";
     size_t client_written = 0;
     assert(SSL_write_ex(client, request, sizeof(request) - 1, &client_written) == 1);
     assert(client_written == sizeof(request) - 1);
-    int read_result = net_tls_read(server, received, sizeof(received));
-    assert(read_result == (int)(sizeof(request) - 1));
-    assert(memcmp(received, request, sizeof(request) - 1) == 0);
+    int read_result = net_tls_read(server, received, 4);
+    assert(read_result == 4);
+    assert(memcmp(received, "ping", 4) == 0);
+    assert(net_tls_pending(server) == 4);
+    read_result = net_tls_read(server, received, sizeof(received));
+    assert(read_result == 4);
+    assert(memcmp(received, "pong", 4) == 0);
+    assert(net_tls_pending(server) == 0);
+
+    int server_shutdown_result = net_tls_shutdown(server);
+    assert(server_shutdown_result == NET_TLS_SHUTDOWN_SENT);
+    assert(net_tls_shutdown(server) == NET_TLS_WANT_READ);
+    received_length = 0;
+    int client_read_result = SSL_read_ex(client, received, sizeof(received), &received_length);
+    int client_read_error = SSL_get_error(client, client_read_result);
+    assert(client_read_result == 0);
+    assert(client_read_error == SSL_ERROR_ZERO_RETURN);
+    int client_shutdown_result = SSL_shutdown(client);
+    assert(client_shutdown_result == 1);
+    server_shutdown_result = net_tls_shutdown(server);
+    assert(server_shutdown_result == 1);
+    assert(net_tls_read(server, received, sizeof(received)) == NET_TLS_CLOSED);
 
     SSL_free(client);
     SSL_CTX_free(client_context);

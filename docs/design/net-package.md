@@ -8,19 +8,21 @@ decision. Usage instructions are out of scope here.
 
 - Provide synchronous IPv4/IPv6 addressing, OS name resolution, TCP, UDP, and
   Unix stream sockets for Mojo 1.0.0.
-- Depend on Mojo `std` and the documented libc/POSIX ABI only, with no C shim
-  and no third-party runtime.
+- Keep core `net` dependent on Mojo `std` and the documented libc/POSIX ABI,
+  with no C shim or third-party runtime. Optional protocol features may add
+  isolated native dependencies.
 - Make descriptor ownership, timeout semantics, and partial I/O explicit in the
   type signatures rather than in prose.
 - Stay warning-clean under `--Werror` on both supported targets.
 
 ## Non-goals for the initial release
 
-Asynchronous I/O, a custom DNS client, TLS, raw IP and multicast
+Asynchronous I/O, a custom DNS client, raw IP and multicast
 APIs, Linux abstract Unix sockets, Unix datagram sockets, Happy Eyeballs,
 Windows, and 32-bit ABIs are all out of scope. Each of them either requires a
-runtime the package does not want to own (async, TLS) or an ABI surface that
-cannot be verified on the supported matrix.
+runtime the package does not want to own (async) or an ABI surface that
+cannot be verified on the supported matrix. HTTPS is an opt-in OpenSSL-backed
+feature and does not add a dependency to core `net`.
 
 ## Module layout
 
@@ -249,8 +251,10 @@ section records only the package-level boundaries.
   never extends them. Shutdown stops accepting, closes idle
   connections at once, and drains in-flight requests within the grace
   period.
-- The server performs no TLS, HTTP/2, or HTTP/3 itself. Shared
-  `Request`/`Headers`/`Handler`/`ResponseWriter` semantics are kept
+- `serve_tls` opts into OpenSSL-backed TLS and accepts HTTP/1.1 only after
+  ALPN selects `http/1.1`; a handshake deadline bounds incomplete peers. Core
+  `net` and plaintext server builds remain OpenSSL-free. HTTP/2 and HTTP/3 are
+  still pending. Shared `Request`/`Headers`/`Handler`/`ResponseWriter` semantics are kept
   protocol-agnostic (scheme/authority/path/query/trailers from Phase 0)
   so future `_http2/` and `_http3/` adapters can reuse them; wire
   formats and state machines stay per protocol.

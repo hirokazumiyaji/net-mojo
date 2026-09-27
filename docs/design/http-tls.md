@@ -49,6 +49,10 @@ transport and HTTP/3 framing implementation or a selected engine.
   protocol must fail explicitly; do not retry in plaintext.
 - Close the TLS connection before releasing its socket and context. The
   connection owner remains the only code that operates on the socket.
+- Distinguish a locally sent `close_notify` from a completed two-way TLS
+  shutdown. The HTTP server may close TCP after its alert is sent; OpenSSL
+  documents this one-way close as a correct TLS shutdown. Callers that require
+  the peer alert can continue the nonblocking shutdown until it is complete.
 - Do not implement cryptographic primitives in Mojo or add a silent system
   provider fallback.
 
@@ -57,9 +61,10 @@ transport and HTTP/3 framing implementation or a selected engine.
 The TLS-enabled target must link or package OpenSSL explicitly. Core `net`
 remains usable without it. The supported build must report a clear error when
 the TLS feature is enabled but the required OpenSSL version is unavailable.
-The first implementation should use a pinned OpenSSL 3.x build for CI and
-document how downstream builds provide the same ABI; silently loading an
-arbitrary system library at runtime would make behavior depend on the host.
+CI and frozen Pixi environments use the OpenSSL build pinned per target in
+`pixi.lock`; downstream builds must provide the same ABI. The shim checks the
+runtime version and fails explicitly instead of silently loading an
+incompatible system library.
 
 The opt-in TLS tests must compile and link the shim on macOS arm64, Linux
 x86_64, and Linux aarch64. They must cover context creation, server ALPN
@@ -71,8 +76,13 @@ TLS integration in Phase 8.
 
 ## Phase 6 implementation boundary
 
-Phase 6 is split into small PRs. The first transport PR adds the C shim and
-Mojo TLS ownership wrapper, then exercises nonblocking handshake readiness,
-certificate/key validation, and malformed handshake bytes. A later PR connects
-the wrapper to the HTTP server and its absolute handshake deadline, then adds
-HTTPS serving and successful ALPN interoperability. HTTP/2 remains separate.
+Phase 6 is split into small PRs. The transport PR adds the C shim and Mojo TLS
+ownership wrapper. `Server.add_tls_listener` supports event-loop driven use and
+`Server.serve_tls` provides the blocking convenience loop. HTTP parsing starts
+only after a nonblocking handshake completes and ALPN selects `http/1.1`;
+connections without that selection close without a plaintext retry. The
+absolute `tls_handshake_timeout` bounds incomplete handshakes. Each TLS
+connection reserves its fixed 8 KiB plaintext read buffer from the shared
+server budget, and the connection releases its TLS session before its socket.
+An independent Python `ssl` client verifies the HTTPS response and ALPN
+selection. HTTP/2 remains separate and will select `h2` in its own adapter.

@@ -7,16 +7,11 @@
 #include <openssl/err.h>
 #include <openssl/ssl.h>
 
+#include "shim.h"
+
 #if OPENSSL_VERSION_NUMBER < 0x30200000L
 #error "net TLS requires OpenSSL 3.2 or newer"
 #endif
-
-enum {
-    NET_TLS_WANT_READ = -2,
-    NET_TLS_WANT_WRITE = -3,
-    NET_TLS_CLOSED = -4,
-    NET_TLS_ERROR = -1,
-};
 
 struct net_tls_context {
     SSL_CTX *ssl;
@@ -211,4 +206,23 @@ int net_tls_selected_alpn(void *opaque, unsigned char *buffer, size_t capacity) 
     }
     memcpy(buffer, protocol, length);
     return (int)length;
+}
+
+int net_tls_pending(void *opaque) {
+    struct net_tls_connection *connection = opaque;
+    return SSL_pending(connection->ssl);
+}
+
+int net_tls_shutdown(void *opaque) {
+    struct net_tls_connection *connection = opaque;
+    ERR_clear_error();
+    int result = SSL_shutdown(connection->ssl);
+    if (result == 1) {
+        return 1;
+    }
+    if (result == 0) {
+        /* Zero means our close alert was sent; this API does not await the peer alert. */
+        return NET_TLS_SHUTDOWN_SENT;
+    }
+    return net_tls_result(connection, result);
 }

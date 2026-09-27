@@ -7,18 +7,23 @@ connections, so the table never shares ownership between threads.
 
 from net import TCPConn
 from net._reactor import ReactorToken
-from net.error import NetError
+from net.error import NetError, NetErrorKind
+from net.tls import TLSConnection, TLSIOResult
 
 comptime STATE_READING: UInt8 = 0
 comptime STATE_SENDING: UInt8 = 1
 comptime STATE_SENDING_100: UInt8 = 2
 comptime STATE_DETACHED: UInt8 = 3
 comptime STATE_STREAMING: UInt8 = 4
+comptime STATE_HANDSHAKING: UInt8 = 5
+comptime STATE_TLS_SHUTDOWN: UInt8 = 6
+comptime READ_BUFFER_SIZE: Int = 8192
 
 
 struct HttpConnection(Movable):
     var token: ReactorToken
-    var conn: TCPConn
+    var conn: Optional[TCPConn]
+    var tls: Optional[TLSConnection]
     var buf: List[Byte]
     var state: UInt8
     var pending: List[Byte]
@@ -44,16 +49,32 @@ struct HttpConnection(Movable):
     var more_work: Bool
     var active: Bool
     var _no_deadline: Int
+    var tls_handshake_at: Int
+    var tls_shutdown_at: Int
+    var tls_handshake_wants_read: Bool
+    var tls_handshake_wants_write: Bool
+    var tls_shutdown_wants_write: Bool
+    var tls_read_would_block: Bool
+    var tls_read_wants_write: Bool
+    var tls_read_retry_length: Int
+    var tls_write_would_block: Bool
+    var tls_write_wants_read: Bool
+    var tls_write_closed: Bool
+    var tls_write_retry_length: Int
+    var tls_read_buffer: List[Byte]
 
     def __init__(
         out self,
         token: ReactorToken,
-        var conn: TCPConn,
+        var conn: Optional[TCPConn],
+        var tls: Optional[TLSConnection],
         idle_at: Int,
         no_deadline: Int,
+        handshake_at: Int,
     ):
         self.token = token.copy()
         self.conn = conn^
+        self.tls = tls^
         self.buf = List[Byte]()
         self.state = STATE_READING
         self.pending = List[Byte]()
@@ -79,10 +100,35 @@ struct HttpConnection(Movable):
         self.scanned_len = 0
         self.more_work = False
         self.active = True
+        self.tls_handshake_at = handshake_at
+        self.tls_shutdown_at = no_deadline
+        self.tls_handshake_wants_read = False
+        self.tls_handshake_wants_write = False
+        self.tls_shutdown_wants_write = False
+        self.tls_read_would_block = False
+        self.tls_read_wants_write = False
+        self.tls_read_retry_length = 0
+        self.tls_write_would_block = False
+        self.tls_write_wants_read = False
+        self.tls_write_closed = False
+        self.tls_write_retry_length = 0
+        self.tls_read_buffer = List[Byte]()
+        if self.tls:
+            self.state = STATE_HANDSHAKING
+            self.tls_handshake_wants_read = True
+            self.tls_read_buffer = List[Byte](length=READ_BUFFER_SIZE, fill=0)
 
     def wants_read(self) -> Bool:
         if not self.active or self.read_eof:
             return False
+        if self.state == STATE_HANDSHAKING:
+            return self.tls_handshake_wants_read
+        if self.state == STATE_TLS_SHUTDOWN:
+            return not self.tls_shutdown_wants_write
+        if self.tls_write_would_block or self.tls_read_would_block:
+            return (
+                self.tls_write_would_block and self.tls_write_wants_read
+            ) or (self.tls_read_would_block and not self.tls_read_wants_write)
         if self.state == STATE_READING:
             return True
         if self.state == STATE_DETACHED or self.state == STATE_STREAMING:
@@ -93,10 +139,40 @@ struct HttpConnection(Movable):
         return False
 
     def wants_write(self) -> Bool:
+        if not self.active:
+            return False
+        if self.state == STATE_HANDSHAKING:
+            return self.tls_handshake_wants_write
+        if self.state == STATE_TLS_SHUTDOWN:
+            return self.tls_shutdown_wants_write
+        if self.tls_read_would_block and self.tls_read_wants_write:
+            return True
+        if self.tls_write_would_block:
+            return not self.tls_write_wants_read
         return (
-            self.active
-            and (self.state == STATE_SENDING or self.state == STATE_STREAMING)
-            and self.pending_offset < len(self.pending)
+            self.state == STATE_SENDING
+            or self.state == STATE_SENDING_100
+            or self.state == STATE_STREAMING
+        ) and self.pending_offset < len(self.pending)
+
+    def is_tls(self) -> Bool:
+        return Bool(self.tls)
+
+    def tls_pending(self) -> Int:
+        if self.tls:
+            return self.tls.value().pending()
+        return 0
+
+    def read_ready(self, readable: Bool, writable: Bool) -> Bool:
+        return readable or (
+            writable and self.tls_read_would_block and self.tls_read_wants_write
+        )
+
+    def write_ready(self, readable: Bool, writable: Bool) -> Bool:
+        return writable or (
+            readable
+            and self.tls_write_would_block
+            and self.tls_write_wants_read
         )
 
     def buffered_len(self) -> Int:
@@ -160,16 +236,47 @@ struct HttpConnection(Movable):
     def clear_pending(mut self):
         self.pending.clear()
         self.pending_offset = 0
+        self.tls_write_would_block = False
+        self.tls_write_wants_read = False
+        self.tls_write_closed = False
+        self.tls_write_retry_length = 0
 
     def try_read_bytes(mut self, limit: Int) raises NetError -> List[Byte]:
         """One non-blocking read of up to `limit` bytes. An empty result
         means EOF; a would-block socket raises a timeout `NetError`."""
-        var tmp = Array[Byte, 8192](fill=0)
-        var bound = limit if limit < 8192 else 8192
-        var count = self.conn.try_read(Span(tmp)[0:bound])
+        var bound = limit if limit < READ_BUFFER_SIZE else READ_BUFFER_SIZE
         var out = List[Byte]()
-        for i in range(count):
-            out.append(tmp[i])
+        if self.tls:
+            if self.tls_read_retry_length > 0:
+                bound = self.tls_read_retry_length
+            var result = self.tls.value().try_read(
+                Span(self.tls_read_buffer)[0:bound]
+            )
+            if (
+                result.progress.is_wants_read()
+                or result.progress.is_wants_write()
+            ):
+                self.tls_read_would_block = True
+                self.tls_read_wants_write = result.progress.is_wants_write()
+                self.tls_read_retry_length = bound
+                raise NetError(
+                    NetErrorKind.timeout(),
+                    "TLS read",
+                    None,
+                    "OpenSSL is waiting for socket readiness",
+                )
+            self.tls_read_would_block = False
+            self.tls_read_wants_write = False
+            self.tls_read_retry_length = 0
+            if result.progress.is_closed():
+                return out^
+            out.extend(Span(self.tls_read_buffer)[0 : result.count])
+            if self.tls.value().pending() > 0:
+                self.more_work = True
+        else:
+            var tmp = Array[Byte, READ_BUFFER_SIZE](fill=0)
+            var count = self.conn.value().try_read(Span(tmp)[0:bound])
+            out.extend(Span(tmp)[0:count])
         return out^
 
     def try_write_pending_capped(mut self, cap: Int) raises NetError -> Int:
@@ -177,22 +284,52 @@ struct HttpConnection(Movable):
         exceed its per-tick fairness allowance in a single call."""
         var available = len(self.pending) - self.pending_offset
         var bound = available if available < cap else cap
+        if self.tls and self.tls_write_retry_length > 0:
+            bound = self.tls_write_retry_length
+            if bound > cap:
+                return 0
         if bound <= 0:
             return 0
         var end = self.pending_offset + bound
-        var written = self.conn.try_write(
-            Span(self.pending)[self.pending_offset : end]
-        )
+        var written: Int
+        if self.tls:
+            var result = self.tls.value().try_write(
+                Span(self.pending)[self.pending_offset : end]
+            )
+            written = self._note_tls_write(result, bound)
+        else:
+            written = self.conn.value().try_write(
+                Span(self.pending)[self.pending_offset : end]
+            )
         self.pending_offset += written
         return written
 
     def try_write_bytes[
         origin: ImmOrigin
     ](mut self, data: Span[Byte, origin]) raises NetError -> Int:
-        return self.conn.try_write(data)
+        if self.tls:
+            var result = self.tls.value().try_write(data)
+            return self._note_tls_write(result, len(data))
+        return self.conn.value().try_write(data)
+
+    def _note_tls_write(mut self, result: TLSIOResult, length: Int) -> Int:
+        """Records a TLS write outcome; OpenSSL requires a would-block
+        write to be retried with the same length."""
+        var blocked = (
+            result.progress.is_wants_read() or result.progress.is_wants_write()
+        )
+        self.tls_write_would_block = blocked
+        self.tls_write_wants_read = result.progress.is_wants_read()
+        self.tls_write_retry_length = length if blocked else 0
+        if blocked:
+            return 0
+        self.tls_write_closed = result.progress.is_closed()
+        return result.count
 
     def raw_fd(self) raises NetError -> Int32:
-        return self.conn.raw_fd()
+        if self.tls:
+            return self.tls.value().raw_fd()
+        return self.conn.value().raw_fd()
 
     def close(mut self) raises NetError:
         """Closes the underlying connection and releases socket allocations.
@@ -214,4 +351,7 @@ struct HttpConnection(Movable):
         self.is_head = False
         self.stream_finished = False
         self.stream_has_body = False
-        self.conn.close()
+        self.tls = None
+        if self.conn:
+            self.conn.value().close()
+            self.conn = None

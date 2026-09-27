@@ -30,7 +30,7 @@ Ownership and resources:
   (reads are paused) so one slow reader cannot grow user buffers.
 """
 
-from net import SocketAddress, TCPListener, Timeout, listen_tcp
+from net import SocketAddress, TCPConn, TCPListener, Timeout, listen_tcp
 from net._actor import WakeupChannel
 from net._reactor import Reactor, ReactorToken
 from net.error import NetError, NetErrorKind
@@ -39,10 +39,13 @@ from ._buffer import BufferBudget
 from ._connection import (
     HttpConnection,
     STATE_DETACHED,
+    STATE_HANDSHAKING,
     STATE_READING,
     STATE_SENDING,
     STATE_SENDING_100,
     STATE_STREAMING,
+    STATE_TLS_SHUTDOWN,
+    READ_BUFFER_SIZE,
 )
 from ._deadline import NO_DEADLINE, deadline_from_now, now_ns
 from ._detach import (
@@ -69,10 +72,10 @@ from .config import ServerConfig
 from .handler import Handler
 from .headers import Headers
 from .response import ResponseWriter, has_body_for_status
+from net.tls import TLSConnection, TLSContext
 
 
 comptime _TICK_POLL_CAP_MS: Int = 100
-comptime _READ_CHUNK: Int = 8192
 comptime _SHUTDOWN_QUIET_MS: Int = 10
 
 
@@ -119,6 +122,7 @@ struct Server(Movable):
     var control: ServerControl
     var _reactor: Reactor
     var _listener: Optional[TCPListener]
+    var _tls_context: Optional[TLSContext]
     var _listener_token: ReactorToken
     var _listener_paused: Bool
     var _conns: List[HttpConnection]
@@ -148,6 +152,7 @@ struct Server(Movable):
         self.control = ServerControl()
         self._reactor = Reactor()
         self._listener = None
+        self._tls_context = None
         self._listener_token = ReactorToken(slot=-1, generation=0)
         self._listener_paused = False
         self._conns = List[HttpConnection]()
@@ -206,6 +211,12 @@ struct Server(Movable):
         self._listener = listener^
         self._listener_token = token.copy()
         self._listener_paused = False
+
+    def add_tls_listener(
+        mut self, var listener: TCPListener, var tls_context: TLSContext
+    ) raises:
+        self.add_listener(listener^)
+        self._tls_context = Optional[TLSContext](tls_context^)
 
     def tick[
         H: Handler
@@ -332,6 +343,23 @@ struct Server(Movable):
         """Runs the event loop until shutdown completes. Takes listener
         ownership."""
         self.add_listener(listener^)
+        self._run(handler)
+
+    def serve_tls[
+        H: Handler
+    ](
+        mut self,
+        var listener: TCPListener,
+        var tls_context: TLSContext,
+        mut handler: H,
+    ) raises:
+        """Serves HTTP/1.1 over TLS and takes ownership of listener and context.
+        """
+        self.add_tls_listener(listener^, tls_context^)
+        self._run(handler)
+        self._tls_context = None
+
+    def _run[H: Handler](mut self, mut handler: H) raises:
         while True:
             if not self.tick(handler, None):
                 break
@@ -399,6 +427,10 @@ struct Server(Movable):
     def _next_deadline(self, idx: Int) -> Int:
         if not self._conns[idx].active:
             return NO_DEADLINE
+        if self._conns[idx].state == STATE_HANDSHAKING:
+            return self._conns[idx].tls_handshake_at
+        if self._conns[idx].state == STATE_TLS_SHUTDOWN:
+            return self._conns[idx].tls_shutdown_at
         if self._conns[idx].state == STATE_DETACHED:
             return self._conns[idx].detach_at
         if self._conns[idx].state == STATE_STREAMING:
@@ -580,9 +612,42 @@ struct Server(Movable):
             try:
                 var fresh = self._listener.value().try_accept()
                 var token = self._reactor.register(fresh.raw_fd())
-                self._ensure_slot_map(token.slot)
                 var idle_at = deadline_from_now(self.config.idle_timeout)
-                var entry = HttpConnection(token, fresh^, idle_at, NO_DEADLINE)
+                var entry: HttpConnection
+                if self._tls_context:
+                    if not self._budget.try_reserve(READ_BUFFER_SIZE):
+                        _ = self._reactor.remove(token)
+                        fresh.close()
+                        accepted += 1
+                        continue
+                    try:
+                        var secure = self._tls_context.value().accept(fresh^)
+                        entry = HttpConnection(
+                            token,
+                            None,
+                            Optional[TLSConnection](secure^),
+                            idle_at,
+                            NO_DEADLINE,
+                            deadline_from_now(
+                                self.config.tls_handshake_timeout
+                            ),
+                        )
+                    except e:
+                        _ = e
+                        _ = self._reactor.remove(token)
+                        self._budget.release(READ_BUFFER_SIZE)
+                        accepted += 1
+                        continue
+                else:
+                    entry = HttpConnection(
+                        token,
+                        Optional[TCPConn](fresh^),
+                        None,
+                        idle_at,
+                        NO_DEADLINE,
+                        NO_DEADLINE,
+                    )
+                self._ensure_slot_map(token.slot)
                 var idx: Int
                 if len(self._conn_free) > 0:
                     idx = self._conn_free.pop()
@@ -638,6 +703,8 @@ struct Server(Movable):
         )
         self._budget.release(self._conns[idx].reserved)
         self._conns[idx].reserved = 0
+        if self._conns[idx].is_tls():
+            self._budget.release(READ_BUFFER_SIZE)
         try:
             self._conns[idx].close()
         except e:
@@ -678,8 +745,58 @@ struct Server(Movable):
         _ = self._reactor.modify(
             self._conns[idx].token,
             self._conns[idx].wants_read(),
-            self._conns[idx].pending_remaining() > 0,
+            self._conns[idx].wants_write(),
         )
+
+    def _drive_tls_handshake(mut self, idx: Int) raises NetError:
+        try:
+            var progress = self._conns[idx].tls.value().handshake()
+            if progress.is_complete():
+                if self._conns[idx].tls.value().selected_alpn() != "http/1.1":
+                    self._close_conn(idx)
+                    return
+                self._conns[idx].state = STATE_READING
+                self._conns[idx].tls_handshake_at = NO_DEADLINE
+                self._conns[idx].idle_at = deadline_from_now(
+                    self.config.idle_timeout
+                )
+                if self._conns[idx].tls_pending() > 0:
+                    self._conns[idx].more_work = True
+                self._sync_interests(idx)
+                return
+            self._conns[idx].tls_handshake_wants_read = progress.is_wants_read()
+            self._conns[
+                idx
+            ].tls_handshake_wants_write = progress.is_wants_write()
+            self._sync_interests(idx)
+        except e:
+            _ = e
+            self._close_conn(idx)
+
+    def _drive_tls_shutdown(mut self, idx: Int) raises NetError:
+        try:
+            var progress = self._conns[idx].tls.value().shutdown()
+            if progress.is_complete() or progress.is_sent_close_notify():
+                self._close_conn(idx)
+                return
+            self._conns[
+                idx
+            ].tls_shutdown_wants_write = progress.is_wants_write()
+            self._sync_interests(idx)
+        except e:
+            _ = e
+            self._close_conn(idx)
+
+    def _finish_connection(mut self, idx: Int) raises NetError:
+        if not self._conns[idx].is_tls():
+            self._close_conn(idx)
+            return
+        self._conns[idx].state = STATE_TLS_SHUTDOWN
+        self._conns[idx].tls_shutdown_at = deadline_from_now(
+            self.config.write_deadline
+        )
+        self._conns[idx].tls_shutdown_wants_write = False
+        self._drive_tls_shutdown(idx)
 
     def _drive_conn[
         H: Handler
@@ -693,20 +810,35 @@ struct Server(Movable):
     ) raises:
         if not self._conns[idx].active:
             return
+        if self._conns[idx].state == STATE_HANDSHAKING:
+            if (self._conns[idx].tls_handshake_wants_read and readable) or (
+                self._conns[idx].tls_handshake_wants_write and writable
+            ):
+                self._drive_tls_handshake(idx)
+            return
+        if self._conns[idx].state == STATE_TLS_SHUTDOWN:
+            if (self._conns[idx].tls_shutdown_wants_write and writable) or (
+                not self._conns[idx].tls_shutdown_wants_write and readable
+            ):
+                self._drive_tls_shutdown(idx)
+            return
         if (
             self._conns[idx].state == STATE_SENDING
             or self._conns[idx].state == STATE_SENDING_100
             or self._conns[idx].state == STATE_STREAMING
         ):
-            self._pump_send(idx, writable)
+            self._pump_send(
+                idx, self._conns[idx].write_ready(readable, writable)
+            )
             if not self._conns[idx].active:
                 return
         if (
             self._conns[idx].state == STATE_DETACHED
             or self._conns[idx].state == STATE_STREAMING
         ):
-            if readable:
-                self._pump_read(idx, readable, now)
+            var read_event = self._conns[idx].read_ready(readable, writable)
+            if read_event:
+                self._pump_read(idx, read_event, now)
                 if not self._conns[idx].active:
                     return
                 if self._conns[idx].read_eof:
@@ -726,7 +858,11 @@ struct Server(Movable):
                 # Drained everything the half-closed peer sent.
                 self._close_conn(idx)
                 return
-            self._pump_read(idx, readable, now)
+            var read_event = (
+                self._conns[idx].read_ready(readable, writable)
+                or self._conns[idx].tls_pending() > 0
+            )
+            self._pump_read(idx, read_event, now)
             if not self._conns[idx].active:
                 return
             # Chain pipelined requests inside one drive: after an eager
@@ -776,7 +912,10 @@ struct Server(Movable):
             )
             if room <= 0:
                 break
-            var limit = room if room < _READ_CHUNK else _READ_CHUNK
+            var limit = room if room < READ_BUFFER_SIZE else READ_BUFFER_SIZE
+            if self._conns[idx].tls_read_retry_length > limit:
+                self._conns[idx].more_work = True
+                break
             try:
                 var chunk = self._conns[idx].try_read_bytes(limit)
                 if len(chunk) == 0:
@@ -938,6 +1077,9 @@ struct Server(Movable):
         var first = len(cont) if len(cont) < allowance else allowance
         try:
             var written = self._conns[idx].try_write_bytes(Span(cont)[0:first])
+            if self._conns[idx].tls_write_closed:
+                self._close_conn(idx)
+                return False
             self._conns[idx].bytes_this_tick += written
             if written < len(cont):
                 var rest = List[Byte]()
@@ -1104,7 +1246,7 @@ struct Server(Movable):
         self._conns[idx].detach_at = NO_DEADLINE
         self._conns[idx].requests_served += 1
         if self._conns[idx].should_close or self._shutdown_at != NO_DEADLINE:
-            self._close_conn(idx)
+            self._finish_connection(idx)
             return
         self._conns[idx].state = STATE_READING
         self._conns[idx].is_head = False
@@ -1146,6 +1288,11 @@ struct Server(Movable):
                 break
             try:
                 var n = self._conns[idx].try_write_pending_capped(allowance)
+                if self._conns[idx].tls_write_closed:
+                    self._close_conn(idx)
+                    return
+                if self._conns[idx].tls_write_would_block:
+                    break
                 self._conns[idx].bytes_this_tick += n
             except e:
                 if e.kind == NetErrorKind.timeout():
@@ -1178,7 +1325,7 @@ struct Server(Movable):
             return
         self._conns[idx].requests_served += 1
         if self._conns[idx].should_close or self._shutdown_at != NO_DEADLINE:
-            self._close_conn(idx)
+            self._finish_connection(idx)
             return
         self._conns[idx].state = STATE_READING
         self._conns[idx].is_head = False

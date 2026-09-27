@@ -1,7 +1,16 @@
 from std.ffi import external_call, c_int, c_uint, c_ulong
 from std.testing import assert_equal
 
-from net._sys.common import F_GETFD, _fcntl
+from net import Timeout
+from net._sys.common import (
+    AF_UNIX,
+    F_GETFD,
+    SOCK_STREAM,
+    _OwnedFD,
+    _fcntl,
+    _set_nonblocking_cloexec,
+)
+from net.http import Handler, Server
 
 
 def _assert_bytes_equal[
@@ -75,3 +84,30 @@ def _count_open_fds() -> Int:
         if _fcntl(c_int(fd), c_int(F_GETFD), c_int(0)) != -1:
             count += 1
     return count
+
+
+@fieldwise_init
+struct _SocketPair(Movable):
+    var first: _OwnedFD
+    var second: _OwnedFD
+
+
+def _socket_pair() raises -> _SocketPair:
+    var raw = SIMD[DType.int32, 2](0)
+    var result = external_call["socketpair", c_int](
+        c_int(AF_UNIX),
+        c_int(SOCK_STREAM),
+        c_int(0),
+        Pointer(to=raw).unsafe_bitcast[c_int](),
+    )
+    if result != 0:
+        raise Error("socketpair failed")
+    var pair = _SocketPair(first=_OwnedFD(raw[0]), second=_OwnedFD(raw[1]))
+    _set_nonblocking_cloexec(pair.first.raw())
+    _set_nonblocking_cloexec(pair.second.raw())
+    return pair^
+
+
+def _tick_n[H: Handler](mut server: Server, mut handler: H, n: Int) raises:
+    for _ in range(n):
+        _ = server.tick(handler, Timeout.nanoseconds(0))

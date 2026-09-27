@@ -20,6 +20,7 @@ from net.tcp import TCPConn
 comptime _TLS_WANT_READ: Int32 = -2
 comptime _TLS_WANT_WRITE: Int32 = -3
 comptime _TLS_CLOSED: Int32 = -4
+comptime _TLS_SHUTDOWN_SENT: Int32 = -5
 
 
 @fieldwise_init
@@ -42,6 +43,10 @@ struct TLSProgress(Copyable, Equatable):
     def closed() -> Self:
         return Self(value=_TLS_CLOSED)
 
+    @staticmethod
+    def sent_close_notify() -> Self:
+        return Self(value=_TLS_SHUTDOWN_SENT)
+
     def is_complete(self) -> Bool:
         return self.value == 1
 
@@ -53,6 +58,9 @@ struct TLSProgress(Copyable, Equatable):
 
     def is_closed(self) -> Bool:
         return self.value == _TLS_CLOSED
+
+    def is_sent_close_notify(self) -> Bool:
+        return self.value == _TLS_SHUTDOWN_SENT
 
 
 @fieldwise_init
@@ -152,7 +160,7 @@ struct TLSConnection(Movable):
     def __deinit__(deinit self):
         self._library.call["net_tls_connection_free"](self._session)
 
-    def handshake(mut self) raises -> TLSProgress:
+    def handshake(mut self) raises NetError -> TLSProgress:
         var result = Int32(
             self._library.call["net_tls_handshake", c_int](self._session)
         )
@@ -171,7 +179,9 @@ struct TLSConnection(Movable):
 
     def try_read[
         origin: MutOrigin
-    ](mut self, buffer: Span[mut=True, Byte, origin]) raises -> TLSIOResult:
+    ](
+        mut self, buffer: Span[mut=True, Byte, origin]
+    ) raises NetError -> TLSIOResult:
         if len(buffer) == 0:
             return TLSIOResult(progress=TLSProgress.complete(), count=0)
         var result = Int32(
@@ -183,7 +193,7 @@ struct TLSConnection(Movable):
 
     def try_write[
         origin: ImmOrigin
-    ](mut self, buffer: Span[Byte, origin]) raises -> TLSIOResult:
+    ](mut self, buffer: Span[Byte, origin]) raises NetError -> TLSIOResult:
         if len(buffer) == 0:
             return TLSIOResult(progress=TLSProgress.complete(), count=0)
         var result = Int32(
@@ -193,7 +203,7 @@ struct TLSConnection(Movable):
         )
         return _io_result(result, "TLS write")
 
-    def selected_alpn(mut self) raises -> String:
+    def selected_alpn(mut self) raises NetError -> String:
         var buffer = Array[Byte, 256](fill=0)
         var count = self._library.call["net_tls_selected_alpn", c_int](
             self._session, buffer.unsafe_ptr(), c_size_t(len(buffer) - 1)
@@ -208,11 +218,33 @@ struct TLSConnection(Movable):
         buffer[count] = 0
         return String(unsafe_from_utf8_ptr=buffer.unsafe_ptr())
 
-    def raw_fd(self) raises -> Int32:
+    def pending(self) -> Int:
+        return Int(self._library.call["net_tls_pending", c_int](self._session))
+
+    def shutdown(mut self) raises NetError -> TLSProgress:
+        var result = Int32(
+            self._library.call["net_tls_shutdown", c_int](self._session)
+        )
+        if result == 1:
+            return TLSProgress.complete()
+        if result == _TLS_WANT_READ:
+            return TLSProgress.wants_read()
+        if result == _TLS_WANT_WRITE:
+            return TLSProgress.wants_write()
+        if result == _TLS_SHUTDOWN_SENT:
+            return TLSProgress.sent_close_notify()
+        raise NetError(
+            NetErrorKind.system_error(),
+            "TLS shutdown",
+            None,
+            "OpenSSL could not send close notification",
+        )
+
+    def raw_fd(self) raises NetError -> Int32:
         return self._socket.raw_fd()
 
 
-def _io_result(result: Int32, operation: String) raises -> TLSIOResult:
+def _io_result(result: Int32, operation: String) raises NetError -> TLSIOResult:
     if result > 0:
         return TLSIOResult(progress=TLSProgress.complete(), count=Int(result))
     if result == _TLS_WANT_READ:

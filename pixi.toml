@@ -71,10 +71,29 @@ benchmark-http-stream = "mojo run --Werror -I . benchmarks/http_stream.mojo"
 c-compiler = "*"
 openssl = ">=3.2,<4"
 pkg-config = "*"
+python = ">=3.10,<3.15"
 
 [feature.tls.tasks]
 tls-build = "bash scripts/build_tls_shim.sh"
 tls-test = { cmd = "mojo run --Werror -I . tests/test_tls.mojo", depends-on = [
+  "tls-build",
+] }
+https-state-test = { cmd = "mojo run --Werror -I . tests/test_https_server.mojo", depends-on = [
+  "tls-build",
+] }
+https-client-test = { cmd = "python3 scripts/test_https_server.py", depends-on = [
+  "tls-build",
+] }
+https-example-build = { cmd = "bash scripts/check_https_example.sh", depends-on = [
+  "tls-build",
+] }
+tls-suite = { depends-on = [
+  "tls-test",
+  "https-state-test",
+  "https-client-test",
+  "https-example-build",
+] }
+example-https-hello = { cmd = "mojo run --Werror -I . examples/https_hello.mojo", depends-on = [
   "tls-build",
 ] }
 
