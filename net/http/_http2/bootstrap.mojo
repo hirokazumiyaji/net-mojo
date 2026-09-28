@@ -3,8 +3,8 @@
 from .frame import FrameParseResult
 from .frame_encoder import FrameEncodeResult, encode_frame
 from .preface import PrefaceParseResult, parse_client_preface
-from .settings import validate_settings_values
 from .settings_frame import parse_settings_frame
+from .settings_state import Http2PeerSettings
 
 
 struct Http2ServerBootstrap(Movable):
@@ -13,6 +13,7 @@ struct Http2ServerBootstrap(Movable):
     var client_settings_received: Bool
     var failed: Bool
     var error_code: UInt32
+    var peer_settings: Http2PeerSettings
 
     def __init__(out self):
         self.preface_complete = False
@@ -20,6 +21,7 @@ struct Http2ServerBootstrap(Movable):
         self.client_settings_received = False
         self.failed = False
         self.error_code = UInt32(0)
+        self.peer_settings = Http2PeerSettings()
 
     def consume_client_preface[
         origin: Origin
@@ -65,7 +67,7 @@ struct Http2ServerBootstrap(Movable):
             self.failed = True
             if self.error_code == UInt32(0):
                 self.error_code = UInt32(1)
-            return FrameEncodeResult.failure()
+            return FrameEncodeResult.failure(self.error_code)
 
         var settings = parse_settings_frame(frame, payload)
         if settings.is_error():
@@ -75,13 +77,13 @@ struct Http2ServerBootstrap(Movable):
         if not settings.is_settings():
             self.failed = True
             self.error_code = UInt32(1)
-            return FrameEncodeResult.failure()
+            return FrameEncodeResult.failure(self.error_code)
 
-        var validated = validate_settings_values(Span(settings.parsed.settings))
-        if validated.is_error():
+        var applied = self.peer_settings.apply(Span(settings.parsed.settings))
+        if applied.is_error():
             self.failed = True
-            self.error_code = validated.error_code
-            return FrameEncodeResult.failure()
+            self.error_code = applied.error_code
+            return FrameEncodeResult.failure(applied.error_code)
 
         self.client_settings_received = True
         var empty_payload = List[Byte]()

@@ -3,6 +3,7 @@ from std.testing import assert_equal, assert_true, TestSuite
 from net.http._http2.frame import parse_frame
 from net.http._http2.frame_encoder import encode_frame
 from net.http._http2.bootstrap import Http2ServerBootstrap
+from net.http._http2.settings_state import Http2PeerSettings
 from net.http._http2.preface import parse_client_preface
 from net.http._http2.settings import (
     Setting,
@@ -169,6 +170,61 @@ def test_settings_payload_rejects_partial_entry() raises:
     assert_equal(len(parsed.settings), 0)
 
 
+def test_peer_settings_apply_known_values_in_order_and_ignore_unknown() raises:
+    var peer = Http2PeerSettings()
+    var settings = List[Setting]()
+    settings.append(Setting(identifier=UInt16(1), value=UInt32(1024)))
+    settings.append(Setting(identifier=UInt16(1), value=UInt32(2048)))
+    settings.append(Setting(identifier=UInt16(2), value=UInt32(1)))
+    settings.append(Setting(identifier=UInt16(3), value=UInt32(100)))
+    settings.append(Setting(identifier=UInt16(4), value=UInt32(32768)))
+    settings.append(Setting(identifier=UInt16(5), value=UInt32(32768)))
+    settings.append(Setting(identifier=UInt16(6), value=UInt32(65536)))
+    settings.append(Setting(identifier=UInt16(0xFF00), value=UInt32(99)))
+
+    var result = peer.apply(Span(settings))
+    assert_true(result.is_success())
+    assert_equal(peer.header_table_size, UInt32(2048))
+    assert_equal(peer.max_concurrent_streams, UInt32(100))
+    assert_equal(peer.initial_window_size, UInt32(32768))
+    assert_equal(peer.max_frame_size, UInt32(32768))
+    assert_equal(peer.max_header_list_size, UInt32(65536))
+
+
+def test_peer_settings_reject_invalid_enable_push_value() raises:
+    var peer = Http2PeerSettings()
+    var settings = List[Setting]()
+    settings.append(Setting(identifier=UInt16(2), value=UInt32(2)))
+    var result = peer.apply(Span(settings))
+    assert_true(result.is_error())
+    assert_equal(result.error_code, UInt32(1))
+
+
+def test_peer_settings_reject_initial_window_overflow() raises:
+    var peer = Http2PeerSettings()
+    var settings = List[Setting]()
+    settings.append(Setting(identifier=UInt16(4), value=UInt32(0x80000000)))
+    var result = peer.apply(Span(settings))
+    assert_true(result.is_error())
+    assert_equal(result.error_code, UInt32(3))
+
+
+def test_peer_settings_reject_frame_size_out_of_range() raises:
+    var too_small = List[Setting]()
+    too_small.append(Setting(identifier=UInt16(5), value=UInt32(16383)))
+    var peer = Http2PeerSettings()
+    var result = peer.apply(Span(too_small))
+    assert_true(result.is_error())
+    assert_equal(result.error_code, UInt32(1))
+
+    var too_large = List[Setting]()
+    too_large.append(Setting(identifier=UInt16(5), value=UInt32(16777216)))
+    var another_peer = Http2PeerSettings()
+    var oversized = another_peer.apply(Span(too_large))
+    assert_true(oversized.is_error())
+    assert_equal(oversized.error_code, UInt32(1))
+
+
 def test_setting_encoder_uses_network_byte_order() raises:
     var settings = List[Setting]()
     settings.append(
@@ -328,6 +384,10 @@ def test_http2_bootstrap_acknowledges_initial_client_settings() raises:
     var payload = List[Byte]()
     for byte in [Byte(0), Byte(1), Byte(0), Byte(0), Byte(0), Byte(128)]:
         payload.append(byte)
+    for byte in [Byte(0), Byte(2), Byte(0), Byte(0), Byte(0), Byte(1)]:
+        payload.append(byte)
+    for byte in [Byte(0), Byte(5), Byte(0), Byte(0), Byte(128), Byte(0)]:
+        payload.append(byte)
     var client_wire = _frame(4, 0, 0, payload)
     var ack = bootstrap.accept_initial_client_settings(
         parse_frame(Span(client_wire)), Span(client_wire)[9:]
@@ -339,6 +399,26 @@ def test_http2_bootstrap_acknowledges_initial_client_settings() raises:
     assert_equal(ack_frame.flags, Byte(1))
     assert_equal(ack_frame.stream_id, UInt32(0))
     assert_equal(ack_frame.payload_length, 0)
+    assert_equal(bootstrap.peer_settings.max_frame_size, UInt32(32768))
+
+
+def test_http2_bootstrap_rejects_invalid_client_setting_value() raises:
+    var bootstrap = Http2ServerBootstrap()
+    var preface = "PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n".as_bytes()
+    assert_true(bootstrap.consume_client_preface(preface).is_complete())
+    assert_true(bootstrap.server_settings().is_complete())
+
+    var payload = List[Byte]()
+    for byte in [Byte(0), Byte(4), Byte(128), Byte(0), Byte(0), Byte(0)]:
+        payload.append(byte)
+    var client_wire = _frame(4, 0, 0, payload)
+    var rejected = bootstrap.accept_initial_client_settings(
+        parse_frame(Span(client_wire)), Span(client_wire)[9:]
+    )
+    assert_true(rejected.is_error())
+    assert_equal(rejected.error_code, UInt32(3))
+    assert_true(bootstrap.is_failed())
+    assert_equal(bootstrap.connection_error_code(), UInt32(3))
 
 
 def test_http2_bootstrap_rejects_invalid_max_frame_size() raises:
@@ -351,11 +431,11 @@ def test_http2_bootstrap_rejects_invalid_max_frame_size() raises:
     for byte in [Byte(0), Byte(5), Byte(0), Byte(0), Byte(0), Byte(0)]:
         payload.append(byte)
     var client_wire = _frame(4, 0, 0, payload)
-    assert_true(
-        bootstrap.accept_initial_client_settings(
-            parse_frame(Span(client_wire)), Span(client_wire)[9:]
-        ).is_error()
+    var rejected = bootstrap.accept_initial_client_settings(
+        parse_frame(Span(client_wire)), Span(client_wire)[9:]
     )
+    assert_true(rejected.is_error())
+    assert_equal(rejected.error_code, UInt32(1))
     assert_true(bootstrap.is_failed())
     assert_true(not bootstrap.is_ready())
     assert_equal(bootstrap.connection_error_code(), UInt32(1))
