@@ -556,6 +556,7 @@ struct Server(Movable):
             for i in range(len(self._conns)):
                 if self._conns[i].active:
                     self._close_conn(i)
+            self._drop_quic_endpoint()
             return
         while len(self._deadline_heap) > 0:
             var top = self._deadline_heap[0]
@@ -591,7 +592,8 @@ struct Server(Movable):
             if self._shutdown_at == NO_DEADLINE:
                 self._shutdown_at = now + Int(self.config.shutdown_grace._value)
                 self._drop_listener()
-                self._drop_quic_endpoint()
+                if self._quic_endpoint:
+                    self._quic_endpoint.value().begin_shutdown()
                 for i in range(len(self._conns)):
                     if (
                         not self._conns[i].active

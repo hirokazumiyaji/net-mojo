@@ -96,6 +96,18 @@ struct QuicServer(Movable):
     def __deinit__(deinit self):
         self._library.call["net_quic_free"](self._server)
 
+    def begin_shutdown(mut self) raises NetError:
+        var result = self._library.call["net_quic_begin_shutdown", c_int](
+            self._server
+        )
+        if result != 1:
+            raise NetError(
+                NetErrorKind.invalid_state(),
+                "begin HTTP/3 shutdown",
+                None,
+                "QUIC provider could not begin shutdown",
+            )
+
     def set_connection_limit(mut self, limit: Int) raises NetError:
         var result = self._library.call["net_quic_set_connection_limit", c_int](
             self._server, c_size_t(limit)
@@ -247,6 +259,9 @@ struct QuicUDPEndpoint(Movable):
 
     def set_connection_limit(mut self, limit: Int) raises NetError:
         self._server.set_connection_limit(limit)
+
+    def begin_shutdown(mut self) raises NetError:
+        self._server.begin_shutdown()
 
     def __init__(
         out self, var server: QuicServer, var socket: UDPConn

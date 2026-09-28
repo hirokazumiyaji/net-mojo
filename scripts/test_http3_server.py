@@ -5,7 +5,8 @@ import sys
 
 from aioquic.asyncio import connect
 from aioquic.asyncio.protocol import QuicConnectionProtocol
-from aioquic.h3.connection import H3_ALPN, H3Connection
+from aioquic.buffer import Buffer
+from aioquic.h3.connection import FrameType, H3_ALPN, H3Connection
 from aioquic.h3.events import DataReceived, HeadersReceived
 from aioquic.quic.configuration import QuicConfiguration
 from aioquic.quic.events import ProtocolNegotiated
@@ -15,7 +16,7 @@ from aioquic.quic.packet import QuicProtocolVersion
 class Http3ClientProtocol(QuicConnectionProtocol):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        self.http = H3Connection(self._quic)
+        self.http = _Http3Connection(self._quic, self._loop.create_future())
         self.responses = {}
         self.alpn = None
 
@@ -80,6 +81,17 @@ class Http3ClientProtocol(QuicConnectionProtocol):
         await asyncio.sleep(0.05)
 
 
+class _Http3Connection(H3Connection):
+    def __init__(self, quic, goaway):
+        super().__init__(quic)
+        self.goaway = goaway
+
+    def _handle_control_frame(self, frame_type, frame_data):
+        if frame_type == FrameType.GOAWAY and not self.goaway.done():
+            self.goaway.set_result(Buffer(data=frame_data).pull_uint_var())
+        super()._handle_control_frame(frame_type, frame_data)
+
+
 async def run_client(address):
     host, port = address.rsplit(":", 1)
     configuration = QuicConfiguration(
@@ -107,6 +119,9 @@ async def run_client(address):
                 raise RuntimeError(f"unexpected HTTP/3 response headers: {response}")
             if bytes(response["body"]) != expected_body:
                 raise RuntimeError(f"unexpected HTTP/3 response body: {response}")
+        goaway_id = await asyncio.wait_for(client.http.goaway, timeout=5)
+        if goaway_id != (1 << 62) - 4:
+            raise RuntimeError(f"unexpected HTTP/3 GOAWAY ID: {goaway_id}")
 
 
 process = subprocess.Popen(

@@ -118,10 +118,13 @@
 
 ## HTTP/3 server graceful shutdown integration slice
 
-- [ ] Expose provider shutdown and drain state through C and Mojo.
-- [ ] Keep the UDP endpoint alive through response drain; force close only at the configured grace deadline.
-- [ ] Verify GOAWAY, accepted response completion, post-GOAWAY rejection, and graceful QUIC close with an independent client.
-- [ ] Run QUIC, HTTP/3 interoperability, HTTP/2, and TLS suites, inspect the diff, and commit the server integration slice locally.
+- [x] Expose provider shutdown through Mojo and notify it when Server shutdown starts.
+- [x] Keep the UDP endpoint registered and drive QUIC during the configured grace period; remove it at the grace deadline.
+- [x] Verify GOAWAY delivery after accepted responses complete with an independent client.
+- [ ] Verify post-GOAWAY rejection and graceful QUIC close with an independent client.
+- [x] Run the QUIC provider, independent HTTP/3 client, and HTTP Server suites; inspect the diff.
+- [x] Run HTTP/2 and TLS suites.
+- [ ] Commit this server integration slice locally.
 
 ## QUIC transport review
 

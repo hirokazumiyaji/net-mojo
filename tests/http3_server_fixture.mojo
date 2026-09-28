@@ -33,7 +33,9 @@ def main() raises:
     var config = provider.server_config(
         "build/tls/test-cert.pem", "build/tls/test-key.pem"
     )
-    var server = Server(ServerConfig.default())
+    var server_config = ServerConfig.default()
+    server_config.shutdown_grace = Timeout.milliseconds(500)
+    var server = Server(server_config^)
     server.add_quic_endpoint(
         QuicUDPEndpoint(provider.server(config^), listener^)
     )
@@ -41,3 +43,7 @@ def main() raises:
     print("READY " + address)
     while handler.requests < 2:
         _ = server.tick(handler, Timeout.seconds(2))
+    server.request_shutdown()
+    var running = True
+    while running:
+        running = server.tick(handler, Timeout.seconds(2))
