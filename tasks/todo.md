@@ -95,19 +95,34 @@
 - [x] Add an optional HTTP/3 integration test that attaches a UDP endpoint to `Server`, drives `tick`, and verifies shutdown exits the loop.
 - [x] Let `Server` own one QUIC endpoint, include its timer in reactor wait time, drain bounded packet batches, and toggle writable readiness when a UDP send is pending.
 - [x] Verify `quic-mojo-test` and review the diff.
-- [ ] Commit this server transport slice.
+- [x] Commit this server transport slice locally as `5e7adb9`.
 
 ## Review
 
 - `quic-mojo-test` passed on Linux x86_64 under Docker after the initial quiche/BoringSSL build. Direct macOS Pixi execution is unavailable because the checked-in environment is linux-64.
-- Server shutdown drops the QUIC UDP descriptor and exits when no TCP listener or active connections remain. HTTP/3 stream parsing and shared-handler dispatch are still future work.
+- Server shutdown drops the QUIC UDP descriptor and exits when no TCP listener or active connections remain.
 
 ## Shared HTTP/3 request version slice
 
 - [x] Add an HTTP/3 version value to shared request metadata and rendering.
 - [x] Run the HTTP API suite and review the diff.
-- [ ] Commit this metadata slice locally.
+- [x] Commit this metadata slice locally as `7868433`.
 
 ## Review
 
 - `test-http-api` passed 19/19 on Linux x86_64.
+
+## HTTP/3 request and response slice
+
+- [x] Decode bounded HTTP/3 request headers and bodies through quiche and expose completed requests through the C/Mojo provider API.
+- [x] Route HTTP/3 requests through the shared `Handler` and return bounded responses through the provider.
+- [x] Apply shared response status, header count, header byte, and body limits.
+- [x] Verify the QUIC provider suite and HTTP server suite.
+- [x] Commit this slice locally.
+
+## Review
+
+- `quic-suite` passed on Linux x86_64, including an HTTP/3 POST over localhost UDP, duplicate request headers, request body extraction, and a complete 200 response body.
+- `test-http-server` passed 27/27 on Linux x86_64; `quic-mojo-test` compiled and passed after applying the HTTP/3 response limits.
+- A valid HTTP/3 request has not yet been exercised through the Mojo `Server` and a user `Handler`; that end-to-end test remains part of the overall integration work.
+- `/review` and PR publication remain pending explicit authorization to upload the code diff to the configured external reviewer.

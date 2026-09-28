@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::ffi::{CStr, c_char};
 use std::fs::File;
 use std::io::{self, Read};
@@ -7,6 +7,7 @@ use std::ptr;
 use std::slice;
 use std::time::Duration;
 
+use quiche::h3::NameValue;
 use quiche::{Connection, ConnectionId, RecvInfo, SendInfo};
 
 pub struct NetQuicServerConfig {
@@ -55,6 +56,12 @@ pub unsafe extern "C" fn net_quic_server_config_new(
     {
         return ptr::null_mut();
     }
+    config.set_initial_max_data(10_000_000);
+    config.set_initial_max_stream_data_bidi_local(1_000_000);
+    config.set_initial_max_stream_data_bidi_remote(1_000_000);
+    config.set_initial_max_stream_data_uni(1_000_000);
+    config.set_initial_max_streams_bidi(100);
+    config.set_initial_max_streams_uni(3);
 
     Box::into_raw(Box::new(NetQuicServerConfig {
         _inner: Some(config),
@@ -189,17 +196,174 @@ pub unsafe extern "C" fn net_quic_server_on_timeout(server: *mut NetQuicServer) 
     }
 }
 
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn net_quic_server_next_request(
+    server: *mut NetQuicServer,
+    output: *mut u8,
+    output_capacity: usize,
+) -> i32 {
+    if server.is_null() {
+        return -1;
+    }
+    let server = unsafe { &mut *server };
+    let Some(request) = server._inner.requests.front() else {
+        return 0;
+    };
+    let mut record = Vec::new();
+    append_u64(&mut record, request.id);
+    append_u64(&mut record, request.stream_id);
+    append_bytes(&mut record, &request.method);
+    append_bytes(&mut record, &request.target);
+    append_bytes(&mut record, &request.scheme);
+    append_bytes(&mut record, &request.authority);
+    append_u32(&mut record, request.headers.len() as u32);
+    for (name, value) in &request.headers {
+        append_bytes(&mut record, name);
+        append_bytes(&mut record, value);
+    }
+    append_bytes(&mut record, &request.body);
+    if output.is_null() || output_capacity < record.len() {
+        return -i32::try_from(record.len()).unwrap_or(i32::MAX);
+    }
+    unsafe { ptr::copy_nonoverlapping(record.as_ptr(), output, record.len()) };
+    let _ = server._inner.requests.pop_front();
+    i32::try_from(record.len()).unwrap_or(-1)
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn net_quic_server_respond(
+    server: *mut NetQuicServer,
+    request_id: u64,
+    status: u32,
+    header_data: *const u8,
+    header_length: usize,
+    body_data: *const u8,
+    body_length: usize,
+) -> i32 {
+    if server.is_null()
+        || !(100..=599).contains(&status)
+        || header_length > 32_768
+        || body_length > 1024 * 1024
+        || (header_length > 0 && header_data.is_null())
+        || (body_length > 0 && body_data.is_null())
+    {
+        return -1;
+    }
+    let header_bytes = if header_length == 0 {
+        &[][..]
+    } else {
+        unsafe { slice::from_raw_parts(header_data, header_length) }
+    };
+    let mut offset = 0usize;
+    let Some(header_count) = read_u32(header_bytes, &mut offset) else {
+        return -1;
+    };
+    if header_count > 100 {
+        return -1;
+    }
+    let mut headers = Vec::with_capacity(header_count as usize);
+    for _ in 0..header_count {
+        let Some(name) = read_bytes(header_bytes, &mut offset) else {
+            return -1;
+        };
+        let Some(value) = read_bytes(header_bytes, &mut offset) else {
+            return -1;
+        };
+        headers.push((name, value));
+    }
+    if offset != header_length {
+        return -1;
+    }
+    let body = if body_length == 0 {
+        Vec::new()
+    } else {
+        unsafe { slice::from_raw_parts(body_data, body_length) }.to_vec()
+    };
+    i32::from(unsafe { &mut *server }._inner.enqueue_response(
+        request_id,
+        status as u16,
+        headers,
+        body,
+    ))
+}
+
+fn read_u32(data: &[u8], offset: &mut usize) -> Option<u32> {
+    let value = data.get(*offset..*offset + 4)?;
+    *offset += 4;
+    Some(u32::from_be_bytes(value.try_into().ok()?))
+}
+
+fn read_bytes(data: &[u8], offset: &mut usize) -> Option<Vec<u8>> {
+    let length = read_u32(data, offset)? as usize;
+    let value = data.get(*offset..*offset + length)?.to_vec();
+    *offset += length;
+    Some(value)
+}
+
+fn append_u32(output: &mut Vec<u8>, value: u32) {
+    output.extend_from_slice(&value.to_be_bytes());
+}
+
+fn append_u64(output: &mut Vec<u8>, value: u64) {
+    output.extend_from_slice(&value.to_be_bytes());
+}
+
+fn append_bytes(output: &mut Vec<u8>, value: &[u8]) {
+    append_u32(output, value.len() as u32);
+    output.extend_from_slice(value);
+}
+
 pub struct QuicServer {
     config: quiche::Config,
-    connections: HashMap<Vec<u8>, Connection>,
+    http3_config: quiche::h3::Config,
+    connections: HashMap<Vec<u8>, QuicConnection>,
     routes: HashMap<Vec<u8>, Vec<u8>>,
+    requests: VecDeque<CompletedRequest>,
+    request_routes: HashMap<u64, (Vec<u8>, u64)>,
+    next_request_id: u64,
     random: File,
+}
+
+struct QuicConnection {
+    transport: Connection,
+    http3: Option<quiche::h3::Connection>,
+    requests: HashMap<u64, PendingRequest>,
+    responses: HashMap<u64, PendingResponse>,
+}
+
+struct PendingResponse {
+    request_id: u64,
+    headers: Vec<quiche::h3::Header>,
+    body: Vec<u8>,
+    headers_sent: bool,
+    body_offset: usize,
+}
+
+struct PendingRequest {
+    method: Vec<u8>,
+    target: Vec<u8>,
+    scheme: Vec<u8>,
+    authority: Vec<u8>,
+    headers: Vec<(Vec<u8>, Vec<u8>)>,
+    body: Vec<u8>,
+}
+
+pub struct CompletedRequest {
+    pub id: u64,
+    pub stream_id: u64,
+    pub method: Vec<u8>,
+    pub target: Vec<u8>,
+    pub scheme: Vec<u8>,
+    pub authority: Vec<u8>,
+    pub headers: Vec<(Vec<u8>, Vec<u8>)>,
+    pub body: Vec<u8>,
 }
 
 #[derive(Debug)]
 pub enum QuicServerError {
     Io(io::Error),
     Quiche(quiche::Error),
+    Http3(quiche::h3::Error),
 }
 
 impl From<io::Error> for QuicServerError {
@@ -214,12 +378,24 @@ impl From<quiche::Error> for QuicServerError {
     }
 }
 
+impl From<quiche::h3::Error> for QuicServerError {
+    fn from(error: quiche::h3::Error) -> Self {
+        Self::Http3(error)
+    }
+}
+
 impl QuicServer {
     pub fn new(config: quiche::Config) -> io::Result<Self> {
+        let mut http3_config = quiche::h3::Config::new().unwrap();
+        http3_config.set_max_field_section_size(32_768);
         Ok(Self {
             config,
+            http3_config,
             connections: HashMap::new(),
             routes: HashMap::new(),
+            requests: VecDeque::new(),
+            request_routes: HashMap::new(),
+            next_request_id: 1,
             random: File::open("/dev/urandom")?,
         })
     }
@@ -248,26 +424,313 @@ impl QuicServer {
                 let key = source_id.as_ref().to_vec();
                 self.routes.insert(destination_id, key.clone());
                 self.routes.insert(key.clone(), key.clone());
-                self.connections.insert(key.clone(), connection);
+                self.connections.insert(
+                    key.clone(),
+                    QuicConnection {
+                        transport: connection,
+                        http3: None,
+                        requests: HashMap::new(),
+                        responses: HashMap::new(),
+                    },
+                );
                 key
             }
             None => return Err(quiche::Error::Done.into()),
         };
 
         let connection = self.connections.get_mut(&key).unwrap();
-        connection.recv(
+        connection.transport.recv(
             packet,
             RecvInfo {
                 from: remote,
                 to: local,
             },
         )?;
+        if connection.transport.is_established() && connection.http3.is_none() {
+            match quiche::h3::Connection::with_transport(
+                &mut connection.transport,
+                &self.http3_config,
+            ) {
+                Ok(http3) => connection.http3 = Some(http3),
+                Err(quiche::h3::Error::InternalError | quiche::h3::Error::Done) => (),
+                Err(error) => return Err(error.into()),
+            }
+        }
+        let completed = Self::poll_http3(connection)?;
         let source_ids: Vec<Vec<u8>> = connection
+            .transport
             .source_ids()
             .map(|source_id| source_id.as_ref().to_vec())
             .collect();
         for source_id in source_ids {
             self.routes.insert(source_id, key.clone());
+        }
+        for request in completed {
+            let id = self.next_request_id;
+            self.next_request_id = self.next_request_id.wrapping_add(1).max(1);
+            self.request_routes
+                .insert(id, (key.clone(), request.stream_id));
+            self.requests.push_back(CompletedRequest {
+                id,
+                stream_id: request.stream_id,
+                method: request.method,
+                target: request.target,
+                scheme: request.scheme,
+                authority: request.authority,
+                headers: request.headers,
+                body: request.body,
+            });
+        }
+        Ok(())
+    }
+
+    fn poll_http3(
+        connection: &mut QuicConnection,
+    ) -> Result<Vec<CompletedRequest>, QuicServerError> {
+        let mut completed = Vec::new();
+        let Some(http3) = connection.http3.as_mut() else {
+            return Ok(completed);
+        };
+        loop {
+            match http3.poll(&mut connection.transport) {
+                Ok((stream_id, quiche::h3::Event::Headers { list, .. })) => {
+                    let mut request = PendingRequest {
+                        method: Vec::new(),
+                        target: Vec::new(),
+                        scheme: Vec::new(),
+                        authority: Vec::new(),
+                        headers: Vec::new(),
+                        body: Vec::new(),
+                    };
+                    let mut seen_pseudo_headers = 0u8;
+                    let mut regular_header_seen = false;
+                    let mut header_bytes = 0usize;
+                    let mut header_count = 0usize;
+                    let mut invalid = false;
+                    for header in list {
+                        header_count += 1;
+                        header_bytes += header.name().len() + header.value().len();
+                        if header_count > 100 || header_bytes > 32_768 {
+                            invalid = true;
+                        }
+                        match header.name() {
+                            b":method" => {
+                                if regular_header_seen || seen_pseudo_headers & 1 != 0 {
+                                    invalid = true;
+                                }
+                                seen_pseudo_headers |= 1;
+                                request.method = header.value().to_vec();
+                            }
+                            b":path" => {
+                                if regular_header_seen || seen_pseudo_headers & 2 != 0 {
+                                    invalid = true;
+                                }
+                                seen_pseudo_headers |= 2;
+                                request.target = header.value().to_vec();
+                            }
+                            b":scheme" => {
+                                if regular_header_seen || seen_pseudo_headers & 4 != 0 {
+                                    invalid = true;
+                                }
+                                seen_pseudo_headers |= 4;
+                                request.scheme = header.value().to_vec();
+                            }
+                            b":authority" => {
+                                if regular_header_seen || seen_pseudo_headers & 8 != 0 {
+                                    invalid = true;
+                                }
+                                seen_pseudo_headers |= 8;
+                                request.authority = header.value().to_vec()
+                            }
+                            b":protocol" => invalid = true,
+                            name if name.starts_with(b":") => invalid = true,
+                            name => {
+                                regular_header_seen = true;
+                                if matches!(
+                                    name,
+                                    b"connection"
+                                        | b"keep-alive"
+                                        | b"proxy-connection"
+                                        | b"transfer-encoding"
+                                        | b"upgrade"
+                                ) || (name == b"te" && header.value() != b"trailers")
+                                {
+                                    invalid = true;
+                                }
+                                request
+                                    .headers
+                                    .push((name.to_vec(), header.value().to_vec()));
+                            }
+                        }
+                    }
+                    if invalid
+                        || seen_pseudo_headers != 15
+                        || request.method == b"CONNECT"
+                        || request.method.is_empty()
+                        || request.target.is_empty()
+                        || request.scheme.is_empty()
+                        || request.authority.is_empty()
+                    {
+                        let code = if header_bytes > 32_768 {
+                            0x107
+                        } else {
+                            0x10e
+                        };
+                        let _ = connection.transport.stream_shutdown(
+                            stream_id,
+                            quiche::Shutdown::Read,
+                            code,
+                        );
+                        continue;
+                    }
+                    connection.requests.insert(stream_id, request);
+                }
+                Ok((stream_id, quiche::h3::Event::Data)) => {
+                    let Some(request) = connection.requests.get_mut(&stream_id) else {
+                        return Err(quiche::h3::Error::FrameUnexpected.into());
+                    };
+                    let mut body = [0; 16 * 1024];
+                    loop {
+                        match http3.recv_body(
+                            &mut connection.transport,
+                            stream_id,
+                            &mut body,
+                        ) {
+                            Ok(length) => {
+                                if request.body.len() + length > 1024 * 1024 {
+                                    let _ = connection.transport.stream_shutdown(
+                                        stream_id,
+                                        quiche::Shutdown::Read,
+                                        0x107,
+                                    );
+                                    connection.requests.remove(&stream_id);
+                                    break;
+                                }
+                                request.body.extend_from_slice(&body[..length]);
+                            }
+                            Err(quiche::h3::Error::Done) => break,
+                            Err(error) => return Err(error.into()),
+                        }
+                    }
+                }
+                Ok((stream_id, quiche::h3::Event::Finished)) => {
+                    if let Some(request) = connection.requests.remove(&stream_id) {
+                        completed.push(CompletedRequest {
+                            id: 0,
+                            stream_id,
+                            method: request.method,
+                            target: request.target,
+                            scheme: request.scheme,
+                            authority: request.authority,
+                            headers: request.headers,
+                            body: request.body,
+                        });
+                    }
+                }
+                Ok((stream_id, quiche::h3::Event::Reset(_))) => {
+                    connection.requests.remove(&stream_id);
+                }
+                Ok(_) => (),
+                Err(quiche::h3::Error::Done) => break,
+                Err(error) => return Err(error.into()),
+            }
+        }
+        Ok(completed)
+    }
+
+    pub fn next_request(&mut self) -> Option<CompletedRequest> {
+        self.requests.pop_front()
+    }
+
+    fn enqueue_response(
+        &mut self,
+        request_id: u64,
+        status: u16,
+        headers: Vec<(Vec<u8>, Vec<u8>)>,
+        body: Vec<u8>,
+    ) -> bool {
+        let Some((connection_key, stream_id)) = self.request_routes.get(&request_id)
+        else {
+            return false;
+        };
+        let Some(connection) = self.connections.get_mut(connection_key) else {
+            return false;
+        };
+        let mut response_headers = Vec::with_capacity(headers.len() + 1);
+        response_headers.push(quiche::h3::Header::new(
+            b":status",
+            status.to_string().as_bytes(),
+        ));
+        response_headers.extend(
+            headers
+                .into_iter()
+                .map(|(name, value)| quiche::h3::Header::new(&name, &value)),
+        );
+        connection.responses.insert(
+            *stream_id,
+            PendingResponse {
+                request_id,
+                headers: response_headers,
+                body,
+                headers_sent: false,
+                body_offset: 0,
+            },
+        );
+        true
+    }
+
+    fn drive_responses(&mut self) -> Result<(), QuicServerError> {
+        let mut completed = Vec::new();
+        for (connection_key, connection) in self.connections.iter_mut() {
+            let stream_ids: Vec<u64> = connection.responses.keys().copied().collect();
+            for stream_id in stream_ids {
+                let response = connection.responses.get_mut(&stream_id).unwrap();
+                let Some(http3) = connection.http3.as_mut() else {
+                    continue;
+                };
+                if !response.headers_sent {
+                    match http3.send_response(
+                        &mut connection.transport,
+                        stream_id,
+                        &response.headers,
+                        response.body.is_empty(),
+                    ) {
+                        Ok(()) => response.headers_sent = true,
+                        Err(
+                            quiche::h3::Error::Done
+                            | quiche::h3::Error::StreamBlocked,
+                        ) => continue,
+                        Err(error) => return Err(error.into()),
+                    }
+                }
+                if response.body.is_empty() {
+                    completed.push((connection_key.clone(), stream_id, response.request_id));
+                    continue;
+                }
+                match http3.send_body(
+                    &mut connection.transport,
+                    stream_id,
+                    &response.body[response.body_offset..],
+                    true,
+                ) {
+                    Ok(written) => {
+                        response.body_offset += written;
+                        if response.body_offset == response.body.len() {
+                            completed.push((connection_key.clone(), stream_id, response.request_id));
+                        }
+                    }
+                    Err(quiche::h3::Error::Done | quiche::h3::Error::StreamBlocked) => (),
+                    Err(error) => return Err(error.into()),
+                }
+            }
+        }
+        for (connection_key, stream_id, request_id) in completed {
+            self.connections
+                .get_mut(&connection_key)
+                .unwrap()
+                .responses
+                .remove(&stream_id);
+            self.request_routes.remove(&request_id);
         }
         Ok(())
     }
@@ -276,8 +739,9 @@ impl QuicServer {
         &mut self,
         packet: &mut [u8],
     ) -> Result<Option<(usize, SendInfo)>, QuicServerError> {
+        self.drive_responses()?;
         for connection in self.connections.values_mut() {
-            match connection.send(packet) {
+            match connection.transport.send(packet) {
                 Ok((length, info)) => return Ok(Some((length, info))),
                 Err(quiche::Error::Done) => {}
                 Err(error) => return Err(error.into()),
@@ -289,17 +753,18 @@ impl QuicServer {
     pub fn timeout(&self) -> Option<Duration> {
         self.connections
             .values()
-            .filter_map(Connection::timeout)
+            .filter_map(|connection| connection.transport.timeout())
             .min()
     }
 
     pub fn on_timeout(&mut self) {
         for connection in self.connections.values_mut() {
             if connection
+                .transport
                 .timeout()
                 .is_some_and(|timeout| timeout.is_zero())
             {
-                connection.on_timeout();
+                connection.transport.on_timeout();
             }
         }
     }
@@ -314,7 +779,11 @@ mod tests {
 
     use quiche::{ConnectionId, Header, RecvInfo};
 
-    use super::{NetQuicServerConfig, net_quic_server_free, net_quic_server_new};
+    use super::{
+        NetQuicServerConfig, append_bytes, append_u32, net_quic_server_free,
+        net_quic_server_new,
+    };
+    use quiche::h3::NameValue;
 
     #[test]
     fn completes_http3_tls_handshake_over_quic_packets() {
@@ -330,12 +799,24 @@ mod tests {
         server_config
             .load_priv_key_from_pem_file(&private_key_path)
             .unwrap();
+        server_config.set_initial_max_data(10_000_000);
+        server_config.set_initial_max_stream_data_bidi_local(1_000_000);
+        server_config.set_initial_max_stream_data_bidi_remote(1_000_000);
+        server_config.set_initial_max_stream_data_uni(1_000_000);
+        server_config.set_initial_max_streams_bidi(100);
+        server_config.set_initial_max_streams_uni(3);
 
         let mut client_config = quiche::Config::new(quiche::PROTOCOL_VERSION).unwrap();
         client_config
             .set_application_protos(quiche::h3::APPLICATION_PROTOCOL)
             .unwrap();
         client_config.verify_peer(false);
+        client_config.set_initial_max_data(10_000_000);
+        client_config.set_initial_max_stream_data_bidi_local(1_000_000);
+        client_config.set_initial_max_stream_data_bidi_remote(1_000_000);
+        client_config.set_initial_max_stream_data_uni(1_000_000);
+        client_config.set_initial_max_streams_bidi(100);
+        client_config.set_initial_max_streams_uni(3);
 
         let client_address = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 54321);
         let server_address = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 4433);
@@ -423,12 +904,24 @@ mod tests {
         server_config
             .load_priv_key_from_pem_file(&private_key_path)
             .unwrap();
+        server_config.set_initial_max_data(10_000_000);
+        server_config.set_initial_max_stream_data_bidi_local(1_000_000);
+        server_config.set_initial_max_stream_data_bidi_remote(1_000_000);
+        server_config.set_initial_max_stream_data_uni(1_000_000);
+        server_config.set_initial_max_streams_bidi(100);
+        server_config.set_initial_max_streams_uni(3);
 
         let mut client_config = quiche::Config::new(quiche::PROTOCOL_VERSION).unwrap();
         client_config
             .set_application_protos(quiche::h3::APPLICATION_PROTOCOL)
             .unwrap();
         client_config.verify_peer(false);
+        client_config.set_initial_max_data(10_000_000);
+        client_config.set_initial_max_stream_data_bidi_local(1_000_000);
+        client_config.set_initial_max_stream_data_bidi_remote(1_000_000);
+        client_config.set_initial_max_stream_data_uni(1_000_000);
+        client_config.set_initial_max_streams_bidi(100);
+        client_config.set_initial_max_streams_uni(3);
 
         let server_socket = UdpSocket::bind("127.0.0.1:0").unwrap();
         let client_socket = UdpSocket::bind("127.0.0.1:0").unwrap();
@@ -462,7 +955,10 @@ mod tests {
                     .send_to(&packet[..length], server_address)
                     .unwrap();
             }
-            if let Ok((length, peer)) = server_socket.recv_from(&mut packet) {
+            loop {
+                let Ok((length, peer)) = server_socket.recv_from(&mut packet) else {
+                    break;
+                };
                 let local = CString::new(server_address.to_string()).unwrap();
                 let remote = CString::new(peer.to_string()).unwrap();
                 let status = unsafe {
@@ -499,7 +995,10 @@ mod tests {
                     .send_to(&packet[..length as usize], destination)
                     .unwrap();
             }
-            if let Ok((length, peer)) = client_socket.recv_from(&mut packet) {
+            loop {
+                let Ok((length, peer)) = client_socket.recv_from(&mut packet) else {
+                    break;
+                };
                 client
                     .recv(
                         &mut packet[..length],
@@ -517,6 +1016,227 @@ mod tests {
 
         assert!(client.is_established());
         assert_eq!(client.application_proto(), b"h3");
+        let mut client_h3 = quiche::h3::Connection::with_transport(
+            &mut client,
+            &quiche::h3::Config::new().unwrap(),
+        )
+        .unwrap();
+        let request_headers = [
+            quiche::h3::Header::new(b":method", b"POST"),
+            quiche::h3::Header::new(b":scheme", b"https"),
+            quiche::h3::Header::new(b":authority", b"localhost"),
+            quiche::h3::Header::new(b":path", b"/items?q=1"),
+            quiche::h3::Header::new(b"x-test", b"provider"),
+            quiche::h3::Header::new(b"x-test", b"duplicate"),
+            quiche::h3::Header::new(b"content-length", b"7"),
+        ];
+        let request_stream_id = client_h3
+            .send_request(&mut client, &request_headers, false)
+            .unwrap();
+        assert_eq!(
+            client_h3
+                .send_body(&mut client, request_stream_id, b"payload", true)
+                .unwrap(),
+            7
+        );
+        for _ in 0..20 {
+            while let Ok((length, _)) = client.send(&mut packet) {
+                client_socket
+                    .send_to(&packet[..length], server_address)
+                    .unwrap();
+            }
+            loop {
+                let Ok((length, peer)) = server_socket.recv_from(&mut packet) else {
+                    break;
+                };
+                let local = CString::new(server_address.to_string()).unwrap();
+                let remote = CString::new(peer.to_string()).unwrap();
+                assert_eq!(
+                    unsafe {
+                        super::net_quic_server_recv(
+                            server,
+                            packet.as_mut_ptr(),
+                            length,
+                            local.as_ptr(),
+                            remote.as_ptr(),
+                        )
+                    },
+                    1
+                );
+            }
+            loop {
+                let mut destination = [0 as c_char; 64];
+                let length = unsafe {
+                    super::net_quic_server_send(
+                        server,
+                        packet.as_mut_ptr(),
+                        packet.len(),
+                        destination.as_mut_ptr(),
+                        destination.len(),
+                    )
+                };
+                if length <= 0 {
+                    break;
+                }
+                let destination = unsafe { CStr::from_ptr(destination.as_ptr()) }
+                    .to_str()
+                    .unwrap()
+                    .parse::<SocketAddr>()
+                    .unwrap();
+                server_socket
+                    .send_to(&packet[..length as usize], destination)
+                    .unwrap();
+            }
+            loop {
+                let Ok((length, peer)) = client_socket.recv_from(&mut packet) else {
+                    break;
+                };
+                client
+                    .recv(
+                        &mut packet[..length],
+                        RecvInfo {
+                            from: peer,
+                            to: client_address,
+                        },
+                    )
+                    .unwrap();
+                while client_h3.poll(&mut client).is_ok() {}
+            }
+            if unsafe { &*server }._inner.requests.len() > 0 {
+                break;
+            }
+        }
+        let server_state = unsafe { &mut *server };
+        assert!(server_state._inner.connections.values().all(|connection| {
+            connection.http3.is_some()
+        }));
+        let request = server_state._inner.requests.front().unwrap();
+        assert_eq!(request.stream_id, request_stream_id);
+        assert_eq!(request.method, b"POST");
+        assert_eq!(request.target, b"/items?q=1");
+        assert_eq!(request.scheme, b"https");
+        assert_eq!(request.authority, b"localhost");
+        assert_eq!(
+            request.headers,
+            vec![
+                (b"x-test".to_vec(), b"provider".to_vec()),
+                (b"x-test".to_vec(), b"duplicate".to_vec()),
+                (b"content-length".to_vec(), b"7".to_vec()),
+            ]
+        );
+        assert_eq!(request.body, b"payload");
+        let mut request_record = vec![0; 1_200_000];
+        let request_record_length = unsafe {
+            super::net_quic_server_next_request(
+                server,
+                request_record.as_mut_ptr(),
+                request_record.len(),
+            )
+        };
+        assert!(request_record_length > 0);
+        assert!(request_record[..request_record_length as usize]
+            .windows(b"/items?q=1".len())
+            .any(|window| window == b"/items?q=1"));
+        assert_eq!(
+            unsafe {
+                super::net_quic_server_next_request(
+                    server,
+                    request_record.as_mut_ptr(),
+                    request_record.len(),
+                )
+            },
+            0
+        );
+        let request_id = u64::from_be_bytes(request_record[0..8].try_into().unwrap());
+        let mut response_headers = Vec::new();
+        append_u32(&mut response_headers, 1);
+        append_bytes(&mut response_headers, b"content-type");
+        append_bytes(&mut response_headers, b"text/plain");
+        let response_body = b"hello";
+        assert_eq!(
+            unsafe {
+                super::net_quic_server_respond(
+                    server,
+                    request_id,
+                    200,
+                    response_headers.as_ptr(),
+                    response_headers.len(),
+                    response_body.as_ptr(),
+                    response_body.len(),
+                )
+            },
+            1
+        );
+        let mut received_status = None;
+        let mut received_body = Vec::new();
+        for _ in 0..10 {
+            loop {
+                let mut destination = [0 as c_char; 64];
+                let length = unsafe {
+                    super::net_quic_server_send(
+                        server,
+                        packet.as_mut_ptr(),
+                        packet.len(),
+                        destination.as_mut_ptr(),
+                        destination.len(),
+                    )
+                };
+                if length <= 0 {
+                    break;
+                }
+                let destination = unsafe { CStr::from_ptr(destination.as_ptr()) }
+                    .to_str()
+                    .unwrap()
+                    .parse::<SocketAddr>()
+                    .unwrap();
+                server_socket
+                    .send_to(&packet[..length as usize], destination)
+                    .unwrap();
+            }
+            loop {
+                let Ok((length, peer)) = client_socket.recv_from(&mut packet) else {
+                    break;
+                };
+                client
+                    .recv(
+                        &mut packet[..length],
+                        RecvInfo {
+                            from: peer,
+                            to: client_address,
+                        },
+                    )
+                    .unwrap();
+                loop {
+                    match client_h3.poll(&mut client) {
+                        Ok((_, quiche::h3::Event::Headers { list, .. })) => {
+                            for header in list {
+                                if header.name() == b":status" {
+                                    received_status = Some(header.value().to_vec());
+                                }
+                            }
+                        }
+                        Ok((stream_id, quiche::h3::Event::Data)) => {
+                            let mut body = [0; 1024];
+                            while let Ok(length) = client_h3.recv_body(
+                                &mut client,
+                                stream_id,
+                                &mut body,
+                            ) {
+                                received_body.extend_from_slice(&body[..length]);
+                            }
+                        }
+                        Ok(_) => (),
+                        Err(quiche::h3::Error::Done) => break,
+                        Err(error) => panic!("HTTP/3 client poll failed: {error:?}"),
+                    }
+                }
+            }
+            if received_body == response_body {
+                break;
+            }
+        }
+        assert_eq!(received_status.as_deref(), Some(&b"200"[..]));
+        assert_eq!(received_body, response_body);
         assert_ne!(
             unsafe { super::net_quic_server_timeout_micros(server) },
             u64::MAX

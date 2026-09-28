@@ -26,6 +26,12 @@ int32_t net_quic_server_send(
 uint64_t net_quic_server_timeout_micros(
     const struct NetQuicServer *server);
 void net_quic_server_on_timeout(struct NetQuicServer *server);
+int32_t net_quic_server_next_request(
+    struct NetQuicServer *server, uint8_t *output, size_t output_capacity);
+int32_t net_quic_server_respond(
+    struct NetQuicServer *server, uint64_t request_id, uint32_t status,
+    const uint8_t *headers, size_t headers_length,
+    const uint8_t *body, size_t body_length);
 struct NetQuicServer *net_quic_create(struct NetQuicServerConfig *config);
 void net_quic_free(struct NetQuicServer *server);
 int32_t net_quic_receive(
@@ -36,5 +42,11 @@ int32_t net_quic_send(
     char *remote_address, size_t address_capacity);
 uint64_t net_quic_timeout_micros(const struct NetQuicServer *server);
 void net_quic_on_timeout(struct NetQuicServer *server);
+int32_t net_quic_next_request(
+    struct NetQuicServer *server, uint8_t *output, size_t output_capacity);
+int32_t net_quic_respond(
+    struct NetQuicServer *server, uint64_t request_id, uint32_t status,
+    const uint8_t *headers, size_t headers_length,
+    const uint8_t *body, size_t body_length);
 
 #endif

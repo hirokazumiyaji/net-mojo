@@ -75,6 +75,7 @@ from .config import ServerConfig
 from .handler import Handler
 from .headers import Headers
 from .response import ResponseWriter, has_body_for_status
+from .request import HttpVersion, Request, split_path_query
 from net.tls import TLSConnection, TLSContext
 from net.http._http2.hpack import Http2HpackDeflater
 from net.http._http2.request_session import (
@@ -287,6 +288,8 @@ struct Server(Movable):
         var events = self._reactor.wait(wait_timeout)
         now = now_ns()
         self._drive_quic()
+        self._dispatch_quic_requests(handler)
+        self._flush_quic()
         if self._listener:
             for i in range(len(events)):
                 if events[i].token == self._listener_token:
@@ -635,6 +638,11 @@ struct Server(Movable):
         var remaining = self._quic_endpoint.value().timeout_micros()
         if remaining == 0:
             self._quic_endpoint.value().on_timeout()
+        self._flush_quic()
+
+    def _flush_quic(mut self) raises NetError:
+        if not self._quic_endpoint:
+            return
         var sent = 0
         while sent < 16:
             if not self._quic_endpoint.value().try_send():
@@ -642,6 +650,95 @@ struct Server(Movable):
             sent += 1
         var want_write = self._quic_endpoint.value().wants_write()
         _ = self._reactor.modify(self._quic_token, True, want_write)
+
+    def _dispatch_quic_requests[
+        H: Handler
+    ](mut self, mut handler: H) raises NetError:
+        if not self._quic_endpoint:
+            return
+        var processed = 0
+        while processed < self.config.max_requests_per_tick:
+            var quic_request = self._quic_endpoint.value().try_next_request()
+            if quic_request.id == 0:
+                break
+            var request_id = quic_request.id
+            var is_head = quic_request.method == "HEAD"
+            var target = quic_request.target.copy()
+            var path, query = split_path_query(target)
+            var request = Request(
+                quic_request.method.copy(),
+                target^,
+                path^,
+                query^,
+                HttpVersion.http3(),
+            )
+            request.scheme = quic_request.scheme.copy()
+            request.authority = quic_request.authority.copy()
+            var response = ResponseWriter(self.config.max_response_body)
+            var body_size = len(quic_request.body)
+            if body_size > self.config.max_body_bytes:
+                response.status = 413
+            elif not self._budget.try_reserve(body_size):
+                response.status = 503
+            else:
+                for i in range(len(quic_request.headers)):
+                    var name = quic_request.headers[i].name.copy()
+                    request.headers.add_bytes(
+                        name^, Span(quic_request.headers[i].value)
+                    )
+                request.body = quic_request.take_body()
+                try:
+                    handler.handle(request^, response)
+                except e:
+                    _ = e
+                    response.status = 500
+                    response.body.clear()
+                self._budget.release(body_size)
+            if response.is_detached():
+                response.status = 500
+                response.body.clear()
+            if response.status < 100 or response.status > 599:
+                response.status = 500
+                response.body.clear()
+            var response_header_bytes = 0
+            for i in range(len(response.headers)):
+                response_header_bytes += (
+                    response.headers.name_at(i).byte_length()
+                    + response.headers.value_byte_length(i)
+                    + 4
+                )
+            if (
+                len(response.headers) > self.config.max_response_headers_count
+                or response_header_bytes
+                > self.config.max_response_headers_bytes
+            ):
+                response.status = 500
+                response.headers.clear()
+                response.body.clear()
+            var headers = List[Byte]()
+            _append_quic_u32(headers, UInt32(len(response.headers)))
+            for i in range(len(response.headers)):
+                var name = response.headers.name_at(i)
+                var name_bytes = name.as_bytes()
+                var value = response.headers.value_bytes_at(i)
+                _append_quic_field(headers, name_bytes)
+                _append_quic_field(headers, Span(value))
+            if has_body_for_status(response.status, is_head):
+                self._quic_endpoint.value().respond(
+                    request_id,
+                    response.status,
+                    Span(headers),
+                    Span(response.body),
+                )
+            else:
+                var empty = List[Byte]()
+                self._quic_endpoint.value().respond(
+                    request_id,
+                    response.status,
+                    Span(headers),
+                    Span(empty),
+                )
+            processed += 1
 
     def _pause_listener(mut self):
         if self._listener and not self._listener_paused:
@@ -2040,6 +2137,21 @@ def _Deadline_from_optional_ms(timeout: Optional[Timeout]) -> Int:
     if ms > UInt64(Int.MAX):
         return Int.MAX
     return Int(ms)
+
+
+def _append_quic_u32(mut output: List[Byte], value: UInt32):
+    output.append(Byte((value >> 24) & UInt32(0xFF)))
+    output.append(Byte((value >> 16) & UInt32(0xFF)))
+    output.append(Byte((value >> 8) & UInt32(0xFF)))
+    output.append(Byte(value & UInt32(0xFF)))
+
+
+def _append_quic_field[
+    origin: Origin
+](mut output: List[Byte], value: Span[Byte, origin]):
+    _append_quic_u32(output, UInt32(len(value)))
+    for i in range(len(value)):
+        output.append(value[i])
 
 
 def listen_and_serve[

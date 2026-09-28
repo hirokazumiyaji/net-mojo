@@ -162,12 +162,73 @@ struct QuicServer(Movable):
     def on_timeout(mut self):
         self._library.call["net_quic_on_timeout"](self._server)
 
+    def next_request[
+        origin: MutOrigin
+    ](mut self, output: Span[mut=True, Byte, origin]) raises NetError -> Int:
+        return Int(
+            self._library.call["net_quic_next_request", c_int](
+                self._server,
+                output.unsafe_ptr(),
+                c_size_t(len(output)),
+            )
+        )
+
+    def respond[
+        headers_origin: Origin, body_origin: Origin
+    ](
+        mut self,
+        request_id: UInt64,
+        status: Int,
+        headers: Span[Byte, headers_origin],
+        body: Span[Byte, body_origin],
+    ) raises NetError:
+        var result = self._library.call["net_quic_respond", c_int](
+            self._server,
+            request_id,
+            UInt32(status),
+            headers.unsafe_ptr(),
+            c_size_t(len(headers)),
+            body.unsafe_ptr(),
+            c_size_t(len(body)),
+        )
+        if result != 1:
+            raise NetError(
+                NetErrorKind.invalid_state(),
+                "send HTTP/3 response",
+                None,
+                "QUIC provider could not queue the response",
+            )
+
+
+@fieldwise_init
+struct QuicRequestHeader(Movable):
+    var name: String
+    var value: List[Byte]
+
+
+@fieldwise_init
+struct QuicRequest(Movable):
+    var id: UInt64
+    var stream_id: UInt64
+    var method: String
+    var target: String
+    var scheme: String
+    var authority: String
+    var headers: List[QuicRequestHeader]
+    var body: List[Byte]
+
+    def take_body(mut self) -> List[Byte]:
+        var body = self.body^
+        self.body = List[Byte]()
+        return body^
+
 
 struct QuicUDPEndpoint(Movable):
     var _server: QuicServer
     var _socket: UDPConn
     var _receive_buffer: List[Byte]
     var _send_buffer: List[Byte]
+    var _request_buffer: List[Byte]
     var _pending_length: Int
     var _pending_destination: Optional[SocketAddress]
 
@@ -178,6 +239,7 @@ struct QuicUDPEndpoint(Movable):
         self._socket = socket^
         self._receive_buffer = List[Byte](length=65535, fill=0)
         self._send_buffer = List[Byte](length=65535, fill=0)
+        self._request_buffer = List[Byte](length=1_200_000, fill=0)
         self._pending_length = 0
         self._pending_destination = None
 
@@ -241,6 +303,106 @@ struct QuicUDPEndpoint(Movable):
 
     def on_timeout(mut self):
         self._server.on_timeout()
+
+    def try_next_request(mut self) raises NetError -> QuicRequest:
+        var length = self._server.next_request(
+            Span[mut=True](self._request_buffer)
+        )
+        if length == 0:
+            return QuicRequest(
+                id=0,
+                stream_id=0,
+                method=String(),
+                target=String(),
+                scheme=String(),
+                authority=String(),
+                headers=List[QuicRequestHeader](),
+                body=List[Byte](),
+            )
+        if length < 0:
+            raise NetError(
+                NetErrorKind.invalid_state(),
+                "receive HTTP/3 request",
+                None,
+                "HTTP/3 request record exceeds the configured buffer",
+            )
+        return _decode_request_record(
+            Span(self._request_buffer)[0:length]
+        )
+
+    def respond[
+        headers_origin: Origin, body_origin: Origin
+    ](
+        mut self,
+        request_id: UInt64,
+        status: Int,
+        headers: Span[Byte, headers_origin],
+        body: Span[Byte, body_origin],
+    ) raises NetError:
+        self._server.respond(request_id, status, headers, body)
+
+
+def _read_request_u32[
+    origin: Origin
+](data: Span[Byte, origin], mut offset: Int) -> UInt32:
+    var value = UInt32(0)
+    for _ in range(4):
+        value = (value << 8) | UInt32(data[offset])
+        offset += 1
+    return value
+
+
+def _read_request_u64[
+    origin: Origin
+](data: Span[Byte, origin], mut offset: Int) -> UInt64:
+    var value = UInt64(0)
+    for _ in range(8):
+        value = (value << 8) | UInt64(data[offset])
+        offset += 1
+    return value
+
+
+def _read_request_bytes[
+    origin: Origin
+](data: Span[Byte, origin], mut offset: Int) -> List[Byte]:
+    var length = Int(_read_request_u32(data, offset))
+    var value = List[Byte]()
+    value.reserve(length)
+    for i in range(length):
+        value.append(data[offset + i])
+    offset += length
+    return value^
+
+
+def _decode_request_record[
+    origin: Origin
+](data: Span[Byte, origin]) -> QuicRequest:
+    var offset = 0
+    var id = _read_request_u64(data, offset)
+    var stream_id = _read_request_u64(data, offset)
+    var method = String(from_utf8_lossy=Span(_read_request_bytes(data, offset)))
+    var target = String(from_utf8_lossy=Span(_read_request_bytes(data, offset)))
+    var scheme = String(from_utf8_lossy=Span(_read_request_bytes(data, offset)))
+    var authority = String(
+        from_utf8_lossy=Span(_read_request_bytes(data, offset))
+    )
+    var header_count = Int(_read_request_u32(data, offset))
+    var headers = List[QuicRequestHeader]()
+    for _ in range(header_count):
+        var name = String(from_utf8_lossy=Span(_read_request_bytes(data, offset)))
+        var value = _read_request_bytes(data, offset)
+        headers.append(QuicRequestHeader(name=name^, value=value^))
+    var body = _read_request_bytes(data, offset)
+    return QuicRequest(
+        id=id,
+        stream_id=stream_id,
+        method=method^,
+        target=target^,
+        scheme=scheme^,
+        authority=authority^,
+        headers=headers^,
+        body=body^,
+    )
 
 
 def _copy_c_string[origin: MutOrigin](address: Pointer[Byte, origin]) -> String:
