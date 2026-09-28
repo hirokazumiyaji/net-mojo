@@ -160,25 +160,28 @@ The shared response encoder composes header adaptation, connection-owned HPACK
 compression, and frame generation; output failure after compression makes that
 deflater terminal because the peer did not receive its updated table state.
 
-## Follow-up connection work
+## Integrated flow control and response scheduling
 
-The current handler path buffers one response at a time. Stream-level send
-window updates, queued response continuation after WINDOW_UPDATE, stream-level
-error responses, concurrent response scheduling, and GOAWAY draining remain
-follow-up work.
+The server tracks connection and stream send windows independently and applies
+stream `WINDOW_UPDATE` and `SETTINGS_INITIAL_WINDOW_SIZE` changes. It buffers
+responses until the peer grants enough credit, then rotates among writable
+streams while continuing to read incoming connection frames. RST_STREAM cancels
+the corresponding queued response and releases its buffer reservation.
 
-Connection and stream flow-control windows are tracked independently. DATA
-consumption returns receive credit even while the bounded buffered handler is
-reading a body larger than the initial window. The writer schedules control
-frames promptly and rotates among writable streams so a stalled stream cannot
-block connection reads or unrelated responses. RST_STREAM, GOAWAY, and drain
-operate on stream or connection state as specified by RFC 9113.
+TLS integration tests send requests on two streams before reading either
+response, verify that each response stays on its stream, and exercise a stream
+whose initial send window is zero before later granting credit. Unit tests cover
+round-robin DATA scheduling, bounded payloads, header-once behavior, completion,
+credit exhaustion, resumption, and reset cancellation.
+
+GOAWAY handling and graceful connection drain remain follow-up work. The current
+server has no shutdown API that stops new HTTP/2 streams while allowing admitted
+streams to finish within a configured grace period.
 
 ## Verification sequence
 
 The frame parser slice uses wire fixtures for incomplete headers and payloads,
 maximum and oversized payload lengths, ignored reserved stream bits, unknown
 frame types, and multiple concatenated frames. The client preface parser tests
-every incomplete prefix, mismatch rejection, and the consumed byte count. Later
-connection PRs add protocol state, flow-control, shutdown, and independent-client
-interoperability tests.
+every incomplete prefix, mismatch rejection, and the consumed byte count. The
+remaining connection work is GOAWAY handling and graceful drain coverage.
