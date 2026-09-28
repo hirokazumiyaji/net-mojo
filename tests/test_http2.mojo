@@ -598,6 +598,11 @@ def test_http2_connection_input_returns_stream_frame_payload() raises:
     assert_equal(stream.stream_id, UInt32(1))
     assert_equal(stream.payload[0], Byte(0x82))
 
+    var unknown_payload: List[Byte] = List[Byte]()
+    var unknown = _frame(0xF0, 0, 0, unknown_payload)
+    var ignored = input.consume(Span(unknown))
+    assert_true(ignored.is_ignored())
+
     var goaway_payload: List[Byte] = [
         Byte(0), Byte(0), Byte(0), Byte(1),
         Byte(0), Byte(0), Byte(0), Byte(0),

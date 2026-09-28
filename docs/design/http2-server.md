@@ -42,6 +42,13 @@ in network byte order. Parsing rejects a trailing partial entry and preserves
 unknown identifiers unchanged; connection-level validation, duplicate handling,
 and negotiation remain with the connection state machine.
 
+## TLS server entry
+
+After TLS selects ALPN `h2`, `Server` uses `Http2ServerConnectionInput` to
+exchange the client preface and initial SETTINGS, and it dispatches control
+frames through the same reactor-owned connection. HTTP/2 request stream frames
+are the next connection layer and are not yet connected to the shared handler.
+
 ## Outbound frame encoding
 
 The socket-independent frame encoder writes the nine-byte frame header and

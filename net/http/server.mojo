@@ -38,10 +38,12 @@ from net.error import NetError, NetErrorKind
 from ._buffer import BufferBudget
 from ._connection import (
     HttpConnection,
+    PROTOCOL_HTTP2,
     STATE_DETACHED,
     STATE_HANDSHAKING,
     STATE_READING,
     STATE_SENDING,
+    STATE_SENDING_HTTP2_CONTROL,
     STATE_SENDING_100,
     STATE_STREAMING,
     STATE_TLS_SHUTDOWN,
@@ -73,6 +75,7 @@ from .handler import Handler
 from .headers import Headers
 from .response import ResponseWriter, has_body_for_status
 from net.tls import TLSConnection, TLSContext
+from net.http._http2.connection_input import Http2ServerConnectionInput
 
 
 comptime _TICK_POLL_CAP_MS: Int = 100
@@ -752,7 +755,13 @@ struct Server(Movable):
         try:
             var progress = self._conns[idx].tls.value().handshake()
             if progress.is_complete():
-                if self._conns[idx].tls.value().selected_alpn() != "http/1.1":
+                var protocol = self._conns[idx].tls.value().selected_alpn()
+                if protocol == "h2":
+                    self._conns[idx].protocol = PROTOCOL_HTTP2
+                    self._conns[idx].http2_input = Optional(
+                        Http2ServerConnectionInput()
+                    )
+                elif protocol != "http/1.1":
                     self._close_conn(idx)
                     return
                 self._conns[idx].state = STATE_READING
@@ -821,6 +830,43 @@ struct Server(Movable):
                 not self._conns[idx].tls_shutdown_wants_write and readable
             ):
                 self._drive_tls_shutdown(idx)
+            return
+        if self._conns[idx].protocol == PROTOCOL_HTTP2:
+            if self._conns[idx].state == STATE_SENDING_HTTP2_CONTROL:
+                self._pump_send(
+                    idx, self._conns[idx].write_ready(readable, writable)
+                )
+                if not self._conns[idx].active:
+                    return
+            if self._conns[idx].state == STATE_READING:
+                var read_event = (
+                    self._conns[idx].read_ready(readable, writable)
+                    or self._conns[idx].tls_pending() > 0
+                )
+                self._pump_read(idx, read_event, now)
+                if not self._conns[idx].active:
+                    return
+                while (
+                    self._conns[idx].active
+                    and self._conns[idx].state == STATE_READING
+                    and self._conns[idx].buffered_len() > 0
+                ):
+                    self._pump_http2_input(idx)
+                    if not self._conns[idx].active:
+                        return
+                    if self._conns[idx].state != STATE_SENDING_HTTP2_CONTROL:
+                        break
+                    self._pump_send(idx, True)
+                    if not self._conns[idx].active:
+                        return
+                if (
+                    self._conns[idx].read_eof
+                    and self._conns[idx].buffered_len() == 0
+                    and self._conns[idx].pending_remaining() == 0
+                ):
+                    self._close_conn(idx)
+                    return
+            self._sync_interests(idx)
             return
         if (
             self._conns[idx].state == STATE_SENDING
@@ -899,6 +945,36 @@ struct Server(Movable):
                 if not self._conns[idx].active:
                     return
         self._sync_interests(idx)
+
+    def _pump_http2_input(mut self, idx: Int) raises NetError:
+        while self._conns[idx].active and self._conns[idx].buffered_len() > 0:
+            var result = self._conns[idx].http2_input.value().consume(
+                Span(self._conns[idx].buf)
+            )
+            if result.is_error():
+                self._close_conn(idx)
+                return
+            if result.consumed > 0:
+                self._conns[idx].drain_prefix(result.consumed)
+                self._budget.release(result.consumed)
+            if result.is_output():
+                var output = result.output.copy()
+                if not self._budget.try_reserve(len(output)):
+                    self._close_conn(idx)
+                    return
+                self._conns[idx].set_pending(output^)
+                self._conns[idx].state = STATE_SENDING_HTTP2_CONTROL
+                self._conns[idx].write_at = deadline_from_now(
+                    self.config.write_deadline
+                )
+                return
+            if result.is_frame():
+                self._close_conn(idx)
+                return
+            if result.is_need_more() or result.is_goaway():
+                if result.is_goaway():
+                    self._close_conn(idx)
+                return
 
     def _pump_read(mut self, idx: Int, event: Bool, now: Int) raises NetError:
         if not event:
@@ -1307,9 +1383,16 @@ struct Server(Movable):
             return
         var sent = len(self._conns[idx].pending)
         self._budget.release(sent)
+        var was_http2_control = (
+            self._conns[idx].state == STATE_SENDING_HTTP2_CONTROL
+        )
         var was_100 = self._conns[idx].state == STATE_SENDING_100
         var was_streaming = self._conns[idx].state == STATE_STREAMING
         self._conns[idx].clear_pending()
+        if was_http2_control:
+            self._conns[idx].state = STATE_READING
+            self._conns[idx].write_at = NO_DEADLINE
+            return
         if was_100:
             self._conns[idx].state = STATE_READING
             self._conns[idx].sent_100 = True

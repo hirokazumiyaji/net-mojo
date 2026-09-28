@@ -24,7 +24,7 @@ def main() raises:
             "build/tls/libnet_tls",
             "build/tls/test-cert.pem",
             "build/tls/test-key.pem",
-            "http/1.1",
+            "h2,http/1.1",
         ),
     )
     print(String("READY ") + String(server.local_address().port))

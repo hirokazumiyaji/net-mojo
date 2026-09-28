@@ -202,10 +202,15 @@ struct Http2ServerConnectionInput(Movable):
             return Http2ConnectionInputResult.event(
                 8, consumed, dispatched.stream_id, dispatched.value
             )
-        if dispatched.is_ignored() and (
-            read.frame_type == Byte(4) or read.frame_type == Byte(6)
-        ):
-            return Http2ConnectionInputResult.ignored(consumed)
+        if dispatched.is_ignored():
+            if read.frame_type == Byte(4) or read.frame_type == Byte(6):
+                return Http2ConnectionInputResult.ignored(consumed)
+            if (
+                read.frame_type != Byte(0)
+                and read.frame_type != Byte(1)
+                and read.frame_type != Byte(9)
+            ):
+                return Http2ConnectionInputResult.ignored(consumed)
 
         return Http2ConnectionInputResult.frame(
             consumed,

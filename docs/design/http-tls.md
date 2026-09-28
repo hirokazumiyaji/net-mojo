@@ -84,5 +84,6 @@ connections without that selection close without a plaintext retry. The
 absolute `tls_handshake_timeout` bounds incomplete handshakes. Each TLS
 connection reserves its fixed 8 KiB plaintext read buffer from the shared
 server budget, and the connection releases its TLS session before its socket.
-An independent Python `ssl` client verifies the HTTPS response and ALPN
-selection. HTTP/2 remains separate and will select `h2` in its own adapter.
+Independent Python `ssl` clients verify HTTPS over `http/1.1` and the HTTP/2
+preface/SETTINGS exchange over `h2`. Request stream handling remains a later
+HTTP/2 connection slice.
