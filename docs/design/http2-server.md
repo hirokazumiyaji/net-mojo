@@ -94,6 +94,12 @@ caller sets the table size between blocks and applies protocol header semantics.
 preserves HPACK state after decoded limits are exceeded, and marks framing or
 compression errors as terminal for that decoder.
 
+`Http2FlowWindow` tracks send and receive credit separately for a connection
+or stream. DATA debits the corresponding window, and receive credit can be
+restored only for bytes the application has consumed. The debit includes the
+full DATA payload, including padding. SETTINGS initial-window changes adjust
+stream send windows; the connection send window remains fixed.
+
 ## Follow-up connection work
 
 The connection layer will require the client connection preface, send server

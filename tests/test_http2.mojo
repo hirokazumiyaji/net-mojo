@@ -14,6 +14,7 @@ from net.http._http2.settings import (
 )
 from net.http._http2.settings_frame import parse_settings_frame
 from net.http._http2.header_block import Http2HeaderBlock
+from net.http._http2.flow_window import Http2FlowWindow
 
 
 def test_header_block_collects_headers_payload_until_end_headers() raises:
@@ -64,6 +65,71 @@ def test_header_block_rejects_compressed_block_over_limit() raises:
     assert_true(block.begin(headers, Span(payload)).is_pending())
     var continuation = FrameParseResult.complete(Byte(9), Byte(4), UInt32(1), 1)
     assert_true(block.continue_with(continuation, Span(payload[0:1])).is_error())
+
+
+def test_http2_flow_window_tracks_data_and_credit_separately() raises:
+    var window = Http2FlowWindow(10, 8)
+    assert_true(window.consume_outbound(6))
+    assert_equal(window.send_window(), 4)
+    assert_true(window.receive_data(7))
+    assert_equal(window.receive_window(), 1)
+    assert_equal(window.pending_receive_credit(), 7)
+    assert_true(window.release_received(5))
+    assert_equal(window.receive_window(), 6)
+    assert_equal(window.pending_receive_credit(), 2)
+    assert_false(window.release_received(3))
+
+
+def test_http2_flow_window_rejects_data_beyond_available_credit() raises:
+    var window = Http2FlowWindow(5, 5)
+    assert_false(window.consume_outbound(6))
+    assert_false(window.receive_data(6))
+    assert_equal(window.send_window(), 5)
+    assert_equal(window.receive_window(), 5)
+
+
+def test_http2_flow_window_validates_window_updates() raises:
+    var window = Http2FlowWindow(10, 10)
+    assert_false(window.apply_window_update(0))
+    assert_true(window.apply_window_update(5))
+    assert_equal(window.send_window(), 15)
+    assert_true(window.receive_data(3))
+    assert_equal(window.receive_window(), 7)
+    assert_true(window.release_received(3))
+    assert_equal(window.receive_window(), 10)
+    assert_equal(window.pending_receive_credit(), 0)
+
+
+def test_http2_flow_window_applies_initial_window_delta() raises:
+    var window = Http2FlowWindow(10, 10)
+    assert_true(window.consume_outbound(8))
+    assert_true(window.update_initial_send_window(6))
+    assert_equal(window.send_window(), -2)
+    assert_false(window.consume_outbound(1))
+    assert_true(window.apply_window_update(4))
+    assert_equal(window.send_window(), 2)
+    assert_true(window.update_initial_send_window(14))
+    assert_equal(window.send_window(), 10)
+
+
+def test_http2_flow_window_rejects_updates_that_overflow() raises:
+    var window = Http2FlowWindow(0x7FFFFFFF, 0x7FFFFFFF)
+    assert_false(window.apply_window_update(1))
+    assert_false(window.release_received(1))
+    assert_false(window.update_initial_send_window(0x80000000))
+    assert_false(window.consume_outbound(-1))
+    assert_false(window.receive_data(-1))
+
+
+def test_http2_connection_and_stream_windows_are_independent() raises:
+    var connection = Http2FlowWindow(100, 100)
+    var stream = Http2FlowWindow(20, 20)
+    assert_true(connection.receive_data(8))
+    assert_true(stream.receive_data(8))
+    assert_true(stream.release_received(8))
+    assert_equal(connection.receive_window(), 92)
+    assert_equal(connection.pending_receive_credit(), 8)
+    assert_equal(stream.receive_window(), 20)
 
 
 def test_partial_client_preface_needs_more_data() raises:
