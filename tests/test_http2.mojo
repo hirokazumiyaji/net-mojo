@@ -1274,7 +1274,11 @@ def test_http2_connection_bootstrap_handles_fragmented_preface_and_settings() ra
     var preface = "PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n".as_bytes()
     for i in range(len(preface)):
         input.append(preface[i])
-    var client_settings = _frame(4, 0, 0, List[Byte]())
+    var settings_payload: List[Byte] = [
+        Byte(0), Byte(1), Byte(0), Byte(0), Byte(0), Byte(128),
+        Byte(0), Byte(5), Byte(0), Byte(0), Byte(0x80), Byte(0),
+    ]
+    var client_settings = _frame(4, 0, 0, settings_payload)
     for i in range(len(client_settings)):
         input.append(client_settings[i])
     var ping_payload: List[Byte] = [
@@ -1297,6 +1301,9 @@ def test_http2_connection_bootstrap_handles_fragmented_preface_and_settings() ra
     assert_true(settings_ack.is_complete())
     assert_equal(settings_ack.frame_type, Byte(4))
     assert_equal(settings_ack.flags, Byte(1))
+    var peer_settings = bootstrap.peer_settings()
+    assert_equal(peer_settings.header_table_size, UInt32(128))
+    assert_equal(peer_settings.max_frame_size, UInt32(32768))
 
     var remainder = parse_frame(Span(input)[result.consumed:])
     assert_true(remainder.is_complete())

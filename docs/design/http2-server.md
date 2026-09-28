@@ -56,7 +56,8 @@ The caller retains and extends preface bytes between incremental parse calls.
 Stream processing begins in a later layer.
 `Http2ConnectionBootstrap` drives that exchange over fragmented byte input,
 enforces the configured inbound frame cap, and returns unconsumed bytes after
-the first client SETTINGS for the frame dispatcher.
+the first client SETTINGS for the frame dispatcher. It exposes a value snapshot
+of negotiated peer limits for the response encoder and stream admission logic.
 
 Initial client settings are applied in order, with duplicate identifiers using
 the last value and unknown identifiers ignored. `ENABLE_PUSH` values must be 0

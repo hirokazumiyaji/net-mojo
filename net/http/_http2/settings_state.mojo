@@ -22,6 +22,15 @@ struct SettingsApplyResult(Movable):
         return self.error_code != UInt32(0)
 
 
+@fieldwise_init
+struct Http2PeerSettingsSnapshot(Copyable, Equatable):
+    var header_table_size: UInt32
+    var max_concurrent_streams: UInt32
+    var initial_window_size: UInt32
+    var max_frame_size: UInt32
+    var max_header_list_size: UInt32
+
+
 struct Http2PeerSettings(Movable):
     var header_table_size: UInt32
     var max_concurrent_streams: UInt32
@@ -62,3 +71,12 @@ struct Http2PeerSettings(Movable):
                 self.max_header_list_size = value
 
         return SettingsApplyResult.success()
+
+    def snapshot(self) -> Http2PeerSettingsSnapshot:
+        return Http2PeerSettingsSnapshot(
+            header_table_size=self.header_table_size,
+            max_concurrent_streams=self.max_concurrent_streams,
+            initial_window_size=self.initial_window_size,
+            max_frame_size=self.max_frame_size,
+            max_header_list_size=self.max_header_list_size,
+        )

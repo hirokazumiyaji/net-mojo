@@ -3,6 +3,7 @@
 from .bootstrap import Http2ServerBootstrap
 from .frame import parse_frame
 from .preface import parse_client_preface
+from .settings_state import Http2PeerSettingsSnapshot
 
 
 @fieldwise_init
@@ -106,6 +107,9 @@ struct Http2ConnectionBootstrap(Movable):
 
     def is_failed(self) -> Bool:
         return self._failed
+
+    def peer_settings(self) -> Http2PeerSettingsSnapshot:
+        return self._protocol.peer_settings.snapshot()
 
 
 def _append_wire[
