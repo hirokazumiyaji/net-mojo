@@ -1244,6 +1244,7 @@ struct Server(Movable):
         ):
             self._close_conn(idx)
             return
+        self._conns[idx].http2_session.value().finish_response(stream_id)
 
         var output = control_output^
         for i in range(len(encoded.wire)):

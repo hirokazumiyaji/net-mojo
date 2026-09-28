@@ -126,3 +126,16 @@
 - `test-http-server` passed 27/27 on Linux x86_64; `quic-mojo-test` compiled and passed after applying the HTTP/3 response limits.
 - A valid HTTP/3 request has not yet been exercised through the Mojo `Server` and a user `Handler`; that end-to-end test remains part of the overall integration work.
 - `/review` and PR publication remain pending explicit authorization to upload the code diff to the configured external reviewer.
+
+## HTTP/2 stream send credit slice
+
+- [x] Add a regression test for independent stream-level `WINDOW_UPDATE` credit and response accounting.
+- [x] Track peer send credit separately for each active response stream; apply connection and stream updates independently.
+- [x] Release send-credit state after response completion and on stream reset.
+- [x] Run HPACK, HTTP/2, and TLS HTTP/2 suites, then commit this slice locally.
+
+## Review
+
+- The first test run failed because only the stream window was increased while the connection window remained the limiting 65,535 bytes. Adding a connection `WINDOW_UPDATE` made the test isolate per-stream credit.
+- HPACK passed 22/22, HTTP/2 passed 97/97, and the TLS/HTTP2 suite passed on Linux x86_64.
+- Response scheduler queues, continued DATA after credit is exhausted, and connection-level read progress during blocked writes remain outstanding.

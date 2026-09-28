@@ -568,6 +568,53 @@ def test_http2_request_session_debits_connection_window_updates() raises:
     assert_equal(session.send_window(UInt32(1)), 65545)
 
 
+def test_http2_request_session_tracks_outbound_credit_per_stream() raises:
+    var session = Http2RequestSession("build/http2/libnet_hpack", 4, 1024)
+    var wire = List[Byte]()
+    var preface = "PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n".as_bytes()
+    for i in range(len(preface)):
+        wire.append(preface[i])
+    var empty: List[Byte] = List[Byte]()
+    _append_frame(wire, Byte(4), Byte(0), UInt32(0), Span(empty))
+    var compressed: List[Byte] = [
+        Byte(0x82), Byte(0x86), Byte(0x84), Byte(0x41), Byte(0x0F),
+        Byte(ord("w")), Byte(ord("w")), Byte(ord("w")), Byte(ord(".")),
+        Byte(ord("e")), Byte(ord("x")), Byte(ord("a")), Byte(ord("m")),
+        Byte(ord("p")), Byte(ord("l")), Byte(ord("e")), Byte(ord(".")),
+        Byte(ord("c")), Byte(ord("o")), Byte(ord("m")),
+    ]
+    _append_frame(wire, Byte(1), Byte(5), UInt32(1), Span(compressed))
+    _append_frame(wire, Byte(1), Byte(5), UInt32(3), Span(compressed))
+    var first = session.consume(Span(wire))
+    assert_true(first.is_request())
+    var second = session.consume(Span(wire)[first.consumed :])
+    assert_true(second.is_request())
+    assert_equal(session.send_window(UInt32(1)), 65535)
+    assert_equal(session.send_window(UInt32(3)), 65535)
+
+    var updates = List[Byte]()
+    var connection_increment: List[Byte] = [
+        Byte(0), Byte(0), Byte(0), Byte(10)
+    ]
+    var first_increment: List[Byte] = [Byte(0), Byte(0), Byte(0), Byte(3)]
+    var second_increment: List[Byte] = [Byte(0), Byte(0), Byte(0), Byte(7)]
+    _append_frame(
+        updates, Byte(8), Byte(0), UInt32(0), Span(connection_increment)
+    )
+    _append_frame(updates, Byte(8), Byte(0), UInt32(1), Span(first_increment))
+    _append_frame(updates, Byte(8), Byte(0), UInt32(3), Span(second_increment))
+    var credit = session.consume(Span(updates))
+    assert_true(credit.is_pending())
+    assert_equal(session.send_window(UInt32(1)), 65538)
+    assert_equal(session.send_window(UInt32(3)), 65542)
+    assert_true(session.consume_outbound(UInt32(1), 3))
+    assert_equal(session.send_window(UInt32(1)), 65535)
+    assert_equal(session.send_window(UInt32(3)), 65542)
+    session.finish_response(UInt32(1))
+    assert_equal(session.send_window(UInt32(1)), 0)
+    assert_equal(session.send_window(UInt32(3)), 65542)
+
+
 def test_http2_request_session_returns_padding_flow_credit() raises:
     var session = Http2RequestSession("build/http2/libnet_hpack", 4, 1024)
     var wire = List[Byte]()

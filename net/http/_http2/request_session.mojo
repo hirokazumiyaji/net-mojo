@@ -83,12 +83,19 @@ struct _Http2RequestEntry(Movable):
         return self.stream^.take_request()
 
 
+@fieldwise_init
+struct _Http2SendWindowEntry(Movable):
+    var stream_id: UInt32
+    var window: Http2FlowWindow
+
+
 struct Http2RequestSession(Movable):
     var _input: Http2ServerConnectionInput
     var _decoder: Optional[Http2HeaderDecoder]
     var _library_path: String
     var _header_output: List[Byte]
     var _streams: List[_Http2RequestEntry]
+    var _send_streams: List[_Http2SendWindowEntry]
     var _receive_window: Http2FlowWindow
     var _send_window: Http2FlowWindow
     var _max_active_streams: Int
@@ -107,6 +114,7 @@ struct Http2RequestSession(Movable):
         self._library_path = library_path^
         self._header_output = List[Byte](length=65536, fill=0)
         self._streams = List[_Http2RequestEntry]()
+        self._send_streams = List[_Http2SendWindowEntry]()
         self._receive_window = Http2FlowWindow(65535, 65535)
         self._send_window = Http2FlowWindow(65535, 65535)
         self._max_active_streams = max_active_streams
@@ -128,6 +136,15 @@ struct Http2RequestSession(Movable):
             if input.is_error():
                 self._failed = True
                 return Http2RequestSessionResult.error(consumed, output^)
+            var initial_stream_window = Int(
+                self._input.peer_settings().initial_window_size
+            )
+            for i in range(len(self._send_streams)):
+                if not self._send_streams[i].window.update_initial_send_window(
+                    initial_stream_window
+                ):
+                    self._failed = True
+                    return Http2RequestSessionResult.error(consumed, output^)
             _append_session_output(output, Span(input.output))
 
             if input.is_frame():
@@ -177,10 +194,22 @@ struct Http2RequestSession(Movable):
                         )
             elif input.is_reset():
                 self._remove_stream(input.stream_id)
-            elif input.is_window_update() and input.stream_id == UInt32(0):
-                if not self._send_window.apply_window_update(Int(input.value)):
-                    self._failed = True
-                    return Http2RequestSessionResult.error(consumed, output^)
+            elif input.is_window_update():
+                if input.stream_id == UInt32(0):
+                    if not self._send_window.apply_window_update(
+                        Int(input.value)
+                    ):
+                        self._failed = True
+                        return Http2RequestSessionResult.error(consumed, output^)
+                else:
+                    var send_index = self._find_send_stream(input.stream_id)
+                    if (
+                        send_index >= 0
+                        and not self._send_streams[send_index].window
+                            .apply_window_update(Int(input.value))
+                    ):
+                        self._failed = True
+                        return Http2RequestSessionResult.error(consumed, output^)
 
             if input.consumed == 0:
                 break
@@ -224,6 +253,14 @@ struct Http2RequestSession(Movable):
                 receive_window=receive_window^,
             )
             self._streams.append(entry^)
+            var initial_send_window = Http2FlowWindow(
+                Int(self._input.peer_settings().initial_window_size), 65535
+            )
+            var send_entry = _Http2SendWindowEntry(
+                stream_id=decoded.stream_id,
+                window=initial_send_window^
+            )
+            self._send_streams.append(send_entry^)
             index = len(self._streams) - 1
 
         return self._streams[index].stream.receive_headers(
@@ -281,16 +318,34 @@ struct Http2RequestSession(Movable):
         return total
 
     def send_window(self, stream_id: UInt32) -> Int:
-        var connection_window = self._send_window.send_window()
-        var stream_window = Int(
-            self._input.peer_settings().initial_window_size
+        var index = self._find_send_stream(stream_id)
+        if index < 0:
+            return 0
+        return min(
+            self._send_window.send_window(),
+            self._send_streams[index].window.send_window(),
         )
-        return min(connection_window, stream_window)
 
     def consume_outbound(mut self, stream_id: UInt32, amount: Int) -> Bool:
-        if amount > Int(self._input.peer_settings().initial_window_size):
+        var index = self._find_send_stream(stream_id)
+        if index < 0 or amount > self.send_window(stream_id):
             return False
-        return self._send_window.consume_outbound(amount)
+        if not self._send_window.consume_outbound(amount):
+            return False
+        return self._send_streams[index].window.consume_outbound(amount)
+
+    def finish_response(mut self, stream_id: UInt32):
+        var index = self._find_send_stream(stream_id)
+        if index >= 0:
+            var last = self._send_streams.pop()
+            if index < len(self._send_streams):
+                self._send_streams[index] = last^
+
+    def _find_send_stream(self, stream_id: UInt32) -> Int:
+        for i in range(len(self._send_streams)):
+            if self._send_streams[i].stream_id == stream_id:
+                return i
+        return -1
 
     def _take_request(mut self, stream_id: UInt32) -> Request:
         var retained = List[_Http2RequestEntry]()
@@ -311,6 +366,11 @@ struct Http2RequestSession(Movable):
         var index = self._find_stream(stream_id)
         if index >= 0:
             self._remove_stream_at(index)
+        var send_index = self._find_send_stream(stream_id)
+        if send_index >= 0:
+            var last = self._send_streams.pop()
+            if send_index < len(self._send_streams):
+                self._send_streams[send_index] = last^
 
     def _remove_stream_at(mut self, index: Int):
         var last = self._streams.pop()
