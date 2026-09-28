@@ -105,6 +105,9 @@ It rejects orphan CONTINUATION frames, stream changes, interleaved frames while
 a header block is open, and client-sent PUSH_PROMISE frames.
 WINDOW_UPDATE parsing accepts connection or stream IDs, masks the reserved bit,
 rejects zero increments, and applies the increment to the selected send window.
+PING validation can generate an exact opaque-data ACK, RST_STREAM exposes the
+stream and error code, and GOAWAY parsing and encoding preserve the last-stream
+limit and error code.
 
 ## Follow-up connection work
 

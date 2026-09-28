@@ -17,6 +17,12 @@ from net.http._http2.header_block import Http2HeaderBlock
 from net.http._http2.flow_window import Http2FlowWindow
 from net.http._http2.frame_sequence import Http2ContinuationSequence
 from net.http._http2.window_update import parse_window_update_frame
+from net.http._http2.control_frames import (
+    encode_goaway_frame,
+    parse_goaway_frame,
+    parse_ping_frame,
+    parse_rst_stream_frame,
+)
 
 
 def test_header_block_collects_headers_payload_until_end_headers() raises:
@@ -208,6 +214,76 @@ def test_http2_window_update_rejects_invalid_frame_shape() raises:
     assert_true(
         parse_window_update_frame(FrameParseResult.failure(), Span(payload)).is_error()
     )
+
+
+def test_http2_rst_stream_parses_stream_and_error_code() raises:
+    var payload: List[Byte] = [Byte(0), Byte(0), Byte(0), Byte(8)]
+    var frame = FrameParseResult.complete(Byte(3), Byte(0), UInt32(7), 4)
+    var reset = parse_rst_stream_frame(frame, Span(payload))
+    assert_true(reset.is_valid())
+    assert_equal(reset.stream_id, UInt32(7))
+    assert_equal(reset.error_code, UInt32(8))
+
+
+def test_http2_rst_stream_rejects_invalid_shape_or_connection_stream() raises:
+    var payload: List[Byte] = [Byte(0), Byte(0), Byte(0), Byte(0)]
+    var connection = FrameParseResult.complete(Byte(3), Byte(0), UInt32(0), 4)
+    assert_true(parse_rst_stream_frame(connection, Span(payload)).is_error())
+    var wrong_length = FrameParseResult.complete(Byte(3), Byte(0), UInt32(1), 3)
+    assert_true(parse_rst_stream_frame(wrong_length, Span(payload[0:3])).is_error())
+
+
+def test_http2_ping_echoes_opaque_data_only_for_non_ack() raises:
+    var payload: List[Byte] = [
+        Byte(1), Byte(2), Byte(3), Byte(4), Byte(5), Byte(6), Byte(7), Byte(8)
+    ]
+    var frame = FrameParseResult.complete(Byte(6), Byte(0), UInt32(0), 8)
+    var ping = parse_ping_frame(frame, Span(payload))
+    assert_true(ping.is_valid())
+    assert_false(ping.is_ack())
+    var ack = ping.encode_ack()
+    assert_true(ack.is_complete())
+    assert_equal(ack.wire[4], Byte(1))
+    for i in range(8):
+        assert_equal(ack.wire[9 + i], payload[i])
+
+
+def test_http2_ping_rejects_ack_response_and_invalid_shape() raises:
+    var payload: List[Byte] = [
+        Byte(0), Byte(0), Byte(0), Byte(0), Byte(0), Byte(0), Byte(0), Byte(0)
+    ]
+    var ack_frame = FrameParseResult.complete(Byte(6), Byte(1), UInt32(0), 8)
+    var ack = parse_ping_frame(ack_frame, Span(payload))
+    assert_true(ack.is_valid())
+    assert_true(ack.is_ack())
+    assert_true(ack.encode_ack().is_error())
+    var wrong_stream = FrameParseResult.complete(Byte(6), Byte(0), UInt32(1), 8)
+    assert_true(parse_ping_frame(wrong_stream, Span(payload)).is_error())
+
+
+def test_http2_goaway_parses_last_stream_and_encodes_frame() raises:
+    var payload: List[Byte] = [
+        Byte(0xFF), Byte(0xFF), Byte(0xFF), Byte(0xFF),
+        Byte(0), Byte(0), Byte(0), Byte(2), Byte(99),
+    ]
+    var frame = FrameParseResult.complete(Byte(7), Byte(0), UInt32(0), 9)
+    var goaway = parse_goaway_frame(frame, Span(payload))
+    assert_true(goaway.is_valid())
+    assert_equal(goaway.last_stream_id, UInt32(0x7FFFFFFF))
+    assert_equal(goaway.error_code, UInt32(2))
+
+    var encoded = encode_goaway_frame(UInt32(7), UInt32(0))
+    assert_true(encoded.is_complete())
+    assert_equal(encoded.wire[3], Byte(7))
+    assert_equal(encoded.wire[12], Byte(7))
+
+
+def test_http2_goaway_rejects_invalid_shape_or_stream() raises:
+    var payload: List[Byte] = [Byte(0), Byte(0), Byte(0), Byte(0), Byte(0), Byte(0), Byte(0)]
+    var frame = FrameParseResult.complete(Byte(7), Byte(0), UInt32(0), 7)
+    assert_true(parse_goaway_frame(frame, Span(payload)).is_error())
+    var wrong_stream = FrameParseResult.complete(Byte(7), Byte(0), UInt32(1), 8)
+    assert_true(parse_goaway_frame(wrong_stream, Span(payload[0:7])).is_error())
 
 
 def test_partial_client_preface_needs_more_data() raises:
