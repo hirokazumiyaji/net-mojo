@@ -8,10 +8,10 @@
 - [x] Defer optional HPACK loading until the first request headers arrive.
 - [x] Connect ALPN `h2` to the server's shared handler path.
 - [x] Respect HTTP/2 connection and stream receive flow-control windows; cap responses to available outbound credit.
-- [ ] Integrate concurrent HTTP/2 request streams, flow control, and response scheduling.
+- [x] Integrate concurrent HTTP/2 request streams, flow control, and response scheduling.
 - [x] Build an optional quiche dependency and validate its C/Mojo FFI entry points.
 - [x] Exercise an HTTP/3 TLS handshake across in-memory QUIC packet exchange.
-- [ ] Integrate QUIC packet I/O, timers, HTTP/3 streams, and the shared handler with the server.
+- [x] Integrate QUIC packet I/O, timers, HTTP/3 streams, and the shared handler with the server.
 - [ ] Complete protocol interoperability, docs, CI, and performance validation.
 
 ## Review
@@ -26,7 +26,8 @@
 - The QUIC packet handshake test passed on Linux x86_64. `quic-suite` now includes this Rust test alongside the C and Mojo provider smoke tests.
 - HTTP/2 requests now reach the shared handler and return encoded responses; the TLS integration client verifies request DATA, receive WINDOW_UPDATE frames, response HEADERS/DATA, and a zero peer stream window on x86_64 and aarch64.
 - Flow-control slice passed TLS, HPACK (21/21), HTTP/2 (97/97), HTTP server (27/27), Python syntax, and diff checks on Linux x86_64 and aarch64.
-- Stream-level outbound WINDOW_UPDATE and continued responses remain outstanding; current responses are capped to the initial peer stream credit.
+- HTTP/2 stream-level outbound WINDOW_UPDATE resumes responses independently; fair scheduling and two-stream TLS integration are committed in `c5902c0`.
+- The HTTP/3 shared-handler integration test passed and is committed in `a296c53` and `6c5ae90`; same-connection concurrent request coverage is committed in `e0d0e24`.
 
 ## Current slice
 
