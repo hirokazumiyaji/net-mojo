@@ -1,6 +1,32 @@
 from std.testing import assert_equal, assert_true, TestSuite
 
 from net.http._http2.frame import parse_frame
+from net.http._http2.preface import parse_client_preface
+
+
+def test_partial_client_preface_needs_more_data() raises:
+    var preface = "PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n".as_bytes()
+    for length in range(24):
+        var result = parse_client_preface(preface[0:length])
+        assert_true(result.is_need_more())
+
+
+def test_complete_client_preface_reports_consumed_bytes() raises:
+    var wire = List[Byte]()
+    var preface = "PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n".as_bytes()
+    for i in range(len(preface)):
+        wire.append(preface[i])
+    wire.append(Byte(0))
+    var result = parse_client_preface(Span(wire))
+    assert_true(result.is_complete())
+    assert_equal(result.consumed, 24)
+
+
+def test_invalid_client_preface_is_rejected() raises:
+    var result = parse_client_preface(
+        "XRI * HTTP/2.0\r\n\r\nSM\r\n\r\n".as_bytes()
+    )
+    assert_true(result.is_error())
 
 
 def _frame(
