@@ -99,6 +99,16 @@
 - `quic-rust-test` passed all three provider tests; `cargo fmt` and `git diff --check` passed.
 - `/review` and PR publication remain pending the user's response about external diff upload.
 
+## HTTP/3 server design notes
+
+- [x] Record the current provider boundary, request mapping, fixed transport and HTTP limits, and verified integration coverage.
+- [x] Identify independent interoperability, loss/cancel stress, aggregate memory bounds, GOAWAY/drain, and Alt-Svc as outstanding.
+
+## Review
+
+- `docs/design/http3-server.md` documents the implemented Mojo UDP ownership and Rust quiche protocol boundary, request/trailer mapping, and the limits configured in code.
+- `git diff --check` passed.
+
 ## HTTP/3 request trailers plan
 
 - [x] Extend the independent concurrent-stream test to send a trailer on one request and assert the handler can read it separately from regular headers.
