@@ -922,7 +922,7 @@ struct Server(Movable):
                     self._conns[idx].http2_session = Optional(
                         Http2RequestSession(
                             "build/http2/libnet_hpack",
-                            100,
+                            self.config.max_http2_streams_per_connection,
                             self.config.max_body_bytes,
                         )
                     )

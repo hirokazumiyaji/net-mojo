@@ -11,6 +11,7 @@ from net import Timeout
 @fieldwise_init
 struct ServerConfig(Copyable, Movable):
     var max_connections: Int
+    var max_http2_streams_per_connection: Int
     var max_request_line: Int
     var max_headers_bytes: Int
     var max_headers_count: Int
@@ -39,6 +40,7 @@ struct ServerConfig(Copyable, Movable):
     def default() raises -> Self:
         return Self(
             max_connections=10000,
+            max_http2_streams_per_connection=100,
             max_request_line=8192,
             max_headers_bytes=32768,
             max_headers_count=100,

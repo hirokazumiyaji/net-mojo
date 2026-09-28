@@ -43,9 +43,13 @@ struct Http2ConnectionBootstrap(Movable):
     var _ready: Bool
     var _failed: Bool
 
-    def __init__(out self, max_frame_size: Int = 16384):
+    def __init__(
+        out self,
+        max_frame_size: Int = 16384,
+        max_concurrent_streams: Int = 100,
+    ):
         self._max_frame_size = max_frame_size
-        self._protocol = Http2ServerBootstrap()
+        self._protocol = Http2ServerBootstrap(max_concurrent_streams)
         self._preface = List[Byte]()
         self._frame = List[Byte]()
         self._preface_complete = False

@@ -138,8 +138,14 @@ struct Http2ServerConnectionInput(Movable):
     var _dispatcher: Http2FrameDispatcher
     var _failed: Bool
 
-    def __init__(out self, max_frame_size: Int = 16384):
-        self._bootstrap = Http2ConnectionBootstrap(max_frame_size)
+    def __init__(
+        out self,
+        max_frame_size: Int = 16384,
+        max_concurrent_streams: Int = 100,
+    ):
+        self._bootstrap = Http2ConnectionBootstrap(
+            max_frame_size, max_concurrent_streams
+        )
         self._reader = Http2FrameReader(max_frame_size)
         self._dispatcher = Http2FrameDispatcher(self._bootstrap.peer_settings())
         self._failed = False

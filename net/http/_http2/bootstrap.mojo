@@ -3,6 +3,7 @@
 from .frame import FrameParseResult
 from .frame_encoder import FrameEncodeResult, encode_frame
 from .preface import PrefaceParseResult, parse_client_preface
+from .settings import Setting, encode_settings_payload
 from .settings_frame import parse_settings_frame
 from .settings_state import Http2PeerSettings
 
@@ -15,8 +16,9 @@ struct Http2ServerBootstrap(Movable):
     var failed: Bool
     var error_code: UInt32
     var peer_settings: Http2PeerSettings
+    var max_concurrent_streams: Int
 
-    def __init__(out self):
+    def __init__(out self, max_concurrent_streams: Int = 100):
         self.preface_complete = False
         self.server_settings_sent = False
         self.client_settings_received = False
@@ -24,6 +26,7 @@ struct Http2ServerBootstrap(Movable):
         self.failed = False
         self.error_code = UInt32(0)
         self.peer_settings = Http2PeerSettings()
+        self.max_concurrent_streams = max_concurrent_streams
 
     def consume_client_preface[
         origin: Origin
@@ -47,7 +50,14 @@ struct Http2ServerBootstrap(Movable):
         ):
             return FrameEncodeResult.failure()
 
-        var payload = List[Byte]()
+        var settings = List[Setting]()
+        settings.append(
+            Setting(
+                identifier=UInt16(3),
+                value=UInt32(self.max_concurrent_streams),
+            )
+        )
+        var payload = encode_settings_payload(Span(settings))
         var frame = encode_frame(Byte(4), Byte(0), UInt32(0), Span(payload))
         if frame.is_complete():
             self.server_settings_sent = True

@@ -118,7 +118,9 @@ struct Http2RequestSession(Movable):
         max_active_streams: Int,
         max_body_size: Int,
     ):
-        self._input = Http2ServerConnectionInput()
+        self._input = Http2ServerConnectionInput(
+            max_concurrent_streams=max_active_streams
+        )
         self._decoder = None
         self._library_path = library_path^
         self._header_output = List[Byte](length=65536, fill=0)

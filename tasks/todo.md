@@ -52,6 +52,13 @@
 - [x] Validate workflow syntax and confirm the existing local suite passes.
 - [ ] Inspect the diff and commit this slice.
 
+## HTTP/2 stream limit configuration slice
+
+- [x] Add a `ServerConfig` limit for concurrent streams on each HTTP/2 connection.
+- [x] Advertise that limit in server SETTINGS and enforce the same value in admission.
+- [x] Test the configured SETTINGS value and stream refusal, then run HTTP/2 suites and HTTPS client interoperability.
+- [ ] Inspect the diff and commit this slice.
+
 ## QUIC transport review
 
 - `QuicServer` accepts Initial datagrams, routes later packets by connection ID, emits pending packets with their destination, and reports/advances connection timeouts.

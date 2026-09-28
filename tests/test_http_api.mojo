@@ -260,6 +260,7 @@ def test_path_query_split_has_no_percent_decoding() raises:
 def test_server_config_defaults_match_design_table() raises:
     var config = ServerConfig.default()
     assert_equal(config.max_connections, 10000)
+    assert_equal(config.max_http2_streams_per_connection, 100)
     assert_equal(config.max_request_line, 8192)
     assert_equal(config.max_headers_bytes, 32768)
     assert_equal(config.max_headers_count, 100)

@@ -564,7 +564,7 @@ def test_http2_connection_input_bootstraps_then_acknowledges_coalesced_ping() ra
     var bootstrap = input.consume(Span(wire))
     assert_true(bootstrap.is_output())
     assert_equal(bootstrap.output[3], Byte(4))
-    assert_equal(bootstrap.output[12], Byte(4))
+    assert_equal(bootstrap.output[18], Byte(4))
     assert_equal(bootstrap.consumed, len(wire) - len(ping))
 
     var ping_result = input.consume(Span(wire)[bootstrap.consumed:])
@@ -1215,7 +1215,13 @@ def test_http2_bootstrap_waits_for_full_preface_before_server_settings() raises:
     assert_equal(server_frame.frame_type, Byte(4))
     assert_equal(server_frame.flags, Byte(0))
     assert_equal(server_frame.stream_id, UInt32(0))
-    assert_equal(server_frame.payload_length, 0)
+    assert_equal(server_frame.payload_length, 6)
+    var settings = parse_settings_frame(
+        server_frame, Span(server_settings.wire)[9:]
+    )
+    assert_true(settings.is_settings())
+    assert_equal(settings.parsed.settings[0].identifier, UInt16(3))
+    assert_equal(settings.parsed.settings[0].value, UInt32(100))
     assert_true(bootstrap.server_settings().is_error())
 
 
@@ -1464,7 +1470,7 @@ def test_http2_connection_bootstrap_handles_fragmented_preface_and_settings() ra
     var result = bootstrap.consume(Span(input))
     assert_true(result.is_ready())
     assert_equal(result.consumed, 24 + len(client_settings))
-    assert_equal(len(result.output), 18)
+    assert_equal(len(result.output), 24)
     var server_settings = parse_frame(Span(result.output))
     assert_true(server_settings.is_complete())
     assert_equal(server_settings.frame_type, Byte(4))
@@ -1493,7 +1499,7 @@ def test_http2_connection_bootstrap_handles_fragmented_preface_and_settings() ra
             ready = True
             break
     assert_true(ready)
-    assert_equal(len(output), 18)
+    assert_equal(len(output), 24)
 
 
 def test_http2_connection_bootstrap_rejects_bad_preface_and_initial_ack() raises:

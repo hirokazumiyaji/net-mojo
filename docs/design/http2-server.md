@@ -97,8 +97,9 @@ stream closes after both directions end or a reset is applied.
 The active stream table accepts only increasing, odd client stream IDs and
 keeps open and half-closed streams under an explicit local cap. Exceeding the
 cap returns a refusal result for the caller to encode as `REFUSED_STREAM`.
-The cap is independent of the peer's `SETTINGS_MAX_CONCURRENT_STREAMS`, which
-limits streams initiated by this server.
+`ServerConfig.max_http2_streams_per_connection` sets this cap and is advertised
+to the peer as `SETTINGS_MAX_CONCURRENT_STREAMS`. The cap is independent of the
+peer's setting, which limits streams initiated by this server.
 
 HPACK decoding uses an optional libnghttp2 dependency behind a narrow C shim.
 Each connection owns one inflater. The shim copies emitted fields into caller

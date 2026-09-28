@@ -57,16 +57,22 @@ try:
                 b"\x00\x00\x00\x04\x00\x00\x00\x00\x00"
             )
             response = bytearray()
-            while len(response) < 18:
-                chunk = client.recv(18 - len(response))
+            while len(response) < 24:
+                chunk = client.recv(24 - len(response))
                 if not chunk:
                     break
                 response.extend(chunk)
-            if len(response) != 18:
+            if len(response) != 24:
                 raise RuntimeError(
                     f"incomplete HTTP/2 bootstrap response: {bytes(response)!r}"
                 )
-            if response[3] != 4 or response[12] != 4 or response[13] != 1:
+            if (
+                response[3] != 4
+                or response[10] != 3
+                or response[14] != 100
+                or response[18] != 4
+                or response[19] != 1
+            ):
                 raise RuntimeError(
                     f"unexpected HTTP/2 bootstrap frames: {bytes(response)!r}"
                 )
@@ -132,12 +138,12 @@ try:
                 b"\x00\x04\x00\x00\x00\x00"
             )
             bootstrap = bytearray()
-            while len(bootstrap) < 18:
-                chunk = client.recv(18 - len(bootstrap))
+            while len(bootstrap) < 24:
+                chunk = client.recv(24 - len(bootstrap))
                 if not chunk:
                     break
                 bootstrap.extend(chunk)
-            if len(bootstrap) != 18:
+            if len(bootstrap) != 24:
                 raise RuntimeError("incomplete HTTP/2 SETTINGS response")
             compressed_headers = b"\x82\x86\x84\x41\x0fwww.example.com"
             client.sendall(
