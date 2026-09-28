@@ -1048,8 +1048,15 @@ mod tests {
         let server = unsafe { net_quic_server_new(config) };
         assert!(!server.is_null());
         let mut packet = [0; 65535];
+        let mut dropped_server_packet = false;
 
-        for _ in 0..8 {
+        for _ in 0..40 {
+            if client.timeout().is_some_and(|timeout| timeout.is_zero()) {
+                client.on_timeout();
+            }
+            if unsafe { super::net_quic_server_timeout_micros(server) } == 0 {
+                unsafe { super::net_quic_server_on_timeout(server) };
+            }
             while let Ok((length, _)) = client.send(&mut packet) {
                 client_socket
                     .send_to(&packet[..length], server_address)
@@ -1086,6 +1093,10 @@ mod tests {
                 if length <= 0 {
                     break;
                 }
+                if !dropped_server_packet {
+                    dropped_server_packet = true;
+                    continue;
+                }
                 let destination = unsafe { CStr::from_ptr(destination.as_ptr()) }
                     .to_str()
                     .unwrap()
@@ -1115,6 +1126,7 @@ mod tests {
         }
 
         assert!(client.is_established());
+        assert!(dropped_server_packet);
         assert_eq!(client.application_proto(), b"h3");
         let mut client_h3 = quiche::h3::Connection::with_transport(
             &mut client,

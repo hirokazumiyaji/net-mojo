@@ -71,6 +71,12 @@
 - [x] Confirm two later requests on the same connection still receive their expected responses.
 - [x] Inspect the test and commit this slice.
 
+## QUIC handshake packet-loss slice
+
+- [x] Drop the first server handshake datagram in the localhost UDP provider test.
+- [x] Drive client and server QUIC timers until the HTTP/3 ALPN handshake completes.
+- [x] Inspect the test and commit this slice.
+
 ## QUIC transport review
 
 - `QuicServer` accepts Initial datagrams, routes later packets by connection ID, emits pending packets with their destination, and reports/advances connection timeouts.
