@@ -369,6 +369,7 @@ def test_http2_request_session_completes_fragmented_header_only_request() raises
     var result = session.consume(Span(wire))
     assert_true(result.is_request())
     assert_equal(result.consumed, len(wire))
+    assert_equal(result.stream_id, UInt32(1))
     assert_equal(result.request.method, "GET")
     assert_equal(result.request.authority, "www.example.com")
 
@@ -400,6 +401,7 @@ def test_http2_request_session_completes_data_body() raises:
 
     var result = session.consume(Span(wire))
     assert_true(result.is_request())
+    assert_equal(result.stream_id, UInt32(1))
     assert_equal(len(result.request.body), 3)
     assert_equal(result.request.body[0], Byte(ord("a")))
     assert_equal(result.request.body[2], Byte(ord("c")))
@@ -434,11 +436,13 @@ def test_http2_request_session_keeps_interleaved_bodies_on_their_streams() raise
 
     var first = session.consume(Span(wire))
     assert_true(first.is_request())
+    assert_equal(first.stream_id, UInt32(1))
     assert_equal(first.request.body[0], Byte(ord("a")))
     assert_equal(first.request.body[1], Byte(ord("c")))
     assert_true(first.consumed < len(wire))
     var second = session.consume(Span(wire)[first.consumed :])
     assert_true(second.is_request())
+    assert_equal(second.stream_id, UInt32(3))
     assert_equal(second.request.body[0], Byte(ord("b")))
     assert_equal(second.request.body[1], Byte(ord("d")))
 
@@ -465,6 +469,20 @@ def test_http2_request_session_rejects_body_over_limit() raises:
     var result = session.consume(Span(wire))
     assert_true(result.is_error())
     assert_equal(result.consumed, len(wire))
+
+
+def test_http2_request_session_bootstraps_before_loading_hpack() raises:
+    var session = Http2RequestSession("build/http2/not-present", 4, 1024)
+    var wire = List[Byte]()
+    var preface = "PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n".as_bytes()
+    for i in range(len(preface)):
+        wire.append(preface[i])
+    var empty: List[Byte] = List[Byte]()
+    _append_frame(wire, Byte(4), Byte(0), UInt32(0), Span(empty))
+
+    var result = session.consume(Span(wire))
+    assert_true(result.is_pending())
+    assert_equal(len(result.output), 18)
 
 def main() raises:
     TestSuite.discover_tests[__functions_in_module()]().run()

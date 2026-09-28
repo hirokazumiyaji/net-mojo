@@ -15,6 +15,7 @@ from .request_stream import Http2RequestStream, Http2RequestStreamResult
 struct Http2RequestSessionResult(Movable):
     var kind: UInt8
     var consumed: Int
+    var stream_id: UInt32
     var output: List[Byte]
     var request: Request
 
@@ -23,6 +24,7 @@ struct Http2RequestSessionResult(Movable):
         return Self(
             kind=1,
             consumed=consumed,
+            stream_id=UInt32(0),
             output=output^,
             request=Request(
                 String(), String(), String(), String(), HttpVersion.http2()
@@ -31,11 +33,15 @@ struct Http2RequestSessionResult(Movable):
 
     @staticmethod
     def complete(
-        consumed: Int, var output: List[Byte], var request: Request
+        consumed: Int,
+        stream_id: UInt32,
+        var output: List[Byte],
+        var request: Request,
     ) -> Self:
         return Self(
             kind=2,
             consumed=consumed,
+            stream_id=stream_id,
             output=output^,
             request=request^,
         )
@@ -45,6 +51,7 @@ struct Http2RequestSessionResult(Movable):
         return Self(
             kind=3,
             consumed=consumed,
+            stream_id=UInt32(0),
             output=output^,
             request=Request(
                 String(), String(), String(), String(), HttpVersion.http2()
@@ -72,7 +79,8 @@ struct _Http2RequestEntry(Movable):
 
 struct Http2RequestSession(Movable):
     var _input: Http2ServerConnectionInput
-    var _decoder: Http2HeaderDecoder
+    var _decoder: Optional[Http2HeaderDecoder]
+    var _library_path: String
     var _header_output: Array[Byte, 65536]
     var _streams: List[_Http2RequestEntry]
     var _max_active_streams: Int
@@ -85,9 +93,10 @@ struct Http2RequestSession(Movable):
         var library_path: String,
         max_active_streams: Int,
         max_body_size: Int,
-    ) raises:
+    ):
         self._input = Http2ServerConnectionInput()
-        self._decoder = Http2HeaderDecoder(library_path^, 4096, 65536)
+        self._decoder = None
+        self._library_path = library_path^
         self._header_output = Array[Byte, 65536](fill=0)
         self._streams = List[_Http2RequestEntry]()
         self._max_active_streams = max_active_streams
@@ -132,7 +141,7 @@ struct Http2RequestSession(Movable):
                         if request_result.is_complete():
                             var request = self._take_request(decoded.stream_id)
                             return Http2RequestSessionResult.complete(
-                                consumed, output^, request^
+                                consumed, decoded.stream_id, output^, request^
                             )
                     elif not decoded.is_pending():
                         self._failed = True
@@ -154,7 +163,7 @@ struct Http2RequestSession(Movable):
                     if request_result.is_complete():
                         var request = self._take_request(input.stream_id)
                         return Http2RequestSessionResult.complete(
-                            consumed, output^, request^
+                            consumed, input.stream_id, output^, request^
                         )
             elif input.is_reset():
                 self._remove_stream(input.stream_id)
@@ -170,8 +179,12 @@ struct Http2RequestSession(Movable):
         mut self,
         frame: FrameParseResult,
         payload: Span[Byte, origin],
-    ) -> Http2HeaderDecodeResult:
-        return self._decoder.consume(
+    ) raises -> Http2HeaderDecodeResult:
+        if not self._decoder:
+            self._decoder = Optional(
+                Http2HeaderDecoder(String(self._library_path), 4096, 65536)
+            )
+        return self._decoder.value().consume(
             frame, payload, 65536, 256, Span(self._header_output)
         )
 
