@@ -41,6 +41,11 @@ payload in network byte order. It rejects a payload above the configured frame
 limit or the 24-bit protocol maximum, and rejects stream identifiers with the
 reserved bit set. It does not validate frame-type-specific flags or lengths.
 
+The SETTINGS frame validator requires stream zero, checks that the parsed
+payload length matches the supplied bytes, and rejects a non-empty ACK frame.
+Unknown flag bits are ignored. It leaves setting-value rules and connection
+sequencing to the connection state machine.
+
 ## Follow-up connection work
 
 The connection layer will require the client connection preface, send server

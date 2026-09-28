@@ -8,6 +8,7 @@ from net.http._http2.settings import (
     encode_settings_payload,
     parse_settings_payload,
 )
+from net.http._http2.settings_frame import parse_settings_frame
 
 
 def test_partial_client_preface_needs_more_data() raises:
@@ -234,6 +235,68 @@ def test_frame_encoder_rejects_invalid_stream_id_and_size() raises:
             Byte(0), Byte(0), UInt32(0), Span(List[Byte]()), 16777216
         ).is_error()
     )
+
+
+def test_settings_frame_accepts_payload_on_stream_zero() raises:
+    var payload = List[Byte]()
+    for byte in [Byte(0), Byte(1), Byte(0), Byte(0), Byte(0), Byte(128)]:
+        payload.append(byte)
+    var wire = _frame(4, 0x80, 0, payload)
+    var frame = parse_frame(Span(wire))
+    var result = parse_settings_frame(frame, Span(wire)[9:])
+    assert_true(result.is_settings())
+    assert_equal(len(result.parsed.settings), 1)
+    assert_equal(result.parsed.settings[0].identifier, UInt16(1))
+    assert_equal(result.parsed.settings[0].value, UInt32(128))
+
+
+def test_settings_frame_accepts_empty_ack() raises:
+    var wire = _frame(4, 1, 0, List[Byte]())
+    var result = parse_settings_frame(parse_frame(Span(wire)), Span(wire)[9:])
+    assert_true(result.is_ack())
+
+
+def test_settings_frame_rejects_wrong_type_or_stream() raises:
+    var wrong_type = _frame(1, 0, 0, List[Byte]())
+    assert_true(
+        parse_settings_frame(
+            parse_frame(Span(wrong_type)), Span(wrong_type)[9:]
+        ).is_error()
+    )
+
+    var wrong_stream = _frame(4, 0, 1, List[Byte]())
+    assert_true(
+        parse_settings_frame(
+            parse_frame(Span(wrong_stream)), Span(wrong_stream)[9:]
+        ).is_error()
+    )
+
+
+def test_settings_frame_rejects_payload_on_ack() raises:
+    var payload = List[Byte]()
+    payload.append(Byte(0))
+    var wire = _frame(4, 1, 0, payload)
+    assert_true(
+        parse_settings_frame(parse_frame(Span(wire)), Span(wire)[9:]).is_error()
+    )
+
+
+def test_settings_frame_rejects_partial_setting_entry() raises:
+    var payload = List[Byte]()
+    for _ in range(5):
+        payload.append(Byte(0))
+    var wire = _frame(4, 0, 0, payload)
+    assert_true(
+        parse_settings_frame(parse_frame(Span(wire)), Span(wire)[9:]).is_error()
+    )
+
+
+def test_settings_frame_rejects_payload_length_mismatch() raises:
+    var wire = _frame(4, 0, 0, List[Byte]())
+    var fake = parse_frame(Span(wire))
+    fake.payload_length = 6
+    var payload = List[Byte]()
+    assert_true(parse_settings_frame(fake, Span(payload)).is_error())
 
 
 def main() raises:
