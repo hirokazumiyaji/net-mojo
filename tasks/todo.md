@@ -120,6 +120,16 @@
 - The tests failed before the fix because the session returned a connection error, closed the stream cap when request assembly finished, and treated raced DATA as connection-fatal. They now verify `REFUSED_STREAM`, ignore trailing DATA on that reset stream, hold the admission slot until the response completes, and admit a later stream after capacity is released.
 - `hpack-mojo-test` passed 25/25, `test-http2` passed 97/97, `https-state-test` passed 2/2, and `https-client-test` passed its HTTP/2 bootstrap and HTTPS roundtrips.
 
+## QUIC connection cleanup plan
+
+- [x] Extend the provider UDP integration test to leave a completed request queued, close the client connection, and check cleanup after the draining timeout.
+- [x] Remove closed connection state, CID route aliases, pending request routes, and queued completed requests.
+- [x] Run the Rust provider test suite and verify all owned state is released.
+
+## Review
+
+- The test failed before cleanup because the server retained the closed connection and its CID routes. After the change, all three Rust provider tests pass and the close test confirms connections, routes, request routes, and queued requests are empty.
+
 ## HTTP/3 request trailers plan
 
 - [x] Extend the independent concurrent-stream test to send a trailer on one request and assert the handler can read it separately from regular headers.

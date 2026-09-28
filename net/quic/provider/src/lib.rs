@@ -491,7 +491,32 @@ impl QuicServer {
                 body: request.body,
             });
         }
+        self.reap_closed_connection(&key);
         Ok(())
+    }
+
+    fn reap_closed_connection(&mut self, connection_key: &[u8]) {
+        if !self
+            .connections
+            .get(connection_key)
+            .is_some_and(|connection| connection.transport.is_closed())
+        {
+            return;
+        }
+        self.connections.remove(connection_key);
+        self.routes
+            .retain(|_, owner_key| owner_key.as_slice() != connection_key);
+        let request_ids: Vec<u64> = self
+            .request_routes
+            .iter()
+            .filter_map(|(request_id, (owner_key, _))| {
+                (owner_key.as_slice() == connection_key).then_some(*request_id)
+            })
+            .collect();
+        self.request_routes
+            .retain(|_, (owner_key, _)| owner_key.as_slice() != connection_key);
+        self.requests
+            .retain(|request| !request_ids.contains(&request.id));
     }
 
     fn poll_http3(
@@ -808,6 +833,7 @@ impl QuicServer {
     }
 
     pub fn on_timeout(&mut self) {
+        let mut closed = Vec::new();
         for connection in self.connections.values_mut() {
             if connection
                 .transport
@@ -816,6 +842,14 @@ impl QuicServer {
             {
                 connection.transport.on_timeout();
             }
+        }
+        for (connection_key, connection) in &self.connections {
+            if connection.transport.is_closed() {
+                closed.push(connection_key.clone());
+            }
+        }
+        for connection_key in closed {
+            self.reap_closed_connection(&connection_key);
         }
     }
 }
@@ -1294,6 +1328,85 @@ mod tests {
             unsafe { super::net_quic_server_timeout_micros(server) },
             u64::MAX
         );
+
+        let pending_headers = [
+            quiche::h3::Header::new(b":method", b"GET"),
+            quiche::h3::Header::new(b":scheme", b"https"),
+            quiche::h3::Header::new(b":authority", b"localhost"),
+            quiche::h3::Header::new(b":path", b"/pending"),
+        ];
+        client_h3
+            .send_request(&mut client, &pending_headers, true)
+            .unwrap();
+        while let Ok((length, _)) = client.send(&mut packet) {
+            client_socket
+                .send_to(&packet[..length], server_address)
+                .unwrap();
+        }
+        loop {
+            let (length, peer) = server_socket.recv_from(&mut packet).unwrap();
+            let local = CString::new(server_address.to_string()).unwrap();
+            let remote = CString::new(peer.to_string()).unwrap();
+            assert_eq!(
+                unsafe {
+                    super::net_quic_server_recv(
+                        server,
+                        packet.as_mut_ptr(),
+                        length,
+                        local.as_ptr(),
+                        remote.as_ptr(),
+                    )
+                },
+                1
+            );
+            if unsafe { &*server }._inner.requests.len() > 0 {
+                break;
+            }
+        }
+        let connection_key = {
+            let server_state = unsafe { &mut *server };
+            assert_eq!(server_state._inner.requests.len(), 1);
+            assert!(server_state._inner.request_routes.len() > 0);
+            server_state._inner.routes.values().next().unwrap().clone()
+        };
+
+        client.close(true, 0, b"test complete").unwrap();
+        while let Ok((length, _)) = client.send(&mut packet) {
+            client_socket
+                .send_to(&packet[..length], server_address)
+                .unwrap();
+        }
+        let (length, peer) = server_socket.recv_from(&mut packet).unwrap();
+        let local = CString::new(server_address.to_string()).unwrap();
+        let remote = CString::new(peer.to_string()).unwrap();
+        assert_eq!(
+            unsafe {
+                super::net_quic_server_recv(
+                    server,
+                    packet.as_mut_ptr(),
+                    length,
+                    local.as_ptr(),
+                    remote.as_ptr(),
+                )
+            },
+            1
+        );
+
+        for _ in 0..400 {
+            let timeout = unsafe { super::net_quic_server_timeout_micros(server) };
+            if timeout == 0 {
+                unsafe { super::net_quic_server_on_timeout(server) };
+            }
+            if !unsafe { &*server }._inner.connections.contains_key(&connection_key) {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let server_state = unsafe { &mut *server };
+        assert!(server_state._inner.connections.is_empty());
+        assert!(server_state._inner.routes.is_empty());
+        assert!(server_state._inner.request_routes.is_empty());
+        assert!(server_state._inner.requests.is_empty());
         unsafe {
             net_quic_server_free(server);
             super::net_quic_server_config_free(config);
