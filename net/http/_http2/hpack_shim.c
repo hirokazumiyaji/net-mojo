@@ -11,6 +11,10 @@ struct net_hpack_inflater {
     nghttp2_hd_inflater *inflater;
 };
 
+struct net_hpack_deflater {
+    nghttp2_hd_deflater *deflater;
+};
+
 net_hpack_inflater *net_hpack_inflater_new(size_t max_table_size) {
     if (max_table_size > UINT32_MAX) {
         return NULL;
@@ -160,4 +164,128 @@ int net_hpack_decode(net_hpack_inflater *wrapper, const uint8_t *block,
             return NET_HPACK_DECODE_INVALID;
         }
     }
+}
+
+net_hpack_deflater *net_hpack_deflater_new(size_t max_table_size) {
+    if (max_table_size > UINT32_MAX) {
+        return NULL;
+    }
+
+    net_hpack_deflater *wrapper = malloc(sizeof(*wrapper));
+    if (wrapper == NULL) {
+        return NULL;
+    }
+    if (nghttp2_hd_deflate_new(&wrapper->deflater, max_table_size) != 0) {
+        free(wrapper);
+        return NULL;
+    }
+    return wrapper;
+}
+
+void net_hpack_deflater_free(net_hpack_deflater *wrapper) {
+    if (wrapper == NULL) {
+        return;
+    }
+    nghttp2_hd_deflate_del(wrapper->deflater);
+    free(wrapper);
+}
+
+int net_hpack_deflater_set_max_table_size(net_hpack_deflater *wrapper,
+                                          size_t max_table_size) {
+    if (wrapper == NULL || max_table_size > UINT32_MAX) {
+        return -1;
+    }
+    return nghttp2_hd_deflate_change_table_size(wrapper->deflater,
+                                                 max_table_size);
+}
+
+static uint32_t read_u32(const uint8_t *input) {
+    return ((uint32_t)input[0] << 24) | ((uint32_t)input[1] << 16) |
+           ((uint32_t)input[2] << 8) | (uint32_t)input[3];
+}
+
+int net_hpack_encode(net_hpack_deflater *wrapper, const uint8_t *fields,
+                    size_t fields_length, size_t max_header_list_size,
+                    size_t max_fields, uint8_t *output,
+                    size_t output_capacity, size_t *output_length) {
+    if (wrapper == NULL || (fields == NULL && fields_length != 0) ||
+        (output == NULL && output_capacity != 0) || output_length == NULL) {
+        return NET_HPACK_ENCODE_INVALID;
+    }
+
+    *output_length = 0;
+    size_t count = 0;
+    size_t offset = 0;
+    size_t decoded_size = 0;
+    while (offset < fields_length) {
+        if (fields_length - offset < 8) {
+            return NET_HPACK_ENCODE_INVALID;
+        }
+        uint32_t name_length = read_u32(fields + offset);
+        uint32_t value_length = read_u32(fields + offset + 4);
+        offset += 8;
+        if (name_length == 0 || name_length > fields_length - offset ||
+            value_length > fields_length - offset - name_length) {
+            return NET_HPACK_ENCODE_INVALID;
+        }
+        if (count == SIZE_MAX) {
+            return NET_HPACK_ENCODE_TOO_LARGE;
+        }
+        ++count;
+        size_t name_size = name_length;
+        size_t value_size = value_length;
+        if (name_size > SIZE_MAX - value_size ||
+            name_size + value_size > SIZE_MAX - 32) {
+            return NET_HPACK_ENCODE_TOO_LARGE;
+        }
+        size_t field_size = name_size + value_size + 32;
+        if (decoded_size > SIZE_MAX - field_size) {
+            return NET_HPACK_ENCODE_TOO_LARGE;
+        }
+        decoded_size += field_size;
+        offset += (size_t)name_length + value_length;
+    }
+    if (count > max_fields || decoded_size > max_header_list_size) {
+        return NET_HPACK_ENCODE_TOO_LARGE;
+    }
+    if (count > SIZE_MAX / sizeof(nghttp2_nv)) {
+        return NET_HPACK_ENCODE_TOO_LARGE;
+    }
+
+    nghttp2_nv *nva = NULL;
+    if (count != 0) {
+        nva = malloc(count * sizeof(*nva));
+        if (nva == NULL) {
+            return NET_HPACK_ENCODE_INVALID;
+        }
+    }
+    offset = 0;
+    for (size_t i = 0; i < count; ++i) {
+        uint32_t name_length = read_u32(fields + offset);
+        uint32_t value_length = read_u32(fields + offset + 4);
+        offset += 8;
+        nva[i].name = (uint8_t *)(fields + offset);
+        nva[i].namelen = name_length;
+        offset += name_length;
+        nva[i].value = (uint8_t *)(fields + offset);
+        nva[i].valuelen = value_length;
+        nva[i].flags = NGHTTP2_NV_FLAG_NONE;
+        offset += value_length;
+    }
+
+    size_t bound = nghttp2_hd_deflate_bound(wrapper->deflater, nva, count);
+    if (bound > output_capacity) {
+        free(nva);
+        return NET_HPACK_ENCODE_TOO_LARGE;
+    }
+    static uint8_t empty_output;
+    uint8_t *output_buffer = output_capacity == 0 ? &empty_output : output;
+    nghttp2_ssize encoded = nghttp2_hd_deflate_hd2(
+        wrapper->deflater, output_buffer, output_capacity, nva, count);
+    free(nva);
+    if (encoded < 0) {
+        return NET_HPACK_ENCODE_INVALID;
+    }
+    *output_length = (size_t)encoded;
+    return NET_HPACK_ENCODE_OK;
 }

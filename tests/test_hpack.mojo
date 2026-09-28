@@ -1,10 +1,27 @@
 from std.testing import assert_equal, assert_true, TestSuite
 
-from net.http._http2.hpack import Http2HpackInflater
+from net.http._http2.hpack import Http2HpackDeflater, Http2HpackInflater
 from net.http._http2.frame import FrameParseResult
 from net.http._http2.header_decoder import Http2HeaderDecoder
 from net.http._http2.request_headers import decode_http2_request_headers
 from net.http.request import HttpVersion
+
+
+def _append_field(mut fields: List[Byte], name: String, value: String):
+    var name_bytes = name.as_bytes()
+    var value_bytes = value.as_bytes()
+    fields.append(Byte((len(name_bytes) >> 24) & 0xFF))
+    fields.append(Byte((len(name_bytes) >> 16) & 0xFF))
+    fields.append(Byte((len(name_bytes) >> 8) & 0xFF))
+    fields.append(Byte(len(name_bytes) & 0xFF))
+    fields.append(Byte((len(value_bytes) >> 24) & 0xFF))
+    fields.append(Byte((len(value_bytes) >> 16) & 0xFF))
+    fields.append(Byte((len(value_bytes) >> 8) & 0xFF))
+    fields.append(Byte(len(value_bytes) & 0xFF))
+    for i in range(len(name_bytes)):
+        fields.append(name_bytes[i])
+    for i in range(len(value_bytes)):
+        fields.append(value_bytes[i])
 
 
 def test_hpack_inflater_decodes_huffman_header_block() raises:
@@ -24,6 +41,34 @@ def test_hpack_inflater_decodes_huffman_header_block() raises:
     assert_equal(output[0], Byte(0))
     assert_equal(output[3], Byte(7))
     assert_equal(output[8], Byte(ord(":")))
+
+
+def test_hpack_deflater_encodes_bounded_header_fields() raises:
+    var deflater = Http2HpackDeflater("build/http2/libnet_hpack", 4096)
+    var fields = List[Byte]()
+    _append_field(fields, String(":status"), String("200"))
+    _append_field(fields, String("content-type"), String("text/plain"))
+    var too_small = Array[Byte, 1](fill=0)
+    var result = deflater.encode(Span(fields), 1024, 8, Span(too_small))
+    assert_true(result.is_too_large())
+    assert_equal(result.output_length, 0)
+    result = deflater.encode(Span(fields), 1024, 1, Span(too_small))
+    assert_true(result.is_too_large())
+    result = deflater.encode(Span(fields), -1, 8, Span(too_small))
+    assert_true(result.is_invalid())
+
+    var output = Array[Byte, 128](fill=0)
+    result = deflater.encode(Span(fields), 1024, 8, Span(output))
+    assert_true(result.is_success())
+    assert_true(result.output_length > 0)
+
+    var inflater = Http2HpackInflater("build/http2/libnet_hpack", 4096)
+    var decoded = inflater.decode(
+        Span(output)[0 : result.output_length], 1024, 8, Span(fields)
+    )
+    assert_true(decoded.is_success())
+    assert_equal(decoded.field_count, 2)
+    assert_equal(decoded.output_length, len(fields))
 
 
 def test_hpack_inflater_preserves_dynamic_table_after_limit() raises:

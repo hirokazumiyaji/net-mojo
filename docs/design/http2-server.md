@@ -90,6 +90,9 @@ connection because skipping an HPACK block can desynchronize the dynamic table.
 connection. It writes copied fields into caller-owned output as repeated
 network-order 32-bit name and value lengths followed by their raw bytes. The
 caller sets the table size between blocks and applies protocol header semantics.
+`Http2HpackDeflater` applies the same encoded-field contract in the outbound
+direction, bounds decoded header size and field count before compression, and
+keeps its dynamic table for the connection lifetime.
 `Http2HeaderDecoder` combines frame assembly and decoding for one connection,
 preserves HPACK state after decoded limits are exceeded, and marks framing or
 compression errors as terminal for that decoder.
