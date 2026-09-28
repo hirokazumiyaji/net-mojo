@@ -11,6 +11,7 @@ struct Http2ServerBootstrap(Movable):
     var preface_complete: Bool
     var server_settings_sent: Bool
     var client_settings_received: Bool
+    var server_settings_acknowledged: Bool
     var failed: Bool
     var error_code: UInt32
     var peer_settings: Http2PeerSettings
@@ -19,6 +20,7 @@ struct Http2ServerBootstrap(Movable):
         self.preface_complete = False
         self.server_settings_sent = False
         self.client_settings_received = False
+        self.server_settings_acknowledged = False
         self.failed = False
         self.error_code = UInt32(0)
         self.peer_settings = Http2PeerSettings()
@@ -49,9 +51,10 @@ struct Http2ServerBootstrap(Movable):
         var frame = encode_frame(Byte(4), Byte(0), UInt32(0), Span(payload))
         if frame.is_complete():
             self.server_settings_sent = True
+            self.server_settings_acknowledged = False
         return frame^
 
-    def accept_initial_client_settings[
+    def accept_client_settings[
         origin: Origin
     ](
         mut self,
@@ -62,7 +65,6 @@ struct Http2ServerBootstrap(Movable):
             self.failed
             or not self.preface_complete
             or not self.server_settings_sent
-            or self.client_settings_received
         ):
             self.failed = True
             if self.error_code == UInt32(0):
@@ -89,6 +91,26 @@ struct Http2ServerBootstrap(Movable):
         var empty_payload = List[Byte]()
         return encode_frame(Byte(4), Byte(1), UInt32(0), Span(empty_payload))
 
+    def accept_server_settings_ack[
+        origin: Origin
+    ](mut self, frame: FrameParseResult, payload: Span[Byte, origin]) -> Bool:
+        if (
+            self.failed
+            or not self.preface_complete
+            or not self.server_settings_sent
+            or not self.client_settings_received
+        ):
+            self.failed = True
+            return False
+
+        var settings = parse_settings_frame(frame, payload)
+        if settings.is_error() or not settings.is_ack():
+            self.failed = True
+            return False
+
+        self.server_settings_acknowledged = True
+        return True
+
     def is_ready(self) -> Bool:
         return self.client_settings_received and not self.failed
 
@@ -97,3 +119,6 @@ struct Http2ServerBootstrap(Movable):
 
     def connection_error_code(self) -> UInt32:
         return self.error_code
+
+    def is_server_settings_acknowledged(self) -> Bool:
+        return self.server_settings_acknowledged

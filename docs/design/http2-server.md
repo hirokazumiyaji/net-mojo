@@ -61,6 +61,10 @@ or 1; `INITIAL_WINDOW_SIZE` is limited to 2^31-1; `MAX_FRAME_SIZE` must be in
 the range 16,384 through 16,777,215. Invalid values terminate bootstrap with
 the corresponding HTTP/2 connection error code.
 
+Later client SETTINGS frames are also applied in order and acknowledged. The
+client may acknowledge the server's initial SETTINGS after its own initial
+SETTINGS has been received.
+
 Per-stream state tracks remote and local closure independently. Initial remote
 HEADERS opens the request side; a later remote HEADERS block is accepted as
 trailers only when it ends that side. DATA requires an open direction, and the
