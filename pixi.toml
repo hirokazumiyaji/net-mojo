@@ -84,6 +84,9 @@ pkg-config = "*"
 
 [feature.http2.tasks]
 hpack-test = "bash scripts/build_hpack_shim.sh"
+hpack-mojo-test = { cmd = "mojo run --Werror -I . tests/test_hpack.mojo", depends-on = [
+  "hpack-test",
+] }
 
 [feature.tls.tasks]
 tls-build = "bash scripts/build_tls_shim.sh"

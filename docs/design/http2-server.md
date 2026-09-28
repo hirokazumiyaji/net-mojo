@@ -86,6 +86,10 @@ The compressed block is assembled from HEADERS and matching CONTINUATION
 frames under a separate byte cap. Padding and HEADERS priority fields are
 removed before the block reaches HPACK. Exceeding the compressed cap fails the
 connection because skipping an HPACK block can desynchronize the dynamic table.
+`Http2HpackInflater` owns the native inflater and library handle for one
+connection. It writes copied fields into caller-owned output as repeated
+network-order 32-bit name and value lengths followed by their raw bytes. The
+caller sets the table size between blocks and applies protocol header semantics.
 
 ## Follow-up connection work
 
