@@ -24,11 +24,14 @@ specific fields, and invalid `TE` values are rejected. A request body is fully
 buffered before the shared handler runs.
 
 Current limits are 100 request header fields and 32 KiB for the combined
-request header sections, 1 MiB for the decoded body, 32 KiB and 100 fields for
-response headers, and 1 MiB for the response body. The provider configures a
-32 KiB HTTP/3 field-section limit. These are per request or response limits;
-aggregate memory accounting across QUIC connections and streams remains
-outstanding.
+request header sections, 1 MiB for each decoded body, and 64 MiB for request
+bodies buffered across all active streams and completed requests awaiting Mojo
+consumption. The aggregate request-body budget is enforced in the provider
+before appending each DATA chunk; an over-budget stream is reset with
+`H3_EXCESSIVE_LOAD`. Response headers are limited to 32 KiB and 100 fields, and
+response bodies to 1 MiB per response. The provider configures a 32 KiB HTTP/3
+field-section limit. Provider response queues and quiche's internal transport
+memory do not yet have aggregate accounting.
 
 The QUIC provider uses a 10,000,000 byte connection receive limit, 1,000,000
 bytes of bidirectional and unidirectional stream receive credit, an initial
@@ -67,5 +70,6 @@ push and CONNECT are not supported.
 
 Closed or timed-out QUIC connections are removed with their connection-ID
 routes, pending request routes, and queued completed requests. New connections
-are capped by `ServerConfig.max_connections`; aggregate queued-request and
-buffer memory across connections remains unbounded.
+are capped by `ServerConfig.max_connections`; request-body buffering is capped
+at 64 MiB across the provider. Aggregate response-queue and QUIC transport
+memory remain unbounded and require separate accounting.

@@ -284,7 +284,9 @@ pub unsafe extern "C" fn net_quic_server_next_request(
         return -i32::try_from(record.len()).unwrap_or(i32::MAX);
     }
     unsafe { ptr::copy_nonoverlapping(record.as_ptr(), output, record.len()) };
-    let _ = server._inner.requests.pop_front();
+    if let Some(request) = server._inner.requests.pop_front() {
+        server._inner.buffered_request_bytes -= request.body.len();
+    }
     i32::try_from(record.len()).unwrap_or(-1)
 }
 
@@ -371,6 +373,32 @@ fn append_bytes(output: &mut Vec<u8>, value: &[u8]) {
     output.extend_from_slice(value);
 }
 
+fn reserve_bytes(used: &mut usize, amount: usize, limit: usize) -> bool {
+    let Some(next) = used.checked_add(amount) else {
+        return false;
+    };
+    if next > limit {
+        return false;
+    }
+    *used = next;
+    true
+}
+
+fn append_request_body(
+    request: &mut PendingRequest,
+    bytes: &[u8],
+    buffered_bytes: &mut usize,
+    limit: usize,
+) -> bool {
+    if request.body.len() + bytes.len() > MAX_HTTP3_REQUEST_BODY_BYTES
+        || !reserve_bytes(buffered_bytes, bytes.len(), limit)
+    {
+        return false;
+    }
+    request.body.extend_from_slice(bytes);
+    true
+}
+
 pub struct QuicServer {
     config: quiche::Config,
     http3_config: quiche::h3::Config,
@@ -381,6 +409,7 @@ pub struct QuicServer {
     next_request_id: u64,
     random: File,
     max_connections: usize,
+    buffered_request_bytes: usize,
     shutdown: ShutdownState,
 }
 
@@ -404,6 +433,9 @@ struct QuicConnection {
 }
 
 const MAX_HTTP3_REQUEST_STREAM_ID: u64 = (1 << 62) - 4;
+const MAX_HTTP3_BUFFERED_REQUEST_BYTES: usize = 64 * 1024 * 1024;
+const MAX_HTTP3_REQUEST_BODY_BYTES: usize = 1024 * 1024;
+const H3_EXCESSIVE_LOAD: u64 = 0x107;
 // RFC 9114 assigns 0x10b to H3_REQUEST_REJECTED.
 const H3_REQUEST_REJECTED: u64 = 0x10b;
 
@@ -415,6 +447,7 @@ struct PendingResponse {
     body_offset: usize,
 }
 
+#[derive(Default)]
 struct PendingRequest {
     method: Vec<u8>,
     target: Vec<u8>,
@@ -478,6 +511,7 @@ impl QuicServer {
             next_request_id: 1,
             random: File::open("/dev/urandom")?,
             max_connections: 10_000,
+            buffered_request_bytes: 0,
             shutdown: ShutdownState::Active,
         })
     }
@@ -601,7 +635,7 @@ impl QuicServer {
                 Err(error) => return Err(error.into()),
             }
         }
-        let completed = Self::poll_http3(connection)?;
+        let completed = Self::poll_http3(connection, &mut self.buffered_request_bytes)?;
         let source_ids: Vec<Vec<u8>> = connection
             .transport
             .source_ids()
@@ -659,7 +693,13 @@ impl QuicServer {
         {
             return;
         }
-        self.connections.remove(connection_key);
+        let connection = self.connections.remove(connection_key).unwrap();
+        let in_flight_bytes: usize = connection
+            .requests
+            .values()
+            .map(|request| request.body.len())
+            .sum();
+        self.buffered_request_bytes -= in_flight_bytes;
         self.routes
             .retain(|_, owner_key| owner_key.as_slice() != connection_key);
         let request_ids: Vec<u64> = self
@@ -671,12 +711,20 @@ impl QuicServer {
             .collect();
         self.request_routes
             .retain(|_, (owner_key, _)| owner_key.as_slice() != connection_key);
+        let queued_bytes: usize = self
+            .requests
+            .iter()
+            .filter(|request| request_ids.contains(&request.id))
+            .map(|request| request.body.len())
+            .sum();
+        self.buffered_request_bytes -= queued_bytes;
         self.requests
             .retain(|request| !request_ids.contains(&request.id));
     }
 
     fn poll_http3(
         connection: &mut QuicConnection,
+        buffered_request_bytes: &mut usize,
     ) -> Result<Vec<CompletedRequest>, QuicServerError> {
         let mut completed = Vec::new();
         let Some(http3) = connection.http3.as_mut() else {
@@ -739,21 +787,13 @@ impl QuicServer {
                                 quiche::Shutdown::Read,
                                 code,
                             );
-                            connection.requests.remove(&stream_id);
+                            if let Some(rejected) = connection.requests.remove(&stream_id) {
+                                *buffered_request_bytes -= rejected.body.len();
+                            }
                         }
                         continue;
                     }
-                    let mut request = PendingRequest {
-                        method: Vec::new(),
-                        target: Vec::new(),
-                        scheme: Vec::new(),
-                        authority: Vec::new(),
-                        headers: Vec::new(),
-                        trailers: Vec::new(),
-                        header_bytes: 0,
-                        header_count: 0,
-                        body: Vec::new(),
-                    };
+                    let mut request = PendingRequest::default();
                     let mut seen_pseudo_headers = 0u8;
                     let mut regular_header_seen = false;
                     let mut header_bytes = 0usize;
@@ -854,16 +894,22 @@ impl QuicServer {
                     loop {
                         match http3.recv_body(&mut connection.transport, stream_id, &mut body) {
                             Ok(length) => {
-                                if request.body.len() + length > 1024 * 1024 {
+                                if !append_request_body(
+                                    request,
+                                    &body[..length],
+                                    buffered_request_bytes,
+                                    MAX_HTTP3_BUFFERED_REQUEST_BYTES,
+                                ) {
                                     let _ = connection.transport.stream_shutdown(
                                         stream_id,
                                         quiche::Shutdown::Read,
-                                        0x107,
+                                        H3_EXCESSIVE_LOAD,
                                     );
-                                    connection.requests.remove(&stream_id);
+                                    if let Some(rejected) = connection.requests.remove(&stream_id) {
+                                        *buffered_request_bytes -= rejected.body.len();
+                                    }
                                     break;
                                 }
-                                request.body.extend_from_slice(&body[..length]);
                             }
                             Err(quiche::h3::Error::Done) => break,
                             Err(error) => return Err(error.into()),
@@ -886,7 +932,9 @@ impl QuicServer {
                     }
                 }
                 Ok((stream_id, quiche::h3::Event::Reset(_))) => {
-                    connection.requests.remove(&stream_id);
+                    if let Some(reset) = connection.requests.remove(&stream_id) {
+                        *buffered_request_bytes -= reset.body.len();
+                    }
                 }
                 Ok(_) => (),
                 Err(quiche::h3::Error::Done) => break,
@@ -897,7 +945,9 @@ impl QuicServer {
     }
 
     pub fn next_request(&mut self) -> Option<CompletedRequest> {
-        self.requests.pop_front()
+        let request = self.requests.pop_front()?;
+        self.buffered_request_bytes -= request.body.len();
+        Some(request)
     }
 
     fn enqueue_response(
@@ -1053,9 +1103,25 @@ mod tests {
     use quiche::{ConnectionId, Header, RecvInfo};
 
     use super::{
-        NetQuicServerConfig, append_bytes, append_u32, net_quic_server_free, net_quic_server_new,
+        NetQuicServerConfig, PendingRequest, append_bytes, append_request_body, append_u32,
+        net_quic_server_free, net_quic_server_new,
     };
     use quiche::h3::NameValue;
+
+    #[test]
+    fn request_memory_budget_rejects_aggregate_overflow_without_changing_usage() {
+        let mut used = 0;
+        let mut first = PendingRequest::default();
+        assert!(append_request_body(&mut first, b"123456", &mut used, 10));
+        assert_eq!(used, 6);
+        let mut second = PendingRequest::default();
+        assert!(append_request_body(&mut second, b"abcd", &mut used, 10));
+        assert_eq!(used, 10);
+        let mut third = PendingRequest::default();
+        assert!(!append_request_body(&mut third, b"x", &mut used, 10));
+        assert_eq!(used, 10);
+        assert!(third.body.is_empty());
+    }
 
     #[test]
     fn completes_http3_tls_handshake_over_quic_packets() {
@@ -1421,6 +1487,10 @@ mod tests {
             ]
         );
         assert_eq!(request.body, b"payload");
+        assert_eq!(
+            server_state._inner.buffered_request_bytes,
+            request.body.len()
+        );
         let mut request_record = vec![0; 1_200_000];
         let request_record_length = unsafe {
             super::net_quic_server_next_request(
@@ -1430,6 +1500,7 @@ mod tests {
             )
         };
         assert!(request_record_length > 0);
+        assert_eq!(server_state._inner.buffered_request_bytes, 0);
         assert!(
             request_record[..request_record_length as usize]
                 .windows(b"/items?q=1".len())

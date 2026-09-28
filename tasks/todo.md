@@ -138,6 +138,7 @@
 - The independent aioquic client verified the initial maximum GOAWAY, the final last-accepted-stream GOAWAY, `H3_REQUEST_REJECTED` for a later stream, and `H3_NO_ERROR` connection close.
 - QUIC provider suite passed 4/4; HTTP/3 client, HTTP Server 27/27, HTTP/2 97/97, HTTPS client, HTTPS example build, Python syntax, Rust formatting, and `git diff --check` passed on Linux x86_64.
 - Follow-up `/review` fixes: model shutdown as ordered states, retry the initial GOAWAY before the final GOAWAY, continue closing other connections when one close fails, skip already draining connections, and report a null shutdown-complete handle as false. Keep `H3_REQUEST_REJECTED` at RFC 9114 value `0x10b`.
+- The HTTP/3 provider caps active and queued request bodies at 64 MiB total. Its five Rust provider tests pass on macOS arm64; the Mojo endpoint fixture still crashes in this platform's Mojo runtime.
 
 ## HTTP protocol documentation correction slice
 
@@ -150,6 +151,13 @@
 - [x] Add Linux x86_64 and aarch64 CI coverage for the optional HPACK provider and independent TLS HTTP/2 client.
 - [x] Parse the workflow YAML, run the configured HTTP/2 tasks locally, and inspect the diff.
 - [x] Commit this CI slice locally.
+
+## HTTP/3 aggregate request memory slice
+
+- [x] Add a provider test for aggregate request-body admission and consumption accounting.
+- [x] Account request body bytes across QUIC streams until Mojo consumes each completed request.
+- [x] Release budget on stream reset, body rejection, request consumption, and connection reaping.
+- [x] Run provider tests, HTTP/3 integration where supported, formatting, and diff checks; review before publishing.
 
 ## QUIC transport review
 
