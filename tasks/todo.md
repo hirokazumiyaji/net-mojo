@@ -22,7 +22,6 @@
 - The connection-input slice passed 97 HTTP/2 tests on Linux x86_64 and aarch64.
 - TLS server bootstrap over ALPN `h2` and HTTP/1.1 passed the TLS suite on Linux x86_64 and aarch64.
 - HTTP/1.1 server suite passed 27 tests, and HTTP/2 suite passed 97 tests on Linux x86_64 and aarch64 after connection routing.
-- `/review` and PR publication remain pending the user's answer about uploading the code diff to the configured external reviewer.
 - The QUIC packet handshake test passed on Linux x86_64. `quic-suite` now includes this Rust test alongside the C and Mojo provider smoke tests.
 - HTTP/2 requests now reach the shared handler and return encoded responses; the TLS integration client verifies request DATA, receive WINDOW_UPDATE frames, response HEADERS/DATA, and a zero peer stream window on x86_64 and aarch64.
 - Flow-control slice passed TLS, HPACK (21/21), HTTP/2 (97/97), HTTP server (27/27), Python syntax, and diff checks on Linux x86_64 and aarch64.
@@ -119,7 +118,7 @@
 ## HTTP/3 server graceful shutdown integration slice
 
 - [x] Expose provider shutdown through Mojo and notify it when Server shutdown starts.
-- [x] Keep the UDP endpoint registered and drive QUIC during the configured grace period; remove it at the grace deadline.
+- [x] Keep the UDP endpoint registered through the configured grace period and continue QUIC close draining until connections close or the drain cap expires.
 - [x] Verify GOAWAY delivery after accepted responses complete with an independent client.
 - [x] Verify the final GOAWAY boundary, post-GOAWAY rejection, and graceful QUIC close with an independent client.
 - [x] Run the QUIC provider, independent HTTP/3 client, and HTTP Server suites; inspect the diff.
@@ -138,6 +137,7 @@
 
 - The independent aioquic client verified the initial maximum GOAWAY, the final last-accepted-stream GOAWAY, `H3_REQUEST_REJECTED` for a later stream, and `H3_NO_ERROR` connection close.
 - QUIC provider suite passed 4/4; HTTP/3 client, HTTP Server 27/27, HTTP/2 97/97, HTTPS client, HTTPS example build, Python syntax, Rust formatting, and `git diff --check` passed on Linux x86_64.
+- Follow-up `/review` fixes: model shutdown as ordered states, retry the initial GOAWAY before the final GOAWAY, continue closing other connections when one close fails, skip already draining connections, and report a null shutdown-complete handle as false. Keep `H3_REQUEST_REJECTED` at RFC 9114 value `0x10b`.
 
 ## HTTP protocol documentation correction slice
 
@@ -203,7 +203,6 @@
 - quiche 0.29.3 is pinned in the Cargo lockfile and compiled with BoringSSL on Linux x86_64 and aarch64. Native C config and Mojo dynamic-library smoke tests passed on both targets.
 - The optional `http3` Pixi feature owns the Rust/CMake/C++/libclang build dependencies; the existing default and HTTP/2 environments do not load them.
 - macOS provider compilation and execution have passed through C smoke tests. Native Mojo execution crashes even on a one-line `print`, so Mojo verification for macOS remains outstanding.
-- `/review` and PR publication remain pending explicit authorization to upload the code diff to the configured external reviewer.
 
 ## HTTP/3 concurrent request streams plan
 
@@ -215,7 +214,6 @@
 
 - The independent client completed two HTTP/3 requests concurrently over one QUIC connection; both received status 200 and `handled:data` on their respective streams.
 - `quic-rust-test` passed all three provider tests; `cargo fmt` and `git diff --check` passed.
-- `/review` and PR publication remain pending the user's response about external diff upload.
 
 ## HTTP/3 server design notes
 
@@ -259,7 +257,6 @@
 - The first test run failed as expected because the HTTP/3 adapter dropped request trailers; after the adapter change, both concurrent responses passed and the first included the handler's `:done` suffix.
 - `quic-suite` passed the C provider smoke test, Mojo FFI test, and all three Rust provider tests; `test-http-server` passed 27/27.
 - `cargo fmt` and `git diff --check` passed.
-- `/review` and PR publication remain pending the user's response about external diff upload.
 
 ## Current slice
 
@@ -299,8 +296,7 @@
 
 - `quic-suite` passed on Linux x86_64, including an HTTP/3 POST over localhost UDP, duplicate request headers, request body extraction, and a complete 200 response body.
 - `test-http-server` passed 27/27 on Linux x86_64; `quic-mojo-test` compiled and passed after applying the HTTP/3 response limits.
-- A valid HTTP/3 request has not yet been exercised through the Mojo `Server` and a user `Handler`; that end-to-end test remains part of the overall integration work.
-- `/review` and PR publication remain pending explicit authorization to upload the code diff to the configured external reviewer.
+- HTTP/3 requests have since been exercised through the Mojo `Server` and shared handler in the concurrent request and graceful shutdown slices above.
 
 ## HTTP/2 stream send credit slice
 
@@ -343,4 +339,3 @@
 - The independent quiche client completed TLS/ALPN negotiation, sent an HTTP/3 POST over localhost UDP, and received `handled:data` from the shared Mojo `Handler`.
 - `quic-suite` passed, including the C provider smoke test, Mojo FFI test, and all three Rust provider tests.
 - `cargo fmt` and `git diff --check` passed.
-- `/review` and PR publication remain pending explicit authorization to upload the code diff to the configured external reviewer.

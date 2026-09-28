@@ -146,7 +146,7 @@ pub unsafe extern "C" fn net_quic_server_close_connections(server: *mut NetQuicS
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn net_quic_server_shutdown_complete(server: *const NetQuicServer) -> i32 {
     if server.is_null() {
-        return -1;
+        return 0;
     }
     i32::from(unsafe { &*server }._inner.shutdown_complete())
 }
@@ -381,9 +381,15 @@ pub struct QuicServer {
     next_request_id: u64,
     random: File,
     max_connections: usize,
-    draining: bool,
-    finishing: bool,
-    closing: bool,
+    shutdown: ShutdownState,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum ShutdownState {
+    Active,
+    Draining,
+    Finishing,
+    Closing,
 }
 
 struct QuicConnection {
@@ -398,6 +404,8 @@ struct QuicConnection {
 }
 
 const MAX_HTTP3_REQUEST_STREAM_ID: u64 = (1 << 62) - 4;
+// RFC 9114 assigns 0x10b to H3_REQUEST_REJECTED.
+const H3_REQUEST_REJECTED: u64 = 0x10b;
 
 struct PendingResponse {
     request_id: u64,
@@ -470,20 +478,22 @@ impl QuicServer {
             next_request_id: 1,
             random: File::open("/dev/urandom")?,
             max_connections: 10_000,
-            draining: false,
-            finishing: false,
-            closing: false,
+            shutdown: ShutdownState::Active,
         })
     }
 
     pub fn begin_shutdown(&mut self) -> Result<(), QuicServerError> {
-        self.draining = true;
+        if self.shutdown < ShutdownState::Draining {
+            self.shutdown = ShutdownState::Draining;
+        }
         self.drive_goaways()
     }
 
     pub fn finish_shutdown(&mut self) -> Result<(), QuicServerError> {
-        self.draining = true;
-        self.finishing = true;
+        if self.shutdown < ShutdownState::Finishing {
+            self.shutdown = ShutdownState::Finishing;
+        }
+        self.drive_goaways()?;
         self.drive_final_goaways()
     }
 
@@ -509,13 +519,22 @@ impl QuicServer {
     }
 
     pub fn close_connections(&mut self) -> Result<(), QuicServerError> {
-        self.closing = true;
+        if self.shutdown < ShutdownState::Finishing {
+            return Err(quiche::Error::Done.into());
+        }
+        self.drive_goaways()?;
+        self.drive_final_goaways()?;
+        self.shutdown = ShutdownState::Closing;
+        let mut first_error = None;
         for connection in self.connections.values_mut() {
-            if !connection.transport.is_closed() {
-                connection.transport.close(true, 0x100, b"")?;
+            if connection.transport.is_closed() || connection.transport.is_draining() {
+                continue;
+            }
+            if let Err(error) = connection.transport.close(true, 0x100, b"") {
+                first_error.get_or_insert(error);
             }
         }
-        Ok(())
+        first_error.map_or(Ok(()), |error| Err(error.into()))
     }
 
     pub fn shutdown_complete(&self) -> bool {
@@ -533,7 +552,7 @@ impl QuicServer {
         let key = match self.routes.get(&destination_id) {
             Some(key) => key.clone(),
             None if header.ty == quiche::Type::Initial => {
-                if self.draining {
+                if self.shutdown >= ShutdownState::Draining {
                     return Err(quiche::Error::Done.into());
                 }
                 if self.connections.len() >= self.max_connections {
@@ -613,7 +632,7 @@ impl QuicServer {
     }
 
     fn drive_goaways(&mut self) -> Result<(), QuicServerError> {
-        if !self.draining {
+        if self.shutdown < ShutdownState::Draining {
             return Ok(());
         }
         for connection in self.connections.values_mut() {
@@ -673,12 +692,12 @@ impl QuicServer {
                         let _ = connection.transport.stream_shutdown(
                             stream_id,
                             quiche::Shutdown::Read,
-                            0x10b,
+                            H3_REQUEST_REJECTED,
                         );
                         let _ = connection.transport.stream_shutdown(
                             stream_id,
                             quiche::Shutdown::Write,
-                            0x10b,
+                            H3_REQUEST_REJECTED,
                         );
                         continue;
                     }
@@ -978,9 +997,9 @@ impl QuicServer {
         &mut self,
         packet: &mut [u8],
     ) -> Result<Option<(usize, SendInfo)>, QuicServerError> {
-        if !self.closing {
+        if self.shutdown < ShutdownState::Closing {
             self.drive_goaways()?;
-            if self.finishing {
+            if self.shutdown >= ShutdownState::Finishing {
                 self.drive_final_goaways()?;
             }
             self.drive_responses()?;
@@ -1200,6 +1219,14 @@ mod tests {
         }));
         let server = unsafe { net_quic_server_new(config) };
         assert!(!server.is_null());
+        assert_eq!(
+            unsafe { super::net_quic_server_shutdown_complete(std::ptr::null()) },
+            0
+        );
+        assert_eq!(
+            unsafe { super::net_quic_server_close_connections(server) },
+            -1
+        );
         let mut packet = [0; 65535];
         let mut dropped_server_packet = false;
 
