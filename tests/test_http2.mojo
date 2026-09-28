@@ -14,6 +14,7 @@ from net.http._http2.response_headers import encode_http2_response_headers
 from net.http.response import ResponseWriter
 from net.http._http2.bootstrap import Http2ServerBootstrap
 from net.http._http2.connection_bootstrap import Http2ConnectionBootstrap
+from net.http._http2.connection_input import Http2ServerConnectionInput
 from net.http._http2.frame_dispatcher import Http2FrameDispatcher
 from net.http._http2.frame_reader import Http2FrameReader
 from net.http._http2.settings_state import (
@@ -543,6 +544,60 @@ def test_http2_frame_reader_rejects_oversized_length_from_header() raises:
     var result = reader.consume(Span(oversized))
     assert_true(result.is_error())
     assert_equal(result.consumed, 9)
+
+
+def test_http2_connection_input_bootstraps_then_acknowledges_coalesced_ping() raises:
+    var input = Http2ServerConnectionInput()
+    var wire = List[Byte]()
+    var preface = "PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n".as_bytes()
+    for i in range(len(preface)):
+        wire.append(preface[i])
+    var settings_payload: List[Byte] = List[Byte]()
+    var settings = _frame(4, 0, 0, settings_payload)
+    var ping_payload: List[Byte] = [Byte(1), Byte(2), Byte(3), Byte(4), Byte(5), Byte(6), Byte(7), Byte(8)]
+    var ping = _frame(6, 0, 0, ping_payload)
+    for i in range(len(settings)):
+        wire.append(settings[i])
+    for i in range(len(ping)):
+        wire.append(ping[i])
+
+    var bootstrap = input.consume(Span(wire))
+    assert_true(bootstrap.is_output())
+    assert_equal(bootstrap.output[3], Byte(4))
+    assert_equal(bootstrap.output[12], Byte(4))
+    assert_equal(bootstrap.consumed, len(wire) - len(ping))
+
+    var ping_result = input.consume(Span(wire)[bootstrap.consumed:])
+    assert_true(ping_result.is_output())
+    assert_equal(ping_result.output[4], Byte(1))
+    assert_equal(ping_result.output[16], Byte(8))
+    assert_equal(ping_result.consumed, len(ping))
+    assert_true(not ping_result.is_goaway())
+
+
+def test_http2_connection_input_returns_stream_frame_payload() raises:
+    var input = Http2ServerConnectionInput()
+    var headers: List[Byte] = [Byte(0x82)]
+    var header_frame = _frame(1, 5, 1, headers)
+    var wire = List[Byte]()
+    var preface = "PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n".as_bytes()
+    for i in range(len(preface)):
+        wire.append(preface[i])
+    var empty: List[Byte] = List[Byte]()
+    var settings = _frame(4, 0, 0, empty)
+    for i in range(len(settings)):
+        wire.append(settings[i])
+    for i in range(len(header_frame)):
+        wire.append(header_frame[i])
+
+    var bootstrap = input.consume(Span(wire))
+    assert_true(bootstrap.is_output())
+    var stream = input.consume(Span(wire)[bootstrap.consumed:])
+    assert_true(stream.is_frame())
+    assert_equal(stream.frame_type, Byte(1))
+    assert_equal(stream.flags, Byte(5))
+    assert_equal(stream.stream_id, UInt32(1))
+    assert_equal(stream.payload[0], Byte(0x82))
 
 def _append_hpack_field(mut wire: List[Byte], name: String, value: String):
     var name_bytes = name.as_bytes()

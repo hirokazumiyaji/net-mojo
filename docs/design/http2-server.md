@@ -33,6 +33,10 @@ required in connection state.
 payload and exact consumed byte count, and leaves coalesced following frames
 with the caller.
 
+`Http2ServerConnectionInput` composes preface/SETTINGS bootstrap, the frame
+reader, and control dispatcher. It emits protocol output, returns stream frames
+for the request layer, and preserves exact input consumption across calls.
+
 The SETTINGS payload codec reads and writes six-byte identifier/value entries
 in network byte order. Parsing rejects a trailing partial entry and preserves
 unknown identifiers unchanged; connection-level validation, duplicate handling,
