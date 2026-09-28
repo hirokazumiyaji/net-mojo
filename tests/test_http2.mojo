@@ -3,6 +3,7 @@ from net.http.request import HttpVersion
 
 from net.http._http2.frame import FrameParseResult, parse_frame
 from net.http._http2.frame_encoder import encode_frame
+from net.http._http2.data_frame import parse_data_frame
 from net.http._http2.bootstrap import Http2ServerBootstrap
 from net.http._http2.settings_state import Http2PeerSettings
 from net.http._http2.stream_state import Http2StreamState
@@ -182,6 +183,44 @@ def test_http2_continuation_sequence_rejects_push_promise_from_client() raises:
     var sequence = Http2ContinuationSequence()
     var push = FrameParseResult.complete(Byte(5), Byte(4), UInt32(1), 4)
     assert_false(sequence.accept(push))
+
+
+def test_http2_data_frame_extracts_payload_and_end_stream() raises:
+    var payload: List[Byte] = [Byte(10), Byte(11), Byte(12)]
+    var frame = FrameParseResult.complete(Byte(0), Byte(1), UInt32(1), 3)
+    var parsed = parse_data_frame(frame, Span(payload))
+    assert_true(parsed.is_valid())
+    assert_equal(parsed.data_offset, 0)
+    assert_equal(parsed.data_length, 3)
+    assert_true(parsed.end_stream)
+
+    var padded_payload: List[Byte] = [Byte(2), Byte(10), Byte(11), Byte(0), Byte(0)]
+    var padded = FrameParseResult.complete(Byte(0), Byte(9), UInt32(1), 5)
+    parsed = parse_data_frame(padded, Span(padded_payload))
+    assert_true(parsed.is_valid())
+    assert_equal(parsed.data_offset, 1)
+    assert_equal(parsed.data_length, 2)
+    assert_true(parsed.end_stream)
+
+
+def test_http2_data_frame_rejects_invalid_padding_and_shape() raises:
+    var empty: List[Byte] = []
+    var padded_empty = FrameParseResult.complete(Byte(0), Byte(8), UInt32(1), 0)
+    assert_true(parse_data_frame(padded_empty, Span(empty)).is_error())
+
+    var invalid_padding_payload: List[Byte] = [Byte(3), Byte(10)]
+    var invalid_padding = FrameParseResult.complete(
+        Byte(0), Byte(8), UInt32(1), 2
+    )
+    assert_true(
+        parse_data_frame(invalid_padding, Span(invalid_padding_payload)).is_error()
+    )
+
+    var payload: List[Byte] = [Byte(1)]
+    var connection = FrameParseResult.complete(Byte(0), Byte(0), UInt32(0), 1)
+    assert_true(parse_data_frame(connection, Span(payload)).is_error())
+    var mismatched = FrameParseResult.complete(Byte(0), Byte(0), UInt32(1), 2)
+    assert_true(parse_data_frame(mismatched, Span(payload)).is_error())
 
 
 def test_http2_window_update_parses_connection_and_stream_credit() raises:
