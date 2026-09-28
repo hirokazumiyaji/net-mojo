@@ -46,6 +46,11 @@ payload length matches the supplied bytes, and rejects a non-empty ACK frame.
 Unknown flag bits are ignored. It leaves setting-value rules and connection
 sequencing to the connection state machine.
 
+The bootstrap state waits for the full client preface, emits one empty server
+SETTINGS frame, then accepts the client's initial non-ACK SETTINGS frame and
+returns an empty SETTINGS ACK. The caller retains and extends preface bytes
+between incremental parse calls. Stream processing begins in a later layer.
+
 ## Follow-up connection work
 
 The connection layer will require the client connection preface, send server
