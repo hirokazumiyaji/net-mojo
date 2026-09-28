@@ -15,6 +15,7 @@ from net.http.response import ResponseWriter
 from net.http._http2.bootstrap import Http2ServerBootstrap
 from net.http._http2.connection_bootstrap import Http2ConnectionBootstrap
 from net.http._http2.frame_dispatcher import Http2FrameDispatcher
+from net.http._http2.frame_reader import Http2FrameReader
 from net.http._http2.settings_state import (
     Http2PeerSettings,
     Http2PeerSettingsSnapshot,
@@ -503,6 +504,45 @@ def test_http2_dispatcher_returns_window_reset_and_goaway_events() raises:
     assert_true(result.is_goaway())
     assert_equal(result.stream_id, UInt32(3))
     assert_equal(result.value, UInt32(2))
+
+
+def test_http2_frame_reader_retains_fragmented_frame_and_leaves_next() raises:
+    var reader = Http2FrameReader(16384)
+    var payload: List[Byte] = [Byte(4), Byte(3), Byte(2), Byte(1)]
+    var first = _frame(8, 0, 3, payload)
+    var partial = reader.consume(Span(first)[0:5])
+    assert_true(partial.is_need_more())
+    assert_equal(partial.consumed, 5)
+
+    var trailing_payload: List[Byte] = [
+        Byte(9), Byte(8), Byte(7), Byte(6), Byte(5), Byte(4), Byte(3), Byte(2)
+    ]
+    var trailing = _frame(6, 0, 0, trailing_payload)
+    var combined = List[Byte]()
+    for i in range(5, len(first)):
+        combined.append(first[i])
+    for i in range(len(trailing)):
+        combined.append(trailing[i])
+    var result = reader.consume(Span(combined))
+    assert_true(result.is_frame())
+    assert_equal(result.consumed, len(first) - 5)
+    assert_equal(result.frame_type, Byte(8))
+    assert_equal(result.stream_id, UInt32(3))
+    assert_equal(result.payload[0], Byte(4))
+    var next = reader.consume(Span(combined)[result.consumed:])
+    assert_true(next.is_frame())
+    assert_equal(next.frame_type, Byte(6))
+
+
+def test_http2_frame_reader_rejects_oversized_length_from_header() raises:
+    var reader = Http2FrameReader(16384)
+    var oversized: List[Byte] = [
+        Byte(0), Byte(0x40), Byte(1), Byte(0), Byte(0),
+        Byte(0), Byte(0), Byte(0), Byte(1),
+    ]
+    var result = reader.consume(Span(oversized))
+    assert_true(result.is_error())
+    assert_equal(result.consumed, 9)
 
 def _append_hpack_field(mut wire: List[Byte], name: String, value: String):
     var name_bytes = name.as_bytes()

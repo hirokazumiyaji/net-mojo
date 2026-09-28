@@ -29,6 +29,10 @@ The separate client preface parser compares incrementally against the fixed
 following frame bytes with the caller. It does not enforce when the preface is
 required in connection state.
 
+`Http2FrameReader` retains partial bytes for one bounded frame, returns an owned
+payload and exact consumed byte count, and leaves coalesced following frames
+with the caller.
+
 The SETTINGS payload codec reads and writes six-byte identifier/value entries
 in network byte order. Parsing rejects a trailing partial entry and preserves
 unknown identifiers unchanged; connection-level validation, duplicate handling,
