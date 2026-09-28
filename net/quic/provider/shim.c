@@ -30,6 +30,18 @@ int32_t net_quic_begin_shutdown(struct NetQuicServer *server) {
     return net_quic_server_begin_shutdown(server);
 }
 
+int32_t net_quic_finish_shutdown(struct NetQuicServer *server) {
+    return net_quic_server_finish_shutdown(server);
+}
+
+int32_t net_quic_close_connections(struct NetQuicServer *server) {
+    return net_quic_server_close_connections(server);
+}
+
+int32_t net_quic_shutdown_complete(const struct NetQuicServer *server) {
+    return net_quic_server_shutdown_complete(server);
+}
+
 int32_t net_quic_receive(
     struct NetQuicServer *server, uint8_t *packet, size_t packet_length,
     const char *local_address, const char *remote_address) {

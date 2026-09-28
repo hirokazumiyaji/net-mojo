@@ -111,9 +111,7 @@ pub unsafe extern "C" fn net_quic_server_set_connection_limit(
 }
 
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn net_quic_server_begin_shutdown(
-    server: *mut NetQuicServer,
-) -> i32 {
+pub unsafe extern "C" fn net_quic_server_begin_shutdown(server: *mut NetQuicServer) -> i32 {
     if server.is_null() {
         return -1;
     }
@@ -121,6 +119,36 @@ pub unsafe extern "C" fn net_quic_server_begin_shutdown(
         Ok(()) => 1,
         Err(_) => -1,
     }
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn net_quic_server_finish_shutdown(server: *mut NetQuicServer) -> i32 {
+    if server.is_null() {
+        return -1;
+    }
+    match unsafe { &mut *server }._inner.finish_shutdown() {
+        Ok(()) => 1,
+        Err(_) => -1,
+    }
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn net_quic_server_close_connections(server: *mut NetQuicServer) -> i32 {
+    if server.is_null() {
+        return -1;
+    }
+    match unsafe { &mut *server }._inner.close_connections() {
+        Ok(()) => 1,
+        Err(_) => -1,
+    }
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn net_quic_server_shutdown_complete(server: *const NetQuicServer) -> i32 {
+    if server.is_null() {
+        return -1;
+    }
+    i32::from(unsafe { &*server }._inner.shutdown_complete())
 }
 
 unsafe fn socket_address(address: *const c_char) -> Option<SocketAddr> {
@@ -354,6 +382,8 @@ pub struct QuicServer {
     random: File,
     max_connections: usize,
     draining: bool,
+    finishing: bool,
+    closing: bool,
 }
 
 struct QuicConnection {
@@ -362,6 +392,9 @@ struct QuicConnection {
     requests: HashMap<u64, PendingRequest>,
     responses: HashMap<u64, PendingResponse>,
     goaway_sent: bool,
+    final_goaway_sent: bool,
+    last_request_stream_id: Option<u64>,
+    final_goaway_last_stream_id: Option<u64>,
 }
 
 const MAX_HTTP3_REQUEST_STREAM_ID: u64 = (1 << 62) - 4;
@@ -438,12 +471,55 @@ impl QuicServer {
             random: File::open("/dev/urandom")?,
             max_connections: 10_000,
             draining: false,
+            finishing: false,
+            closing: false,
         })
     }
 
     pub fn begin_shutdown(&mut self) -> Result<(), QuicServerError> {
         self.draining = true;
         self.drive_goaways()
+    }
+
+    pub fn finish_shutdown(&mut self) -> Result<(), QuicServerError> {
+        self.draining = true;
+        self.finishing = true;
+        self.drive_final_goaways()
+    }
+
+    fn drive_final_goaways(&mut self) -> Result<(), QuicServerError> {
+        for connection in self.connections.values_mut() {
+            if connection.final_goaway_sent {
+                continue;
+            }
+            let Some(http3) = connection.http3.as_mut() else {
+                continue;
+            };
+            let last_stream_id = connection.last_request_stream_id.unwrap_or(0);
+            match http3.send_goaway(&mut connection.transport, last_stream_id) {
+                Ok(()) => {
+                    connection.final_goaway_sent = true;
+                    connection.final_goaway_last_stream_id = Some(last_stream_id);
+                }
+                Err(quiche::h3::Error::StreamBlocked | quiche::h3::Error::Done) => (),
+                Err(error) => return Err(error.into()),
+            }
+        }
+        Ok(())
+    }
+
+    pub fn close_connections(&mut self) -> Result<(), QuicServerError> {
+        self.closing = true;
+        for connection in self.connections.values_mut() {
+            if !connection.transport.is_closed() {
+                connection.transport.close(true, 0x100, b"")?;
+            }
+        }
+        Ok(())
+    }
+
+    pub fn shutdown_complete(&self) -> bool {
+        self.connections.is_empty()
     }
 
     pub fn recv_datagram(
@@ -466,13 +542,7 @@ impl QuicServer {
                 let mut source_id = [0; 16];
                 self.random.read_exact(&mut source_id)?;
                 let source_id = ConnectionId::from_ref(&source_id);
-                let connection = quiche::accept(
-                    &source_id,
-                    None,
-                    local,
-                    remote,
-                    &mut self.config,
-                )?;
+                let connection = quiche::accept(&source_id, None, local, remote, &mut self.config)?;
                 let key = source_id.as_ref().to_vec();
                 self.routes.insert(destination_id, key.clone());
                 self.routes.insert(key.clone(), key.clone());
@@ -484,6 +554,9 @@ impl QuicServer {
                         requests: HashMap::new(),
                         responses: HashMap::new(),
                         goaway_sent: false,
+                        final_goaway_sent: false,
+                        last_request_stream_id: None,
+                        final_goaway_last_stream_id: None,
                     },
                 );
                 key
@@ -550,10 +623,7 @@ impl QuicServer {
             let Some(http3) = connection.http3.as_mut() else {
                 continue;
             };
-            match http3.send_goaway(
-                &mut connection.transport,
-                MAX_HTTP3_REQUEST_STREAM_ID,
-            ) {
+            match http3.send_goaway(&mut connection.transport, MAX_HTTP3_REQUEST_STREAM_ID) {
                 Ok(()) => connection.goaway_sent = true,
                 Err(quiche::h3::Error::StreamBlocked | quiche::h3::Error::Done) => (),
                 Err(error) => return Err(error.into()),
@@ -596,6 +666,22 @@ impl QuicServer {
         loop {
             match http3.poll(&mut connection.transport) {
                 Ok((stream_id, quiche::h3::Event::Headers { list, .. })) => {
+                    if connection
+                        .final_goaway_last_stream_id
+                        .is_some_and(|last| stream_id > last)
+                    {
+                        let _ = connection.transport.stream_shutdown(
+                            stream_id,
+                            quiche::Shutdown::Read,
+                            0x10b,
+                        );
+                        let _ = connection.transport.stream_shutdown(
+                            stream_id,
+                            quiche::Shutdown::Write,
+                            0x10b,
+                        );
+                        continue;
+                    }
                     if let Some(request) = connection.requests.get_mut(&stream_id) {
                         let mut invalid = false;
                         for header in list {
@@ -728,9 +814,20 @@ impl QuicServer {
                         );
                         continue;
                     }
+                    connection.last_request_stream_id = Some(
+                        connection
+                            .last_request_stream_id
+                            .map_or(stream_id, |last| last.max(stream_id)),
+                    );
                     connection.requests.insert(stream_id, request);
                 }
                 Ok((stream_id, quiche::h3::Event::Data)) => {
+                    if connection
+                        .final_goaway_last_stream_id
+                        .is_some_and(|last| stream_id > last)
+                    {
+                        continue;
+                    }
                     let Some(request) = connection.requests.get_mut(&stream_id) else {
                         return Err(quiche::h3::Error::FrameUnexpected.into());
                     };
@@ -881,8 +978,13 @@ impl QuicServer {
         &mut self,
         packet: &mut [u8],
     ) -> Result<Option<(usize, SendInfo)>, QuicServerError> {
-        self.drive_goaways()?;
-        self.drive_responses()?;
+        if !self.closing {
+            self.drive_goaways()?;
+            if self.finishing {
+                self.drive_final_goaways()?;
+            }
+            self.drive_responses()?;
+        }
         for connection in self.connections.values_mut() {
             match connection.transport.send(packet) {
                 Ok((length, info)) => return Ok(Some((length, info))),
@@ -1532,7 +1634,11 @@ mod tests {
             if timeout == 0 {
                 unsafe { super::net_quic_server_on_timeout(server) };
             }
-            if !unsafe { &*server }._inner.connections.contains_key(&connection_key) {
+            if !unsafe { &*server }
+                ._inner
+                .connections
+                .contains_key(&connection_key)
+            {
                 break;
             }
             std::thread::sleep(Duration::from_millis(5));

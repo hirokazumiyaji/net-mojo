@@ -89,6 +89,8 @@ from net.http._http2.response_encoder import (
 
 comptime _TICK_POLL_CAP_MS: Int = 100
 comptime _SHUTDOWN_QUIET_MS: Int = 10
+comptime _QUIC_GOAWAY_DELAY_NS: Int = 1_000_000_000
+comptime _QUIC_CLOSE_DRAIN_NS: Int = 3_000_000_000
 
 
 @fieldwise_init
@@ -145,6 +147,8 @@ struct Server(Movable):
     var _active_conns: Int
     var _budget: BufferBudget
     var _shutdown_at: Int
+    var _quic_finish_at: Int
+    var _quic_close_at: Int
     var _tick_date: String
     # Phase 4: no per-tick full-table scans. Fairness counters reset lazily
     # via _tick_seen, capped pipelines re-drive via _urgent, and deadlines
@@ -177,6 +181,8 @@ struct Server(Movable):
         self._active_conns = 0
         self._budget = BufferBudget(budget_total)
         self._shutdown_at = NO_DEADLINE
+        self._quic_finish_at = NO_DEADLINE
+        self._quic_close_at = NO_DEADLINE
         self._tick_date = String("")
         self._tick_id = 0
         self._tick_seen = List[Int]()
@@ -292,6 +298,7 @@ struct Server(Movable):
         now = now_ns()
         self._drive_quic()
         self._dispatch_quic_requests(handler)
+        self._finish_quic_shutdown_if_due(now)
         self._flush_quic()
         if self._listener:
             for i in range(len(events)):
@@ -550,13 +557,28 @@ struct Server(Movable):
         return top^
 
     def _expire_deadlines(mut self, now: Int) raises NetError:
+        if self._quic_close_at != NO_DEADLINE:
+            if (
+                not self._quic_endpoint
+                or self._quic_endpoint.value().shutdown_complete()
+                or now >= self._quic_close_at
+            ):
+                self._drop_quic_endpoint()
+                self._quic_close_at = NO_DEADLINE
+            return
         if self._shutdown_at != NO_DEADLINE and now >= self._shutdown_at:
             # Shutdown expiry is global and runs once: close everything.
             # O(N) here is fine; it is not a per-tick hot path.
             for i in range(len(self._conns)):
                 if self._conns[i].active:
                     self._close_conn(i)
-            self._drop_quic_endpoint()
+            self._finish_quic_shutdown()
+            if self._quic_endpoint:
+                self._quic_endpoint.value().close_connections()
+                self._flush_quic()
+                self._quic_close_at = now + _QUIC_CLOSE_DRAIN_NS
+            else:
+                self._drop_quic_endpoint()
             return
         while len(self._deadline_heap) > 0:
             var top = self._deadline_heap[0]
@@ -594,6 +616,11 @@ struct Server(Movable):
                 self._drop_listener()
                 if self._quic_endpoint:
                     self._quic_endpoint.value().begin_shutdown()
+                    var delay = _QUIC_GOAWAY_DELAY_NS
+                    var half_grace = Int(self.config.shutdown_grace._value) // 2
+                    if half_grace < delay:
+                        delay = half_grace
+                    self._quic_finish_at = now + delay
                 for i in range(len(self._conns)):
                     if (
                         not self._conns[i].active
@@ -629,6 +656,18 @@ struct Server(Movable):
                     ):
                         self._conns[i].idle_at = quiet
                         self._arm_deadline(i)
+
+    def _finish_quic_shutdown_if_due(mut self, now: Int) raises NetError:
+        if self._quic_finish_at != NO_DEADLINE and now >= self._quic_finish_at:
+            self._finish_quic_shutdown()
+
+    def _finish_quic_shutdown(mut self) raises NetError:
+        if self._quic_finish_at == NO_DEADLINE:
+            return
+        if self._quic_endpoint:
+            self._quic_endpoint.value().finish_shutdown()
+            self._flush_quic()
+        self._quic_finish_at = NO_DEADLINE
 
     def _drop_listener(mut self):
         if self._listener:
@@ -2147,12 +2186,17 @@ struct Server(Movable):
                 var quic_ms = Int((quic_timeout + 999) // 1000)
                 if quic_ms < best:
                     best = quic_ms
-        if self._shutdown_at != NO_DEADLINE:
+        if (
+            self._shutdown_at != NO_DEADLINE
+            and self._quic_close_at == NO_DEADLINE
+        ):
             var left_ms = (self._shutdown_at - now) // 1_000_000
             if left_ms < 0:
                 left_ms = 0
             if left_ms < best:
                 best = Int(left_ms)
+        if self._quic_close_at != NO_DEADLINE:
+            best = _sooner(best, self._quic_close_at, now)
         # Heap peek only: no scan over idle connections. Stale entries are
         # skipped without popping so a burst of invalidations never costs
         # more than the live minimum.

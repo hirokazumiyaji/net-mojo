@@ -9,20 +9,26 @@ from aioquic.buffer import Buffer
 from aioquic.h3.connection import FrameType, H3_ALPN, H3Connection
 from aioquic.h3.events import DataReceived, HeadersReceived
 from aioquic.quic.configuration import QuicConfiguration
-from aioquic.quic.events import ProtocolNegotiated
+from aioquic.quic.events import ConnectionTerminated, ProtocolNegotiated, StreamReset
 from aioquic.quic.packet import QuicProtocolVersion
 
 
 class Http3ClientProtocol(QuicConnectionProtocol):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        self.http = _Http3Connection(self._quic, self._loop.create_future())
+        self.http = _Http3Connection(self._quic)
         self.responses = {}
+        self.resets = {}
+        self.terminated = self._loop.create_future()
         self.alpn = None
 
     def quic_event_received(self, event):
         if isinstance(event, ProtocolNegotiated):
             self.alpn = event.alpn_protocol
+        if isinstance(event, ConnectionTerminated) and not self.terminated.done():
+            self.terminated.set_result(event.error_code)
+        if isinstance(event, StreamReset) and event.stream_id in self.resets:
+            self.resets[event.stream_id].set_result(event.error_code)
         for http_event in self.http.handle_event(event):
             response = self.responses.get(http_event.stream_id)
             if response is None:
@@ -57,7 +63,9 @@ class Http3ClientProtocol(QuicConnectionProtocol):
             )
         self.transmit()
         try:
-            return await asyncio.wait_for(future, timeout=10)
+            result = await asyncio.wait_for(future, timeout=10)
+            result["stream_id"] = stream_id
+            return result
         finally:
             self.responses.pop(stream_id, None)
 
@@ -80,16 +88,45 @@ class Http3ClientProtocol(QuicConnectionProtocol):
         self.transmit()
         await asyncio.sleep(0.05)
 
+    async def post_after_goaway(self):
+        stream_id = self._quic.get_next_available_stream_id()
+        future = self._loop.create_future()
+        self.resets[stream_id] = future
+        self.http.send_headers(
+            stream_id,
+            [
+                (b":method", b"POST"),
+                (b":scheme", b"https"),
+                (b":authority", b"localhost"),
+                (b":path", b"/echo?source=quic"),
+                (b"content-length", b"4"),
+            ],
+            end_stream=False,
+        )
+        self.http.send_data(stream_id, b"data", end_stream=True)
+        self.transmit()
+        try:
+            return await asyncio.wait_for(future, timeout=3)
+        finally:
+            self.resets.pop(stream_id, None)
+
 
 class _Http3Connection(H3Connection):
-    def __init__(self, quic, goaway):
+    def __init__(self, quic):
         super().__init__(quic)
-        self.goaway = goaway
+        self.goaways = []
+        self.goaway_event = asyncio.Event()
 
     def _handle_control_frame(self, frame_type, frame_data):
-        if frame_type == FrameType.GOAWAY and not self.goaway.done():
-            self.goaway.set_result(Buffer(data=frame_data).pull_uint_var())
+        if frame_type == FrameType.GOAWAY:
+            self.goaways.append(Buffer(data=frame_data).pull_uint_var())
+            self.goaway_event.set()
         super()._handle_control_frame(frame_type, frame_data)
+
+    async def wait_for_goaways(self, count):
+        while len(self.goaways) < count:
+            self.goaway_event.clear()
+            await self.goaway_event.wait()
 
 
 async def run_client(address):
@@ -119,9 +156,20 @@ async def run_client(address):
                 raise RuntimeError(f"unexpected HTTP/3 response headers: {response}")
             if bytes(response["body"]) != expected_body:
                 raise RuntimeError(f"unexpected HTTP/3 response body: {response}")
-        goaway_id = await asyncio.wait_for(client.http.goaway, timeout=5)
-        if goaway_id != (1 << 62) - 4:
-            raise RuntimeError(f"unexpected HTTP/3 GOAWAY ID: {goaway_id}")
+        await asyncio.wait_for(client.http.wait_for_goaways(2), timeout=5)
+        expected_goaways = [(1 << 62) - 4, second["stream_id"]]
+        if client.http.goaways != expected_goaways:
+            raise RuntimeError(
+                f"unexpected HTTP/3 GOAWAY IDs: {client.http.goaways}"
+            )
+        reset_code = await client.post_after_goaway()
+        if reset_code != 0x10B:
+            raise RuntimeError(
+                f"expected H3_REQUEST_REJECTED after GOAWAY, got {reset_code}"
+            )
+        close_code = await asyncio.wait_for(client.terminated, timeout=5)
+        if close_code != 0x100:
+            raise RuntimeError(f"expected H3_NO_ERROR close, got {close_code}")
 
 
 process = subprocess.Popen(

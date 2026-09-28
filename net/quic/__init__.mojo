@@ -108,6 +108,35 @@ struct QuicServer(Movable):
                 "QUIC provider could not begin shutdown",
             )
 
+    def finish_shutdown(mut self) raises NetError:
+        var result = self._library.call["net_quic_finish_shutdown", c_int](
+            self._server
+        )
+        if result != 1:
+            raise NetError(
+                NetErrorKind.invalid_state(),
+                "finish HTTP/3 shutdown",
+                None,
+                "QUIC provider could not finish shutdown",
+            )
+
+    def close_connections(mut self) raises NetError:
+        var result = self._library.call["net_quic_close_connections", c_int](
+            self._server
+        )
+        if result != 1:
+            raise NetError(
+                NetErrorKind.invalid_state(),
+                "close QUIC connections",
+                None,
+                "QUIC provider could not close connections",
+            )
+
+    def shutdown_complete(self) -> Bool:
+        return self._library.call["net_quic_shutdown_complete", c_int](
+            self._server
+        ) == 1
+
     def set_connection_limit(mut self, limit: Int) raises NetError:
         var result = self._library.call["net_quic_set_connection_limit", c_int](
             self._server, c_size_t(limit)
@@ -262,6 +291,15 @@ struct QuicUDPEndpoint(Movable):
 
     def begin_shutdown(mut self) raises NetError:
         self._server.begin_shutdown()
+
+    def finish_shutdown(mut self) raises NetError:
+        self._server.finish_shutdown()
+
+    def close_connections(mut self) raises NetError:
+        self._server.close_connections()
+
+    def shutdown_complete(self) -> Bool:
+        return self._server.shutdown_complete()
 
     def __init__(
         out self, var server: QuicServer, var socket: UDPConn

@@ -20,6 +20,9 @@ void net_quic_server_free(struct NetQuicServer *server);
 int32_t net_quic_server_set_connection_limit(
     struct NetQuicServer *server, size_t limit);
 int32_t net_quic_server_begin_shutdown(struct NetQuicServer *server);
+int32_t net_quic_server_finish_shutdown(struct NetQuicServer *server);
+int32_t net_quic_server_close_connections(struct NetQuicServer *server);
+int32_t net_quic_server_shutdown_complete(const struct NetQuicServer *server);
 int32_t net_quic_server_recv(
     struct NetQuicServer *server, uint8_t *packet, size_t packet_length,
     const char *local_address, const char *remote_address);
@@ -40,6 +43,9 @@ void net_quic_free(struct NetQuicServer *server);
 int32_t net_quic_set_connection_limit(
     struct NetQuicServer *server, size_t limit);
 int32_t net_quic_begin_shutdown(struct NetQuicServer *server);
+int32_t net_quic_finish_shutdown(struct NetQuicServer *server);
+int32_t net_quic_close_connections(struct NetQuicServer *server);
+int32_t net_quic_shutdown_complete(const struct NetQuicServer *server);
 int32_t net_quic_receive(
     struct NetQuicServer *server, uint8_t *packet, size_t packet_length,
     const char *local_address, const char *remote_address);

@@ -121,10 +121,23 @@
 - [x] Expose provider shutdown through Mojo and notify it when Server shutdown starts.
 - [x] Keep the UDP endpoint registered and drive QUIC during the configured grace period; remove it at the grace deadline.
 - [x] Verify GOAWAY delivery after accepted responses complete with an independent client.
-- [ ] Verify post-GOAWAY rejection and graceful QUIC close with an independent client.
+- [x] Verify the final GOAWAY boundary, post-GOAWAY rejection, and graceful QUIC close with an independent client.
 - [x] Run the QUIC provider, independent HTTP/3 client, and HTTP Server suites; inspect the diff.
 - [x] Run HTTP/2 and TLS suites.
-- [ ] Commit this server integration slice locally.
+- [x] Commit this server integration slice locally as `4cec08a`.
+
+## HTTP/3 final GOAWAY and QUIC close drain slice
+
+- [x] Extend the independent client to require a final GOAWAY at the last accepted request stream ID.
+- [x] Reject streams above that final boundary with `H3_REQUEST_REJECTED`.
+- [x] Send `H3_NO_ERROR` QUIC close at the shutdown deadline and keep driving the connection until closed or the drain cap.
+- [x] Run provider, HTTP/3, HTTP Server, HTTP/2, and TLS suites; inspect the diff.
+- [x] Commit this final GOAWAY and QUIC close drain slice locally.
+
+## Review
+
+- The independent aioquic client verified the initial maximum GOAWAY, the final last-accepted-stream GOAWAY, `H3_REQUEST_REJECTED` for a later stream, and `H3_NO_ERROR` connection close.
+- QUIC provider suite passed 4/4; HTTP/3 client, HTTP Server 27/27, HTTP/2 97/97, HTTPS client, HTTPS example build, Python syntax, Rust formatting, and `git diff --check` passed on Linux x86_64.
 
 ## QUIC transport review
 
