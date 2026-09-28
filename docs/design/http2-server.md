@@ -70,6 +70,12 @@ HEADERS opens the request side; a later remote HEADERS block is accepted as
 trailers only when it ends that side. DATA requires an open direction, and the
 stream closes after both directions end or a reset is applied.
 
+The active stream table accepts only increasing, odd client stream IDs and
+keeps open and half-closed streams under an explicit local cap. Exceeding the
+cap returns a refusal result for the caller to encode as `REFUSED_STREAM`.
+The cap is independent of the peer's `SETTINGS_MAX_CONCURRENT_STREAMS`, which
+limits streams initiated by this server.
+
 ## Follow-up connection work
 
 The connection layer will require the client connection preface, send server

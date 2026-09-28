@@ -5,6 +5,7 @@ from net.http._http2.frame_encoder import encode_frame
 from net.http._http2.bootstrap import Http2ServerBootstrap
 from net.http._http2.settings_state import Http2PeerSettings
 from net.http._http2.stream_state import Http2StreamState
+from net.http._http2.stream_table import Http2ActiveStreams
 from net.http._http2.preface import parse_client_preface
 from net.http._http2.settings import (
     Setting,
@@ -678,6 +679,68 @@ def test_http2_stream_reset_closes_active_stream() raises:
     assert_true(active.is_closed())
     assert_false(active.receive_data(False))
     assert_false(active.reset())
+
+
+def test_http2_stream_table_enforces_local_limit_and_half_close_count() raises:
+    var streams = Http2ActiveStreams(UInt32(1))
+    assert_true(streams.receive_headers(UInt32(1), False).is_accepted())
+    assert_equal(streams.active_count(), 1)
+    assert_true(streams.receive_headers(UInt32(3), False).is_refused())
+    assert_equal(streams.active_count(), 1)
+
+    assert_true(streams.receive_headers(UInt32(1), True).is_accepted())
+    assert_equal(streams.active_count(), 1)
+    assert_true(streams.send_headers(UInt32(1), True))
+    assert_equal(streams.active_count(), 0)
+    assert_true(streams.receive_headers(UInt32(5), False).is_accepted())
+    assert_equal(streams.active_count(), 1)
+
+
+def test_http2_stream_table_releases_capacity_after_reset() raises:
+    var streams = Http2ActiveStreams(UInt32(1))
+    assert_true(streams.receive_headers(UInt32(1), False).is_accepted())
+    assert_true(streams.reset(UInt32(1)))
+    assert_equal(streams.active_count(), 0)
+    assert_true(streams.receive_headers(UInt32(3), False).is_accepted())
+
+
+def test_http2_stream_table_rejects_invalid_or_reused_ids() raises:
+    var streams = Http2ActiveStreams(UInt32(2))
+    assert_true(streams.receive_headers(UInt32(0), False).is_error())
+    assert_true(streams.receive_headers(UInt32(2), False).is_error())
+    assert_true(streams.receive_headers(UInt32(0x80000001), False).is_error())
+    assert_true(streams.receive_headers(UInt32(3), False).is_accepted())
+    assert_true(streams.reset(UInt32(3)))
+    assert_true(streams.receive_headers(UInt32(3), False).is_error())
+    assert_true(streams.receive_headers(UInt32(1), False).is_error())
+
+
+def test_http2_stream_table_releases_capacity_after_remote_data_end() raises:
+    var streams = Http2ActiveStreams(UInt32(1))
+    assert_true(streams.receive_headers(UInt32(1), False).is_accepted())
+    assert_true(streams.send_headers(UInt32(1), True))
+    assert_equal(streams.active_count(), 1)
+    assert_true(streams.receive_data(UInt32(1), True))
+    assert_equal(streams.active_count(), 0)
+    assert_true(streams.receive_headers(UInt32(3), False).is_accepted())
+
+
+def test_http2_stream_table_zero_limit_still_consumes_stream_id() raises:
+    var streams = Http2ActiveStreams(UInt32(0))
+    assert_true(streams.receive_headers(UInt32(1), False).is_refused())
+    assert_true(streams.receive_headers(UInt32(1), False).is_error())
+    assert_true(streams.receive_headers(UInt32(3), False).is_refused())
+
+
+def test_http2_peer_stream_limit_does_not_set_local_admission_limit() raises:
+    var peer_settings = Http2PeerSettings()
+    var setting_values = List[Setting]()
+    setting_values.append(Setting(identifier=UInt16(3), value=UInt32(0)))
+    assert_true(peer_settings.apply(Span(setting_values)).is_success())
+    assert_equal(peer_settings.max_concurrent_streams, UInt32(0))
+
+    var streams = Http2ActiveStreams(UInt32(1))
+    assert_true(streams.receive_headers(UInt32(1), False).is_accepted())
 
 
 def main() raises:
