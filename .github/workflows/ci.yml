@@ -14,6 +14,26 @@ permissions:
   contents: read
 
 jobs:
+  http3:
+    name: HTTP/3 (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+          - ubuntu-24.04
+          - ubuntu-24.04-arm
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      - name: Install pixi
+        uses: prefix-dev/setup-pixi@f00437f565399d418b0acc85936d12c1fb668347
+        with:
+          frozen: true
+      - name: Test HTTP/3 provider and integration
+        run: pixi run -e tls-http3 quic-suite
+
   test:
     name: Test (${{ matrix.os }})
     runs-on: ${{ matrix.os }}

@@ -46,6 +46,12 @@
 - [x] Return connection-level receive credit and emit a stream reset for the oversized request.
 - [x] Run HPACK/HTTP/2 suites, inspect the diff, and commit this slice.
 
+## HTTP/3 provider CI slice
+
+- [x] Add a Linux x86_64 and aarch64 CI job for the QUIC provider suite.
+- [x] Validate workflow syntax and confirm the existing local suite passes.
+- [ ] Inspect the diff and commit this slice.
+
 ## QUIC transport review
 
 - `QuicServer` accepts Initial datagrams, routes later packets by connection ID, emits pending packets with their destination, and reports/advances connection timeouts.
