@@ -31,7 +31,9 @@ before appending each DATA chunk; an over-budget stream is reset with
 `H3_EXCESSIVE_LOAD`. Response headers are limited to 32 KiB and 100 fields, and
 response bodies to 1 MiB per response. The provider configures a 32 KiB HTTP/3
 field-section limit. Provider response queues and quiche's internal transport
-memory do not yet have aggregate accounting.
+memory do not yet have aggregate accounting. Pending response field and body
+bytes are capped at 64 MiB across the provider; a stream that exceeds this
+queue budget is reset with `H3_EXCESSIVE_LOAD`.
 
 The QUIC provider uses a 10,000,000 byte connection receive limit, 1,000,000
 bytes of bidirectional and unidirectional stream receive credit, an initial
@@ -70,6 +72,7 @@ push and CONNECT are not supported.
 
 Closed or timed-out QUIC connections are removed with their connection-ID
 routes, pending request routes, and queued completed requests. New connections
-are capped by `ServerConfig.max_connections`; request-body buffering is capped
-at 64 MiB across the provider. Aggregate response-queue and QUIC transport
-memory remain unbounded and require separate accounting.
+are capped by `ServerConfig.max_connections`; request-body buffering and
+pending response fields and bodies each have a 64 MiB aggregate provider cap.
+quiche transport memory remains outside these budgets and requires separate
+accounting.

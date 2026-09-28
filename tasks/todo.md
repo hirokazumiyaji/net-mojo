@@ -159,6 +159,15 @@
 - [x] Release budget on stream reset, body rejection, request consumption, and connection reaping.
 - [x] Run provider tests, HTTP/3 integration where supported, formatting, and diff checks; review before publishing.
 
+## HTTP/3 aggregate response memory slice
+
+- [x] Add a provider test for aggregate response queue admission and completion accounting.
+- [x] Bound queued response fields and bodies across all QUIC streams.
+- [x] Release the response budget when a stream finishes, resets, or its connection is reaped.
+- [x] Run provider tests and checks; review before publishing.
+
+- Request and response queues each have a 64 MiB aggregate provider limit. The Rust suite passed 6/6 on macOS arm64; full `/review` remains pending because the configured OCR review request times out.
+
 ## QUIC transport review
 
 - `QuicServer` accepts Initial datagrams, routes later packets by connection ID, emits pending packets with their destination, and reports/advances connection timeouts.

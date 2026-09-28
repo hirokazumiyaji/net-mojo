@@ -399,6 +399,10 @@ fn append_request_body(
     true
 }
 
+fn reserve_response_bytes(used: &mut usize, amount: usize) -> bool {
+    reserve_bytes(used, amount, MAX_HTTP3_BUFFERED_RESPONSE_BYTES)
+}
+
 pub struct QuicServer {
     config: quiche::Config,
     http3_config: quiche::h3::Config,
@@ -410,6 +414,7 @@ pub struct QuicServer {
     random: File,
     max_connections: usize,
     buffered_request_bytes: usize,
+    buffered_response_bytes: usize,
     shutdown: ShutdownState,
 }
 
@@ -435,6 +440,7 @@ struct QuicConnection {
 const MAX_HTTP3_REQUEST_STREAM_ID: u64 = (1 << 62) - 4;
 const MAX_HTTP3_BUFFERED_REQUEST_BYTES: usize = 64 * 1024 * 1024;
 const MAX_HTTP3_REQUEST_BODY_BYTES: usize = 1024 * 1024;
+const MAX_HTTP3_BUFFERED_RESPONSE_BYTES: usize = 64 * 1024 * 1024;
 const H3_EXCESSIVE_LOAD: u64 = 0x107;
 // RFC 9114 assigns 0x10b to H3_REQUEST_REJECTED.
 const H3_REQUEST_REJECTED: u64 = 0x10b;
@@ -445,6 +451,7 @@ struct PendingResponse {
     body: Vec<u8>,
     headers_sent: bool,
     body_offset: usize,
+    buffered_bytes: usize,
 }
 
 #[derive(Default)]
@@ -512,6 +519,7 @@ impl QuicServer {
             random: File::open("/dev/urandom")?,
             max_connections: 10_000,
             buffered_request_bytes: 0,
+            buffered_response_bytes: 0,
             shutdown: ShutdownState::Active,
         })
     }
@@ -635,7 +643,16 @@ impl QuicServer {
                 Err(error) => return Err(error.into()),
             }
         }
-        let completed = Self::poll_http3(connection, &mut self.buffered_request_bytes)?;
+        let mut cancelled_requests = Vec::new();
+        let completed = Self::poll_http3(
+            connection,
+            &mut self.buffered_request_bytes,
+            &mut self.buffered_response_bytes,
+            &mut cancelled_requests,
+        )?;
+        for request_id in cancelled_requests {
+            self.request_routes.remove(&request_id);
+        }
         let source_ids: Vec<Vec<u8>> = connection
             .transport
             .source_ids()
@@ -700,6 +717,12 @@ impl QuicServer {
             .map(|request| request.body.len())
             .sum();
         self.buffered_request_bytes -= in_flight_bytes;
+        let response_bytes: usize = connection
+            .responses
+            .values()
+            .map(|response| response.buffered_bytes)
+            .sum();
+        self.buffered_response_bytes -= response_bytes;
         self.routes
             .retain(|_, owner_key| owner_key.as_slice() != connection_key);
         let request_ids: Vec<u64> = self
@@ -725,6 +748,8 @@ impl QuicServer {
     fn poll_http3(
         connection: &mut QuicConnection,
         buffered_request_bytes: &mut usize,
+        buffered_response_bytes: &mut usize,
+        cancelled_requests: &mut Vec<u64>,
     ) -> Result<Vec<CompletedRequest>, QuicServerError> {
         let mut completed = Vec::new();
         let Some(http3) = connection.http3.as_mut() else {
@@ -935,6 +960,10 @@ impl QuicServer {
                     if let Some(reset) = connection.requests.remove(&stream_id) {
                         *buffered_request_bytes -= reset.body.len();
                     }
+                    if let Some(reset) = connection.responses.remove(&stream_id) {
+                        *buffered_response_bytes -= reset.buffered_bytes;
+                        cancelled_requests.push(reset.request_id);
+                    }
                 }
                 Ok(_) => (),
                 Err(quiche::h3::Error::Done) => break,
@@ -957,30 +986,54 @@ impl QuicServer {
         headers: Vec<(Vec<u8>, Vec<u8>)>,
         body: Vec<u8>,
     ) -> bool {
-        let Some((connection_key, stream_id)) = self.request_routes.get(&request_id) else {
+        let Some((connection_key, stream_id)) = self.request_routes.get(&request_id).cloned()
+        else {
             return false;
         };
-        let Some(connection) = self.connections.get_mut(connection_key) else {
+        if !self.connections.contains_key(&connection_key) {
             return false;
-        };
+        }
+        if self.connections[&connection_key]
+            .responses
+            .contains_key(&stream_id)
+        {
+            return false;
+        }
+        let status_value = status.to_string();
+        let buffered_bytes = body.len()
+            + b":status".len()
+            + status_value.len()
+            + headers
+                .iter()
+                .map(|(name, value)| name.len() + value.len())
+                .sum::<usize>();
+        if !reserve_response_bytes(&mut self.buffered_response_bytes, buffered_bytes) {
+            let connection = self.connections.get_mut(&connection_key).unwrap();
+            let _ = connection.transport.stream_shutdown(
+                stream_id,
+                quiche::Shutdown::Write,
+                H3_EXCESSIVE_LOAD,
+            );
+            self.request_routes.remove(&request_id);
+            return true;
+        }
+        let connection = self.connections.get_mut(&connection_key).unwrap();
         let mut response_headers = Vec::with_capacity(headers.len() + 1);
-        response_headers.push(quiche::h3::Header::new(
-            b":status",
-            status.to_string().as_bytes(),
-        ));
+        response_headers.push(quiche::h3::Header::new(b":status", status_value.as_bytes()));
         response_headers.extend(
             headers
                 .into_iter()
                 .map(|(name, value)| quiche::h3::Header::new(&name, &value)),
         );
         connection.responses.insert(
-            *stream_id,
+            stream_id,
             PendingResponse {
                 request_id,
                 headers: response_headers,
                 body,
                 headers_sent: false,
                 body_offset: 0,
+                buffered_bytes,
             },
         );
         true
@@ -1033,11 +1086,14 @@ impl QuicServer {
             }
         }
         for (connection_key, stream_id, request_id) in completed {
-            self.connections
+            let response = self
+                .connections
                 .get_mut(&connection_key)
                 .unwrap()
                 .responses
-                .remove(&stream_id);
+                .remove(&stream_id)
+                .unwrap();
+            self.buffered_response_bytes -= response.buffered_bytes;
             self.request_routes.remove(&request_id);
         }
         Ok(())
@@ -1103,8 +1159,9 @@ mod tests {
     use quiche::{ConnectionId, Header, RecvInfo};
 
     use super::{
-        NetQuicServerConfig, PendingRequest, append_bytes, append_request_body, append_u32,
-        net_quic_server_free, net_quic_server_new,
+        MAX_HTTP3_BUFFERED_RESPONSE_BYTES, NetQuicServerConfig, PendingRequest, append_bytes,
+        append_request_body, append_u32, net_quic_server_free, net_quic_server_new,
+        reserve_response_bytes,
     };
     use quiche::h3::NameValue;
 
@@ -1121,6 +1178,15 @@ mod tests {
         assert!(!append_request_body(&mut third, b"x", &mut used, 10));
         assert_eq!(used, 10);
         assert!(third.body.is_empty());
+    }
+
+    #[test]
+    fn response_queue_budget_rejects_aggregate_overflow_without_changing_usage() {
+        let mut used = MAX_HTTP3_BUFFERED_RESPONSE_BYTES - 6;
+        assert!(reserve_response_bytes(&mut used, 6));
+        assert_eq!(used, MAX_HTTP3_BUFFERED_RESPONSE_BYTES);
+        assert!(!reserve_response_bytes(&mut used, 1));
+        assert_eq!(used, MAX_HTTP3_BUFFERED_RESPONSE_BYTES);
     }
 
     #[test]
@@ -1536,6 +1602,14 @@ mod tests {
             },
             1
         );
+        assert_eq!(
+            server_state._inner.buffered_response_bytes,
+            response_body.len()
+                + b":status".len()
+                + 3
+                + b"content-type".len()
+                + b"text/plain".len()
+        );
         let mut received_status = None;
         let mut received_body = Vec::new();
         for _ in 0..10 {
@@ -1604,6 +1678,7 @@ mod tests {
         }
         assert_eq!(received_status.as_deref(), Some(&b"200"[..]));
         assert_eq!(received_body, response_body);
+        assert_eq!(server_state._inner.buffered_response_bytes, 0);
         assert_ne!(
             unsafe { super::net_quic_server_timeout_micros(server) },
             u64::MAX
