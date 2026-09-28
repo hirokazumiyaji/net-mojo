@@ -174,6 +174,12 @@
 - [x] Run the smoke tasks in the Linux CI provider jobs.
 - [x] Verify both packaged provider smokes locally on macOS arm64 and update package docs.
 
+## HTTP/2 and HTTP/3 server examples slice
+
+- [x] Add a TLS/ALPN HTTP/2 example using the shared handler.
+- [x] Add a same-numbered TCP HTTPS and UDP HTTP/3 example using the shared handler.
+- [x] Build both examples in the optional-provider CI jobs and document their environment requirements.
+
 ## QUIC transport review
 
 - `QuicServer` accepts Initial datagrams, routes later packets by connection ID, emits pending packets with their destination, and reports/advances connection timeouts.

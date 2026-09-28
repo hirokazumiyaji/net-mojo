@@ -92,6 +92,10 @@ http2-package-smoke = { cmd = "mojo run --Werror -I build tests/http2_package_sm
   "package",
   "hpack-test",
 ] }
+http2-example-build = { cmd = "bash scripts/check_http2_example.sh", depends-on = [
+  "tls-build",
+  "hpack-test",
+] }
 
 [feature.http3.dependencies]
 binutils = "*"
@@ -129,6 +133,10 @@ http3-client-test = { cmd = "python3 scripts/test_http3_server.py", depends-on =
 ] }
 http3-package-smoke = { cmd = "mojo run --Werror -I build tests/http3_package_smoke.mojo", depends-on = [
   "package",
+  "tls-build",
+  "quic-build",
+] }
+http3-example-build = { cmd = "bash scripts/check_http3_example.sh", depends-on = [
   "tls-build",
   "quic-build",
 ] }

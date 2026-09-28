@@ -251,12 +251,12 @@ section records only the package-level boundaries.
   never extends them. Shutdown stops accepting, closes idle
   connections at once, and drains in-flight requests within the grace
   period.
-- `serve_tls` opts into OpenSSL-backed TLS and accepts HTTP/1.1 only after
-  ALPN selects `http/1.1`; a handshake deadline bounds incomplete peers. Core
-  `net` and plaintext server builds remain OpenSSL-free. Optional HTTP/2 and
-  HTTP/3 environments provide TLS/ALPN and QUIC-backed protocol adapters while
-  preserving the shared `Request`/`Headers`/`Handler`/`ResponseWriter`
-  semantics; wire formats and state machines stay per protocol.
+- `serve_tls` opts into OpenSSL-backed TLS and routes negotiated `h2` and
+  `http/1.1` connections through their protocol adapters; a handshake deadline
+  bounds incomplete peers. Core `net` and plaintext server builds remain
+  OpenSSL-free. HTTP/3 uses a separately configured QUIC UDP endpoint and the
+  same shared `Request`/`Headers`/`Handler`/`ResponseWriter` semantics; wire
+  formats and state machines stay per protocol.
 
 ## Testing
 
