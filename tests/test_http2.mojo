@@ -9,6 +9,7 @@ from net.http._http2.response_frames import (
 )
 from net.http._http2.data_frame import parse_data_frame
 from net.http._http2.request_body import Http2RequestBody
+from net.http._http2.request_stream import Http2RequestStream
 from net.http._http2.response_headers import encode_http2_response_headers
 from net.http.response import ResponseWriter
 from net.http._http2.bootstrap import Http2ServerBootstrap
@@ -549,6 +550,49 @@ def test_http2_request_headers_validate_authority_port_syntax() raises:
 def test_http2_request_headers_reject_truncated_serialized_fields() raises:
     var encoded: List[Byte] = [Byte(0), Byte(0), Byte(0), Byte(7)]
     assert_true(decode_http2_request_headers(Span(encoded), 1).is_error())
+
+
+def test_http2_request_stream_combines_headers_body_and_trailers() raises:
+    var stream = Http2RequestStream(8)
+    var head = List[Byte]()
+    _append_hpack_field(head, String(":method"), String("POST"))
+    _append_hpack_field(head, String(":scheme"), String("https"))
+    _append_hpack_field(head, String(":authority"), String("example.com"))
+    _append_hpack_field(head, String(":path"), String("/upload"))
+    var result = stream.receive_headers(Span(head), 4, False)
+    assert_true(result.is_pending())
+
+    var payload: List[Byte] = [Byte(1), Byte(2)]
+    var data_frame = FrameParseResult.complete(Byte(0), Byte(0), UInt32(1), 2)
+    var data = parse_data_frame(data_frame, Span(payload))
+    assert_true(stream.receive_data(data, Span(payload)).is_pending())
+
+    var trailing_fields = List[Byte]()
+    _append_hpack_field(trailing_fields, String("x-check"), String("done"))
+    result = stream.receive_headers(Span(trailing_fields), 1, True)
+    assert_true(result.is_complete())
+
+    var request = stream^.take_request()
+    assert_equal(request.method, "POST")
+    assert_equal(len(request.body), 2)
+    assert_equal(request.body[0], Byte(1))
+    assert_equal(request.body[1], Byte(2))
+    assert_equal(request.trailers.get_first("x-check"), Optional[String]("done"))
+
+
+def test_http2_request_stream_reports_body_limit() raises:
+    var stream = Http2RequestStream(1)
+    var head = List[Byte]()
+    _append_hpack_field(head, String(":method"), String("POST"))
+    _append_hpack_field(head, String(":scheme"), String("https"))
+    _append_hpack_field(head, String(":authority"), String("example.com"))
+    _append_hpack_field(head, String(":path"), String("/upload"))
+    assert_true(stream.receive_headers(Span(head), 4, False).is_pending())
+
+    var payload: List[Byte] = [Byte(1), Byte(2)]
+    var frame = FrameParseResult.complete(Byte(0), Byte(1), UInt32(1), 2)
+    var data = parse_data_frame(frame, Span(payload))
+    assert_true(stream.receive_data(data, Span(payload)).is_too_large())
 
 
 def test_http2_trailers_preserve_regular_fields() raises:

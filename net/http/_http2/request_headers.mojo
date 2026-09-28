@@ -89,6 +89,9 @@ struct Http2TrailersResult(Movable):
     def is_error(self) -> Bool:
         return self.kind == 2
 
+    def take_trailers(deinit self) -> Headers:
+        return self.trailers^
+
 
 def _bytes_equal[
     origin: Origin
