@@ -59,3 +59,18 @@
 - The Rust localhost UDP test exercised the C ABI receive/send path through handshake completion and the negotiated `h3` ALPN.
 - The Mojo smoke test loaded the server, exercised an empty send queue and timeout path, then released ownership.
 - `quic-suite` passed in the locked HTTP/3 environment. `hpack-test` and `tls-suite` passed in the locked TLS/HTTP/2 environment.
+
+### Task 3: UDP socket endpoint
+
+- [x] Add `QuicUDPEndpoint` to own a `QuicServer` and `UDPConn` with bounded receive/send buffers.
+- [x] Expose the UDP descriptor, write interest, and QUIC timeout hooks for a reactor owner.
+- [x] Keep the current output datagram and destination until `UDPConn.try_send_to` completes; ignore malformed datagrams.
+- [x] Test reactor readability and malformed-datagram handling, then run the full `quic-suite`.
+- [x] Review the diff and record verification results in `tasks/todo.md`.
+- [x] Commit this endpoint slice.
+
+## Review
+
+- The Mojo test registers the endpoint's socket with `Reactor`, sends an invalid datagram through localhost UDP, and confirms the ready endpoint consumes it without producing output or closing the socket.
+- `wants_write` reflects a pending output packet. A UDP queue saturation test is not included yet.
+- `quic-suite`, Rust formatting, script syntax, and `git diff --check` pass on Linux x86_64.

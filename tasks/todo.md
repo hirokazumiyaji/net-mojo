@@ -30,7 +30,7 @@
 
 ## Current slice
 
-- Integrate the Mojo `QuicServer` with `UDPConn` and the server reactor, retaining a generated QUIC packet until the nonblocking UDP send completes.
+- Attach `QuicUDPEndpoint` to `net.http.Server`, drive QUIC timers and HTTP/3 control/request streams, and route completed requests to the shared handler.
 
 ## QUIC transport review
 
@@ -39,6 +39,7 @@
 - The Rust provider suite passed on Linux x86_64. The C/Mojo FFI now exposes datagram receive/send and timeout operations while keeping UDP socket ownership with Mojo.
 - The TLS/HTTP/2 integration suite passed in the `tls-http2` environment after rebuilding the HPACK shim for Linux x86_64. An earlier run had loaded a stale aarch64 artifact into x86_64; the test itself passed with the correct architecture.
 - The HTTP/3 environment now pins Mojo 1.0 to match the TLS/HTTP/2 environments and lockfile, avoiding two Mojo API levels for the shared networking modules.
+- `QuicUDPEndpoint` now owns the UDP socket, exposes its descriptor/read-write interest and timeout, drops malformed packets, and retains outgoing packet bytes/destination across a would-block send. Reactor readability and malformed-packet handling are covered in Mojo; forced UDP send-queue saturation remains untested.
 
 ## QUIC packet I/O slice
 
@@ -54,6 +55,20 @@
 - `pixi run -e tls-http3 quic-suite` passed on Linux x86_64: C config smoke, Mojo FFI smoke, and both Rust handshake tests.
 - `cargo fmt --check`, test script syntax, and `git diff --check` passed.
 - The UDP socket remains caller-owned. The next slice connects these operations to `UDPConn` and the reactor and preserves pending packets across UDP backpressure.
+
+## QUIC UDP endpoint slice
+
+- [x] Add `QuicUDPEndpoint` to own `QuicServer` and `UDPConn` with bounded packet buffers.
+- [x] Expose descriptor, write interest, receive/send attempts, and timeout hooks for a reactor owner.
+- [x] Confirm reactor readability and malformed datagram handling over localhost UDP.
+- [x] Run the full HTTP/3 provider suite on Linux x86_64.
+- [x] Review and commit the endpoint slice locally.
+
+## Review
+
+- Mojo endpoint tests register the owned UDP descriptor with `Reactor`, receive and ignore a malformed packet, and confirm no output packet or write interest is pending.
+- Send-buffer preservation across `would-block` is implemented, but the current suite does not saturate the local UDP send queue.
+- `quic-suite`, Rust format, shell syntax, and `git diff --check` passed on Linux x86_64.
 
 ## Review
 

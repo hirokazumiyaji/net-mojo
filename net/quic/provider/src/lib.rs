@@ -122,7 +122,12 @@ pub unsafe extern "C" fn net_quic_server_recv(
         .recv_datagram(packet, local_address, remote_address)
     {
         Ok(()) => 1,
-        Err(QuicServerError::Quiche(quiche::Error::Done)) => 0,
+        Err(QuicServerError::Quiche(
+            quiche::Error::Done
+            | quiche::Error::BufferTooShort
+            | quiche::Error::UnknownVersion
+            | quiche::Error::InvalidPacket,
+        )) => 0,
         Err(_) => -1,
     }
 }

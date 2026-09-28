@@ -4,6 +4,7 @@ from std.ffi import OwnedDLHandle, Pointer, c_int, c_size_t
 
 from net.address import SocketAddress
 from net.error import NetError, NetErrorKind
+from net.udp import UDPConn
 
 
 struct QuicProvider(Movable):
@@ -102,7 +103,7 @@ struct QuicServer(Movable):
         packet: Span[mut=True, Byte, origin],
         local_address: SocketAddress,
         remote_address: SocketAddress,
-    ) raises -> Bool:
+    ) raises NetError -> Bool:
         var local = String(local_address)
         var remote = String(remote_address)
         var local_c = local.as_c_string_slice()
@@ -127,7 +128,7 @@ struct QuicServer(Movable):
         origin: MutOrigin
     ](
         mut self, packet: Span[mut=True, Byte, origin]
-    ) raises -> Optional[QuicSendDatagramResult]:
+    ) raises NetError -> Optional[QuicSendDatagramResult]:
         var destination = Array[Byte, 64](fill=0)
         var destination_ptr = Pointer(to=destination).unsafe_bitcast[Byte]()
         var result = self._library.call["net_quic_send", c_int](
@@ -160,6 +161,86 @@ struct QuicServer(Movable):
 
     def on_timeout(mut self):
         self._library.call["net_quic_on_timeout"](self._server)
+
+
+struct QuicUDPEndpoint(Movable):
+    var _server: QuicServer
+    var _socket: UDPConn
+    var _receive_buffer: List[Byte]
+    var _send_buffer: List[Byte]
+    var _pending_length: Int
+    var _pending_destination: Optional[SocketAddress]
+
+    def __init__(
+        out self, var server: QuicServer, var socket: UDPConn
+    ):
+        self._server = server^
+        self._socket = socket^
+        self._receive_buffer = List[Byte](length=65535, fill=0)
+        self._send_buffer = List[Byte](length=65535, fill=0)
+        self._pending_length = 0
+        self._pending_destination = None
+
+    def raw_fd(self) raises NetError -> Int32:
+        return self._socket.raw_fd()
+
+    def try_receive(mut self) raises NetError -> Bool:
+        try:
+            var received = self._socket.try_recv_from(
+                Span[mut=True](self._receive_buffer)
+            )
+            if received.truncated:
+                return False
+            return self._server.recv_datagram(
+                Span[mut=True](self._receive_buffer)[0 : received.count],
+                self._socket.local_address(),
+                received.source,
+            )
+        except error:
+            if error.kind == NetErrorKind.timeout():
+                return False
+            raise error^
+
+    def try_send(mut self) raises NetError -> Bool:
+        if self._pending_length == 0:
+            var packet = self._server.try_send_datagram(
+                Span[mut=True](self._send_buffer)
+            )
+            if not packet:
+                return False
+            self._pending_length = packet.value().count
+            self._pending_destination = Optional(
+                packet.value().destination.copy()
+            )
+
+        try:
+            var written = self._socket.try_send_to(
+                Span(self._send_buffer)[0 : self._pending_length],
+                self._pending_destination.value(),
+            )
+            if written != self._pending_length:
+                raise NetError(
+                    NetErrorKind.invalid_state(),
+                    "send QUIC datagram",
+                    None,
+                    "UDP socket wrote a partial datagram",
+                )
+            self._pending_length = 0
+            self._pending_destination = None
+            return True
+        except error:
+            if error.kind == NetErrorKind.timeout():
+                return False
+            raise error^
+
+    def wants_write(self) -> Bool:
+        return self._pending_length > 0
+
+    def timeout_micros(self) -> UInt64:
+        return self._server.timeout_micros()
+
+    def on_timeout(mut self):
+        self._server.on_timeout()
 
 
 def _copy_c_string[origin: MutOrigin](address: Pointer[Byte, origin]) -> String:
