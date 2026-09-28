@@ -54,6 +54,9 @@ ACK: `ENABLE_PUSH` must be 0 or 1, `INITIAL_WINDOW_SIZE` at most 2^31-1, and
 with the corresponding HTTP/2 connection error code and do not acknowledge.
 The caller retains and extends preface bytes between incremental parse calls.
 Stream processing begins in a later layer.
+`Http2ConnectionBootstrap` drives that exchange over fragmented byte input,
+enforces the configured inbound frame cap, and returns unconsumed bytes after
+the first client SETTINGS for the frame dispatcher.
 
 Initial client settings are applied in order, with duplicate identifiers using
 the last value and unknown identifiers ignored. `ENABLE_PUSH` values must be 0

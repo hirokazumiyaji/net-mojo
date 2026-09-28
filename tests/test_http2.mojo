@@ -13,6 +13,7 @@ from net.http._http2.request_stream import Http2RequestStream
 from net.http._http2.response_headers import encode_http2_response_headers
 from net.http.response import ResponseWriter
 from net.http._http2.bootstrap import Http2ServerBootstrap
+from net.http._http2.connection_bootstrap import Http2ConnectionBootstrap
 from net.http._http2.settings_state import Http2PeerSettings
 from net.http._http2.stream_state import Http2StreamState
 from net.http._http2.stream_table import Http2ActiveStreams
@@ -1220,7 +1221,7 @@ def test_http2_bootstrap_rejects_partial_settings_with_frame_size_error() raises
         payload.append(byte)
     var client_wire = _frame(4, 0, 0, payload)
     assert_true(
-        bootstrap.accept_initial_client_settings(
+        bootstrap.accept_client_settings(
             parse_frame(Span(client_wire)), Span(client_wire)[9:]
         ).is_error()
     )
@@ -1260,12 +1261,91 @@ def test_http2_bootstrap_rejects_nonempty_ack_with_frame_size_error() raises:
         payload.append(byte)
     var client_wire = _frame(4, 1, 0, payload)
     assert_true(
-        bootstrap.accept_initial_client_settings(
+        bootstrap.accept_client_settings(
             parse_frame(Span(client_wire)), Span(client_wire)[9:]
         ).is_error()
     )
     assert_true(bootstrap.is_failed())
     assert_equal(bootstrap.connection_error_code(), UInt32(6))
+
+
+def test_http2_connection_bootstrap_handles_fragmented_preface_and_settings() raises:
+    var input = List[Byte]()
+    var preface = "PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n".as_bytes()
+    for i in range(len(preface)):
+        input.append(preface[i])
+    var client_settings = _frame(4, 0, 0, List[Byte]())
+    for i in range(len(client_settings)):
+        input.append(client_settings[i])
+    var ping_payload: List[Byte] = [
+        Byte(1), Byte(2), Byte(3), Byte(4), Byte(5), Byte(6), Byte(7), Byte(8)
+    ]
+    var ping = _frame(6, 0, 0, ping_payload)
+    for i in range(len(ping)):
+        input.append(ping[i])
+
+    var bootstrap = Http2ConnectionBootstrap()
+    var result = bootstrap.consume(Span(input))
+    assert_true(result.is_ready())
+    assert_equal(result.consumed, 24 + len(client_settings))
+    assert_equal(len(result.output), 18)
+    var server_settings = parse_frame(Span(result.output))
+    assert_true(server_settings.is_complete())
+    assert_equal(server_settings.frame_type, Byte(4))
+    assert_equal(server_settings.flags, Byte(0))
+    var settings_ack = parse_frame(Span(result.output)[server_settings.consumed:])
+    assert_true(settings_ack.is_complete())
+    assert_equal(settings_ack.frame_type, Byte(4))
+    assert_equal(settings_ack.flags, Byte(1))
+
+    var remainder = parse_frame(Span(input)[result.consumed:])
+    assert_true(remainder.is_complete())
+    assert_equal(remainder.frame_type, Byte(6))
+
+    var bytewise = Http2ConnectionBootstrap()
+    var output = List[Byte]()
+    var ready = False
+    for i in range(len(input)):
+        var part = bytewise.consume(Span(input)[i : i + 1])
+        assert_false(part.is_error())
+        for j in range(len(part.output)):
+            output.append(part.output[j])
+        if part.is_ready():
+            ready = True
+            break
+    assert_true(ready)
+    assert_equal(len(output), 18)
+
+
+def test_http2_connection_bootstrap_rejects_bad_preface_and_initial_ack() raises:
+    var bad_preface = Http2ConnectionBootstrap()
+    var bad = bad_preface.consume("X".as_bytes())
+    assert_true(bad.is_error())
+    assert_true(bad_preface.is_failed())
+
+    var input = List[Byte]()
+    var preface = "PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n".as_bytes()
+    for i in range(len(preface)):
+        input.append(preface[i])
+    var ack = _frame(4, 1, 0, List[Byte]())
+    for i in range(len(ack)):
+        input.append(ack[i])
+    var bootstrap = Http2ConnectionBootstrap()
+    var result = bootstrap.consume(Span(input))
+    assert_true(result.is_error())
+    assert_true(bootstrap.is_failed())
+
+    var oversized_input = List[Byte]()
+    for i in range(len(preface)):
+        oversized_input.append(preface[i])
+    for byte in [
+        Byte(0), Byte(0x40), Byte(1), Byte(4), Byte(0), Byte(0), Byte(0),
+        Byte(0), Byte(0),
+    ]:
+        oversized_input.append(byte)
+    var oversized_bootstrap = Http2ConnectionBootstrap()
+    assert_true(oversized_bootstrap.consume(Span(oversized_input)).is_error())
+
 
 
 def test_http2_bootstrap_rejects_initial_settings_ack() raises:
