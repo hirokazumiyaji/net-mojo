@@ -5,7 +5,7 @@ from net.http.request import HttpVersion, Request
 from .connection_input import (
     Http2ServerConnectionInput,
 )
-from .control_frames import encode_rst_stream_frame
+from .control_frames import encode_goaway_frame, encode_rst_stream_frame
 from .data_frame import parse_data_frame
 from .frame import FrameParseResult
 from .frame_encoder import encode_frame
@@ -110,6 +110,7 @@ struct Http2RequestSession(Movable):
     var _max_active_streams: Int
     var _max_body_size: Int
     var _last_stream_id: UInt32
+    var _draining: Bool
     var _failed: Bool
 
     def __init__(
@@ -131,7 +132,17 @@ struct Http2RequestSession(Movable):
         self._max_active_streams = max_active_streams
         self._max_body_size = max_body_size
         self._last_stream_id = UInt32(0)
+        self._draining = False
         self._failed = max_active_streams < 0 or max_body_size < 0
+
+    def begin_shutdown(mut self) -> List[Byte]:
+        if self._draining:
+            return List[Byte]()
+        self._draining = True
+        var goaway = encode_goaway_frame(self._last_stream_id, UInt32(0))
+        var output = List[Byte]()
+        _append_session_output(output, Span(goaway.wire))
+        return output^
 
     def consume[
         origin: Origin
@@ -170,6 +181,17 @@ struct Http2RequestSession(Movable):
                         frame, Span(input.payload)
                     )
                     if decoded.is_complete():
+                        if self._draining:
+                            var reset = encode_rst_stream_frame(
+                                decoded.stream_id, UInt32(7)
+                            )
+                            if not reset.is_complete():
+                                self._failed = True
+                                return Http2RequestSessionResult.error(
+                                    consumed, output^
+                                )
+                            _append_session_output(output, Span(reset.wire))
+                            continue
                         var request_result = self._receive_headers(decoded)
                         if request_result.is_error():
                             self._failed = True

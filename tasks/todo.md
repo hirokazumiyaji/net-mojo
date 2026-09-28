@@ -83,6 +83,18 @@
 - [x] Reject both forms of idle-stream reset while preserving closed peer-stream cancellation.
 - [x] Run HPACK/HTTP/2 suites, inspect the diff, and commit this slice.
 
+## HTTP/2 graceful shutdown session slice
+
+- [x] Add a request-session test for a successful GOAWAY carrying the highest admitted peer stream ID.
+- [x] Add a request-session test that shutdown prevents later peer streams from being admitted.
+- [x] Implement session shutdown signaling and reject new streams after GOAWAY.
+- [x] Run HPACK and HTTP/2 suites, inspect the diff, and commit this slice locally.
+
+## Review
+
+- The session GOAWAY slice passed `hpack-mojo-test` (29/29) and `test-http2` (97/97) in the Linux x86_64 `tls-http2` environment. `git diff --check` passed.
+- Server shutdown does not yet call the new session method; wiring GOAWAY into the server connection output and draining accepted streams is a follow-up slice.
+
 ## QUIC transport review
 
 - `QuicServer` accepts Initial datagrams, routes later packets by connection ID, emits pending packets with their destination, and reports/advances connection timeouts.

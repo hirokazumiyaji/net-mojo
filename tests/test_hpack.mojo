@@ -7,6 +7,7 @@ from net.http._http2.request_session import Http2RequestSession
 from net.http._http2.response_scheduler import Http2ResponseScheduler
 from net.http._http2.frame_encoder import encode_frame
 from net.http._http2.control_frames import parse_rst_stream_frame
+from net.http._http2.control_frames import parse_goaway_frame
 from net.http._http2.window_update import parse_window_update_frame
 from net.http._http2.response_encoder import encode_http2_response
 from net.http._http2.request_headers import decode_http2_request_headers
@@ -375,6 +376,60 @@ def test_http2_request_session_completes_fragmented_header_only_request() raises
     assert_equal(result.stream_id, UInt32(1))
     assert_equal(result.request.method, "GET")
     assert_equal(result.request.authority, "www.example.com")
+
+
+def test_http2_request_session_goaway_uses_last_admitted_stream() raises:
+    var session = Http2RequestSession("build/http2/libnet_hpack", 4, 1024)
+    var wire = List[Byte]()
+    var preface = "PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n".as_bytes()
+    for i in range(len(preface)):
+        wire.append(preface[i])
+    var empty = List[Byte]()
+    _append_frame(wire, Byte(4), Byte(0), UInt32(0), Span(empty))
+    var compressed: List[Byte] = [
+        Byte(0x82), Byte(0x86), Byte(0x84), Byte(0x41), Byte(0x0F),
+        Byte(ord("w")), Byte(ord("w")), Byte(ord("w")), Byte(ord(".")),
+        Byte(ord("e")), Byte(ord("x")), Byte(ord("a")), Byte(ord("m")),
+        Byte(ord("p")), Byte(ord("l")), Byte(ord("e")), Byte(ord(".")),
+        Byte(ord("c")), Byte(ord("o")), Byte(ord("m")),
+    ]
+    _append_frame(wire, Byte(1), Byte(5), UInt32(3), Span(compressed))
+    var request = session.consume(Span(wire))
+    assert_true(request.is_request())
+    assert_equal(request.stream_id, UInt32(3))
+
+    var goaway_wire = session.begin_shutdown()
+    var frame = parse_frame(Span(goaway_wire))
+    assert_true(frame.is_complete())
+    assert_equal(frame.frame_type, Byte(7))
+    var goaway = parse_goaway_frame(frame, Span(goaway_wire[9:]))
+    assert_true(goaway.is_valid())
+    assert_equal(goaway.last_stream_id, UInt32(3))
+
+
+def test_http2_request_session_refuses_new_streams_after_goaway() raises:
+    var session = Http2RequestSession("build/http2/libnet_hpack", 4, 1024)
+    var wire = List[Byte]()
+    var preface = "PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n".as_bytes()
+    for i in range(len(preface)):
+        wire.append(preface[i])
+    var empty = List[Byte]()
+    _append_frame(wire, Byte(4), Byte(0), UInt32(0), Span(empty))
+    _ = session.consume(Span(wire))
+    _ = session.begin_shutdown()
+
+    var compressed: List[Byte] = [Byte(0x82), Byte(0x86), Byte(0x84)]
+    var headers = List[Byte]()
+    _append_frame(headers, Byte(1), Byte(5), UInt32(1), Span(compressed))
+    var result = session.consume(Span(headers))
+    assert_true(result.is_pending())
+    var reset_frame = parse_frame(Span(result.output))
+    assert_true(reset_frame.is_complete())
+    assert_equal(reset_frame.frame_type, Byte(3))
+    assert_equal(reset_frame.stream_id, UInt32(1))
+    var reset = parse_rst_stream_frame(reset_frame, Span(result.output[9:]))
+    assert_true(reset.is_valid())
+    assert_equal(reset.error_code, UInt32(7))
 
 
 def test_http2_request_session_completes_data_body() raises:
