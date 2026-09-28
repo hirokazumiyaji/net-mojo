@@ -109,7 +109,11 @@ quic-mojo-test = { cmd = "mojo run --Werror -I . tests/test_quic_provider.mojo",
   "tls-build",
   "quic-build",
 ] }
-quic-suite = { depends-on = ["quic-test", "quic-mojo-test"] }
+quic-rust-test = { cmd = "bash scripts/test_quic_provider.sh", depends-on = [
+  "tls-build",
+  "quic-build",
+] }
+quic-suite = { depends-on = ["quic-test", "quic-mojo-test", "quic-rust-test"] }
 
 [feature.tls.tasks]
 tls-build = "bash scripts/build_tls_shim.sh"
