@@ -88,4 +88,16 @@
 
 ## Current slice
 
-- Integrate the Mojo `QuicServer` with `UDPConn` and the server reactor, retaining a generated QUIC packet until the nonblocking UDP send completes.
+- Integrate QUIC transport with `Server.tick()`; then add HTTP/3 request streams and shared-handler dispatch.
+
+## QUIC server reactor slice
+
+- [x] Add an optional HTTP/3 integration test that attaches a UDP endpoint to `Server`, drives `tick`, and verifies shutdown exits the loop.
+- [x] Let `Server` own one QUIC endpoint, include its timer in reactor wait time, drain bounded packet batches, and toggle writable readiness when a UDP send is pending.
+- [x] Verify `quic-mojo-test` and review the diff.
+- [ ] Commit this server transport slice.
+
+## Review
+
+- `quic-mojo-test` passed on Linux x86_64 under Docker after the initial quiche/BoringSSL build. Direct macOS Pixi execution is unavailable because the checked-in environment is linux-64.
+- Server shutdown drops the QUIC UDP descriptor and exits when no TCP listener or active connections remain. HTTP/3 stream parsing and shared-handler dispatch are still future work.

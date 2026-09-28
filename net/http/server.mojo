@@ -34,6 +34,7 @@ from net import SocketAddress, TCPConn, TCPListener, Timeout, listen_tcp
 from net._actor import WakeupChannel
 from net._reactor import Reactor, ReactorToken
 from net.error import NetError, NetErrorKind
+from net.quic import QuicUDPEndpoint
 
 from ._buffer import BufferBudget
 from ._connection import (
@@ -133,6 +134,8 @@ struct Server(Movable):
     var _tls_context: Optional[TLSContext]
     var _listener_token: ReactorToken
     var _listener_paused: Bool
+    var _quic_endpoint: Optional[QuicUDPEndpoint]
+    var _quic_token: ReactorToken
     var _conns: List[HttpConnection]
     var _conn_free: List[Int]
     var _slot_map: List[Int]
@@ -163,6 +166,8 @@ struct Server(Movable):
         self._tls_context = None
         self._listener_token = ReactorToken(slot=-1, generation=0)
         self._listener_paused = False
+        self._quic_endpoint = None
+        self._quic_token = ReactorToken(slot=-1, generation=0)
         self._conns = List[HttpConnection]()
         self._conn_free = List[Int]()
         self._slot_map = List[Int]()
@@ -226,6 +231,20 @@ struct Server(Movable):
         self.add_listener(listener^)
         self._tls_context = Optional[TLSContext](tls_context^)
 
+    def add_quic_endpoint(
+        mut self, var endpoint: QuicUDPEndpoint
+    ) raises:
+        if self._quic_endpoint:
+            raise NetError(
+                NetErrorKind.invalid_state(),
+                "add QUIC endpoint",
+                None,
+                "server already has a QUIC endpoint",
+            )
+        var token = self._reactor.register(endpoint.raw_fd())
+        self._quic_token = token.copy()
+        self._quic_endpoint = Optional[QuicUDPEndpoint](endpoint^)
+
     def tick[
         H: Handler
     ](
@@ -237,7 +256,7 @@ struct Server(Movable):
         var now = now_ns()
         self._tick_date = current_http_date()
         self._note_shutdown(now)
-        if not self._listener and self._active_conns == 0:
+        if not self._listener and not self._quic_endpoint and self._active_conns == 0:
             self.control.mark_exited()
             return False
         self._tick_id += 1
@@ -267,6 +286,7 @@ struct Server(Movable):
             wait_timeout = Timeout.nanoseconds(0)
         var events = self._reactor.wait(wait_timeout)
         now = now_ns()
+        self._drive_quic()
         if self._listener:
             for i in range(len(events)):
                 if events[i].token == self._listener_token:
@@ -340,7 +360,7 @@ struct Server(Movable):
                 self._arm_deadline(idx)
         self._expire_deadlines(now_ns())
         self._process_detached_messages(now_ns())
-        if not self._listener and self._active_conns == 0:
+        if not self._listener and not self._quic_endpoint and self._active_conns == 0:
             self.control.mark_exited()
             return False
         return True
@@ -565,6 +585,7 @@ struct Server(Movable):
             if self._shutdown_at == NO_DEADLINE:
                 self._shutdown_at = now + Int(self.config.shutdown_grace._value)
                 self._drop_listener()
+                self._drop_quic_endpoint()
                 # Idle connections (nothing buffered, nothing queued)
                 # stop waiting out their long keep-alive clock: give
                 # them a short cushion instead. Anything with bytes in
@@ -595,6 +616,32 @@ struct Server(Movable):
             self._listener = None
             self._listener_token = ReactorToken(slot=-1, generation=0)
             self._listener_paused = False
+
+    def _drop_quic_endpoint(mut self):
+        if self._quic_endpoint:
+            _ = self._reactor.remove(self._quic_token)
+            self._quic_endpoint = None
+            self._quic_token = ReactorToken(slot=-1, generation=0)
+
+    def _drive_quic(mut self) raises NetError:
+        if not self._quic_endpoint:
+            return
+        # The QUIC descriptor is handled separately from HTTP connection slots.
+        var received = 0
+        while received < 16:
+            if not self._quic_endpoint.value().try_receive():
+                break
+            received += 1
+        var remaining = self._quic_endpoint.value().timeout_micros()
+        if remaining == 0:
+            self._quic_endpoint.value().on_timeout()
+        var sent = 0
+        while sent < 16:
+            if not self._quic_endpoint.value().try_send():
+                break
+            sent += 1
+        var want_write = self._quic_endpoint.value().wants_write()
+        _ = self._reactor.modify(self._quic_token, True, want_write)
 
     def _pause_listener(mut self):
         if self._listener and not self._listener_paused:
@@ -1930,6 +1977,12 @@ struct Server(Movable):
         var best = _TICK_POLL_CAP_MS
         if explicit < best:
             best = explicit
+        if self._quic_endpoint:
+            var quic_timeout = self._quic_endpoint.value().timeout_micros()
+            if quic_timeout != UInt64.MAX:
+                var quic_ms = Int((quic_timeout + 999) // 1000)
+                if quic_ms < best:
+                    best = quic_ms
         if self._shutdown_at != NO_DEADLINE:
             var left_ms = (self._shutdown_at - now) // 1_000_000
             if left_ms < 0:
