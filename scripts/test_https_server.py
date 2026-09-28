@@ -26,6 +26,76 @@ def read_h2_frame(client):
     )
 
 
+def test_http2_shutdown_goaway():
+    shutdown_process = subprocess.Popen(
+        [
+            "mojo",
+            "run",
+            "--Werror",
+            "-I",
+            ".",
+            "tests/https_shutdown_fixture.mojo",
+        ],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    try:
+        ready = shutdown_process.stdout.readline().strip()
+        if not ready.startswith("READY "):
+            raise RuntimeError(f"shutdown fixture did not start: {ready}")
+        port = int(ready.split()[1])
+        context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+        context.check_hostname = False
+        context.verify_mode = ssl.CERT_NONE
+        context.set_alpn_protocols(["h2"])
+        with socket.create_connection(("127.0.0.1", port), timeout=5) as raw:
+            with context.wrap_socket(raw, server_hostname="localhost") as client:
+                client.settimeout(5)
+                client.sendall(
+                    b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n"
+                    b"\x00\x00\x00\x04\x00\x00\x00\x00\x00"
+                )
+                bootstrap = bytearray()
+                while len(bootstrap) < 24:
+                    chunk = client.recv(24 - len(bootstrap))
+                    if not chunk:
+                        raise RuntimeError("incomplete shutdown HTTP/2 bootstrap")
+                    bootstrap.extend(chunk)
+                headers = b"\x82\x86\x84\x41\x0fwww.example.com"
+                client.sendall(
+                    len(headers).to_bytes(3, "big")
+                    + b"\x01\x05\x00\x00\x00\x01"
+                    + headers
+                )
+                response_ended = False
+                while True:
+                    frame_type, flags, stream_id, payload = read_h2_frame(client)
+                    if stream_id == 1 and frame_type == 0 and flags & 1:
+                        response_ended = True
+                    if frame_type == 7:
+                        last_stream_id = (
+                            int.from_bytes(payload[:4], "big") & 0x7FFFFFFF
+                        )
+                        error_code = int.from_bytes(payload[4:8], "big")
+                        if (
+                            last_stream_id != 1
+                            or error_code != 0
+                            or not response_ended
+                        ):
+                            raise RuntimeError(
+                                f"unexpected graceful shutdown frames: {frame_type, stream_id, payload!r}"
+                            )
+                        break
+        if shutdown_process.wait(timeout=5) != 0:
+            raise RuntimeError(shutdown_process.stderr.read())
+    except Exception:
+        shutdown_process.kill()
+        shutdown_process.wait()
+        sys.stderr.write(shutdown_process.stderr.read())
+        raise
+
+
 process = subprocess.Popen(
     ["mojo", "run", "--Werror", "-I", ".", "tests/https_server_fixture.mojo"],
     stdout=subprocess.PIPE,
@@ -196,6 +266,7 @@ try:
         raise RuntimeError(f"unexpected HTTPS response body: {wire!r}")
     if process.wait(timeout=5) != 0:
         raise RuntimeError(process.stderr.read())
+    test_http2_shutdown_goaway()
     print("HTTP/2 bootstrap and HTTPS roundtrips succeeded")
 except Exception:
     process.kill()

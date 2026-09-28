@@ -586,12 +586,28 @@ struct Server(Movable):
                 continue
             self._close_conn(idx)
 
-    def _note_shutdown(mut self, now: Int):
+    def _note_shutdown(mut self, now: Int) raises NetError:
         if self.control.is_shutdown_requested():
             if self._shutdown_at == NO_DEADLINE:
                 self._shutdown_at = now + Int(self.config.shutdown_grace._value)
                 self._drop_listener()
                 self._drop_quic_endpoint()
+                for i in range(len(self._conns)):
+                    if (
+                        not self._conns[i].active
+                        or self._conns[i].protocol != PROTOCOL_HTTP2
+                        or not self._conns[i].http2_session
+                    ):
+                        continue
+                    var goaway = self._conns[i].http2_session.value().begin_shutdown()
+                    if not self._budget.try_reserve(len(goaway)):
+                        self._close_conn(i)
+                        continue
+                    self._conns[i].append_pending(goaway^)
+                    self._conns[i].state = STATE_SENDING_HTTP2_CONTROL
+                    self._conns[i].write_at = deadline_from_now(
+                        self.config.write_deadline
+                    )
                 # Idle connections (nothing buffered, nothing queued)
                 # stop waiting out their long keep-alive clock: give
                 # them a short cushion instead. Anything with bytes in

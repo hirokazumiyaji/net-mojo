@@ -93,7 +93,18 @@
 ## Review
 
 - The session GOAWAY slice passed `hpack-mojo-test` (29/29) and `test-http2` (97/97) in the Linux x86_64 `tls-http2` environment. `git diff --check` passed.
-- Server shutdown does not yet call the new session method; wiring GOAWAY into the server connection output and draining accepted streams is a follow-up slice.
+
+## HTTP/2 server graceful shutdown slice
+
+- [x] Add independent TLS client coverage for server shutdown GOAWAY and a fully drained response.
+- [x] Start HTTP/2 session shutdown when the server receives its shutdown request.
+- [x] Queue GOAWAY behind pending connection output and retain the existing grace deadline.
+- [x] Run TLS, HTTPS interoperability, HPACK, and HTTP/2 suites; inspect the diff.
+
+## Review
+
+- The HTTP/2 shutdown session slice is committed as `44d9c9d`.
+- Server graceful shutdown passed `tls-suite`, including independent TLS interoperability; HPACK passed 29/29, HTTP/2 passed 97/97, Python syntax validation and `git diff --check` passed on Linux x86_64.
 
 ## QUIC transport review
 
