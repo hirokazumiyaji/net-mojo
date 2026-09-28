@@ -3,6 +3,8 @@ from std.testing import assert_equal, assert_true, TestSuite
 from net.http._http2.hpack import Http2HpackInflater
 from net.http._http2.frame import FrameParseResult
 from net.http._http2.header_decoder import Http2HeaderDecoder
+from net.http._http2.request_headers import decode_http2_request_headers
+from net.http.request import HttpVersion
 
 
 def test_hpack_inflater_decodes_huffman_header_block() raises:
@@ -138,7 +140,6 @@ def test_header_decoder_fails_connection_on_invalid_continuation_sequence() rais
         wrong_stream, Span(continuation), 1024, 16, Span(output)
     )
     assert_true(result.is_protocol_error())
-
     var next_headers = FrameParseResult.complete(
         Byte(1), Byte(4), UInt32(3), 1
     )
@@ -147,6 +148,36 @@ def test_header_decoder_fails_connection_on_invalid_continuation_sequence() rais
     )
     assert_true(result.is_protocol_error())
 
+
+def test_hpack_headers_become_a_shared_http2_request() raises:
+    var decoder = Http2HeaderDecoder("build/http2/libnet_hpack", 4096, 1024)
+    var compressed: List[Byte] = [
+        Byte(0x82), Byte(0x86), Byte(0x84), Byte(0x41), Byte(0x0F),
+        Byte(ord("w")), Byte(ord("w")), Byte(ord("w")), Byte(ord(".")),
+        Byte(ord("e")), Byte(ord("x")), Byte(ord("a")), Byte(ord("m")),
+        Byte(ord("p")), Byte(ord("l")), Byte(ord("e")), Byte(ord(".")),
+        Byte(ord("c")), Byte(ord("o")), Byte(ord("m")),
+    ]
+    var frame = FrameParseResult.complete(
+        Byte(1), Byte(4), UInt32(1), len(compressed)
+    )
+    var output = Array[Byte, 512](fill=0)
+    var decoded = decoder.consume(
+        frame, Span(compressed), 1024, 16, Span(output)
+    )
+    assert_true(decoded.is_complete())
+    var serialized = List[Byte]()
+    for i in range(decoded.output_length):
+        serialized.append(output[i])
+    var request_head = decode_http2_request_headers(
+        Span(serialized), decoded.field_count
+    )
+    assert_true(request_head.is_valid())
+    var request = request_head^.into_request()
+    assert_equal(request.version, HttpVersion.http2())
+    assert_equal(request.method, "GET")
+    assert_equal(request.path, "/")
+    assert_equal(request.authority, "www.example.com")
 
 def main() raises:
     TestSuite.discover_tests[__functions_in_module()]().run()

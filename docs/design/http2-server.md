@@ -108,6 +108,9 @@ rejects zero increments, and applies the increment to the selected send window.
 PING validation can generate an exact opaque-data ACK, RST_STREAM exposes the
 stream and error code, and GOAWAY parsing and encoding preserve the last-stream
 limit and error code.
+Decoded HPACK fields are validated for pseudo-header ordering and uniqueness,
+lowercase regular names, forbidden connection-specific fields, `TE: trailers`,
+and matching Host/authority before conversion to the shared `Request` type.
 
 ## Follow-up connection work
 

@@ -80,6 +80,7 @@ python = ">=3.10,<3.15"
 [feature.http2.dependencies]
 c-compiler = "*"
 libnghttp2 = ">=1.64,<2"
+mojo = ">=1.0.0,<1.1"
 pkg-config = "*"
 
 [feature.http2.tasks]

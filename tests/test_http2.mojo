@@ -1,4 +1,5 @@
 from std.testing import assert_equal, assert_false, assert_true, TestSuite
+from net.http.request import HttpVersion
 
 from net.http._http2.frame import FrameParseResult, parse_frame
 from net.http._http2.frame_encoder import encode_frame
@@ -23,6 +24,7 @@ from net.http._http2.control_frames import (
     parse_ping_frame,
     parse_rst_stream_frame,
 )
+from net.http._http2.request_headers import decode_http2_request_headers
 
 
 def test_header_block_collects_headers_payload_until_end_headers() raises:
@@ -284,6 +286,119 @@ def test_http2_goaway_rejects_invalid_shape_or_stream() raises:
     assert_true(parse_goaway_frame(frame, Span(payload)).is_error())
     var wrong_stream = FrameParseResult.complete(Byte(7), Byte(0), UInt32(1), 8)
     assert_true(parse_goaway_frame(wrong_stream, Span(payload[0:7])).is_error())
+
+
+def _append_hpack_field(mut wire: List[Byte], name: String, value: String):
+    var name_bytes = name.as_bytes()
+    var value_bytes = value.as_bytes()
+    wire.append(Byte((len(name_bytes) >> 24) & 0xFF))
+    wire.append(Byte((len(name_bytes) >> 16) & 0xFF))
+    wire.append(Byte((len(name_bytes) >> 8) & 0xFF))
+    wire.append(Byte(len(name_bytes) & 0xFF))
+    wire.append(Byte((len(value_bytes) >> 24) & 0xFF))
+    wire.append(Byte((len(value_bytes) >> 16) & 0xFF))
+    wire.append(Byte((len(value_bytes) >> 8) & 0xFF))
+    wire.append(Byte(len(value_bytes) & 0xFF))
+    for i in range(len(name_bytes)):
+        wire.append(name_bytes[i])
+    for i in range(len(value_bytes)):
+        wire.append(value_bytes[i])
+
+
+def test_http2_request_headers_map_pseudo_and_regular_fields() raises:
+    var encoded = List[Byte]()
+    _append_hpack_field(encoded, String(":method"), String("GET"))
+    _append_hpack_field(encoded, String(":scheme"), String("https"))
+    _append_hpack_field(encoded, String(":authority"), String("example.com"))
+    _append_hpack_field(encoded, String(":path"), String("/items?q=1"))
+    _append_hpack_field(encoded, String("content-type"), String("application/json"))
+    _append_hpack_field(encoded, String("x-tag"), String("one"))
+    _append_hpack_field(encoded, String("x-tag"), String("two"))
+    var result = decode_http2_request_headers(Span(encoded), 7)
+    assert_true(result.is_valid())
+    var request = result^.into_request()
+    assert_equal(request.method, "GET")
+    assert_equal(request.target, "/items?q=1")
+    assert_equal(request.path, "/items")
+    assert_equal(request.query, "q=1")
+    assert_equal(request.scheme, "https")
+    assert_equal(request.authority, "example.com")
+    assert_equal(request.version, HttpVersion.http2())
+    assert_equal(request.headers.count("x-tag"), 2)
+
+
+def test_http2_request_headers_require_pseudo_fields_before_regular() raises:
+    var encoded = List[Byte]()
+    _append_hpack_field(encoded, String("x-tag"), String("one"))
+    _append_hpack_field(encoded, String(":method"), String("GET"))
+    _append_hpack_field(encoded, String(":scheme"), String("https"))
+    _append_hpack_field(encoded, String(":path"), String("/"))
+    assert_true(decode_http2_request_headers(Span(encoded), 4).is_error())
+
+
+def test_http2_request_headers_reject_duplicates_and_unknown_pseudo() raises:
+    var duplicate = List[Byte]()
+    _append_hpack_field(duplicate, String(":method"), String("GET"))
+    _append_hpack_field(duplicate, String(":method"), String("POST"))
+    _append_hpack_field(duplicate, String(":scheme"), String("https"))
+    _append_hpack_field(duplicate, String(":path"), String("/"))
+    assert_true(decode_http2_request_headers(Span(duplicate), 4).is_error())
+
+    var unknown = List[Byte]()
+    _append_hpack_field(unknown, String(":method"), String("GET"))
+    _append_hpack_field(unknown, String(":protocol"), String("websocket"))
+    _append_hpack_field(unknown, String(":scheme"), String("https"))
+    _append_hpack_field(unknown, String(":path"), String("/"))
+    assert_true(decode_http2_request_headers(Span(unknown), 4).is_error())
+
+
+def test_http2_request_headers_reject_connection_fields_and_invalid_te() raises:
+    var connection = List[Byte]()
+    _append_hpack_field(connection, String(":method"), String("GET"))
+    _append_hpack_field(connection, String(":scheme"), String("https"))
+    _append_hpack_field(connection, String(":path"), String("/"))
+    _append_hpack_field(connection, String("connection"), String("close"))
+    assert_true(decode_http2_request_headers(Span(connection), 4).is_error())
+
+    var te = List[Byte]()
+    _append_hpack_field(te, String(":method"), String("GET"))
+    _append_hpack_field(te, String(":scheme"), String("https"))
+    _append_hpack_field(te, String(":path"), String("/"))
+    _append_hpack_field(te, String(":authority"), String("example.com"))
+    _append_hpack_field(te, String("te"), String("trailers"))
+    assert_true(decode_http2_request_headers(Span(te), 5).is_valid())
+
+    var invalid_te = List[Byte]()
+    _append_hpack_field(invalid_te, String(":method"), String("GET"))
+    _append_hpack_field(invalid_te, String(":scheme"), String("https"))
+    _append_hpack_field(invalid_te, String(":path"), String("/"))
+    _append_hpack_field(invalid_te, String(":authority"), String("example.com"))
+    _append_hpack_field(invalid_te, String("te"), String("trailers, gzip"))
+    assert_true(decode_http2_request_headers(Span(invalid_te), 5).is_error())
+
+
+def test_http2_request_headers_reject_host_authority_mismatch() raises:
+    var encoded = List[Byte]()
+    _append_hpack_field(encoded, String(":method"), String("GET"))
+    _append_hpack_field(encoded, String(":scheme"), String("https"))
+    _append_hpack_field(encoded, String(":authority"), String("example.com"))
+    _append_hpack_field(encoded, String(":path"), String("/"))
+    _append_hpack_field(encoded, String("host"), String("other.example"))
+    assert_true(decode_http2_request_headers(Span(encoded), 5).is_error())
+
+
+def test_http2_request_headers_validate_authority_port_syntax() raises:
+    var encoded = List[Byte]()
+    _append_hpack_field(encoded, String(":method"), String("GET"))
+    _append_hpack_field(encoded, String(":scheme"), String("https"))
+    _append_hpack_field(encoded, String(":authority"), String("example.com:http"))
+    _append_hpack_field(encoded, String(":path"), String("/"))
+    assert_true(decode_http2_request_headers(Span(encoded), 4).is_error())
+
+
+def test_http2_request_headers_reject_truncated_serialized_fields() raises:
+    var encoded: List[Byte] = [Byte(0), Byte(0), Byte(0), Byte(7)]
+    assert_true(decode_http2_request_headers(Span(encoded), 1).is_error())
 
 
 def test_partial_client_preface_needs_more_data() raises:
