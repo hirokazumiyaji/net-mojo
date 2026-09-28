@@ -572,7 +572,6 @@ def test_http2_connection_input_bootstraps_then_acknowledges_coalesced_ping() ra
     assert_equal(ping_result.output[4], Byte(1))
     assert_equal(ping_result.output[16], Byte(8))
     assert_equal(ping_result.consumed, len(ping))
-    assert_true(not ping_result.is_goaway())
 
 
 def test_http2_connection_input_returns_stream_frame_payload() raises:
@@ -598,6 +597,15 @@ def test_http2_connection_input_returns_stream_frame_payload() raises:
     assert_equal(stream.flags, Byte(5))
     assert_equal(stream.stream_id, UInt32(1))
     assert_equal(stream.payload[0], Byte(0x82))
+
+    var goaway_payload: List[Byte] = [
+        Byte(0), Byte(0), Byte(0), Byte(1),
+        Byte(0), Byte(0), Byte(0), Byte(0),
+    ]
+    var goaway = _frame(7, 0, 0, goaway_payload)
+    var drain = input.consume(Span(goaway))
+    assert_true(drain.is_goaway())
+    assert_equal(drain.stream_id, UInt32(1))
 
 def _append_hpack_field(mut wire: List[Byte], name: String, value: String):
     var name_bytes = name.as_bytes()
