@@ -139,6 +139,12 @@
 - The independent aioquic client verified the initial maximum GOAWAY, the final last-accepted-stream GOAWAY, `H3_REQUEST_REJECTED` for a later stream, and `H3_NO_ERROR` connection close.
 - QUIC provider suite passed 4/4; HTTP/3 client, HTTP Server 27/27, HTTP/2 97/97, HTTPS client, HTTPS example build, Python syntax, Rust formatting, and `git diff --check` passed on Linux x86_64.
 
+## HTTP protocol documentation correction slice
+
+- [x] Update README and changelog to describe the implemented HTTP/2 and HTTP/3 support and optional provider environments.
+- [x] Replace stale HTTP/2 and HTTP/3 design notes with verified shutdown and interoperability status.
+- [x] Verify local documentation links and diff checks; commit this documentation slice locally.
+
 ## QUIC transport review
 
 - `QuicServer` accepts Initial datagrams, routes later packets by connection ID, emits pending packets with their destination, and reports/advances connection timeouts.

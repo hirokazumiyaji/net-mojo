@@ -41,17 +41,29 @@ The Rust provider test drives a Mojo server over localhost UDP using a separate
 quiche client connection. It confirms TLS negotiation with ALPN `h3`, dispatch
 to the shared handler, two concurrent request streams on one connection,
 stream-specific responses, and request trailer visibility through
-`Request.trailers`. C and Mojo FFI smoke tests exercise the provider boundary.
+`Request.trailers`. A pinned aioquic client independently verifies concurrent
+requests, cancellation, trailers, and graceful shutdown. C and Mojo FFI smoke
+tests exercise the provider boundary.
+
+## Graceful shutdown
+
+Shutdown first sends GOAWAY with the maximum request stream ID, then sends a
+second GOAWAY after a short interval with the highest request stream ID already
+accepted by the server. Streams above that final boundary receive
+`H3_REQUEST_REJECTED`. The server keeps the UDP endpoint active during the
+configured grace period, sends a QUIC close with `H3_NO_ERROR` when the period
+ends, and continues driving transport timers and packets until the provider
+reports the connections closed or the drain cap expires.
 
 ## Remaining protocol work
 
 The QUIC engine supplies HTTP/3 control and QPACK behavior; the application does
 not implement duplicate control streams or a second QPACK implementation.
-Independent-client interoperability beyond the current quiche client, loss and
-reordering coverage, cancellation and reset stress, and aggregate memory bounds
-remain outstanding. The server does not yet expose HTTP/3 GOAWAY or graceful
-connection drain. HTTPS Alt-Svc advertisement and shared TCP/UDP origin setup
-also remain outstanding. Server push and CONNECT are not supported.
+Interoperability coverage currently uses aioquic 1.3.0 and quiche. Broader
+independent-client coverage, loss and reordering stress, cancellation and reset
+stress, and aggregate memory bounds remain outstanding. HTTPS Alt-Svc
+advertisement and shared TCP/UDP origin setup also remain outstanding. Server
+push and CONNECT are not supported.
 
 Closed or timed-out QUIC connections are removed with their connection-ID
 routes, pending request routes, and queued completed requests. New connections

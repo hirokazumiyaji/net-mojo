@@ -1,8 +1,11 @@
 # net-mojo
 
 `net-mojo` is a synchronous networking package for Mojo 1.0.0.
-It provides IPv4 and IPv6 addresses, OS name resolution, TCP, UDP, and Unix stream sockets.
-The runtime depends on Mojo `std` and the documented libc/POSIX ABI only.
+It provides IPv4 and IPv6 addresses, OS name resolution, TCP, UDP, Unix stream
+sockets, and an HTTP server with HTTP/1.1, HTTP/2, and HTTP/3 support.
+The core runtime depends on Mojo `std` and the documented libc/POSIX ABI.
+TLS, HTTP/2, and HTTP/3 are optional build environments with separate native
+providers.
 
 The design rationale is documented in [docs/design/net-package.md](docs/design/net-package.md).
 
@@ -124,8 +127,19 @@ Constraints (see `docs/design/http-server.md` for the full contract):
 - `Request` views and `ResponseWriter` are valid only during the
   `handle` call. Copy values you want to keep; the server owns the
   receive buffer and the queued response.
-- HTTP/1.1 is supported over plaintext or opt-in TLS. HTTP/2 and HTTP/3
-  remain in progress under Issue #42.
+- HTTP/1.1 is supported over plaintext or opt-in TLS. HTTPS negotiates HTTP/2
+  with ALPN `h2`; HTTP/3 uses a separately configured UDP endpoint and ALPN
+  `h3`. Both protocols call the shared `Handler`.
+- TLS/HTTP/2 and HTTP/3 provider dependencies are optional. Build and validate
+  them with `pixi run -e tls-http2 tls-suite` plus
+  `pixi run -e tls-http2 hpack-mojo-test`, and `pixi run -e tls-http3 quic-suite`
+  plus `pixi run -e tls-http3 http3-client-test`.
+- HTTP/3 does not automatically advertise `Alt-Svc`; configure HTTPS and UDP
+  endpoints separately. Protocol behavior, limits, and unsupported features
+  are documented in [HTTP/2](docs/design/http2-server.md) and
+  [HTTP/3](docs/design/http3-server.md).
+- HTTP/3 CI and independent-client coverage run on Linux x86_64 and aarch64;
+  end-to-end HTTP/3 validation on macOS remains outstanding.
 - No client, no HTTP/1.0, no WebSocket/CONNECT/Upgrade switching, no
   multipart helpers, no body compression, no static file serving.
 
@@ -220,13 +234,18 @@ CI runs the complete warning-clean suite on all supported runners and keeps sepa
 Mojo 1.0.0 marks foundational standard APIs unstable, so CI uses `--Werror` without `--warn-on-unstable-apis`.
 The local macOS arm64 toolchain may fail to resolve `___asan_*` runtime symbols before sanitizer tests start.
 
-The initial release excludes asynchronous I/O, a custom DNS client, HTTP/2, HTTP/3, raw IP and multicast APIs, Linux abstract Unix sockets, Unix datagram sockets, Happy Eyeballs, Windows, and 32-bit ABIs. TLS is an opt-in OpenSSL-backed feature and is not required by the core `net` package.
+The package excludes asynchronous I/O, a custom DNS client, raw IP and
+multicast APIs, Linux abstract Unix sockets, Unix datagram sockets, Happy
+Eyeballs, Windows, and 32-bit ABIs. TLS and HTTP/2/HTTP/3 providers are
+optional and are not required by the core `net` package.
 
 ## 日本語
 
 `net-mojo` は Mojo 1.0.0 用の同期ネットワーク package です。
 IPv4、IPv6、OS の名前解決、TCP、UDP、Unix stream socket を提供します。
-runtime 依存は Mojo の `std` と文書化した libc/POSIX ABI だけです。
+core runtime 依存は Mojo の `std` と文書化した libc/POSIX ABI です。
+HTTP/2 と HTTP/3 は TLS／protocol provider を含む optional environment で
+利用できます。
 
 対応環境は macOS arm64 と Linux x86_64 / aarch64 です。
 Windows、32-bit ABI、表にない target は対象外です。
@@ -234,7 +253,9 @@ Windows、32-bit ABI、表にない target は対象外です。
 環境は `pixi install --frozen` で構築します。
 test は全体を `pixi run test`、個別を `pixi run test-tcp` のように実行します。
 examples は loopback だけを使い、benchmarks は閾値を持たない測定プログラムです。
-HTTP/1.1 origin server は `net.http` から利用します（`pixi run example-http-hello`）。
+HTTP server は `net.http` から利用します（`pixi run example-http-hello`）。
+HTTPS は ALPN `h2` を交渉し、HTTP/3 は UDP endpoint を追加して ALPN `h3` を
+利用します。
 handler は loop 上で同期実行されますが、`writer.detach()` を呼ぶことで別スレッドへの応答切り離し（遅延応答・SSE レスポンスストリーミング）が可能です（`pixi run example-http-sse`）。
 詳細は [docs/design/http-server.md](docs/design/http-server.md) を参照してください。
 

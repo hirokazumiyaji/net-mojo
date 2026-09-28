@@ -181,14 +181,17 @@ local cap is reached, the server advances the client stream ID and sends
 the connection usable. DATA that races with the refusal is ignored for that
 closed stream.
 
-GOAWAY handling and graceful connection drain remain follow-up work. The current
-server has no shutdown API that stops new HTTP/2 streams while allowing admitted
-streams to finish within a configured grace period.
+When shutdown begins, the server sends GOAWAY with the highest admitted peer
+stream ID and refuses later streams with `REFUSED_STREAM`. GOAWAY is queued
+behind existing connection output, and admitted requests keep the configured
+shutdown grace period to finish. At the grace deadline, remaining TCP
+connections are closed.
 
 ## Verification sequence
 
 The frame parser slice uses wire fixtures for incomplete headers and payloads,
 maximum and oversized payload lengths, ignored reserved stream bits, unknown
 frame types, and multiple concatenated frames. The client preface parser tests
-every incomplete prefix, mismatch rejection, and the consumed byte count. The
-remaining connection work is GOAWAY handling and graceful drain coverage.
+every incomplete prefix, mismatch rejection, and the consumed byte count.
+Independent TLS client tests verify response completion and the GOAWAY boundary
+during graceful HTTP/2 shutdown.
