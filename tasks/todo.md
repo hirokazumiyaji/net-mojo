@@ -30,13 +30,15 @@
 
 ## Current slice
 
-- Expose provider datagram and timer operations to Mojo, drive them from a borrowed `UDPConn` descriptor, and keep packet output when a nonblocking send cannot complete.
+- Integrate the Mojo `QuicServer` with `UDPConn` and the server reactor, retaining a generated QUIC packet until the nonblocking UDP send completes.
 
 ## QUIC transport review
 
 - `QuicServer` accepts Initial datagrams, routes later packets by connection ID, emits pending packets with their destination, and reports/advances connection timeouts.
 - A localhost UDP test completed the HTTP/3 TLS handshake through this provider boundary and confirmed ALPN `h3` and a pending connection timeout.
-- The Rust provider suite passed on Linux x86_64. Socket ownership and Mojo integration remain outstanding.
+- The Rust provider suite passed on Linux x86_64. The C/Mojo FFI now exposes datagram receive/send and timeout operations while keeping UDP socket ownership with Mojo.
+- The TLS/HTTP/2 integration suite passed in the `tls-http2` environment after rebuilding the HPACK shim for Linux x86_64. An earlier run had loaded a stale aarch64 artifact into x86_64; the test itself passed with the correct architecture.
+- The HTTP/3 environment now pins Mojo 1.0 to match the TLS/HTTP/2 environments and lockfile, avoiding two Mojo API levels for the shared networking modules.
 
 ## QUIC packet I/O slice
 
@@ -51,7 +53,7 @@
 - The Rust test first failed to compile because `QuicServer` was absent, then passed after adding datagram receive/send, connection ID routing, and timeout accessors.
 - `pixi run -e tls-http3 quic-suite` passed on Linux x86_64: C config smoke, Mojo FFI smoke, and both Rust handshake tests.
 - `cargo fmt --check`, test script syntax, and `git diff --check` passed.
-- This slice keeps the UDP socket with the caller. The C/Mojo API that connects a `UDPConn` to `QuicServer` remains the next slice.
+- The UDP socket remains caller-owned. The next slice connects these operations to `UDPConn` and the reactor and preserves pending packets across UDP backpressure.
 
 ## Review
 
@@ -71,4 +73,4 @@
 
 ## Current slice
 
-- Expose provider datagram and timer operations to Mojo, drive them from a borrowed `UDPConn` descriptor, and keep packet output when a nonblocking send cannot complete.
+- Integrate the Mojo `QuicServer` with `UDPConn` and the server reactor, retaining a generated QUIC packet until the nonblocking UDP send completes.

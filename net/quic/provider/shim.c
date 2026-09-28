@@ -12,3 +12,33 @@ struct NetQuicServerConfig *net_quic_config_new(
 void net_quic_config_free(struct NetQuicServerConfig *config) {
     net_quic_server_config_free(config);
 }
+
+struct NetQuicServer *net_quic_create(struct NetQuicServerConfig *config) {
+    return net_quic_server_new(config);
+}
+
+void net_quic_free(struct NetQuicServer *server) {
+    net_quic_server_free(server);
+}
+
+int32_t net_quic_receive(
+    struct NetQuicServer *server, uint8_t *packet, size_t packet_length,
+    const char *local_address, const char *remote_address) {
+    return net_quic_server_recv(server, packet, packet_length, local_address,
+                                remote_address);
+}
+
+int32_t net_quic_send(
+    struct NetQuicServer *server, uint8_t *packet, size_t packet_capacity,
+    char *remote_address, size_t address_capacity) {
+    return net_quic_server_send(server, packet, packet_capacity,
+                                remote_address, address_capacity);
+}
+
+uint64_t net_quic_timeout_micros(const struct NetQuicServer *server) {
+    return net_quic_server_timeout_micros(server);
+}
+
+void net_quic_on_timeout(struct NetQuicServer *server) {
+    net_quic_server_on_timeout(server);
+}

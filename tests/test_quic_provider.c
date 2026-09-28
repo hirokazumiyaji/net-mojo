@@ -13,7 +13,13 @@ int main(int argc, char **argv) {
     if (config == NULL) {
         return 2;
     }
+
+    struct NetQuicServer *server = net_quic_create(config);
+    if (server == NULL) {
+        return 3;
+    }
+    net_quic_free(server);
     net_quic_config_free(config);
-    puts("QUIC provider config: ok");
+    puts("QUIC provider server ownership: ok");
     return 0;
 }

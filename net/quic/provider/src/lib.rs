@@ -4,12 +4,17 @@ use std::fs::File;
 use std::io::{self, Read};
 use std::net::SocketAddr;
 use std::ptr;
+use std::slice;
 use std::time::Duration;
 
 use quiche::{Connection, ConnectionId, RecvInfo, SendInfo};
 
 pub struct NetQuicServerConfig {
-    _inner: quiche::Config,
+    _inner: Option<quiche::Config>,
+}
+
+pub struct NetQuicServer {
+    _inner: QuicServer,
 }
 
 #[unsafe(no_mangle)]
@@ -51,13 +56,131 @@ pub unsafe extern "C" fn net_quic_server_config_new(
         return ptr::null_mut();
     }
 
-    Box::into_raw(Box::new(NetQuicServerConfig { _inner: config }))
+    Box::into_raw(Box::new(NetQuicServerConfig {
+        _inner: Some(config),
+    }))
 }
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn net_quic_server_config_free(config: *mut NetQuicServerConfig) {
     if !config.is_null() {
         drop(unsafe { Box::from_raw(config) });
+    }
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn net_quic_server_new(
+    config: *mut NetQuicServerConfig,
+) -> *mut NetQuicServer {
+    if config.is_null() {
+        return ptr::null_mut();
+    }
+    let Some(config) = (unsafe { (*config)._inner.take() }) else {
+        return ptr::null_mut();
+    };
+    let Ok(server) = QuicServer::new(config) else {
+        return ptr::null_mut();
+    };
+    Box::into_raw(Box::new(NetQuicServer { _inner: server }))
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn net_quic_server_free(server: *mut NetQuicServer) {
+    if !server.is_null() {
+        drop(unsafe { Box::from_raw(server) });
+    }
+}
+
+unsafe fn socket_address(address: *const c_char) -> Option<SocketAddr> {
+    let address = unsafe { CStr::from_ptr(address) }.to_str().ok()?;
+    address.parse().ok()
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn net_quic_server_recv(
+    server: *mut NetQuicServer,
+    packet: *mut u8,
+    packet_length: usize,
+    local_address: *const c_char,
+    remote_address: *const c_char,
+) -> i32 {
+    if server.is_null() || packet.is_null() || packet_length == 0 {
+        return -1;
+    }
+    if local_address.is_null() || remote_address.is_null() {
+        return -1;
+    }
+    let Some(local_address) = (unsafe { socket_address(local_address) }) else {
+        return -1;
+    };
+    let Some(remote_address) = (unsafe { socket_address(remote_address) }) else {
+        return -1;
+    };
+    let packet = unsafe { slice::from_raw_parts_mut(packet, packet_length) };
+    match unsafe { &mut *server }
+        ._inner
+        .recv_datagram(packet, local_address, remote_address)
+    {
+        Ok(()) => 1,
+        Err(QuicServerError::Quiche(quiche::Error::Done)) => 0,
+        Err(_) => -1,
+    }
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn net_quic_server_send(
+    server: *mut NetQuicServer,
+    packet: *mut u8,
+    packet_capacity: usize,
+    remote_address: *mut c_char,
+    address_capacity: usize,
+) -> i32 {
+    if server.is_null()
+        || packet.is_null()
+        || packet_capacity == 0
+        || remote_address.is_null()
+        || address_capacity < 64
+    {
+        return -1;
+    }
+    let packet = unsafe { slice::from_raw_parts_mut(packet, packet_capacity) };
+    let (length, info) = match (unsafe { &mut *server })._inner.send(packet) {
+        Ok(Some(packet)) => packet,
+        Ok(None) => return 0,
+        Err(_) => return -1,
+    };
+    let address = info.to.to_string();
+    let address_bytes = address.as_bytes();
+    if address_bytes.len() + 1 > address_capacity {
+        return -1;
+    }
+    unsafe {
+        ptr::copy_nonoverlapping(
+            address_bytes.as_ptr(),
+            remote_address.cast::<u8>(),
+            address_bytes.len(),
+        );
+        *remote_address.add(address_bytes.len()) = 0;
+    }
+    i32::try_from(length).unwrap_or(-1)
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn net_quic_server_timeout_micros(server: *const NetQuicServer) -> u64 {
+    if server.is_null() {
+        return u64::MAX;
+    }
+    unsafe { &*server }
+        ._inner
+        .timeout()
+        .map(|timeout| u64::try_from(timeout.as_micros()).unwrap_or(u64::MAX - 1))
+        .unwrap_or(u64::MAX)
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn net_quic_server_on_timeout(server: *mut NetQuicServer) {
+    if !server.is_null() {
+        unsafe { &mut *server }._inner.on_timeout();
     }
 }
 
@@ -179,13 +302,14 @@ impl QuicServer {
 
 #[cfg(test)]
 mod tests {
+    use std::ffi::{CStr, CString, c_char};
     use std::net::UdpSocket;
     use std::net::{IpAddr, Ipv4Addr, SocketAddr};
     use std::time::Duration;
 
     use quiche::{ConnectionId, Header, RecvInfo};
 
-    use super::QuicServer;
+    use super::{NetQuicServerConfig, net_quic_server_free, net_quic_server_new};
 
     #[test]
     fn completes_http3_tls_handshake_over_quic_packets() {
@@ -320,7 +444,11 @@ mod tests {
             &mut client_config,
         )
         .unwrap();
-        let mut server = QuicServer::new(server_config).unwrap();
+        let config = Box::into_raw(Box::new(NetQuicServerConfig {
+            _inner: Some(server_config),
+        }));
+        let server = unsafe { net_quic_server_new(config) };
+        assert!(!server.is_null());
         let mut packet = [0; 65535];
 
         for _ in 0..8 {
@@ -330,12 +458,41 @@ mod tests {
                     .unwrap();
             }
             if let Ok((length, peer)) = server_socket.recv_from(&mut packet) {
-                server
-                    .recv_datagram(&mut packet[..length], server_address, peer)
-                    .unwrap();
+                let local = CString::new(server_address.to_string()).unwrap();
+                let remote = CString::new(peer.to_string()).unwrap();
+                let status = unsafe {
+                    super::net_quic_server_recv(
+                        server,
+                        packet.as_mut_ptr(),
+                        length,
+                        local.as_ptr(),
+                        remote.as_ptr(),
+                    )
+                };
+                assert_eq!(status, 1);
             }
-            while let Some((length, info)) = server.send(&mut packet).unwrap() {
-                server_socket.send_to(&packet[..length], info.to).unwrap();
+            loop {
+                let mut destination = [0 as c_char; 64];
+                let length = unsafe {
+                    super::net_quic_server_send(
+                        server,
+                        packet.as_mut_ptr(),
+                        packet.len(),
+                        destination.as_mut_ptr(),
+                        destination.len(),
+                    )
+                };
+                if length <= 0 {
+                    break;
+                }
+                let destination = unsafe { CStr::from_ptr(destination.as_ptr()) }
+                    .to_str()
+                    .unwrap()
+                    .parse::<SocketAddr>()
+                    .unwrap();
+                server_socket
+                    .send_to(&packet[..length as usize], destination)
+                    .unwrap();
             }
             if let Ok((length, peer)) = client_socket.recv_from(&mut packet) {
                 client
@@ -355,6 +512,13 @@ mod tests {
 
         assert!(client.is_established());
         assert_eq!(client.application_proto(), b"h3");
-        assert!(server.timeout().is_some());
+        assert_ne!(
+            unsafe { super::net_quic_server_timeout_micros(server) },
+            u64::MAX
+        );
+        unsafe {
+            net_quic_server_free(server);
+            super::net_quic_server_config_free(config);
+        }
     }
 }

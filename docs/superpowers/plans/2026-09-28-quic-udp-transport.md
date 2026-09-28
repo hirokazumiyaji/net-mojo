@@ -41,4 +41,21 @@
 
 - The UDP test fails before implementation with the missing `QuicServer` API and passes after adding it.
 - Linux x86_64 `quic-suite`, Rust format check, shell syntax check, and `git diff --check` pass.
-- This task implements the provider state boundary only. C/Mojo socket integration, connection limits, HTTP/3 request streams, and send fairness remain later slices.
+- This task implements the provider state boundary only. Connection limits, HTTP/3 request streams, and send fairness remain later slices.
+
+### Task 2: C and Mojo datagram API
+
+- [x] Add C tests for server handle creation and destruction.
+- [x] Expose server receive/send, destination, and timeout operations through the C shim and Mojo owner.
+- [x] Exercise the server packet boundary over localhost UDP in the Rust FFI test.
+- [x] Run `quic-suite` with the HTTP/3 environment pinned to Mojo 1.0 and run the TLS/HTTP/2 suite with a freshly built matching HPACK shim.
+- [x] Review the diff, record results in `tasks/todo.md`, and commit this API slice.
+
+**Ruling:** Pin the optional HTTP/3 Mojo dependency to `>=1.0.0,<1.1` to match the project lockfile's TLS and HTTP/2 environments and the shared networking modules' supported API level. This avoids having shared `net` modules compile against different Mojo APIs in separate environments.
+
+## Review
+
+- The C test verified server handle creation and destruction after config ownership transfer.
+- The Rust localhost UDP test exercised the C ABI receive/send path through handshake completion and the negotiated `h3` ALPN.
+- The Mojo smoke test loaded the server, exercised an empty send queue and timeout path, then released ownership.
+- `quic-suite` passed in the locked HTTP/3 environment. `hpack-test` and `tls-suite` passed in the locked TLS/HTTP/2 environment.
