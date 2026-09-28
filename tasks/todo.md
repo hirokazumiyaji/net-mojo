@@ -139,3 +139,20 @@
 - The first test run failed because only the stream window was increased while the connection window remained the limiting 65,535 bytes. Adding a connection `WINDOW_UPDATE` made the test isolate per-stream credit.
 - HPACK passed 22/22, HTTP/2 passed 97/97, and the TLS/HTTP2 suite passed on Linux x86_64.
 - Response scheduler queues, continued DATA after credit is exhausted, and connection-level read progress during blocked writes remain outstanding.
+
+## HTTP/2 response scheduler slice plan
+
+- [x] Add a socket-independent round-robin scheduler test with two blocked streams, bounded DATA frames, and WINDOW_UPDATE resumption.
+- [x] Separate response HEADERS encoding from DATA framing while preserving HEAD and bodyless status behavior.
+- [x] Queue response bodies per stream, debit connection and stream windows as DATA frames are scheduled, and retain unsent offsets.
+- [x] Keep HTTP/2 reads active while queued response bytes are blocked on socket writability or flow-control credit.
+- [x] Account queued body/header bytes and release them after completion or reset.
+- [x] Run HPACK, HTTP/2, HTTP Server, and TLS/HTTP2 suites; commit the slice locally.
+
+## Review
+
+- The scheduler unit test proves round-robin DATA frames, bounded payloads, no repeated HEADERS, completion flags, per-stream credit exhaustion, and resumption after stream `WINDOW_UPDATE`.
+- TLS HTTP/2 client coverage sends two requests on streams 1 and 3 before reading either response and verifies both bodies on one connection.
+- The TLS HTTP/2 client also sets the initial stream window to zero, grants credit later, and verifies the buffered response body resumes.
+- HPACK passed 24/24, HTTP/2 passed 97/97, HTTP Server passed 27/27, and `tls-suite` passed on Linux x86_64.
+- `/review` was attempted as requested, but the auto-reviewer rejected external diff upload and session persistence outside the workspace. PR publication remains blocked pending explicit approval for that data transfer.

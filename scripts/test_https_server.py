@@ -83,7 +83,12 @@ try:
                 + b"\x00\x01\x00\x00\x00\x01"
                 + request_body
             )
-            client.sendall(headers_frame + data_frame)
+            second_headers_frame = (
+                len(compressed_headers).to_bytes(3, "big")
+                + b"\x01\x05\x00\x00\x00\x03"
+                + compressed_headers
+            )
+            client.sendall(headers_frame + data_frame + second_headers_frame)
 
             connection_credit = read_h2_frame(client)
             stream_credit = read_h2_frame(client)
@@ -100,22 +105,24 @@ try:
                     f"{connection_credit!r}, {stream_credit!r}"
                 )
 
-            response_headers = read_h2_frame(client)
-            if (
-                response_headers[0] != 1
-                or response_headers[2] != 1
-                or response_headers[3][0] != 0x88
-            ):
+            response_bodies = {}
+            for _ in range(4):
+                frame = read_h2_frame(client)
+                if frame[0] == 1:
+                    if frame[3][0] != 0x88:
+                        raise RuntimeError(
+                            f"unexpected HTTP/2 headers: {frame!r}"
+                        )
+                    response_bodies[frame[2]] = bytearray()
+                elif frame[0] == 0 and frame[2] in response_bodies:
+                    response_bodies[frame[2]].extend(frame[3])
+            if response_bodies != {
+                1: b"hello over httpsfrom h2",
+                3: b"hello over https",
+            }:
                 raise RuntimeError(
-                    f"unexpected HTTP/2 headers: {response_headers!r}"
+                    f"unexpected multiplexed HTTP/2 bodies: {response_bodies!r}"
                 )
-            response_data = read_h2_frame(client)
-            if (
-                response_data[0] != 0
-                or response_data[2] != 1
-                or response_data[3] != b"hello over httpsfrom h2"
-            ):
-                raise RuntimeError(f"unexpected HTTP/2 body: {response_data!r}")
 
     with socket.create_connection(("127.0.0.1", port), timeout=5) as raw:
         with http2_context.wrap_socket(raw, server_hostname="localhost") as client:
@@ -142,11 +149,26 @@ try:
             if (
                 limited_headers[0] != 1
                 or limited_headers[2] != 1
-                or (limited_headers[1] & 1) == 0
-                or limited_headers[3][0] != 0x8E
+                or (limited_headers[1] & 1) != 0
+                or limited_headers[3][0] != 0x88
             ):
                 raise RuntimeError(
                     f"server exceeded a zero HTTP/2 send window: {limited_headers!r}"
+                )
+            stream_increment = b"\x00\x00\x00\x20"
+            client.sendall(
+                b"\x00\x00\x04\x08\x00\x00\x00\x00\x01"
+                + stream_increment
+            )
+            response_data = read_h2_frame(client)
+            if (
+                response_data[0] != 0
+                or response_data[1] & 1 == 0
+                or response_data[2] != 1
+                or response_data[3] != b"hello over https"
+            ):
+                raise RuntimeError(
+                    f"server did not resume HTTP/2 body after credit: {response_data!r}"
                 )
 
     with socket.create_connection(("127.0.0.1", port), timeout=5) as raw:

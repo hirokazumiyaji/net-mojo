@@ -4,6 +4,7 @@ from net.http._http2.hpack import Http2HpackDeflater, Http2HpackInflater
 from net.http._http2.frame import FrameParseResult, parse_frame
 from net.http._http2.header_decoder import Http2HeaderDecoder
 from net.http._http2.request_session import Http2RequestSession
+from net.http._http2.response_scheduler import Http2ResponseScheduler
 from net.http._http2.frame_encoder import encode_frame
 from net.http._http2.response_encoder import encode_http2_response
 from net.http._http2.request_headers import decode_http2_request_headers
@@ -613,6 +614,151 @@ def test_http2_request_session_tracks_outbound_credit_per_stream() raises:
     session.finish_response(UInt32(1))
     assert_equal(session.send_window(UInt32(1)), 0)
     assert_equal(session.send_window(UInt32(3)), 65542)
+
+
+def test_http2_response_scheduler_resumes_each_stream_after_window_update() raises:
+    var session = Http2RequestSession("build/http2/libnet_hpack", 4, 1024)
+    var wire = List[Byte]()
+    var preface = "PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n".as_bytes()
+    for i in range(len(preface)):
+        wire.append(preface[i])
+    var initial_window: List[Byte] = [
+        Byte(0), Byte(4), Byte(0), Byte(0), Byte(0), Byte(2)
+    ]
+    _append_frame(wire, Byte(4), Byte(0), UInt32(0), Span(initial_window))
+    var compressed: List[Byte] = [
+        Byte(0x82), Byte(0x86), Byte(0x84), Byte(0x41), Byte(0x0F),
+        Byte(ord("w")), Byte(ord("w")), Byte(ord("w")), Byte(ord(".")),
+        Byte(ord("e")), Byte(ord("x")), Byte(ord("a")), Byte(ord("m")),
+        Byte(ord("p")), Byte(ord("l")), Byte(ord("e")), Byte(ord(".")),
+        Byte(ord("c")), Byte(ord("o")), Byte(ord("m")),
+    ]
+    _append_frame(wire, Byte(1), Byte(5), UInt32(1), Span(compressed))
+    _append_frame(wire, Byte(1), Byte(5), UInt32(3), Span(compressed))
+    var first = session.consume(Span(wire))
+    assert_true(first.is_request())
+    var second = session.consume(Span(wire)[first.consumed :])
+    assert_true(second.is_request())
+    var stream_three_credit: List[Byte] = [
+        Byte(0), Byte(0), Byte(0), Byte(2)
+    ]
+    var update = List[Byte]()
+    _append_frame(
+        update, Byte(8), Byte(0), UInt32(3), Span(stream_three_credit)
+    )
+    assert_true(session.consume(Span(update)).is_pending())
+
+    var scheduler = Http2ResponseScheduler()
+    var header_payload = List[Byte]()
+    var first_headers = List[Byte]()
+    var second_headers = List[Byte]()
+    _append_frame(first_headers, Byte(1), Byte(0), UInt32(1), Span(header_payload))
+    _append_frame(second_headers, Byte(1), Byte(0), UInt32(3), Span(header_payload))
+    var first_body: List[Byte] = [
+        Byte(ord("a")), Byte(ord("b")), Byte(ord("c")),
+        Byte(ord("d")), Byte(ord("e")),
+    ]
+    var second_body: List[Byte] = [
+        Byte(ord("v")), Byte(ord("w")), Byte(ord("x")),
+        Byte(ord("y")), Byte(ord("z")),
+    ]
+    assert_true(
+        scheduler.enqueue(UInt32(1), first_headers^, first_body^)
+    )
+    assert_true(
+        scheduler.enqueue(UInt32(3), second_headers^, second_body^)
+    )
+    var first_batch = scheduler.drain(session, 2, 256)
+    assert_equal(len(first_batch.completed_streams), 0)
+    var first_data_streams = List[UInt32]()
+    var offset = 0
+    while offset < len(first_batch.wire):
+        var frame = parse_frame(Span(first_batch.wire)[offset:])
+        if frame.frame_type == Byte(0):
+            first_data_streams.append(frame.stream_id)
+            assert_equal(frame.payload_length, 2)
+            assert_equal(frame.flags & Byte(1), Byte(0))
+        offset += frame.consumed
+    assert_equal(first_data_streams[0], UInt32(1))
+    assert_equal(first_data_streams[1], UInt32(3))
+    assert_equal(first_data_streams[2], UInt32(3))
+    assert_equal(session.send_window(UInt32(1)), 0)
+    assert_equal(session.send_window(UInt32(3)), 0)
+
+    var more_credit = List[Byte]()
+    var first_increment: List[Byte] = [
+        Byte(0), Byte(0), Byte(0), Byte(3)
+    ]
+    var second_increment: List[Byte] = [
+        Byte(0), Byte(0), Byte(0), Byte(1)
+    ]
+    _append_frame(
+        more_credit, Byte(8), Byte(0), UInt32(1), Span(first_increment)
+    )
+    _append_frame(
+        more_credit, Byte(8), Byte(0), UInt32(3), Span(second_increment)
+    )
+    assert_true(session.consume(Span(more_credit)).is_pending())
+    var final_batch = scheduler.drain(session, 2, 256)
+    assert_equal(len(final_batch.completed_streams), 2)
+    assert_equal(final_batch.released_bytes, 28)
+    var final_data_streams = List[UInt32]()
+    var final_data_flags = List[UInt8]()
+    offset = 0
+    while offset < len(final_batch.wire):
+        var frame = parse_frame(Span(final_batch.wire)[offset:])
+        assert_equal(frame.frame_type, Byte(0))
+        final_data_streams.append(frame.stream_id)
+        final_data_flags.append(frame.flags)
+        offset += frame.consumed
+    assert_equal(final_data_streams[0], UInt32(1))
+    assert_equal(final_data_streams[1], UInt32(3))
+    assert_equal(final_data_streams[2], UInt32(1))
+    assert_equal(final_data_flags[0] & UInt8(1), UInt8(0))
+    assert_equal(final_data_flags[1] & UInt8(1), UInt8(1))
+    assert_equal(final_data_flags[2] & UInt8(1), UInt8(1))
+    assert_equal(session.send_window(UInt32(1)), 0)
+    assert_equal(session.send_window(UInt32(3)), 0)
+
+    var cancelled = Http2ResponseScheduler()
+    var cancel_headers = List[Byte]()
+    var cancel_body: List[Byte] = [Byte(1), Byte(2)]
+    _append_frame(
+        cancel_headers, Byte(1), Byte(0), UInt32(5), Span(header_payload)
+    )
+    assert_true(
+        cancelled.enqueue(UInt32(5), cancel_headers^, cancel_body^)
+    )
+    assert_equal(cancelled.cancel(UInt32(5)), 11)
+    assert_equal(cancelled.cancel(UInt32(5)), 0)
+    assert_equal(cancelled.queued_count(), 0)
+
+
+def test_http2_request_session_reports_reset_stream_for_response_cancel() raises:
+    var session = Http2RequestSession("build/http2/libnet_hpack", 4, 1024)
+    var wire = List[Byte]()
+    var preface = "PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n".as_bytes()
+    for i in range(len(preface)):
+        wire.append(preface[i])
+    var empty = List[Byte]()
+    _append_frame(wire, Byte(4), Byte(0), UInt32(0), Span(empty))
+    var compressed: List[Byte] = [
+        Byte(0x82), Byte(0x86), Byte(0x84), Byte(0x41), Byte(0x0F),
+        Byte(ord("w")), Byte(ord("w")), Byte(ord("w")), Byte(ord(".")),
+        Byte(ord("e")), Byte(ord("x")), Byte(ord("a")), Byte(ord("m")),
+        Byte(ord("p")), Byte(ord("l")), Byte(ord("e")), Byte(ord(".")),
+        Byte(ord("c")), Byte(ord("o")), Byte(ord("m")),
+    ]
+    _append_frame(wire, Byte(1), Byte(5), UInt32(1), Span(compressed))
+    var request = session.consume(Span(wire))
+    assert_true(request.is_request())
+
+    var reset_payload: List[Byte] = [Byte(0), Byte(0), Byte(0), Byte(8)]
+    var reset = List[Byte]()
+    _append_frame(reset, Byte(3), Byte(0), UInt32(1), Span(reset_payload))
+    var result = session.consume(Span(reset))
+    assert_true(result.is_pending())
+    assert_equal(result.reset_stream_id, UInt32(1))
 
 
 def test_http2_request_session_returns_padding_flow_credit() raises:

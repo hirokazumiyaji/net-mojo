@@ -11,6 +11,7 @@ from net.error import NetError, NetErrorKind
 from net.tls import TLSConnection, TLSIOResult
 from net.http._http2.hpack import Http2HpackDeflater
 from net.http._http2.request_session import Http2RequestSession
+from net.http._http2.response_scheduler import Http2ResponseScheduler
 
 comptime STATE_READING: UInt8 = 0
 comptime STATE_SENDING: UInt8 = 1
@@ -31,6 +32,8 @@ struct HttpConnection(Movable):
     var tls: Optional[TLSConnection]
     var http2_session: Optional[Http2RequestSession]
     var http2_deflater: Optional[Http2HpackDeflater]
+    var http2_responses: Http2ResponseScheduler
+    var http2_response_bytes_reserved: Int
     var http2_body_reserved: Int
     var protocol: UInt8
     var buf: List[Byte]
@@ -86,6 +89,8 @@ struct HttpConnection(Movable):
         self.tls = tls^
         self.http2_session = None
         self.http2_deflater = None
+        self.http2_responses = Http2ResponseScheduler()
+        self.http2_response_bytes_reserved = 0
         self.http2_body_reserved = 0
         self.protocol = PROTOCOL_HTTP11
         self.buf = List[Byte]()
@@ -142,6 +147,8 @@ struct HttpConnection(Movable):
             return (
                 self.tls_write_would_block and self.tls_write_wants_read
             ) or (self.tls_read_would_block and not self.tls_read_wants_write)
+        if self.state == STATE_SENDING_HTTP2_CONTROL:
+            return True
         if self.state == STATE_READING:
             return True
         if self.state == STATE_DETACHED or self.state == STATE_STREAMING:
@@ -368,6 +375,8 @@ struct HttpConnection(Movable):
         self.tls = None
         self.http2_session = None
         self.http2_deflater = None
+        self.http2_responses = Http2ResponseScheduler()
+        self.http2_response_bytes_reserved = 0
         self.http2_body_reserved = 0
         if self.conn:
             self.conn.value().close()

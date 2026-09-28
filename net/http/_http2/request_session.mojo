@@ -18,15 +18,21 @@ struct Http2RequestSessionResult(Movable):
     var kind: UInt8
     var consumed: Int
     var stream_id: UInt32
+    var reset_stream_id: UInt32
     var output: List[Byte]
     var request: Request
 
     @staticmethod
-    def pending(consumed: Int, var output: List[Byte]) -> Self:
+    def pending(
+        consumed: Int,
+        var output: List[Byte],
+        reset_stream_id: UInt32 = UInt32(0),
+    ) -> Self:
         return Self(
             kind=1,
             consumed=consumed,
             stream_id=UInt32(0),
+            reset_stream_id=reset_stream_id,
             output=output^,
             request=Request(
                 String(), String(), String(), String(), HttpVersion.http2()
@@ -44,6 +50,7 @@ struct Http2RequestSessionResult(Movable):
             kind=2,
             consumed=consumed,
             stream_id=stream_id,
+            reset_stream_id=UInt32(0),
             output=output^,
             request=request^,
         )
@@ -54,6 +61,7 @@ struct Http2RequestSessionResult(Movable):
             kind=3,
             consumed=consumed,
             stream_id=UInt32(0),
+            reset_stream_id=UInt32(0),
             output=output^,
             request=Request(
                 String(), String(), String(), String(), HttpVersion.http2()
@@ -194,6 +202,9 @@ struct Http2RequestSession(Movable):
                         )
             elif input.is_reset():
                 self._remove_stream(input.stream_id)
+                return Http2RequestSessionResult.pending(
+                    consumed, output^, input.stream_id
+                )
             elif input.is_window_update():
                 if input.stream_id == UInt32(0):
                     if not self._send_window.apply_window_update(

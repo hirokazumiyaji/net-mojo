@@ -82,7 +82,9 @@ from net.http._http2.request_session import (
     Http2RequestSession,
     Http2RequestSessionResult,
 )
-from net.http._http2.response_encoder import encode_http2_response
+from net.http._http2.response_encoder import (
+    encode_http2_response_header_frames,
+)
 
 
 comptime _TICK_POLL_CAP_MS: Int = 100
@@ -857,6 +859,8 @@ struct Server(Movable):
         self._conns[idx].reserved = 0
         self._budget.release(self._conns[idx].http2_body_reserved)
         self._conns[idx].http2_body_reserved = 0
+        self._budget.release(self._conns[idx].http2_response_bytes_reserved)
+        self._conns[idx].http2_response_bytes_reserved = 0
         if self._conns[idx].is_tls():
             self._budget.release(READ_BUFFER_SIZE)
         try:
@@ -993,40 +997,37 @@ struct Server(Movable):
                 )
                 if not self._conns[idx].active:
                     return
-            if self._conns[idx].state == STATE_READING:
-                var read_event = (
-                    self._conns[idx].read_ready(readable, writable)
-                    or self._conns[idx].tls_pending() > 0
-                )
-                self._pump_read(idx, read_event, now)
+            var read_event = (
+                self._conns[idx].read_ready(readable, writable)
+                or self._conns[idx].tls_pending() > 0
+            )
+            self._pump_read(idx, read_event, now)
+            if not self._conns[idx].active:
+                return
+            while (
+                self._conns[idx].active
+                and self._conns[idx].buffered_len() > 0
+            ):
+                if (
+                    self._conns[idx].requests_this_tick
+                    >= self.config.max_requests_per_tick
+                ):
+                    self._conns[idx].more_work = True
+                    break
+                var buffered_before = self._conns[idx].buffered_len()
+                self._pump_http2_input(idx, handler)
                 if not self._conns[idx].active:
                     return
-                while (
-                    self._conns[idx].active
-                    and self._conns[idx].state == STATE_READING
-                    and self._conns[idx].buffered_len() > 0
-                ):
-                    if (
-                        self._conns[idx].requests_this_tick
-                        >= self.config.max_requests_per_tick
-                    ):
-                        self._conns[idx].more_work = True
-                        break
-                    self._pump_http2_input(idx, handler)
-                    if not self._conns[idx].active:
-                        return
-                    if self._conns[idx].state != STATE_SENDING_HTTP2_CONTROL:
-                        break
-                    self._pump_send(idx, True)
-                    if not self._conns[idx].active:
-                        return
-                if (
-                    self._conns[idx].read_eof
-                    and self._conns[idx].buffered_len() == 0
-                    and self._conns[idx].pending_remaining() == 0
-                ):
-                    self._close_conn(idx)
-                    return
+                if self._conns[idx].buffered_len() >= buffered_before:
+                    break
+            if (
+                self._conns[idx].read_eof
+                and self._conns[idx].buffered_len() == 0
+                and self._conns[idx].pending_remaining() == 0
+                and self._conns[idx].http2_responses.queued_count() == 0
+            ):
+                self._close_conn(idx)
+                return
             self._sync_interests(idx)
             return
         if (
@@ -1126,6 +1127,12 @@ struct Server(Movable):
             if result.consumed > 0:
                 self._conns[idx].drain_prefix(result.consumed)
                 self._budget.release(result.consumed)
+            if result.reset_stream_id != UInt32(0):
+                var released = self._conns[idx].http2_responses.cancel(
+                    result.reset_stream_id
+                )
+                self._budget.release(released)
+                self._conns[idx].http2_response_bytes_reserved -= released
             var request_body_bytes = 0
             if result.is_request():
                 request_body_bytes = len(result.request.body)
@@ -1155,13 +1162,14 @@ struct Server(Movable):
                 if not self._budget.try_reserve(len(output)):
                     self._close_conn(idx)
                     return
-                self._conns[idx].set_pending(output^)
+                self._conns[idx].append_pending(output^)
                 self._conns[idx].state = STATE_SENDING_HTTP2_CONTROL
                 self._conns[idx].write_at = deadline_from_now(
                     self.config.write_deadline
                 )
                 return
             if result.is_pending():
+                self._drain_http2_responses(idx)
                 return
 
     def _respond_http2[
@@ -1178,12 +1186,13 @@ struct Server(Movable):
         var request = result^.take_request()
         var is_head = request.method == "HEAD"
         var cap = self.config.max_response_body
-        var send_window = self._conns[idx].http2_session.value().send_window(
-            stream_id
+        var room = (
+            self._budget.remaining()
+            - len(control_output)
+            - self.config.max_response_headers_bytes
+            - 16384
+            - 256
         )
-        if send_window < cap:
-            cap = send_window
-        var room = self._budget.remaining() - len(control_output) - 256
         if room < cap:
             cap = room
         if cap < 0:
@@ -1220,7 +1229,7 @@ struct Server(Movable):
 
         var compressed = List[Byte](length=65536, fill=0)
         var available = self._budget.remaining() - len(control_output)
-        var encoded = encode_http2_response(
+        var encoded = encode_http2_response_header_frames(
             self._conns[idx].http2_deflater.value(),
             writer,
             is_head,
@@ -1236,23 +1245,55 @@ struct Server(Movable):
             self._close_conn(idx)
             return
 
-        var response_data_bytes = 0
-        if has_body_for_status(writer.status, is_head):
-            response_data_bytes = len(writer.body)
-        if not self._conns[idx].http2_session.value().consume_outbound(
-            stream_id, response_data_bytes
+        var response_body = writer.body.copy()
+        if not has_body_for_status(writer.status, is_head):
+            response_body.clear()
+        var headers_wire = encoded.wire.copy()
+        var response_reservation = len(headers_wire) + len(response_body)
+        if not self._budget.try_reserve(response_reservation):
+            self._close_conn(idx)
+            return
+        if not self._conns[idx].http2_responses.enqueue(
+            stream_id, headers_wire^, response_body^
         ):
+            self._budget.release(response_reservation)
             self._close_conn(idx)
             return
-        self._conns[idx].http2_session.value().finish_response(stream_id)
+        self._conns[idx].http2_response_bytes_reserved += response_reservation
+        if len(control_output) > 0:
+            if not self._budget.try_reserve(len(control_output)):
+                self._close_conn(idx)
+                return
+            self._conns[idx].append_pending(control_output^)
+            self._conns[idx].state = STATE_SENDING_HTTP2_CONTROL
+            self._conns[idx].write_at = deadline_from_now(
+                self.config.write_deadline
+            )
+        self._drain_http2_responses(idx)
 
-        var output = control_output^
-        for i in range(len(encoded.wire)):
-            output.append(encoded.wire[i])
-        if not self._budget.try_reserve(len(output)):
+    def _drain_http2_responses(mut self, idx: Int) raises NetError:
+        if (
+            not self._conns[idx].active
+            or self._conns[idx].pending_remaining() > 0
+        ):
+            return
+        var batch = self._conns[idx].http2_responses.drain(
+            self._conns[idx].http2_session.value(), 16384, 65536
+        )
+        if batch.released_bytes > 0:
+            self._budget.release(batch.released_bytes)
+            self._conns[idx].http2_response_bytes_reserved -= (
+                batch.released_bytes
+            )
+        if len(batch.wire) == 0:
+            self._conns[idx].state = STATE_READING
+            self._conns[idx].write_at = NO_DEADLINE
+            return
+        if not self._budget.try_reserve(len(batch.wire)):
             self._close_conn(idx)
             return
-        self._conns[idx].set_pending(output^)
+        var output = batch.wire.copy()
+        self._conns[idx].append_pending(output^)
         self._conns[idx].state = STATE_SENDING_HTTP2_CONTROL
         self._conns[idx].write_at = deadline_from_now(
             self.config.write_deadline
@@ -1674,6 +1715,7 @@ struct Server(Movable):
         if was_http2_control:
             self._conns[idx].state = STATE_READING
             self._conns[idx].write_at = NO_DEADLINE
+            self._drain_http2_responses(idx)
             return
         if was_100:
             self._conns[idx].state = STATE_READING
