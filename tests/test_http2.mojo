@@ -1,6 +1,6 @@
 from std.testing import assert_equal, assert_false, assert_true, TestSuite
 
-from net.http._http2.frame import parse_frame
+from net.http._http2.frame import FrameParseResult, parse_frame
 from net.http._http2.frame_encoder import encode_frame
 from net.http._http2.bootstrap import Http2ServerBootstrap
 from net.http._http2.settings_state import Http2PeerSettings
@@ -13,6 +13,57 @@ from net.http._http2.settings import (
     parse_settings_payload,
 )
 from net.http._http2.settings_frame import parse_settings_frame
+from net.http._http2.header_block import Http2HeaderBlock
+
+
+def test_header_block_collects_headers_payload_until_end_headers() raises:
+    var block = Http2HeaderBlock(16)
+    var first: List[Byte] = [Byte(1), Byte(2)]
+    var initial = FrameParseResult.complete(Byte(1), Byte(0), UInt32(1), 2)
+    var result = block.begin(initial, Span(first))
+    assert_true(result.is_pending())
+
+    var second: List[Byte] = [Byte(3)]
+    var continuation = FrameParseResult.complete(
+        Byte(9), Byte(4), UInt32(1), 1
+    )
+    result = block.continue_with(continuation, Span(second))
+    assert_true(result.is_complete())
+    var decoded = block.compressed_block()
+    assert_equal(len(decoded), 3)
+    assert_equal(decoded[0], Byte(1))
+    assert_equal(decoded[2], Byte(3))
+
+
+def test_header_block_skips_padding_and_priority_fields() raises:
+    var block = Http2HeaderBlock(16)
+    var payload: List[Byte] = [
+        Byte(1), Byte(0), Byte(0), Byte(0), Byte(1), Byte(0), Byte(7), Byte(8)
+    ]
+    var frame = FrameParseResult.complete(Byte(1), Byte(0x2C), UInt32(3), 8)
+    var result = block.begin(frame, Span(payload))
+    assert_true(result.is_complete())
+    var decoded = block.compressed_block()
+    assert_equal(len(decoded), 1)
+    assert_equal(decoded[0], Byte(7))
+
+
+def test_header_block_rejects_wrong_stream_continuation() raises:
+    var block = Http2HeaderBlock(16)
+    var payload: List[Byte] = [Byte(1)]
+    var headers = FrameParseResult.complete(Byte(1), Byte(0), UInt32(1), 1)
+    assert_true(block.begin(headers, Span(payload)).is_pending())
+    var wrong = FrameParseResult.complete(Byte(9), Byte(4), UInt32(3), 1)
+    assert_true(block.continue_with(wrong, Span(payload)).is_error())
+
+
+def test_header_block_rejects_compressed_block_over_limit() raises:
+    var block = Http2HeaderBlock(2)
+    var payload: List[Byte] = [Byte(1), Byte(2)]
+    var headers = FrameParseResult.complete(Byte(1), Byte(0), UInt32(1), 2)
+    assert_true(block.begin(headers, Span(payload)).is_pending())
+    var continuation = FrameParseResult.complete(Byte(9), Byte(4), UInt32(1), 1)
+    assert_true(block.continue_with(continuation, Span(payload[0:1])).is_error())
 
 
 def test_partial_client_preface_needs_more_data() raises:

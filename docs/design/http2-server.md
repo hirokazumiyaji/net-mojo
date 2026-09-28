@@ -82,6 +82,10 @@ storage and never returns pointers into the compressed block or the inflater's
 dynamic table. It continues decoding after the decoded header-list or output
 limit is exceeded, then reports the limit result so the connection can reject
 the stream without desynchronizing later header blocks.
+The compressed block is assembled from HEADERS and matching CONTINUATION
+frames under a separate byte cap. Padding and HEADERS priority fields are
+removed before the block reaches HPACK. Exceeding the compressed cap fails the
+connection because skipping an HPACK block can desynchronize the dynamic table.
 
 ## Follow-up connection work
 
