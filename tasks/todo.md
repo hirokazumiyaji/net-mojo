@@ -50,14 +50,20 @@
 
 - [x] Add a Linux x86_64 and aarch64 CI job for the QUIC provider suite.
 - [x] Validate workflow syntax and confirm the existing local suite passes.
-- [ ] Inspect the diff and commit this slice.
+- [x] Inspect the diff and commit this slice.
 
 ## HTTP/2 stream limit configuration slice
 
 - [x] Add a `ServerConfig` limit for concurrent streams on each HTTP/2 connection.
 - [x] Advertise that limit in server SETTINGS and enforce the same value in admission.
 - [x] Test the configured SETTINGS value and stream refusal, then run HTTP/2 suites and HTTPS client interoperability.
-- [ ] Inspect the diff and commit this slice.
+- [x] Inspect the diff and commit this slice.
+
+## Independent HTTP/3 client interoperability slice
+
+- [x] Add a pinned aioquic client test against the existing Mojo HTTP/3 fixture.
+- [x] Run it in the HTTP/3 CI job and confirm request and trailer behavior.
+- [ ] Inspect the dependency, lockfile, and diff, then commit this slice.
 
 ## QUIC transport review
 

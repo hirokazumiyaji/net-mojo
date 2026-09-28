@@ -442,7 +442,7 @@ impl QuicServer {
                 let source_id = ConnectionId::from_ref(&source_id);
                 let connection = quiche::accept(
                     &source_id,
-                    Some(&header.dcid),
+                    None,
                     local,
                     remote,
                     &mut self.config,

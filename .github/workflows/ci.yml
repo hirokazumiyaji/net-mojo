@@ -33,6 +33,8 @@ jobs:
           frozen: true
       - name: Test HTTP/3 provider and integration
         run: pixi run -e tls-http3 quic-suite
+      - name: Test independent HTTP/3 client
+        run: pixi run -e tls-http3 http3-client-test
 
   test:
     name: Test (${{ matrix.os }})
