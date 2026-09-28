@@ -3,6 +3,8 @@ from std.testing import assert_equal, assert_true, TestSuite
 from net.http._http2.hpack import Http2HpackDeflater, Http2HpackInflater
 from net.http._http2.frame import FrameParseResult, parse_frame
 from net.http._http2.header_decoder import Http2HeaderDecoder
+from net.http._http2.request_session import Http2RequestSession
+from net.http._http2.frame_encoder import encode_frame
 from net.http._http2.response_encoder import encode_http2_response
 from net.http._http2.request_headers import decode_http2_request_headers
 from net.http.response import ResponseWriter
@@ -24,6 +26,20 @@ def _append_field(mut fields: List[Byte], name: String, value: String):
         fields.append(name_bytes[i])
     for i in range(len(value_bytes)):
         fields.append(value_bytes[i])
+
+
+def _append_frame[
+    origin: Origin
+](
+    mut wire: List[Byte],
+    frame_type: UInt8,
+    flags: UInt8,
+    stream_id: UInt32,
+    payload: Span[Byte, origin],
+):
+    var frame = encode_frame(frame_type, flags, stream_id, payload)
+    for i in range(len(frame.wire)):
+        wire.append(frame.wire[i])
 
 
 def test_hpack_inflater_decodes_huffman_header_block() raises:
@@ -323,6 +339,132 @@ def test_hpack_headers_become_a_shared_http2_request() raises:
     assert_equal(request.method, "GET")
     assert_equal(request.path, "/")
     assert_equal(request.authority, "www.example.com")
+
+
+def test_http2_request_session_completes_fragmented_header_only_request() raises:
+    var session = Http2RequestSession("build/http2/libnet_hpack", 4, 1024)
+    var wire = List[Byte]()
+    var preface = "PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n".as_bytes()
+    for i in range(len(preface)):
+        wire.append(preface[i])
+    var empty: List[Byte] = List[Byte]()
+    var settings = encode_frame(Byte(4), Byte(0), UInt32(0), Span(empty))
+    for i in range(len(settings.wire)):
+        wire.append(settings.wire[i])
+    var first: List[Byte] = [Byte(0x82), Byte(0x86)]
+    var headers = encode_frame(Byte(1), Byte(1), UInt32(1), Span(first))
+    for i in range(len(headers.wire)):
+        wire.append(headers.wire[i])
+    var rest: List[Byte] = [
+        Byte(0x84), Byte(0x41), Byte(0x0F), Byte(ord("w")), Byte(ord("w")),
+        Byte(ord("w")), Byte(ord(".")), Byte(ord("e")), Byte(ord("x")),
+        Byte(ord("a")), Byte(ord("m")), Byte(ord("p")), Byte(ord("l")),
+        Byte(ord("e")), Byte(ord(".")), Byte(ord("c")), Byte(ord("o")),
+        Byte(ord("m")),
+    ]
+    var continuation = encode_frame(Byte(9), Byte(4), UInt32(1), Span(rest))
+    for i in range(len(continuation.wire)):
+        wire.append(continuation.wire[i])
+
+    var result = session.consume(Span(wire))
+    assert_true(result.is_request())
+    assert_equal(result.consumed, len(wire))
+    assert_equal(result.request.method, "GET")
+    assert_equal(result.request.authority, "www.example.com")
+
+
+def test_http2_request_session_completes_data_body() raises:
+    var session = Http2RequestSession("build/http2/libnet_hpack", 4, 1024)
+    var wire = List[Byte]()
+    var preface = "PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n".as_bytes()
+    for i in range(len(preface)):
+        wire.append(preface[i])
+    var empty: List[Byte] = List[Byte]()
+    var settings = encode_frame(Byte(4), Byte(0), UInt32(0), Span(empty))
+    for i in range(len(settings.wire)):
+        wire.append(settings.wire[i])
+    var compressed: List[Byte] = [
+        Byte(0x82), Byte(0x86), Byte(0x84), Byte(0x41), Byte(0x0F),
+        Byte(ord("w")), Byte(ord("w")), Byte(ord("w")), Byte(ord(".")),
+        Byte(ord("e")), Byte(ord("x")), Byte(ord("a")), Byte(ord("m")),
+        Byte(ord("p")), Byte(ord("l")), Byte(ord("e")), Byte(ord(".")),
+        Byte(ord("c")), Byte(ord("o")), Byte(ord("m")),
+    ]
+    var headers = encode_frame(Byte(1), Byte(4), UInt32(1), Span(compressed))
+    for i in range(len(headers.wire)):
+        wire.append(headers.wire[i])
+    var body: List[Byte] = [Byte(ord("a")), Byte(ord("b")), Byte(ord("c"))]
+    var data = encode_frame(Byte(0), Byte(1), UInt32(1), Span(body))
+    for i in range(len(data.wire)):
+        wire.append(data.wire[i])
+
+    var result = session.consume(Span(wire))
+    assert_true(result.is_request())
+    assert_equal(len(result.request.body), 3)
+    assert_equal(result.request.body[0], Byte(ord("a")))
+    assert_equal(result.request.body[2], Byte(ord("c")))
+
+
+def test_http2_request_session_keeps_interleaved_bodies_on_their_streams() raises:
+    var session = Http2RequestSession("build/http2/libnet_hpack", 4, 1024)
+    var wire = List[Byte]()
+    var preface = "PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n".as_bytes()
+    for i in range(len(preface)):
+        wire.append(preface[i])
+    var empty: List[Byte] = List[Byte]()
+    _append_frame(wire, Byte(4), Byte(0), UInt32(0), Span(empty))
+
+    var compressed: List[Byte] = [
+        Byte(0x82), Byte(0x86), Byte(0x84), Byte(0x41), Byte(0x0F),
+        Byte(ord("w")), Byte(ord("w")), Byte(ord("w")), Byte(ord(".")),
+        Byte(ord("e")), Byte(ord("x")), Byte(ord("a")), Byte(ord("m")),
+        Byte(ord("p")), Byte(ord("l")), Byte(ord("e")), Byte(ord(".")),
+        Byte(ord("c")), Byte(ord("o")), Byte(ord("m")),
+    ]
+    _append_frame(wire, Byte(1), Byte(4), UInt32(1), Span(compressed))
+    _append_frame(wire, Byte(1), Byte(4), UInt32(3), Span(compressed))
+    var first_body: List[Byte] = [Byte(ord("a"))]
+    _append_frame(wire, Byte(0), Byte(0), UInt32(1), Span(first_body))
+    var second_body: List[Byte] = [Byte(ord("b"))]
+    _append_frame(wire, Byte(0), Byte(0), UInt32(3), Span(second_body))
+    var first_end: List[Byte] = [Byte(ord("c"))]
+    _append_frame(wire, Byte(0), Byte(1), UInt32(1), Span(first_end))
+    var second_end: List[Byte] = [Byte(ord("d"))]
+    _append_frame(wire, Byte(0), Byte(1), UInt32(3), Span(second_end))
+
+    var first = session.consume(Span(wire))
+    assert_true(first.is_request())
+    assert_equal(first.request.body[0], Byte(ord("a")))
+    assert_equal(first.request.body[1], Byte(ord("c")))
+    assert_true(first.consumed < len(wire))
+    var second = session.consume(Span(wire)[first.consumed :])
+    assert_true(second.is_request())
+    assert_equal(second.request.body[0], Byte(ord("b")))
+    assert_equal(second.request.body[1], Byte(ord("d")))
+
+
+def test_http2_request_session_rejects_body_over_limit() raises:
+    var session = Http2RequestSession("build/http2/libnet_hpack", 4, 2)
+    var wire = List[Byte]()
+    var preface = "PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n".as_bytes()
+    for i in range(len(preface)):
+        wire.append(preface[i])
+    var empty: List[Byte] = List[Byte]()
+    _append_frame(wire, Byte(4), Byte(0), UInt32(0), Span(empty))
+    var compressed: List[Byte] = [
+        Byte(0x82), Byte(0x86), Byte(0x84), Byte(0x41), Byte(0x0F),
+        Byte(ord("w")), Byte(ord("w")), Byte(ord("w")), Byte(ord(".")),
+        Byte(ord("e")), Byte(ord("x")), Byte(ord("a")), Byte(ord("m")),
+        Byte(ord("p")), Byte(ord("l")), Byte(ord("e")), Byte(ord(".")),
+        Byte(ord("c")), Byte(ord("o")), Byte(ord("m")),
+    ]
+    _append_frame(wire, Byte(1), Byte(4), UInt32(1), Span(compressed))
+    var body: List[Byte] = [Byte(1), Byte(2), Byte(3)]
+    _append_frame(wire, Byte(0), Byte(1), UInt32(1), Span(body))
+
+    var result = session.consume(Span(wire))
+    assert_true(result.is_error())
+    assert_equal(result.consumed, len(wire))
 
 def main() raises:
     TestSuite.discover_tests[__functions_in_module()]().run()

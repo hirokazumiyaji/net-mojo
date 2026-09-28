@@ -144,6 +144,9 @@ Trailing header blocks are decoded separately and reject pseudo-headers and
 fields that affect framing or routing.
 Per-stream request assembly applies the stream half-close rules while attaching
 validated request headers, bounded body bytes, and separate trailers.
+`Http2RequestSession` owns the connection input, one header decoder, and the
+bounded in-progress request streams; each call yields at most one completed
+shared `Request` and leaves later coalesced frames for the next call.
 The response adapter emits `:status`, lowercases regular names, rejects
 connection-specific fields, and derives Content-Length from the buffered body.
 Outbound header blocks are split into HEADERS and CONTINUATION frames, and
