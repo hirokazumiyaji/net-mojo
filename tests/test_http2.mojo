@@ -1,9 +1,10 @@
-from std.testing import assert_equal, assert_true, TestSuite
+from std.testing import assert_equal, assert_false, assert_true, TestSuite
 
 from net.http._http2.frame import parse_frame
 from net.http._http2.frame_encoder import encode_frame
 from net.http._http2.bootstrap import Http2ServerBootstrap
 from net.http._http2.settings_state import Http2PeerSettings
+from net.http._http2.stream_state import Http2StreamState
 from net.http._http2.preface import parse_client_preface
 from net.http._http2.settings import (
     Setting,
@@ -555,6 +556,50 @@ def test_http2_bootstrap_fails_on_invalid_client_preface() raises:
         ).is_error()
     )
     assert_true(bootstrap.is_failed())
+
+
+def test_http2_stream_remote_trailers_and_local_response_close() raises:
+    var stream = Http2StreamState()
+    assert_true(stream.receive_headers(False))
+    assert_true(stream.receive_data(False))
+    assert_true(stream.receive_headers(True))
+    assert_true(stream.is_remote_closed())
+    assert_true(stream.send_headers(False))
+    assert_true(stream.send_data(True))
+    assert_true(stream.is_local_closed())
+    assert_true(stream.is_closed())
+
+
+def test_http2_stream_early_response_allows_remote_body_to_finish() raises:
+    var stream = Http2StreamState()
+    assert_true(stream.receive_headers(False))
+    assert_true(stream.send_headers(True))
+    assert_true(stream.is_local_closed())
+    assert_true(stream.receive_data(True))
+    assert_true(stream.is_remote_closed())
+    assert_true(stream.is_closed())
+
+
+def test_http2_stream_rejects_invalid_data_and_trailer_order() raises:
+    var stream = Http2StreamState()
+    assert_false(stream.receive_data(False))
+    assert_false(stream.send_data(False))
+    assert_true(stream.receive_headers(False))
+    assert_false(stream.receive_headers(False))
+    assert_true(stream.receive_headers(True))
+    assert_false(stream.receive_data(False))
+
+
+def test_http2_stream_reset_closes_active_stream() raises:
+    var idle = Http2StreamState()
+    assert_false(idle.reset())
+
+    var active = Http2StreamState()
+    assert_true(active.receive_headers(False))
+    assert_true(active.reset())
+    assert_true(active.is_closed())
+    assert_false(active.receive_data(False))
+    assert_false(active.reset())
 
 
 def main() raises:
