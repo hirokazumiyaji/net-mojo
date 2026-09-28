@@ -1244,6 +1244,7 @@ mod tests {
 
     #[test]
     fn routes_http3_request_through_mojo_server_handler() {
+        use std::collections::HashMap;
         use std::io::{BufRead, BufReader, ErrorKind};
         use std::net::UdpSocket;
         use std::process::{Command, Stdio};
@@ -1343,18 +1344,27 @@ mod tests {
             quiche::h3::Header::new(b":path", b"/echo?source=quic"),
             quiche::h3::Header::new(b"content-length", b"4"),
         ];
-        let stream_id = client_h3
+        let first_stream_id = client_h3
             .send_request(&mut client, &request_headers, false)
             .unwrap();
         assert_eq!(
             client_h3
-                .send_body(&mut client, stream_id, b"data", true)
+                .send_body(&mut client, first_stream_id, b"data", true)
+                .unwrap(),
+            4
+        );
+        let second_stream_id = client_h3
+            .send_request(&mut client, &request_headers, false)
+            .unwrap();
+        assert_eq!(
+            client_h3
+                .send_body(&mut client, second_stream_id, b"data", true)
                 .unwrap(),
             4
         );
 
-        let mut status = None;
-        let mut response_body = Vec::new();
+        let mut statuses = HashMap::new();
+        let mut response_bodies = HashMap::<u64, Vec<u8>>::new();
         for _ in 0..400 {
             while let Ok((length, _)) = client.send(&mut packet) {
                 socket.send_to(&packet[..length], server_address).unwrap();
@@ -1383,17 +1393,20 @@ mod tests {
             }
             loop {
                 match client_h3.poll(&mut client) {
-                    Ok((_, quiche::h3::Event::Headers { list, .. })) => {
+                    Ok((id, quiche::h3::Event::Headers { list, .. })) => {
                         for header in list {
                             if header.name() == b":status" {
-                                status = Some(header.value().to_vec());
+                                statuses.insert(id, header.value().to_vec());
                             }
                         }
                     }
                     Ok((id, quiche::h3::Event::Data)) => {
                         let mut body = [0; 1024];
                         while let Ok(length) = client_h3.recv_body(&mut client, id, &mut body) {
-                            response_body.extend_from_slice(&body[..length]);
+                            response_bodies
+                                .entry(id)
+                                .or_default()
+                                .extend_from_slice(&body[..length]);
                         }
                     }
                     Ok(_) => (),
@@ -1401,13 +1414,15 @@ mod tests {
                     Err(error) => panic!("HTTP/3 response poll failed: {error:?}"),
                 }
             }
-            if response_body == b"handled:data" {
+            if response_bodies.len() == 2 {
                 break;
             }
         }
 
-        assert_eq!(status.as_deref(), Some(&b"200"[..]));
-        assert_eq!(response_body, b"handled:data");
+        assert_eq!(statuses.get(&first_stream_id), Some(&b"200".to_vec()));
+        assert_eq!(statuses.get(&second_stream_id), Some(&b"200".to_vec()));
+        assert_eq!(response_bodies[&first_stream_id], b"handled:data");
+        assert_eq!(response_bodies[&second_stream_id], b"handled:data");
         assert!(fixture.wait().unwrap().success());
     }
 }

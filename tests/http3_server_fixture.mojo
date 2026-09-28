@@ -36,5 +36,5 @@ def main() raises:
     )
     var handler = _Http3Handler()
     print("READY " + address)
-    while handler.requests == 0:
+    while handler.requests < 2:
         _ = server.tick(handler, Timeout.seconds(2))

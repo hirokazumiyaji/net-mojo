@@ -86,6 +86,18 @@
 - macOS provider compilation and execution have passed through C smoke tests. Native Mojo execution crashes even on a one-line `print`, so Mojo verification for macOS remains outstanding.
 - `/review` and PR publication remain pending explicit authorization to upload the code diff to the configured external reviewer.
 
+## HTTP/3 concurrent request streams plan
+
+- [x] Send two POST requests before receiving responses on one independent quiche connection.
+- [x] Verify both streams reach the shared Mojo handler and their responses stay associated with the correct stream IDs.
+- [x] Run Rust provider tests, rustfmt, and diff checks; commit this test slice locally.
+
+## Review
+
+- The independent client completed two HTTP/3 requests concurrently over one QUIC connection; both received status 200 and `handled:data` on their respective streams.
+- `quic-rust-test` passed all three provider tests; `cargo fmt` and `git diff --check` passed.
+- `/review` and PR publication remain pending the user's response about external diff upload.
+
 ## Current slice
 
 - Integrate QUIC transport with `Server.tick()`; then add HTTP/3 request streams and shared-handler dispatch.
