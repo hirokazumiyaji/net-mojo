@@ -60,6 +60,26 @@ class Http3ClientProtocol(QuicConnectionProtocol):
         finally:
             self.responses.pop(stream_id, None)
 
+    async def cancel_partial_post(self):
+        stream_id = self._quic.get_next_available_stream_id()
+        self.http.send_headers(
+            stream_id,
+            [
+                (b":method", b"POST"),
+                (b":scheme", b"https"),
+                (b":authority", b"localhost"),
+                (b":path", b"/echo?source=quic"),
+                (b"content-length", b"4"),
+            ],
+            end_stream=False,
+        )
+        self.http.send_data(stream_id, b"da", end_stream=False)
+        self.transmit()
+        self._quic.reset_stream(stream_id, error_code=0x10C)
+        self.transmit()
+        await asyncio.sleep(0.05)
+
+
 async def run_client(address):
     host, port = address.rsplit(":", 1)
     configuration = QuicConfiguration(
@@ -76,6 +96,7 @@ async def run_client(address):
     ) as client:
         if client.alpn != "h3":
             raise RuntimeError(f"unexpected negotiated ALPN: {client.alpn!r}")
+        await client.cancel_partial_post()
         first = await client.post(b"data", trailers=True)
         second = await client.post(b"data", trailers=False)
         for response, expected_body in (

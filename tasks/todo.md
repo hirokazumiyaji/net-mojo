@@ -63,7 +63,13 @@
 
 - [x] Add a pinned aioquic client test against the existing Mojo HTTP/3 fixture.
 - [x] Run it in the HTTP/3 CI job and confirm request and trailer behavior.
-- [ ] Inspect the dependency, lockfile, and diff, then commit this slice.
+- [x] Inspect the dependency, lockfile, and diff, then commit this slice.
+
+## HTTP/3 cancel interoperability slice
+
+- [x] Reset a partially sent request stream from an independent aioquic client.
+- [x] Confirm two later requests on the same connection still receive their expected responses.
+- [x] Inspect the test and commit this slice.
 
 ## QUIC transport review
 
