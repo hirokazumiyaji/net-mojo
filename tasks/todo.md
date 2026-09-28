@@ -30,7 +30,28 @@
 
 ## Current slice
 
-- Support receiving multiple concurrent streams and resuming buffered responses as peer flow-control credit arrives.
+- Expose provider datagram and timer operations to Mojo, drive them from a borrowed `UDPConn` descriptor, and keep packet output when a nonblocking send cannot complete.
+
+## QUIC transport review
+
+- `QuicServer` accepts Initial datagrams, routes later packets by connection ID, emits pending packets with their destination, and reports/advances connection timeouts.
+- A localhost UDP test completed the HTTP/3 TLS handshake through this provider boundary and confirmed ALPN `h3` and a pending connection timeout.
+- The Rust provider suite passed on Linux x86_64. Socket ownership and Mojo integration remain outstanding.
+
+## QUIC packet I/O slice
+
+- [x] Define the provider boundary between UDP datagrams, peer addresses, quiche connection state, and next timeout.
+- [x] Add a failing localhost UDP test for server handshake packet exchange.
+- [x] Implement the smallest provider API that passes that test.
+- [x] Run the QUIC provider suite and record the platform and result.
+- [x] Commit the packet I/O slice locally.
+
+## Review
+
+- The Rust test first failed to compile because `QuicServer` was absent, then passed after adding datagram receive/send, connection ID routing, and timeout accessors.
+- `pixi run -e tls-http3 quic-suite` passed on Linux x86_64: C config smoke, Mojo FFI smoke, and both Rust handshake tests.
+- `cargo fmt --check`, test script syntax, and `git diff --check` passed.
+- This slice keeps the UDP socket with the caller. The C/Mojo API that connects a `UDPConn` to `QuicServer` remains the next slice.
 
 ## Review
 
@@ -50,4 +71,4 @@
 
 ## Current slice
 
-- Add per-connection QUIC packet receive/send and timeout operations to the quiche provider and exercise them with a local UDP integration test.
+- Expose provider datagram and timer operations to Mojo, drive them from a borrowed `UDPConn` descriptor, and keep packet output when a nonblocking send cannot complete.
