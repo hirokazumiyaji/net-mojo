@@ -33,6 +33,10 @@ struct HttpVersion(Copyable, Equatable, Writable):
     def http2() -> Self:
         return Self(value=2)
 
+    @staticmethod
+    def http3() -> Self:
+        return Self(value=3)
+
     def is_supported(self) -> Bool:
         return self.value == 1
 
@@ -43,6 +47,8 @@ struct HttpVersion(Copyable, Equatable, Writable):
             writer.write("HTTP/1.1")
         elif self.value == 2:
             writer.write("HTTP/2")
+        elif self.value == 3:
+            writer.write("HTTP/3")
         else:
             # Never misidentify an unsupported version as HTTP/1.1 in diagnostics.
             writer.write("HTTP/unknown")

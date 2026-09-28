@@ -101,3 +101,13 @@
 
 - `quic-mojo-test` passed on Linux x86_64 under Docker after the initial quiche/BoringSSL build. Direct macOS Pixi execution is unavailable because the checked-in environment is linux-64.
 - Server shutdown drops the QUIC UDP descriptor and exits when no TCP listener or active connections remain. HTTP/3 stream parsing and shared-handler dispatch are still future work.
+
+## Shared HTTP/3 request version slice
+
+- [x] Add an HTTP/3 version value to shared request metadata and rendering.
+- [x] Run the HTTP API suite and review the diff.
+- [ ] Commit this metadata slice locally.
+
+## Review
+
+- `test-http-api` passed 19/19 on Linux x86_64.

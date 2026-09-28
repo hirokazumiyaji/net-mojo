@@ -142,6 +142,7 @@ def test_version_rendering_distinguishes_unsupported() raises:
     assert_equal(String(HttpVersion.http10()), "HTTP/1.0")
     assert_equal(String(HttpVersion.http11()), "HTTP/1.1")
     assert_equal(String(HttpVersion.http2()), "HTTP/2")
+    assert_equal(String(HttpVersion.http3()), "HTTP/3")
     assert_equal(String(HttpVersion(value=9)), "HTTP/unknown")
     assert_true(HttpVersion.http11().is_supported())
     assert_false(HttpVersion(value=9).is_supported())
