@@ -3,6 +3,10 @@ from net.http.request import HttpVersion
 
 from net.http._http2.frame import FrameParseResult, parse_frame
 from net.http._http2.frame_encoder import encode_frame
+from net.http._http2.response_frames import (
+    encode_data_frames,
+    encode_headers_block,
+)
 from net.http._http2.data_frame import parse_data_frame
 from net.http._http2.request_body import Http2RequestBody
 from net.http._http2.response_headers import encode_http2_response_headers
@@ -853,6 +857,68 @@ def test_frame_encoder_rejects_invalid_stream_id_and_size() raises:
         encode_frame(
             Byte(0), Byte(0), UInt32(0), Span(List[Byte]()), 16777216
         ).is_error()
+    )
+
+
+def test_http2_headers_block_fragments_with_continuation() raises:
+    var block: List[Byte] = [
+        Byte(1), Byte(2), Byte(3), Byte(4), Byte(5), Byte(6), Byte(7)
+    ]
+    var encoded = encode_headers_block(UInt32(1), Span(block), True, 3, 64)
+    assert_true(encoded.is_complete())
+
+    var offset = 0
+    var first = parse_frame(Span(encoded.wire)[offset:], 3)
+    assert_true(first.is_complete())
+    assert_equal(first.frame_type, Byte(1))
+    assert_equal(first.flags, Byte(1))
+    assert_equal(first.stream_id, UInt32(1))
+    offset += first.consumed
+
+    var second = parse_frame(Span(encoded.wire)[offset:], 3)
+    assert_true(second.is_complete())
+    assert_equal(second.frame_type, Byte(9))
+    assert_equal(second.flags, Byte(0))
+    offset += second.consumed
+
+    var final = parse_frame(Span(encoded.wire)[offset:], 3)
+    assert_true(final.is_complete())
+    assert_equal(final.frame_type, Byte(9))
+    assert_equal(final.flags, Byte(4))
+    assert_equal(final.payload_length, 1)
+    assert_equal(offset + final.consumed, len(encoded.wire))
+
+
+def test_http2_data_frames_fragment_and_end_stream() raises:
+    var body: List[Byte] = [
+        Byte(10), Byte(11), Byte(12), Byte(13), Byte(14), Byte(15), Byte(16)
+    ]
+    var encoded = encode_data_frames(UInt32(3), Span(body), True, 3, 64)
+    assert_true(encoded.is_complete())
+    var first = parse_frame(Span(encoded.wire), 3)
+    assert_true(first.is_complete())
+    assert_equal(first.frame_type, Byte(0))
+    assert_equal(first.flags, Byte(0))
+    var second = parse_frame(Span(encoded.wire)[first.consumed:], 3)
+    assert_true(second.is_complete())
+    assert_equal(second.flags, Byte(0))
+    var final = parse_frame(
+        Span(encoded.wire)[first.consumed + second.consumed :], 3
+    )
+    assert_true(final.is_complete())
+    assert_equal(final.flags, Byte(1))
+    assert_equal(final.payload_length, 1)
+
+    var empty: List[Byte] = []
+    var end = encode_data_frames(UInt32(3), Span(empty), True, 3, 9)
+    assert_true(end.is_complete())
+    var empty_frame = parse_frame(Span(end.wire), 3)
+    assert_true(empty_frame.is_complete())
+    assert_equal(empty_frame.payload_length, 0)
+    assert_equal(empty_frame.flags, Byte(1))
+
+    assert_true(
+        encode_data_frames(UInt32(3), Span(body), True, 3, 8).is_error()
     )
 
 

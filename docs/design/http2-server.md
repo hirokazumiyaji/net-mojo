@@ -122,6 +122,8 @@ Trailing header blocks are decoded separately and reject pseudo-headers and
 fields that affect framing or routing.
 The response adapter emits `:status`, lowercases regular names, rejects
 connection-specific fields, and derives Content-Length from the buffered body.
+Outbound header blocks are split into HEADERS and CONTINUATION frames, and
+buffered bodies into DATA frames, under peer frame-size and total wire-byte caps.
 
 ## Follow-up connection work
 
