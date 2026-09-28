@@ -34,6 +34,13 @@ in network byte order. Parsing rejects a trailing partial entry and preserves
 unknown identifiers unchanged; connection-level validation, duplicate handling,
 and negotiation remain with the connection state machine.
 
+## Outbound frame encoding
+
+The socket-independent frame encoder writes the nine-byte frame header and
+payload in network byte order. It rejects a payload above the configured frame
+limit or the 24-bit protocol maximum, and rejects stream identifiers with the
+reserved bit set. It does not validate frame-type-specific flags or lengths.
+
 ## Follow-up connection work
 
 The connection layer will require the client connection preface, send server

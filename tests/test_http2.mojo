@@ -1,6 +1,7 @@
 from std.testing import assert_equal, assert_true, TestSuite
 
 from net.http._http2.frame import parse_frame
+from net.http._http2.frame_encoder import encode_frame
 from net.http._http2.preface import parse_client_preface
 from net.http._http2.settings import (
     Setting,
@@ -177,6 +178,62 @@ def test_setting_encoder_uses_network_byte_order() raises:
     assert_equal(wire[3], Byte(0x02))
     assert_equal(wire[4], Byte(0x03))
     assert_equal(wire[5], Byte(0x04))
+
+
+def test_frame_encoder_emits_header_in_network_byte_order() raises:
+    var payload = List[Byte]()
+    payload.append(Byte(0xA5))
+    var encoded = encode_frame(
+        Byte(0xF0), Byte(0x03), UInt32(0x1234567), Span(payload)
+    )
+    assert_true(encoded.is_complete())
+    assert_equal(len(encoded.wire), 10)
+    assert_equal(encoded.wire[0], Byte(0))
+    assert_equal(encoded.wire[1], Byte(0))
+    assert_equal(encoded.wire[2], Byte(1))
+    assert_equal(encoded.wire[3], Byte(0xF0))
+    assert_equal(encoded.wire[4], Byte(0x03))
+    assert_equal(encoded.wire[5], Byte(0x01))
+    assert_equal(encoded.wire[6], Byte(0x23))
+    assert_equal(encoded.wire[7], Byte(0x45))
+    assert_equal(encoded.wire[8], Byte(0x67))
+    assert_equal(encoded.wire[9], Byte(0xA5))
+
+    var parsed = parse_frame(Span(encoded.wire))
+    assert_true(parsed.is_complete())
+    assert_equal(parsed.frame_type, Byte(0xF0))
+    assert_equal(parsed.flags, Byte(0x03))
+    assert_equal(parsed.stream_id, UInt32(0x1234567))
+
+
+def test_frame_encoder_accepts_empty_payload_at_zero_limit() raises:
+    var encoded = encode_frame(
+        Byte(4), Byte(0), UInt32(0), Span(List[Byte]()), 0
+    )
+    assert_true(encoded.is_complete())
+    assert_equal(len(encoded.wire), 9)
+    assert_equal(encoded.wire[8], Byte(0))
+
+
+def test_frame_encoder_rejects_invalid_stream_id_and_size() raises:
+    var payload = List[Byte]()
+    payload.append(Byte(1))
+    assert_true(
+        encode_frame(
+            Byte(0), Byte(0), UInt32(0x80000000), Span(payload)
+        ).is_error()
+    )
+    assert_true(
+        encode_frame(Byte(0), Byte(0), UInt32(0), Span(payload), 0).is_error()
+    )
+    assert_true(
+        encode_frame(Byte(0), Byte(0), UInt32(0), Span(payload), -1).is_error()
+    )
+    assert_true(
+        encode_frame(
+            Byte(0), Byte(0), UInt32(0), Span(List[Byte]()), 16777216
+        ).is_error()
+    )
 
 
 def main() raises:
