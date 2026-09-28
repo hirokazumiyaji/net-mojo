@@ -1,6 +1,8 @@
 from std.testing import assert_equal, assert_true, TestSuite
 
 from net.http._http2.hpack import Http2HpackInflater
+from net.http._http2.frame import FrameParseResult
+from net.http._http2.header_decoder import Http2HeaderDecoder
 
 
 def test_hpack_inflater_decodes_huffman_header_block() raises:
@@ -68,6 +70,82 @@ def test_hpack_inflater_applies_table_limit_between_blocks() raises:
     )
     assert_true(result.is_success())
     assert_equal(result.field_count, 0)
+
+
+def test_header_decoder_handles_fragmented_header_block() raises:
+    var decoder = Http2HeaderDecoder("build/http2/libnet_hpack", 4096, 1024)
+    var first: List[Byte] = [Byte(0x82), Byte(0x86)]
+    var headers = FrameParseResult.complete(Byte(1), Byte(0), UInt32(1), 2)
+    var output = Array[Byte, 128](fill=0)
+    var result = decoder.consume(headers, Span(first), 1024, 16, Span(output))
+    assert_true(result.is_pending())
+
+    var continuation: List[Byte] = [
+        Byte(0x84), Byte(0x41), Byte(0x0F), Byte(ord("w")), Byte(ord("w")),
+        Byte(ord("w")), Byte(ord(".")), Byte(ord("e")), Byte(ord("x")),
+        Byte(ord("a")), Byte(ord("m")), Byte(ord("p")), Byte(ord("l")),
+        Byte(ord("e")), Byte(ord(".")), Byte(ord("c")), Byte(ord("o")),
+        Byte(ord("m")),
+    ]
+    var continuation_frame = FrameParseResult.complete(
+        Byte(9), Byte(4), UInt32(1), len(continuation)
+    )
+    result = decoder.consume(
+        continuation_frame, Span(continuation), 1024, 16, Span(output)
+    )
+    assert_true(result.is_complete())
+    assert_equal(result.field_count, 4)
+    assert_true(result.output_length > 0)
+
+
+def test_header_decoder_distinguishes_size_and_compression_errors() raises:
+    var decoder = Http2HeaderDecoder("build/http2/libnet_hpack", 4096, 1024)
+    var block: List[Byte] = [Byte(0x82), Byte(0x86)]
+    var output = Array[Byte, 128](fill=0)
+    var headers = FrameParseResult.complete(Byte(1), Byte(4), UInt32(1), 2)
+    var too_large = decoder.consume(
+        headers, Span(block), 0, 16, Span(output)
+    )
+    assert_true(too_large.is_too_large())
+    assert_equal(too_large.field_count, 2)
+
+    var invalid_decoder = Http2HeaderDecoder(
+        "build/http2/libnet_hpack", 4096, 1024
+    )
+    var invalid_block: List[Byte] = [Byte(0xFF)]
+    var invalid_headers = FrameParseResult.complete(
+        Byte(1), Byte(4), UInt32(1), 1
+    )
+    var invalid = invalid_decoder.consume(
+        invalid_headers, Span(invalid_block), 1024, 16, Span(output)
+    )
+    assert_true(invalid.is_compression_error())
+
+
+def test_header_decoder_fails_connection_on_invalid_continuation_sequence() raises:
+    var decoder = Http2HeaderDecoder("build/http2/libnet_hpack", 4096, 8)
+    var first: List[Byte] = [Byte(0x82)]
+    var headers = FrameParseResult.complete(Byte(1), Byte(0), UInt32(1), 1)
+    var output = Array[Byte, 64](fill=0)
+    var result = decoder.consume(headers, Span(first), 1024, 16, Span(output))
+    assert_true(result.is_pending())
+
+    var continuation: List[Byte] = [Byte(0x86)]
+    var wrong_stream = FrameParseResult.complete(
+        Byte(9), Byte(4), UInt32(3), 1
+    )
+    result = decoder.consume(
+        wrong_stream, Span(continuation), 1024, 16, Span(output)
+    )
+    assert_true(result.is_protocol_error())
+
+    var next_headers = FrameParseResult.complete(
+        Byte(1), Byte(4), UInt32(3), 1
+    )
+    result = decoder.consume(
+        next_headers, Span(continuation), 1024, 16, Span(output)
+    )
+    assert_true(result.is_protocol_error())
 
 
 def main() raises:
