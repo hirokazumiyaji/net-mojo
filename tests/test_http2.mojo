@@ -15,6 +15,7 @@ from net.http._http2.settings import (
 from net.http._http2.settings_frame import parse_settings_frame
 from net.http._http2.header_block import Http2HeaderBlock
 from net.http._http2.flow_window import Http2FlowWindow
+from net.http._http2.frame_sequence import Http2ContinuationSequence
 
 
 def test_header_block_collects_headers_payload_until_end_headers() raises:
@@ -130,6 +131,48 @@ def test_http2_connection_and_stream_windows_are_independent() raises:
     assert_equal(connection.receive_window(), 92)
     assert_equal(connection.pending_receive_credit(), 8)
     assert_equal(stream.receive_window(), 20)
+
+
+def test_http2_continuation_sequence_accepts_matching_fragment_chain() raises:
+    var sequence = Http2ContinuationSequence()
+    var headers = FrameParseResult.complete(Byte(1), Byte(0), UInt32(1), 4)
+    assert_true(sequence.accept(headers))
+    var first = FrameParseResult.complete(Byte(9), Byte(0), UInt32(1), 3)
+    assert_true(sequence.accept(first))
+    var final = FrameParseResult.complete(Byte(9), Byte(4), UInt32(1), 2)
+    assert_true(sequence.accept(final))
+    var ping = FrameParseResult.complete(Byte(6), Byte(0), UInt32(0), 8)
+    assert_true(sequence.accept(ping))
+
+
+def test_http2_continuation_sequence_rejects_interleaving() raises:
+    var sequence = Http2ContinuationSequence()
+    var headers = FrameParseResult.complete(Byte(1), Byte(0), UInt32(1), 1)
+    assert_true(sequence.accept(headers))
+    var ping = FrameParseResult.complete(Byte(6), Byte(0), UInt32(0), 8)
+    assert_false(sequence.accept(ping))
+    var continuation = FrameParseResult.complete(Byte(9), Byte(4), UInt32(1), 1)
+    assert_false(sequence.accept(continuation))
+
+
+def test_http2_continuation_sequence_rejects_orphan_and_wrong_stream() raises:
+    var orphan_sequence = Http2ContinuationSequence()
+    var orphan = FrameParseResult.complete(Byte(9), Byte(4), UInt32(1), 1)
+    assert_false(orphan_sequence.accept(orphan))
+
+    var wrong_stream_sequence = Http2ContinuationSequence()
+    var headers = FrameParseResult.complete(Byte(1), Byte(0), UInt32(1), 1)
+    assert_true(wrong_stream_sequence.accept(headers))
+    var wrong_stream = FrameParseResult.complete(
+        Byte(9), Byte(4), UInt32(3), 1
+    )
+    assert_false(wrong_stream_sequence.accept(wrong_stream))
+
+
+def test_http2_continuation_sequence_rejects_push_promise_from_client() raises:
+    var sequence = Http2ContinuationSequence()
+    var push = FrameParseResult.complete(Byte(5), Byte(4), UInt32(1), 4)
+    assert_false(sequence.accept(push))
 
 
 def test_partial_client_preface_needs_more_data() raises:

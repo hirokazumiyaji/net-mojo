@@ -100,6 +100,10 @@ restored only for bytes the application has consumed. The debit includes the
 full DATA payload, including padding. SETTINGS initial-window changes adjust
 stream send windows; the connection send window remains fixed.
 
+`Http2ContinuationSequence` is checked before dispatching each complete frame.
+It rejects orphan CONTINUATION frames, stream changes, interleaved frames while
+a header block is open, and client-sent PUSH_PROMISE frames.
+
 ## Follow-up connection work
 
 The connection layer will require the client connection preface, send server
