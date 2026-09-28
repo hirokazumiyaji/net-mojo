@@ -1,9 +1,11 @@
 from std.testing import assert_equal, assert_true, TestSuite
 
 from net.http._http2.hpack import Http2HpackDeflater, Http2HpackInflater
-from net.http._http2.frame import FrameParseResult
+from net.http._http2.frame import FrameParseResult, parse_frame
 from net.http._http2.header_decoder import Http2HeaderDecoder
+from net.http._http2.response_encoder import encode_http2_response
 from net.http._http2.request_headers import decode_http2_request_headers
+from net.http.response import ResponseWriter
 from net.http.request import HttpVersion
 
 
@@ -69,6 +71,82 @@ def test_hpack_deflater_encodes_bounded_header_fields() raises:
     assert_true(decoded.is_success())
     assert_equal(decoded.field_count, 2)
     assert_equal(decoded.output_length, len(fields))
+
+
+def test_shared_response_encodes_to_http2_headers_and_data() raises:
+    var writer = ResponseWriter(64)
+    writer.set_status(201)
+    writer.headers.add("X-Trace", "abc")
+    writer.write_string("body")
+    var deflater = Http2HpackDeflater("build/http2/libnet_hpack", 4096)
+    var compressed = Array[Byte, 1024](fill=0)
+    var encoded = encode_http2_response(
+        deflater,
+        writer,
+        False,
+        "Thu, 01 Jan 1970 00:00:00 GMT",
+        UInt32(1),
+        4096,
+        32,
+        16384,
+        8192,
+        Span[mut=True](compressed),
+    )
+    assert_true(encoded.is_complete())
+    var headers = parse_frame(Span(encoded.wire))
+    assert_true(headers.is_complete())
+    assert_equal(headers.frame_type, Byte(1))
+    assert_equal(headers.flags, Byte(4))
+    var inflater = Http2HpackInflater("build/http2/libnet_hpack", 4096)
+    var decoded_fields = Array[Byte, 1024](fill=0)
+    var decoded = inflater.decode(
+        Span(encoded.wire)[9 : headers.consumed],
+        4096,
+        32,
+        Span(decoded_fields),
+    )
+    assert_true(decoded.is_success())
+    assert_equal(decoded.field_count, 4)
+
+    var data = parse_frame(Span(encoded.wire)[headers.consumed:])
+    assert_true(data.is_complete())
+    assert_equal(data.frame_type, Byte(0))
+    assert_equal(data.flags, Byte(1))
+    assert_equal(data.payload_length, 4)
+    assert_equal(encoded.wire[headers.consumed + 9], Byte(ord("b")))
+
+
+def test_failed_response_encoding_poisoned_deflater() raises:
+    var writer = ResponseWriter(64)
+    writer.write_string("body")
+    var deflater = Http2HpackDeflater("build/http2/libnet_hpack", 4096)
+    var compressed = Array[Byte, 1024](fill=0)
+    var failed = encode_http2_response(
+        deflater,
+        writer,
+        False,
+        "Thu, 01 Jan 1970 00:00:00 GMT",
+        UInt32(1),
+        4096,
+        32,
+        16384,
+        16,
+        Span[mut=True](compressed),
+    )
+    assert_true(failed.is_error())
+    var retried = encode_http2_response(
+        deflater,
+        writer,
+        False,
+        "Thu, 01 Jan 1970 00:00:00 GMT",
+        UInt32(1),
+        4096,
+        32,
+        16384,
+        8192,
+        Span[mut=True](compressed),
+    )
+    assert_true(retried.is_error())
 
 
 def test_hpack_inflater_preserves_dynamic_table_after_limit() raises:

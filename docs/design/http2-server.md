@@ -124,6 +124,9 @@ The response adapter emits `:status`, lowercases regular names, rejects
 connection-specific fields, and derives Content-Length from the buffered body.
 Outbound header blocks are split into HEADERS and CONTINUATION frames, and
 buffered bodies into DATA frames, under peer frame-size and total wire-byte caps.
+The shared response encoder composes header adaptation, connection-owned HPACK
+compression, and frame generation; output failure after compression makes that
+deflater terminal because the peer did not receive its updated table state.
 
 ## Follow-up connection work
 
