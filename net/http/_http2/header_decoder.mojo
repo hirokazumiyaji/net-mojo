@@ -11,18 +11,31 @@ struct Http2HeaderDecodeResult(Copyable):
     var output_length: Int
     var field_count: Int
     var decoded_size: Int
+    var stream_id: UInt32
+    var end_stream: Bool
 
     @staticmethod
     def pending() -> Self:
-        return Self(status=0, output_length=0, field_count=0, decoded_size=0)
+        return Self(
+            status=0,
+            output_length=0,
+            field_count=0,
+            decoded_size=0,
+            stream_id=UInt32(0),
+            end_stream=False,
+        )
 
     @staticmethod
-    def complete(decoded: HpackDecodeResult) -> Self:
+    def complete(
+        decoded: HpackDecodeResult, stream_id: UInt32, end_stream: Bool
+    ) -> Self:
         return Self(
             status=1,
             output_length=decoded.output_length,
             field_count=decoded.field_count,
             decoded_size=decoded.decoded_size,
+            stream_id=stream_id,
+            end_stream=end_stream,
         )
 
     @staticmethod
@@ -32,15 +45,31 @@ struct Http2HeaderDecodeResult(Copyable):
             output_length=decoded.output_length,
             field_count=decoded.field_count,
             decoded_size=decoded.decoded_size,
+            stream_id=UInt32(0),
+            end_stream=False,
         )
 
     @staticmethod
     def protocol_error() -> Self:
-        return Self(status=3, output_length=0, field_count=0, decoded_size=0)
+        return Self(
+            status=3,
+            output_length=0,
+            field_count=0,
+            decoded_size=0,
+            stream_id=UInt32(0),
+            end_stream=False,
+        )
 
     @staticmethod
     def compression_error() -> Self:
-        return Self(status=4, output_length=0, field_count=0, decoded_size=0)
+        return Self(
+            status=4,
+            output_length=0,
+            field_count=0,
+            decoded_size=0,
+            stream_id=UInt32(0),
+            end_stream=False,
+        )
 
     def is_pending(self) -> Bool:
         return self.status == 0
@@ -102,11 +131,15 @@ struct Http2HeaderDecoder(Movable):
             return Http2HeaderDecodeResult.pending()
 
         var compressed = self._block.compressed_block()
+        var stream_id = self._block.stream_id
+        var end_stream = self._block.end_stream
         var decoded = self._inflater.decode(
             Span(compressed), max_header_list_size, max_fields, output
         )
         if decoded.is_success():
-            return Http2HeaderDecodeResult.complete(decoded)
+            return Http2HeaderDecodeResult.complete(
+                decoded, stream_id, end_stream
+            )
         if decoded.is_too_large():
             return Http2HeaderDecodeResult.too_large(decoded)
         self._failed = True

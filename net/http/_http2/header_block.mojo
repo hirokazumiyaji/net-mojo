@@ -32,6 +32,7 @@ struct HeaderBlockResult(Movable):
 struct Http2HeaderBlock(Movable):
     var max_compressed_size: Int
     var stream_id: UInt32
+    var end_stream: Bool
     var pending: Bool
     var failed: Bool
     var bytes: List[Byte]
@@ -39,6 +40,7 @@ struct Http2HeaderBlock(Movable):
     def __init__(out self, max_compressed_size: Int):
         self.max_compressed_size = max_compressed_size
         self.stream_id = UInt32(0)
+        self.end_stream = False
         self.pending = False
         self.failed = max_compressed_size < 0
         self.bytes = List[Byte]()
@@ -64,6 +66,7 @@ struct Http2HeaderBlock(Movable):
 
         self.bytes.clear()
         self.stream_id = frame.stream_id
+        self.end_stream = (frame.flags & Byte(1)) != Byte(0)
         var fragment = Self._headers_fragment(frame.flags, payload)
         if fragment.kind != 0:
             self.failed = True

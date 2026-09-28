@@ -114,7 +114,8 @@ direction, bounds decoded header size and field count before compression, and
 keeps its dynamic table for the connection lifetime.
 `Http2HeaderDecoder` combines frame assembly and decoding for one connection,
 preserves HPACK state after decoded limits are exceeded, and marks framing or
-compression errors as terminal for that decoder.
+compression errors as terminal for that decoder. A completed decode retains
+the original HEADERS stream ID and END_STREAM bit across CONTINUATION frames.
 
 `Http2FlowWindow` tracks send and receive credit separately for a connection
 or stream. DATA debits the corresponding window, and receive credit can be

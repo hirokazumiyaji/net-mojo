@@ -219,8 +219,30 @@ def test_header_decoder_handles_fragmented_header_block() raises:
         continuation_frame, Span(continuation), 1024, 16, Span(output)
     )
     assert_true(result.is_complete())
+    assert_equal(result.stream_id, UInt32(1))
+    assert_true(not result.end_stream)
     assert_equal(result.field_count, 4)
     assert_true(result.output_length > 0)
+
+
+def test_header_decoder_preserves_end_stream_on_fragmented_headers() raises:
+    var decoder = Http2HeaderDecoder("build/http2/libnet_hpack", 4096, 1024)
+    var first: List[Byte] = [Byte(0x82)]
+    var headers = FrameParseResult.complete(Byte(1), Byte(1), UInt32(5), 1)
+    var output = Array[Byte, 128](fill=0)
+    var result = decoder.consume(headers, Span(first), 1024, 16, Span(output))
+    assert_true(result.is_pending())
+
+    var continuation: List[Byte] = [Byte(0x86)]
+    var continuation_frame = FrameParseResult.complete(
+        Byte(9), Byte(4), UInt32(5), 1
+    )
+    result = decoder.consume(
+        continuation_frame, Span(continuation), 1024, 16, Span(output)
+    )
+    assert_true(result.is_complete())
+    assert_equal(result.stream_id, UInt32(5))
+    assert_true(result.end_stream)
 
 
 def test_header_decoder_distinguishes_size_and_compression_errors() raises:
