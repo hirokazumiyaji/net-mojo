@@ -2,6 +2,11 @@ from std.testing import assert_equal, assert_true, TestSuite
 
 from net.http._http2.frame import parse_frame
 from net.http._http2.preface import parse_client_preface
+from net.http._http2.settings import (
+    Setting,
+    encode_settings_payload,
+    parse_settings_payload,
+)
 
 
 def test_partial_client_preface_needs_more_data() raises:
@@ -121,6 +126,57 @@ def test_unknown_frame_type_and_concatenated_frames() raises:
     var parsed_second = parse_frame(remainder)
     assert_true(parsed_second.is_complete())
     assert_equal(parsed_second.frame_type, Byte(6))
+
+
+def test_empty_settings_payload_round_trips() raises:
+    var parsed = parse_settings_payload(Span(List[Byte]()))
+    assert_true(parsed.is_complete())
+    assert_equal(len(parsed.settings), 0)
+    assert_equal(len(encode_settings_payload(Span(parsed.settings))), 0)
+
+
+def test_settings_payload_preserves_known_and_unknown_entries() raises:
+    var wire = List[Byte]()
+    for byte in [Byte(0), Byte(1), Byte(0), Byte(0), Byte(0), Byte(128)]:
+        wire.append(byte)
+    for byte in [Byte(255), Byte(254), Byte(1), Byte(2), Byte(3), Byte(4)]:
+        wire.append(byte)
+
+    var parsed = parse_settings_payload(Span(wire))
+    assert_true(parsed.is_complete())
+    assert_equal(len(parsed.settings), 2)
+    assert_equal(parsed.settings[0].identifier, UInt16(1))
+    assert_equal(parsed.settings[0].value, UInt32(128))
+    assert_equal(parsed.settings[1].identifier, UInt16(65534))
+    assert_equal(parsed.settings[1].value, UInt32(0x01020304))
+
+    var encoded = encode_settings_payload(Span(parsed.settings))
+    assert_equal(len(encoded), len(wire))
+    for i in range(len(wire)):
+        assert_equal(encoded[i], wire[i])
+
+
+def test_settings_payload_rejects_partial_entry() raises:
+    var wire = List[Byte]()
+    for _ in range(5):
+        wire.append(Byte(0))
+    var parsed = parse_settings_payload(Span(wire))
+    assert_true(parsed.is_error())
+    assert_equal(len(parsed.settings), 0)
+
+
+def test_setting_encoder_uses_network_byte_order() raises:
+    var settings = List[Setting]()
+    settings.append(
+        Setting(identifier=UInt16(0x1234), value=UInt32(0x01020304))
+    )
+    var wire = encode_settings_payload(Span(settings))
+    assert_equal(wire[0], Byte(0x12))
+    assert_equal(wire[1], Byte(0x34))
+    assert_equal(wire[2], Byte(0x01))
+    assert_equal(wire[3], Byte(0x02))
+    assert_equal(wire[4], Byte(0x03))
+    assert_equal(wire[5], Byte(0x04))
 
 
 def main() raises:
