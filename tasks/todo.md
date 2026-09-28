@@ -145,6 +145,12 @@
 - [x] Replace stale HTTP/2 and HTTP/3 design notes with verified shutdown and interoperability status.
 - [x] Verify local documentation links and diff checks; commit this documentation slice locally.
 
+## HTTP/2 provider CI slice
+
+- [x] Add Linux x86_64 and aarch64 CI coverage for the optional HPACK provider and independent TLS HTTP/2 client.
+- [x] Parse the workflow YAML, run the configured HTTP/2 tasks locally, and inspect the diff.
+- [x] Commit this CI slice locally.
+
 ## QUIC transport review
 
 - `QuicServer` accepts Initial datagrams, routes later packets by connection ID, emits pending packets with their destination, and reports/advances connection timeouts.
