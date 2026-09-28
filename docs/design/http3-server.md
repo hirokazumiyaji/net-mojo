@@ -54,5 +54,6 @@ connection drain. HTTPS Alt-Svc advertisement and shared TCP/UDP origin setup
 also remain outstanding. Server push and CONNECT are not supported.
 
 Closed or timed-out QUIC connections are removed with their connection-ID
-routes, pending request routes, and queued completed requests. The provider does
-not yet impose a global connection or queued-request cap.
+routes, pending request routes, and queued completed requests. New connections
+are capped by `ServerConfig.max_connections`; aggregate queued-request and
+buffer memory across connections remains unbounded.

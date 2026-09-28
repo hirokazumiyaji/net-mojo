@@ -96,6 +96,18 @@ struct QuicServer(Movable):
     def __deinit__(deinit self):
         self._library.call["net_quic_free"](self._server)
 
+    def set_connection_limit(mut self, limit: Int) raises NetError:
+        var result = self._library.call["net_quic_set_connection_limit", c_int](
+            self._server, c_size_t(limit)
+        )
+        if result != 1:
+            raise NetError(
+                NetErrorKind.invalid_state(),
+                "set QUIC connection limit",
+                None,
+                "QUIC provider could not set the connection limit",
+            )
+
     def recv_datagram[
         origin: MutOrigin
     ](
@@ -232,6 +244,9 @@ struct QuicUDPEndpoint(Movable):
     var _request_buffer: List[Byte]
     var _pending_length: Int
     var _pending_destination: Optional[SocketAddress]
+
+    def set_connection_limit(mut self, limit: Int) raises NetError:
+        self._server.set_connection_limit(limit)
 
     def __init__(
         out self, var server: QuicServer, var socket: UDPConn

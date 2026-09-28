@@ -21,6 +21,11 @@ void net_quic_free(struct NetQuicServer *server) {
     net_quic_server_free(server);
 }
 
+int32_t net_quic_set_connection_limit(
+    struct NetQuicServer *server, size_t limit) {
+    return net_quic_server_set_connection_limit(server, limit);
+}
+
 int32_t net_quic_receive(
     struct NetQuicServer *server, uint8_t *packet, size_t packet_length,
     const char *local_address, const char *remote_address) {

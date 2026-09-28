@@ -244,6 +244,7 @@ struct Server(Movable):
                 None,
                 "server already has a QUIC endpoint",
             )
+        endpoint.set_connection_limit(self.config.max_connections)
         var token = self._reactor.register(endpoint.raw_fd())
         self._quic_token = token.copy()
         self._quic_endpoint = Optional[QuicUDPEndpoint](endpoint^)

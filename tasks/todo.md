@@ -33,6 +33,13 @@
 
 - Attach `QuicUDPEndpoint` to `net.http.Server`, drive QUIC timers and HTTP/3 control/request streams, and route completed requests to the shared handler.
 
+## QUIC connection capacity slice
+
+- [x] Add a Rust test that refuses a new Initial packet once the configured connection cap is reached.
+- [x] Enforce the connection cap before allocating a QUIC connection or CID routes.
+- [x] Pass `ServerConfig.max_connections` through the Mojo endpoint to the provider.
+- [x] Run QUIC provider and HTTP server suites, inspect the diff, and commit this slice.
+
 ## QUIC transport review
 
 - `QuicServer` accepts Initial datagrams, routes later packets by connection ID, emits pending packets with their destination, and reports/advances connection timeouts.

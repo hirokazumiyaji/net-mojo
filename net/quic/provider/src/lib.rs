@@ -98,6 +98,18 @@ pub unsafe extern "C" fn net_quic_server_free(server: *mut NetQuicServer) {
     }
 }
 
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn net_quic_server_set_connection_limit(
+    server: *mut NetQuicServer,
+    limit: usize,
+) -> i32 {
+    if server.is_null() {
+        return -1;
+    }
+    unsafe { &mut *server }._inner.max_connections = limit;
+    1
+}
+
 unsafe fn socket_address(address: *const c_char) -> Option<SocketAddr> {
     let address = unsafe { CStr::from_ptr(address) }.to_str().ok()?;
     address.parse().ok()
@@ -327,6 +339,7 @@ pub struct QuicServer {
     request_routes: HashMap<u64, (Vec<u8>, u64)>,
     next_request_id: u64,
     random: File,
+    max_connections: usize,
 }
 
 struct QuicConnection {
@@ -406,6 +419,7 @@ impl QuicServer {
             request_routes: HashMap::new(),
             next_request_id: 1,
             random: File::open("/dev/urandom")?,
+            max_connections: 10_000,
         })
     }
 
@@ -420,6 +434,9 @@ impl QuicServer {
         let key = match self.routes.get(&destination_id) {
             Some(key) => key.clone(),
             None if header.ty == quiche::Type::Initial => {
+                if self.connections.len() >= self.max_connections {
+                    return Err(quiche::Error::Done.into());
+                }
                 let mut source_id = [0; 16];
                 self.random.read_exact(&mut source_id)?;
                 let source_id = ConnectionId::from_ref(&source_id);
@@ -1411,6 +1428,81 @@ mod tests {
             net_quic_server_free(server);
             super::net_quic_server_config_free(config);
         }
+    }
+
+    #[test]
+    fn refuses_new_quic_connections_at_the_configured_limit() {
+        let certificate_path = std::env::var("NET_HTTP_TEST_CERT").unwrap();
+        let private_key_path = std::env::var("NET_HTTP_TEST_KEY").unwrap();
+        let mut server_config = quiche::Config::new(quiche::PROTOCOL_VERSION).unwrap();
+        server_config
+            .set_application_protos(quiche::h3::APPLICATION_PROTOCOL)
+            .unwrap();
+        server_config
+            .load_cert_chain_from_pem_file(&certificate_path)
+            .unwrap();
+        server_config
+            .load_priv_key_from_pem_file(&private_key_path)
+            .unwrap();
+        let mut server = super::QuicServer::new(server_config).unwrap();
+        server.max_connections = 1;
+
+        let local = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 4433);
+        let mut packet = [0; 65535];
+        let mut first_config = quiche::Config::new(quiche::PROTOCOL_VERSION).unwrap();
+        first_config
+            .set_application_protos(quiche::h3::APPLICATION_PROTOCOL)
+            .unwrap();
+        first_config.verify_peer(false);
+        let first_address = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 54321);
+        let first_scid = [0x61; 16];
+        let mut first_client = quiche::connect(
+            Some("localhost"),
+            &ConnectionId::from_ref(&first_scid),
+            first_address,
+            local,
+            &mut first_config,
+        )
+        .unwrap();
+        let (first_length, _) = first_client.send(&mut packet).unwrap();
+        let first_dcid = Header::from_slice(&mut packet[..first_length], 16)
+            .unwrap()
+            .dcid
+            .as_ref()
+            .to_vec();
+        server
+            .recv_datagram(&mut packet[..first_length], local, first_address)
+            .unwrap();
+        assert_eq!(server.connections.len(), 1);
+        assert!(server.routes.contains_key(&first_dcid));
+
+        let mut second_config = quiche::Config::new(quiche::PROTOCOL_VERSION).unwrap();
+        second_config
+            .set_application_protos(quiche::h3::APPLICATION_PROTOCOL)
+            .unwrap();
+        second_config.verify_peer(false);
+        let second_address = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 54322);
+        let second_scid = [0x62; 16];
+        let mut second_client = quiche::connect(
+            Some("localhost"),
+            &ConnectionId::from_ref(&second_scid),
+            second_address,
+            local,
+            &mut second_config,
+        )
+        .unwrap();
+        let (second_length, _) = second_client.send(&mut packet).unwrap();
+        let second_dcid = Header::from_slice(&mut packet[..second_length], 16)
+            .unwrap()
+            .dcid
+            .as_ref()
+            .to_vec();
+        assert!(matches!(
+            server.recv_datagram(&mut packet[..second_length], local, second_address),
+            Err(super::QuicServerError::Quiche(quiche::Error::Done))
+        ));
+        assert_eq!(server.connections.len(), 1);
+        assert!(!server.routes.contains_key(&second_dcid));
     }
 
     #[test]
