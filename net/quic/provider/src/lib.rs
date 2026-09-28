@@ -571,11 +571,7 @@ impl QuicServer {
                         || request.scheme.is_empty()
                         || request.authority.is_empty()
                     {
-                        let code = if header_bytes > 32_768 {
-                            0x107
-                        } else {
-                            0x10e
-                        };
+                        let code = if header_bytes > 32_768 { 0x107 } else { 0x10e };
                         let _ = connection.transport.stream_shutdown(
                             stream_id,
                             quiche::Shutdown::Read,
@@ -591,11 +587,7 @@ impl QuicServer {
                     };
                     let mut body = [0; 16 * 1024];
                     loop {
-                        match http3.recv_body(
-                            &mut connection.transport,
-                            stream_id,
-                            &mut body,
-                        ) {
+                        match http3.recv_body(&mut connection.transport, stream_id, &mut body) {
                             Ok(length) => {
                                 if request.body.len() + length > 1024 * 1024 {
                                     let _ = connection.transport.stream_shutdown(
@@ -649,8 +641,7 @@ impl QuicServer {
         headers: Vec<(Vec<u8>, Vec<u8>)>,
         body: Vec<u8>,
     ) -> bool {
-        let Some((connection_key, stream_id)) = self.request_routes.get(&request_id)
-        else {
+        let Some((connection_key, stream_id)) = self.request_routes.get(&request_id) else {
             return false;
         };
         let Some(connection) = self.connections.get_mut(connection_key) else {
@@ -696,10 +687,7 @@ impl QuicServer {
                         response.body.is_empty(),
                     ) {
                         Ok(()) => response.headers_sent = true,
-                        Err(
-                            quiche::h3::Error::Done
-                            | quiche::h3::Error::StreamBlocked,
-                        ) => continue,
+                        Err(quiche::h3::Error::Done | quiche::h3::Error::StreamBlocked) => continue,
                         Err(error) => return Err(error.into()),
                     }
                 }
@@ -716,7 +704,11 @@ impl QuicServer {
                     Ok(written) => {
                         response.body_offset += written;
                         if response.body_offset == response.body.len() {
-                            completed.push((connection_key.clone(), stream_id, response.request_id));
+                            completed.push((
+                                connection_key.clone(),
+                                stream_id,
+                                response.request_id,
+                            ));
                         }
                     }
                     Err(quiche::h3::Error::Done | quiche::h3::Error::StreamBlocked) => (),
@@ -780,8 +772,7 @@ mod tests {
     use quiche::{ConnectionId, Header, RecvInfo};
 
     use super::{
-        NetQuicServerConfig, append_bytes, append_u32, net_quic_server_free,
-        net_quic_server_new,
+        NetQuicServerConfig, append_bytes, append_u32, net_quic_server_free, net_quic_server_new,
     };
     use quiche::h3::NameValue;
 
@@ -1107,9 +1098,13 @@ mod tests {
             }
         }
         let server_state = unsafe { &mut *server };
-        assert!(server_state._inner.connections.values().all(|connection| {
-            connection.http3.is_some()
-        }));
+        assert!(
+            server_state
+                ._inner
+                .connections
+                .values()
+                .all(|connection| { connection.http3.is_some() })
+        );
         let request = server_state._inner.requests.front().unwrap();
         assert_eq!(request.stream_id, request_stream_id);
         assert_eq!(request.method, b"POST");
@@ -1134,9 +1129,11 @@ mod tests {
             )
         };
         assert!(request_record_length > 0);
-        assert!(request_record[..request_record_length as usize]
-            .windows(b"/items?q=1".len())
-            .any(|window| window == b"/items?q=1"));
+        assert!(
+            request_record[..request_record_length as usize]
+                .windows(b"/items?q=1".len())
+                .any(|window| window == b"/items?q=1")
+        );
         assert_eq!(
             unsafe {
                 super::net_quic_server_next_request(
@@ -1217,11 +1214,9 @@ mod tests {
                         }
                         Ok((stream_id, quiche::h3::Event::Data)) => {
                             let mut body = [0; 1024];
-                            while let Ok(length) = client_h3.recv_body(
-                                &mut client,
-                                stream_id,
-                                &mut body,
-                            ) {
+                            while let Ok(length) =
+                                client_h3.recv_body(&mut client, stream_id, &mut body)
+                            {
                                 received_body.extend_from_slice(&body[..length]);
                             }
                         }
@@ -1245,5 +1240,174 @@ mod tests {
             net_quic_server_free(server);
             super::net_quic_server_config_free(config);
         }
+    }
+
+    #[test]
+    fn routes_http3_request_through_mojo_server_handler() {
+        use std::io::{BufRead, BufReader, ErrorKind};
+        use std::net::UdpSocket;
+        use std::process::{Command, Stdio};
+        use std::time::Duration;
+
+        let mut fixture = Command::new("mojo")
+            .current_dir("../../..")
+            .args([
+                "run",
+                "--Werror",
+                "-I",
+                ".",
+                "tests/http3_server_fixture.mojo",
+            ])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::inherit())
+            .spawn()
+            .expect("start Mojo HTTP/3 fixture");
+        let mut ready = String::new();
+        BufReader::new(fixture.stdout.take().unwrap())
+            .read_line(&mut ready)
+            .expect("read Mojo HTTP/3 fixture address");
+        let server_address: SocketAddr = ready
+            .strip_prefix("READY ")
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+
+        let socket = UdpSocket::bind("127.0.0.1:0").unwrap();
+        socket
+            .set_read_timeout(Some(Duration::from_millis(5)))
+            .unwrap();
+        let client_address = socket.local_addr().unwrap();
+        let client_scid = [0x21; 16];
+        let mut client_config = quiche::Config::new(quiche::PROTOCOL_VERSION).unwrap();
+        client_config
+            .set_application_protos(quiche::h3::APPLICATION_PROTOCOL)
+            .unwrap();
+        client_config.verify_peer(false);
+        client_config.set_initial_max_data(10_000_000);
+        client_config.set_initial_max_stream_data_bidi_local(1_000_000);
+        client_config.set_initial_max_stream_data_bidi_remote(1_000_000);
+        client_config.set_initial_max_stream_data_uni(1_000_000);
+        client_config.set_initial_max_streams_bidi(100);
+        client_config.set_initial_max_streams_uni(3);
+        let mut client = quiche::connect(
+            Some("localhost"),
+            &ConnectionId::from_ref(&client_scid),
+            client_address,
+            server_address,
+            &mut client_config,
+        )
+        .unwrap();
+
+        let mut packet = [0; 65535];
+        for _ in 0..400 {
+            while let Ok((length, _)) = client.send(&mut packet) {
+                socket.send_to(&packet[..length], server_address).unwrap();
+            }
+            match socket.recv_from(&mut packet) {
+                Ok((length, peer)) => {
+                    client
+                        .recv(
+                            &mut packet[..length],
+                            RecvInfo {
+                                from: peer,
+                                to: client_address,
+                            },
+                        )
+                        .unwrap();
+                }
+                Err(error)
+                    if error.kind() == ErrorKind::WouldBlock
+                        || error.kind() == ErrorKind::TimedOut =>
+                {
+                    ()
+                }
+                Err(error) => panic!("HTTP/3 client receive failed: {error}"),
+            }
+            if client.is_established() {
+                break;
+            }
+        }
+        assert!(client.is_established());
+        assert_eq!(client.application_proto(), b"h3");
+
+        let mut client_h3 = quiche::h3::Connection::with_transport(
+            &mut client,
+            &quiche::h3::Config::new().unwrap(),
+        )
+        .unwrap();
+        let request_headers = [
+            quiche::h3::Header::new(b":method", b"POST"),
+            quiche::h3::Header::new(b":scheme", b"https"),
+            quiche::h3::Header::new(b":authority", b"localhost"),
+            quiche::h3::Header::new(b":path", b"/echo?source=quic"),
+            quiche::h3::Header::new(b"content-length", b"4"),
+        ];
+        let stream_id = client_h3
+            .send_request(&mut client, &request_headers, false)
+            .unwrap();
+        assert_eq!(
+            client_h3
+                .send_body(&mut client, stream_id, b"data", true)
+                .unwrap(),
+            4
+        );
+
+        let mut status = None;
+        let mut response_body = Vec::new();
+        for _ in 0..400 {
+            while let Ok((length, _)) = client.send(&mut packet) {
+                socket.send_to(&packet[..length], server_address).unwrap();
+            }
+            loop {
+                match socket.recv_from(&mut packet) {
+                    Ok((length, peer)) => {
+                        client
+                            .recv(
+                                &mut packet[..length],
+                                RecvInfo {
+                                    from: peer,
+                                    to: client_address,
+                                },
+                            )
+                            .unwrap();
+                    }
+                    Err(error)
+                        if error.kind() == ErrorKind::WouldBlock
+                            || error.kind() == ErrorKind::TimedOut =>
+                    {
+                        break;
+                    }
+                    Err(error) => panic!("HTTP/3 client receive failed: {error}"),
+                }
+            }
+            loop {
+                match client_h3.poll(&mut client) {
+                    Ok((_, quiche::h3::Event::Headers { list, .. })) => {
+                        for header in list {
+                            if header.name() == b":status" {
+                                status = Some(header.value().to_vec());
+                            }
+                        }
+                    }
+                    Ok((id, quiche::h3::Event::Data)) => {
+                        let mut body = [0; 1024];
+                        while let Ok(length) = client_h3.recv_body(&mut client, id, &mut body) {
+                            response_body.extend_from_slice(&body[..length]);
+                        }
+                    }
+                    Ok(_) => (),
+                    Err(quiche::h3::Error::Done) => break,
+                    Err(error) => panic!("HTTP/3 response poll failed: {error:?}"),
+                }
+            }
+            if response_body == b"handled:data" {
+                break;
+            }
+        }
+
+        assert_eq!(status.as_deref(), Some(&b"200"[..]));
+        assert_eq!(response_body, b"handled:data");
+        assert!(fixture.wait().unwrap().success());
     }
 }

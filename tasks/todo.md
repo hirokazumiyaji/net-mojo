@@ -156,3 +156,16 @@
 - The TLS HTTP/2 client also sets the initial stream window to zero, grants credit later, and verifies the buffered response body resumes.
 - HPACK passed 24/24, HTTP/2 passed 97/97, HTTP Server passed 27/27, and `tls-suite` passed on Linux x86_64.
 - `/review` was attempted as requested, but the auto-reviewer rejected external diff upload and session persistence outside the workspace. PR publication remains blocked pending explicit approval for that data transfer.
+
+## HTTP/3 shared-handler integration slice plan
+
+- [x] Start a Mojo `Server` with a QUIC UDP endpoint and a handler that validates HTTP/3 request metadata/body.
+- [x] Use an independent quiche client over localhost UDP to send a request and assert the shared-handler response.
+- [x] Run the HTTP/3 provider suite and record the end-to-end result; commit this slice locally.
+
+## Review
+
+- The independent quiche client completed TLS/ALPN negotiation, sent an HTTP/3 POST over localhost UDP, and received `handled:data` from the shared Mojo `Handler`.
+- `quic-suite` passed, including the C provider smoke test, Mojo FFI test, and all three Rust provider tests.
+- `cargo fmt` and `git diff --check` passed.
+- `/review` and PR publication remain pending explicit authorization to upload the code diff to the configured external reviewer.
