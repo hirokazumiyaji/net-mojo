@@ -110,6 +110,19 @@ pub unsafe extern "C" fn net_quic_server_set_connection_limit(
     1
 }
 
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn net_quic_server_begin_shutdown(
+    server: *mut NetQuicServer,
+) -> i32 {
+    if server.is_null() {
+        return -1;
+    }
+    match unsafe { &mut *server }._inner.begin_shutdown() {
+        Ok(()) => 1,
+        Err(_) => -1,
+    }
+}
+
 unsafe fn socket_address(address: *const c_char) -> Option<SocketAddr> {
     let address = unsafe { CStr::from_ptr(address) }.to_str().ok()?;
     address.parse().ok()
@@ -340,6 +353,7 @@ pub struct QuicServer {
     next_request_id: u64,
     random: File,
     max_connections: usize,
+    draining: bool,
 }
 
 struct QuicConnection {
@@ -347,7 +361,10 @@ struct QuicConnection {
     http3: Option<quiche::h3::Connection>,
     requests: HashMap<u64, PendingRequest>,
     responses: HashMap<u64, PendingResponse>,
+    goaway_sent: bool,
 }
+
+const MAX_HTTP3_REQUEST_STREAM_ID: u64 = (1 << 62) - 4;
 
 struct PendingResponse {
     request_id: u64,
@@ -420,7 +437,13 @@ impl QuicServer {
             next_request_id: 1,
             random: File::open("/dev/urandom")?,
             max_connections: 10_000,
+            draining: false,
         })
+    }
+
+    pub fn begin_shutdown(&mut self) -> Result<(), QuicServerError> {
+        self.draining = true;
+        self.drive_goaways()
     }
 
     pub fn recv_datagram(
@@ -434,6 +457,9 @@ impl QuicServer {
         let key = match self.routes.get(&destination_id) {
             Some(key) => key.clone(),
             None if header.ty == quiche::Type::Initial => {
+                if self.draining {
+                    return Err(quiche::Error::Done.into());
+                }
                 if self.connections.len() >= self.max_connections {
                     return Err(quiche::Error::Done.into());
                 }
@@ -457,6 +483,7 @@ impl QuicServer {
                         http3: None,
                         requests: HashMap::new(),
                         responses: HashMap::new(),
+                        goaway_sent: false,
                     },
                 );
                 key
@@ -509,6 +536,29 @@ impl QuicServer {
             });
         }
         self.reap_closed_connection(&key);
+        Ok(())
+    }
+
+    fn drive_goaways(&mut self) -> Result<(), QuicServerError> {
+        if !self.draining {
+            return Ok(());
+        }
+        for connection in self.connections.values_mut() {
+            if connection.goaway_sent {
+                continue;
+            }
+            let Some(http3) = connection.http3.as_mut() else {
+                continue;
+            };
+            match http3.send_goaway(
+                &mut connection.transport,
+                MAX_HTTP3_REQUEST_STREAM_ID,
+            ) {
+                Ok(()) => connection.goaway_sent = true,
+                Err(quiche::h3::Error::StreamBlocked | quiche::h3::Error::Done) => (),
+                Err(error) => return Err(error.into()),
+            }
+        }
         Ok(())
     }
 
@@ -831,6 +881,7 @@ impl QuicServer {
         &mut self,
         packet: &mut [u8],
     ) -> Result<Option<(usize, SendInfo)>, QuicServerError> {
+        self.drive_goaways()?;
         self.drive_responses()?;
         for connection in self.connections.values_mut() {
             match connection.transport.send(packet) {
@@ -1392,6 +1443,61 @@ mod tests {
                 break;
             }
         }
+
+        assert_eq!(unsafe { super::net_quic_server_begin_shutdown(server) }, 1);
+        let mut received_goaway = false;
+        for _ in 0..20 {
+            loop {
+                let mut destination = [0 as c_char; 64];
+                let length = unsafe {
+                    super::net_quic_server_send(
+                        server,
+                        packet.as_mut_ptr(),
+                        packet.len(),
+                        destination.as_mut_ptr(),
+                        destination.len(),
+                    )
+                };
+                if length <= 0 {
+                    break;
+                }
+                let destination = unsafe { CStr::from_ptr(destination.as_ptr()) }
+                    .to_str()
+                    .unwrap()
+                    .parse::<SocketAddr>()
+                    .unwrap();
+                server_socket
+                    .send_to(&packet[..length as usize], destination)
+                    .unwrap();
+            }
+            if let Ok((length, peer)) = client_socket.recv_from(&mut packet) {
+                client
+                    .recv(
+                        &mut packet[..length],
+                        RecvInfo {
+                            from: peer,
+                            to: client_address,
+                        },
+                    )
+                    .unwrap();
+                loop {
+                    match client_h3.poll(&mut client) {
+                        Ok((_, quiche::h3::Event::GoAway)) => {
+                            received_goaway = true;
+                            break;
+                        }
+                        Ok(_) => (),
+                        Err(quiche::h3::Error::Done) => break,
+                        Err(error) => panic!("HTTP/3 client poll failed: {error:?}"),
+                    }
+                }
+            }
+            if received_goaway {
+                break;
+            }
+        }
+        assert!(received_goaway);
+
         let connection_key = {
             let server_state = unsafe { &mut *server };
             assert_eq!(server_state._inner.requests.len(), 1);

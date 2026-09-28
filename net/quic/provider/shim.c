@@ -26,6 +26,10 @@ int32_t net_quic_set_connection_limit(
     return net_quic_server_set_connection_limit(server, limit);
 }
 
+int32_t net_quic_begin_shutdown(struct NetQuicServer *server) {
+    return net_quic_server_begin_shutdown(server);
+}
+
 int32_t net_quic_receive(
     struct NetQuicServer *server, uint8_t *packet, size_t packet_length,
     const char *local_address, const char *remote_address) {

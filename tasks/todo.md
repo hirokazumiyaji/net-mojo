@@ -106,6 +106,23 @@
 - The HTTP/2 shutdown session slice is committed as `44d9c9d`.
 - Server graceful shutdown passed `tls-suite`, including independent TLS interoperability; HPACK passed 29/29, HTTP/2 passed 97/97, Python syntax validation and `git diff --check` passed on Linux x86_64.
 
+## HTTP/3 graceful shutdown provider slice
+
+- [x] Add provider-level HTTP/3 shutdown state and GOAWAY retry behavior.
+- [x] Verify GOAWAY delivery while retaining a completed request for response handling.
+- [x] Run the QUIC provider suite and commit the provider slice locally.
+
+## Review
+
+- The QUIC provider suite passed 4/4 tests on Linux x86_64, including a client receiving the provider's shutdown GOAWAY. The C/Rust provider build also passed.
+
+## HTTP/3 server graceful shutdown integration slice
+
+- [ ] Expose provider shutdown and drain state through C and Mojo.
+- [ ] Keep the UDP endpoint alive through response drain; force close only at the configured grace deadline.
+- [ ] Verify GOAWAY, accepted response completion, post-GOAWAY rejection, and graceful QUIC close with an independent client.
+- [ ] Run QUIC, HTTP/3 interoperability, HTTP/2, and TLS suites, inspect the diff, and commit the server integration slice locally.
+
 ## QUIC transport review
 
 - `QuicServer` accepts Initial datagrams, routes later packets by connection ID, emits pending packets with their destination, and reports/advances connection timeouts.
