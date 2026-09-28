@@ -5,6 +5,8 @@ from net.http._http2.frame import FrameParseResult, parse_frame
 from net.http._http2.frame_encoder import encode_frame
 from net.http._http2.data_frame import parse_data_frame
 from net.http._http2.request_body import Http2RequestBody
+from net.http._http2.response_headers import encode_http2_response_headers
+from net.http.response import ResponseWriter
 from net.http._http2.bootstrap import Http2ServerBootstrap
 from net.http._http2.settings_state import Http2PeerSettings
 from net.http._http2.stream_state import Http2StreamState
@@ -263,6 +265,69 @@ def test_http2_request_body_enforces_limit_and_completion() raises:
     var data = parse_data_frame(frame, Span(payload))
     assert_true(complete.append_data(data, Span(payload)).is_accepted())
     assert_true(complete.append_data(data, Span(payload)).is_invalid_state())
+
+
+def test_http2_response_headers_map_shared_response() raises:
+    var writer = ResponseWriter(16)
+    writer.set_status(201)
+    writer.headers.add("X-Trace", "abc")
+    writer.write_string("hello")
+    var encoded = encode_http2_response_headers(
+        writer, False, "Thu, 01 Jan 1970 00:00:00 GMT", 1024, 8
+    )
+    assert_true(encoded.is_valid())
+    assert_true(encoded.send_body)
+    assert_equal(encoded.field_count, 4)
+    var status_name = String(from_utf8_lossy=Span(encoded.fields)[8:15])
+    var status_value = String(from_utf8_lossy=Span(encoded.fields)[15:18])
+    assert_equal(status_name, ":status")
+    assert_equal(status_value, "201")
+
+
+def test_http2_response_headers_reject_forbidden_and_mismatched_fields() raises:
+    var connection = ResponseWriter(16)
+    connection.headers.add("Connection", "close")
+    assert_true(
+        encode_http2_response_headers(connection, False, "date", 1024, 8)
+        .is_error()
+    )
+
+    var mismatch = ResponseWriter(16)
+    mismatch.headers.add("Content-Length", "3")
+    mismatch.write_string("hello")
+    assert_true(
+        encode_http2_response_headers(mismatch, False, "date", 1024, 8)
+        .is_error()
+    )
+
+    var invalid_status = ResponseWriter(16)
+    invalid_status.set_status(101)
+    assert_true(
+        encode_http2_response_headers(invalid_status, False, "date", 1024, 8)
+        .is_error()
+    )
+
+
+def test_http2_response_headers_keep_head_length_and_drop_no_body_length() raises:
+    var head = ResponseWriter(16)
+    head.write_string("hello")
+    var head_fields = encode_http2_response_headers(
+        head, True, "date", 1024, 8
+    )
+    assert_true(head_fields.is_valid())
+    assert_false(head_fields.send_body)
+    assert_equal(head_fields.field_count, 3)
+
+    var no_content = ResponseWriter(16)
+    no_content.set_status(204)
+    no_content.headers.add("Content-Length", "5")
+    no_content.write_string("hello")
+    var no_content_fields = encode_http2_response_headers(
+        no_content, False, "date", 1024, 8
+    )
+    assert_true(no_content_fields.is_valid())
+    assert_false(no_content_fields.send_body)
+    assert_equal(no_content_fields.field_count, 2)
 
 
 def test_http2_window_update_parses_connection_and_stream_credit() raises:

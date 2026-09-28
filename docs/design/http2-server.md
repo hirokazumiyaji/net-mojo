@@ -120,6 +120,8 @@ lowercase regular names, forbidden connection-specific fields, `TE: trailers`,
 and matching Host/authority before conversion to the shared `Request` type.
 Trailing header blocks are decoded separately and reject pseudo-headers and
 fields that affect framing or routing.
+The response adapter emits `:status`, lowercases regular names, rejects
+connection-specific fields, and derives Content-Length from the buffered body.
 
 ## Follow-up connection work
 
