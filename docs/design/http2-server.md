@@ -103,6 +103,8 @@ stream send windows; the connection send window remains fixed.
 `Http2ContinuationSequence` is checked before dispatching each complete frame.
 It rejects orphan CONTINUATION frames, stream changes, interleaved frames while
 a header block is open, and client-sent PUSH_PROMISE frames.
+WINDOW_UPDATE parsing accepts connection or stream IDs, masks the reserved bit,
+rejects zero increments, and applies the increment to the selected send window.
 
 ## Follow-up connection work
 

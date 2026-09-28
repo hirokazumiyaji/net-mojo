@@ -16,6 +16,7 @@ from net.http._http2.settings_frame import parse_settings_frame
 from net.http._http2.header_block import Http2HeaderBlock
 from net.http._http2.flow_window import Http2FlowWindow
 from net.http._http2.frame_sequence import Http2ContinuationSequence
+from net.http._http2.window_update import parse_window_update_frame
 
 
 def test_header_block_collects_headers_payload_until_end_headers() raises:
@@ -173,6 +174,40 @@ def test_http2_continuation_sequence_rejects_push_promise_from_client() raises:
     var sequence = Http2ContinuationSequence()
     var push = FrameParseResult.complete(Byte(5), Byte(4), UInt32(1), 4)
     assert_false(sequence.accept(push))
+
+
+def test_http2_window_update_parses_connection_and_stream_credit() raises:
+    var payload: List[Byte] = [Byte(0x80), Byte(0), Byte(0), Byte(5)]
+    var connection = FrameParseResult.complete(Byte(8), Byte(0), UInt32(0), 4)
+    var parsed = parse_window_update_frame(connection, Span(payload))
+    assert_true(parsed.is_valid())
+    assert_equal(parsed.stream_id, UInt32(0))
+    assert_equal(parsed.increment, UInt32(5))
+    var connection_window = Http2FlowWindow(2, 10)
+    assert_true(parsed.apply_to(connection_window))
+    assert_equal(connection_window.send_window(), 7)
+
+    var stream = FrameParseResult.complete(Byte(8), Byte(0), UInt32(7), 4)
+    parsed = parse_window_update_frame(stream, Span(payload))
+    assert_true(parsed.is_valid())
+    assert_equal(parsed.stream_id, UInt32(7))
+
+
+def test_http2_window_update_rejects_zero_increment() raises:
+    var payload: List[Byte] = [Byte(0), Byte(0), Byte(0), Byte(0)]
+    var frame = FrameParseResult.complete(Byte(8), Byte(0), UInt32(0), 4)
+    assert_true(parse_window_update_frame(frame, Span(payload)).is_error())
+
+
+def test_http2_window_update_rejects_invalid_frame_shape() raises:
+    var payload: List[Byte] = [Byte(0), Byte(0), Byte(0)]
+    var partial = FrameParseResult.complete(Byte(8), Byte(0), UInt32(0), 3)
+    assert_true(parse_window_update_frame(partial, Span(payload)).is_error())
+    var wrong_type = FrameParseResult.complete(Byte(6), Byte(0), UInt32(0), 3)
+    assert_true(parse_window_update_frame(wrong_type, Span(payload)).is_error())
+    assert_true(
+        parse_window_update_frame(FrameParseResult.failure(), Span(payload)).is_error()
+    )
 
 
 def test_partial_client_preface_needs_more_data() raises:
