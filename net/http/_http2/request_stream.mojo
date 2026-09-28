@@ -131,3 +131,6 @@ struct Http2RequestStream(Movable):
 
     def take_request(deinit self) -> Request:
         return self._request^
+
+    def buffered_body_bytes(self) -> Int:
+        return self._body.size()

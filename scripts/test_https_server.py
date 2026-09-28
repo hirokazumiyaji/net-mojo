@@ -4,6 +4,28 @@ import subprocess
 import sys
 
 
+def read_h2_frame(client):
+    header = bytearray()
+    while len(header) < 9:
+        chunk = client.recv(9 - len(header))
+        if not chunk:
+            raise RuntimeError("connection closed before HTTP/2 response")
+        header.extend(chunk)
+    length = int.from_bytes(header[:3], "big")
+    payload = bytearray()
+    while len(payload) < length:
+        chunk = client.recv(length - len(payload))
+        if not chunk:
+            raise RuntimeError("incomplete HTTP/2 response frame")
+        payload.extend(chunk)
+    return (
+        header[3],
+        header[4],
+        int.from_bytes(header[5:9], "big"),
+        bytes(payload),
+    )
+
+
 process = subprocess.Popen(
     ["mojo", "run", "--Werror", "-I", ".", "tests/https_server_fixture.mojo"],
     stdout=subprocess.PIPE,
@@ -47,6 +69,84 @@ try:
             if response[3] != 4 or response[12] != 4 or response[13] != 1:
                 raise RuntimeError(
                     f"unexpected HTTP/2 bootstrap frames: {bytes(response)!r}"
+                )
+
+            compressed_headers = b"\x82\x86\x84\x41\x0fwww.example.com"
+            headers_frame = (
+                len(compressed_headers).to_bytes(3, "big")
+                + b"\x01\x04\x00\x00\x00\x01"
+                + compressed_headers
+            )
+            request_body = b"from h2"
+            data_frame = (
+                len(request_body).to_bytes(3, "big")
+                + b"\x00\x01\x00\x00\x00\x01"
+                + request_body
+            )
+            client.sendall(headers_frame + data_frame)
+
+            connection_credit = read_h2_frame(client)
+            stream_credit = read_h2_frame(client)
+            if (
+                connection_credit[0] != 8
+                or connection_credit[2] != 0
+                or connection_credit[3][-1] != len(request_body)
+                or stream_credit[0] != 8
+                or stream_credit[2] != 1
+                or stream_credit[3][-1] != len(request_body)
+            ):
+                raise RuntimeError(
+                    "unexpected HTTP/2 receive credit: "
+                    f"{connection_credit!r}, {stream_credit!r}"
+                )
+
+            response_headers = read_h2_frame(client)
+            if (
+                response_headers[0] != 1
+                or response_headers[2] != 1
+                or response_headers[3][0] != 0x88
+            ):
+                raise RuntimeError(
+                    f"unexpected HTTP/2 headers: {response_headers!r}"
+                )
+            response_data = read_h2_frame(client)
+            if (
+                response_data[0] != 0
+                or response_data[2] != 1
+                or response_data[3] != b"hello over httpsfrom h2"
+            ):
+                raise RuntimeError(f"unexpected HTTP/2 body: {response_data!r}")
+
+    with socket.create_connection(("127.0.0.1", port), timeout=5) as raw:
+        with http2_context.wrap_socket(raw, server_hostname="localhost") as client:
+            client.sendall(
+                b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n"
+                b"\x00\x00\x06\x04\x00\x00\x00\x00\x00"
+                b"\x00\x04\x00\x00\x00\x00"
+            )
+            bootstrap = bytearray()
+            while len(bootstrap) < 18:
+                chunk = client.recv(18 - len(bootstrap))
+                if not chunk:
+                    break
+                bootstrap.extend(chunk)
+            if len(bootstrap) != 18:
+                raise RuntimeError("incomplete HTTP/2 SETTINGS response")
+            compressed_headers = b"\x82\x86\x84\x41\x0fwww.example.com"
+            client.sendall(
+                len(compressed_headers).to_bytes(3, "big")
+                + b"\x01\x05\x00\x00\x00\x01"
+                + compressed_headers
+            )
+            limited_headers = read_h2_frame(client)
+            if (
+                limited_headers[0] != 1
+                or limited_headers[2] != 1
+                or (limited_headers[1] & 1) == 0
+                or limited_headers[3][0] != 0x8E
+            ):
+                raise RuntimeError(
+                    f"server exceeded a zero HTTP/2 send window: {limited_headers!r}"
                 )
 
     with socket.create_connection(("127.0.0.1", port), timeout=5) as raw:

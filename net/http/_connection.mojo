@@ -9,7 +9,8 @@ from net import TCPConn
 from net._reactor import ReactorToken
 from net.error import NetError, NetErrorKind
 from net.tls import TLSConnection, TLSIOResult
-from net.http._http2.connection_input import Http2ServerConnectionInput
+from net.http._http2.hpack import Http2HpackDeflater
+from net.http._http2.request_session import Http2RequestSession
 
 comptime STATE_READING: UInt8 = 0
 comptime STATE_SENDING: UInt8 = 1
@@ -28,7 +29,9 @@ struct HttpConnection(Movable):
     var token: ReactorToken
     var conn: Optional[TCPConn]
     var tls: Optional[TLSConnection]
-    var http2_input: Optional[Http2ServerConnectionInput]
+    var http2_session: Optional[Http2RequestSession]
+    var http2_deflater: Optional[Http2HpackDeflater]
+    var http2_body_reserved: Int
     var protocol: UInt8
     var buf: List[Byte]
     var state: UInt8
@@ -81,7 +84,9 @@ struct HttpConnection(Movable):
         self.token = token.copy()
         self.conn = conn^
         self.tls = tls^
-        self.http2_input = None
+        self.http2_session = None
+        self.http2_deflater = None
+        self.http2_body_reserved = 0
         self.protocol = PROTOCOL_HTTP11
         self.buf = List[Byte]()
         self.state = STATE_READING
@@ -361,6 +366,9 @@ struct HttpConnection(Movable):
         self.stream_finished = False
         self.stream_has_body = False
         self.tls = None
+        self.http2_session = None
+        self.http2_deflater = None
+        self.http2_body_reserved = 0
         if self.conn:
             self.conn.value().close()
             self.conn = None

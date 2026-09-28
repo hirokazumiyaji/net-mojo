@@ -71,5 +71,8 @@ struct Http2RequestBody(Movable):
     def is_complete(self) -> Bool:
         return self._complete
 
+    def size(self) -> Int:
+        return len(self._bytes)
+
     def bytes(self) -> List[Byte]:
         return self._bytes.copy()

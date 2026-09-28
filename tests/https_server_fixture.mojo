@@ -14,6 +14,7 @@ struct _OneRequestHandler(Handler):
         writer.set_status(200)
         writer.set_should_close(True)
         writer.write_string("hello over https")
+        writer.write(Span(req.body))
 
 
 def main() raises:
@@ -29,7 +30,7 @@ def main() raises:
     )
     print(String("READY ") + String(server.local_address().port))
     var handler = _OneRequestHandler()
-    while handler.requests == 0:
+    while handler.requests < 3:
         _ = server.tick(handler, Timeout.seconds(2))
     while server.active_connections() > 0:
         _ = server.tick(handler, Timeout.seconds(2))

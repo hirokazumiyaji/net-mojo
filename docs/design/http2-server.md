@@ -44,10 +44,15 @@ and negotiation remain with the connection state machine.
 
 ## TLS server entry
 
-After TLS selects ALPN `h2`, `Server` uses `Http2ServerConnectionInput` to
-exchange the client preface and initial SETTINGS, and it dispatches control
-frames through the same reactor-owned connection. HTTP/2 request stream frames
-are the next connection layer and are not yet connected to the shared handler.
+After TLS selects ALPN `h2`, `Server` uses `Http2RequestSession` to exchange
+the client preface and SETTINGS, assemble bounded requests, and call the shared
+handler. It encodes each buffered response with a connection-owned HPACK
+deflater and queues its HEADERS and DATA frames through the reactor-owned
+connection. The optional HPACK shim is loaded when the first request headers
+arrive. It returns connection and stream receive credit after request DATA is
+copied into the bounded body buffer. Responses stay within current connection
+send credit and the peer's initial stream window; response bodies that do not
+fit that credit become an empty 500 response.
 
 ## Outbound frame encoding
 
@@ -157,11 +162,10 @@ deflater terminal because the peer did not receive its updated table state.
 
 ## Follow-up connection work
 
-The connection layer will require the client connection preface, send server
-SETTINGS, validate frame sequencing and type-specific constraints, and map
-connection errors separately from stream errors. A bounded stream table and
-HPACK decoder will enforce concurrent stream, decoded header, and dynamic
-table limits before requests reach the shared handler.
+The current handler path buffers one response at a time. Stream-level send
+window updates, queued response continuation after WINDOW_UPDATE, stream-level
+error responses, concurrent response scheduling, and GOAWAY draining remain
+follow-up work.
 
 Connection and stream flow-control windows are tracked independently. DATA
 consumption returns receive credit even while the bounded buffered handler is

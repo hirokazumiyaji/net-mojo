@@ -4,6 +4,7 @@ from .connection_bootstrap import Http2ConnectionBootstrap
 from .frame_dispatcher import Http2FrameDispatcher
 from .frame import FrameParseResult
 from .frame_reader import Http2FrameReader
+from .settings_state import Http2PeerSettingsSnapshot
 
 
 @fieldwise_init
@@ -222,3 +223,6 @@ struct Http2ServerConnectionInput(Movable):
 
     def is_failed(self) -> Bool:
         return self._failed
+
+    def peer_settings(self) -> Http2PeerSettingsSnapshot:
+        return self._dispatcher.peer_settings()

@@ -7,6 +7,8 @@ from .connection_input import (
 )
 from .data_frame import parse_data_frame
 from .frame import FrameParseResult
+from .frame_encoder import encode_frame
+from .flow_window import Http2FlowWindow
 from .header_decoder import Http2HeaderDecodeResult, Http2HeaderDecoder
 from .request_stream import Http2RequestStream, Http2RequestStreamResult
 
@@ -67,11 +69,15 @@ struct Http2RequestSessionResult(Movable):
     def is_error(self) -> Bool:
         return self.kind == 3
 
+    def take_request(deinit self) -> Request:
+        return self.request^
+
 
 @fieldwise_init
 struct _Http2RequestEntry(Movable):
     var stream_id: UInt32
     var stream: Http2RequestStream
+    var receive_window: Http2FlowWindow
 
     def take_request(deinit self) -> Request:
         return self.stream^.take_request()
@@ -81,8 +87,10 @@ struct Http2RequestSession(Movable):
     var _input: Http2ServerConnectionInput
     var _decoder: Optional[Http2HeaderDecoder]
     var _library_path: String
-    var _header_output: Array[Byte, 65536]
+    var _header_output: List[Byte]
     var _streams: List[_Http2RequestEntry]
+    var _receive_window: Http2FlowWindow
+    var _send_window: Http2FlowWindow
     var _max_active_streams: Int
     var _max_body_size: Int
     var _last_stream_id: UInt32
@@ -97,8 +105,10 @@ struct Http2RequestSession(Movable):
         self._input = Http2ServerConnectionInput()
         self._decoder = None
         self._library_path = library_path^
-        self._header_output = Array[Byte, 65536](fill=0)
+        self._header_output = List[Byte](length=65536, fill=0)
         self._streams = List[_Http2RequestEntry]()
+        self._receive_window = Http2FlowWindow(65535, 65535)
+        self._send_window = Http2FlowWindow(65535, 65535)
         self._max_active_streams = max_active_streams
         self._max_body_size = max_body_size
         self._last_stream_id = UInt32(0)
@@ -150,7 +160,7 @@ struct Http2RequestSession(Movable):
                         )
                 elif input.frame_type == Byte(0):
                     var request_result = self._receive_data(
-                        frame, Span(input.payload)
+                        frame, Span(input.payload), output
                     )
                     if (
                         request_result.is_error()
@@ -167,6 +177,10 @@ struct Http2RequestSession(Movable):
                         )
             elif input.is_reset():
                 self._remove_stream(input.stream_id)
+            elif input.is_window_update() and input.stream_id == UInt32(0):
+                if not self._send_window.apply_window_update(Int(input.value)):
+                    self._failed = True
+                    return Http2RequestSessionResult.error(consumed, output^)
 
             if input.consumed == 0:
                 break
@@ -203,8 +217,11 @@ struct Http2RequestSession(Movable):
                 return Http2RequestStreamResult.error()
             self._last_stream_id = decoded.stream_id
             var stream = Http2RequestStream(self._max_body_size)
+            var receive_window = Http2FlowWindow(65535, 65535)
             var entry = _Http2RequestEntry(
-                stream_id=decoded.stream_id, stream=stream^
+                stream_id=decoded.stream_id,
+                stream=stream^,
+                receive_window=receive_window^,
             )
             self._streams.append(entry^)
             index = len(self._streams) - 1
@@ -221,6 +238,7 @@ struct Http2RequestSession(Movable):
         mut self,
         frame: FrameParseResult,
         payload: Span[Byte, origin],
+        mut output: List[Byte],
     ) -> Http2RequestStreamResult:
         var index = self._find_stream(frame.stream_id)
         if index < 0:
@@ -228,13 +246,51 @@ struct Http2RequestSession(Movable):
         var data = parse_data_frame(frame, payload)
         if not data.is_valid():
             return Http2RequestStreamResult.error()
-        return self._streams[index].stream.receive_data(data, payload)
+        if (
+            not self._receive_window.receive_data(frame.payload_length)
+            or not self._streams[index].receive_window.receive_data(
+                frame.payload_length
+            )
+        ):
+            return Http2RequestStreamResult.error()
+        var received = self._streams[index].stream.receive_data(data, payload)
+        if not received.is_pending() and not received.is_complete():
+            return received^
+        if frame.payload_length > 0:
+            if (
+                not self._receive_window.release_received(frame.payload_length)
+                or not self._streams[index].receive_window.release_received(
+                    frame.payload_length
+                )
+            ):
+                return Http2RequestStreamResult.error()
+            _append_window_update(output, UInt32(0), frame.payload_length)
+            _append_window_update(output, frame.stream_id, frame.payload_length)
+        return received^
 
     def _find_stream(self, stream_id: UInt32) -> Int:
         for i in range(len(self._streams)):
             if self._streams[i].stream_id == stream_id:
                 return i
         return -1
+
+    def buffered_body_bytes(self) -> Int:
+        var total = 0
+        for i in range(len(self._streams)):
+            total += self._streams[i].stream.buffered_body_bytes()
+        return total
+
+    def send_window(self, stream_id: UInt32) -> Int:
+        var connection_window = self._send_window.send_window()
+        var stream_window = Int(
+            self._input.peer_settings().initial_window_size
+        )
+        return min(connection_window, stream_window)
+
+    def consume_outbound(mut self, stream_id: UInt32, amount: Int) -> Bool:
+        if amount > Int(self._input.peer_settings().initial_window_size):
+            return False
+        return self._send_window.consume_outbound(amount)
 
     def _take_request(mut self, stream_id: UInt32) -> Request:
         var retained = List[_Http2RequestEntry]()
@@ -267,3 +323,16 @@ def _append_session_output[
 ](mut output: List[Byte], bytes: Span[Byte, origin]):
     for i in range(len(bytes)):
         output.append(bytes[i])
+
+
+def _append_window_update(
+    mut output: List[Byte], stream_id: UInt32, increment: Int
+):
+    var payload: List[Byte] = [
+        Byte((increment >> 24) & 0x7F),
+        Byte((increment >> 16) & 0xFF),
+        Byte((increment >> 8) & 0xFF),
+        Byte(increment & 0xFF),
+    ]
+    var frame = encode_frame(Byte(8), Byte(0), stream_id, Span(payload))
+    _append_session_output(output, Span(frame.wire))
