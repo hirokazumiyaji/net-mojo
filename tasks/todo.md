@@ -180,6 +180,12 @@
 - [x] Add a same-numbered TCP HTTPS and UDP HTTP/3 example using the shared handler.
 - [x] Build both examples in the optional-provider CI jobs and document their environment requirements.
 
+## HTTP/3 packet loss interoperability slice
+
+- [x] Drop one client QUIC datagram while sending an HTTP/3 request.
+- [x] Verify QUIC retransmission recovers the request and later streams complete on the same connection.
+- [x] Run the independent aioquic HTTP/3 test and Python syntax check.
+
 ## QUIC transport review
 
 - `QuicServer` accepts Initial datagrams, routes later packets by connection ID, emits pending packets with their destination, and reports/advances connection timeouts.

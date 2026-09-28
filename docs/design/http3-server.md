@@ -47,8 +47,8 @@ quiche client connection. It confirms TLS negotiation with ALPN `h3`, dispatch
 to the shared handler, two concurrent request streams on one connection,
 stream-specific responses, and request trailer visibility through
 `Request.trailers`. A pinned aioquic client independently verifies concurrent
-requests, cancellation, trailers, and graceful shutdown. C and Mojo FFI smoke
-tests exercise the provider boundary.
+requests, recovery after a dropped client datagram, cancellation, trailers, and
+graceful shutdown. C and Mojo FFI smoke tests exercise the provider boundary.
 
 ## Graceful shutdown
 

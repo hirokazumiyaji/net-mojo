@@ -21,6 +21,25 @@ class Http3ClientProtocol(QuicConnectionProtocol):
         self.resets = {}
         self.terminated = self._loop.create_future()
         self.alpn = None
+        self.dropped_datagrams = 0
+
+    def transmit(self, drop_next_datagram=False):
+        self._transmit_task = None
+        dropped = False
+        for data, address in self._quic.datagrams_to_send(now=self._loop.time()):
+            if drop_next_datagram and not dropped:
+                self.dropped_datagrams += 1
+                dropped = True
+                continue
+            self._transport.sendto(data, address)
+
+        timer_at = self._quic.get_timer()
+        if self._timer is not None and self._timer_at != timer_at:
+            self._timer.cancel()
+            self._timer = None
+        if self._timer is None and timer_at is not None:
+            self._timer = self._loop.call_at(timer_at, self._handle_timer)
+        self._timer_at = timer_at
 
     def quic_event_received(self, event):
         if isinstance(event, ProtocolNegotiated):
@@ -40,7 +59,7 @@ class Http3ClientProtocol(QuicConnectionProtocol):
             if http_event.stream_ended:
                 response["future"].set_result(response)
 
-    async def post(self, body, trailers):
+    async def post(self, body, trailers, drop_first_datagram=False):
         stream_id = self._quic.get_next_available_stream_id()
         future = self._loop.create_future()
         response = {"future": future, "headers": [], "body": bytearray()}
@@ -61,7 +80,7 @@ class Http3ClientProtocol(QuicConnectionProtocol):
             self.http.send_headers(
                 stream_id, [(b"x-check", b"done")], end_stream=True
             )
-        self.transmit()
+        self.transmit(drop_next_datagram=drop_first_datagram)
         try:
             result = await asyncio.wait_for(future, timeout=10)
             result["stream_id"] = stream_id
@@ -146,8 +165,14 @@ async def run_client(address):
         if client.alpn != "h3":
             raise RuntimeError(f"unexpected negotiated ALPN: {client.alpn!r}")
         await client.cancel_partial_post()
-        first = await client.post(b"data", trailers=True)
+        first = await client.post(
+            b"data", trailers=True, drop_first_datagram=True
+        )
         second = await client.post(b"data", trailers=False)
+        if client.dropped_datagrams != 1:
+            raise RuntimeError(
+                f"expected one dropped client datagram, got {client.dropped_datagrams}"
+            )
         for response, expected_body in (
             (first, b"handled:data:done"),
             (second, b"handled:data"),
