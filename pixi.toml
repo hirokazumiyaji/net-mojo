@@ -77,6 +77,14 @@ openssl = ">=3.2,<4"
 pkg-config = "*"
 python = ">=3.10,<3.15"
 
+[feature.http2.dependencies]
+c-compiler = "*"
+libnghttp2 = ">=1.64,<2"
+pkg-config = "*"
+
+[feature.http2.tasks]
+hpack-test = "bash scripts/build_hpack_shim.sh"
+
 [feature.tls.tasks]
 tls-build = "bash scripts/build_tls_shim.sh"
 tls-test = { cmd = "mojo run --Werror -I . tests/test_tls.mojo", depends-on = [
@@ -106,3 +114,5 @@ mojo = ">=1.0.0,<2"
 
 [environments]
 tls = ["tls"]
+http2 = ["http2"]
+tls-http2 = ["tls", "http2"]
