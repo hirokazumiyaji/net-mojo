@@ -70,6 +70,26 @@ struct Http2RequestHeadResult(Movable):
         return request^
 
 
+@fieldwise_init
+struct Http2TrailersResult(Movable):
+    var kind: UInt8
+    var trailers: Headers
+
+    @staticmethod
+    def valid(var trailers: Headers) -> Self:
+        return Self(kind=1, trailers=trailers^)
+
+    @staticmethod
+    def error() -> Self:
+        return Self(kind=2, trailers=Headers())
+
+    def is_valid(self) -> Bool:
+        return self.kind == 1
+
+    def is_error(self) -> Bool:
+        return self.kind == 2
+
+
 def _bytes_equal[
     origin: Origin
 ](name: Span[Byte, origin], expected: StringSlice) -> Bool:
@@ -325,3 +345,68 @@ def decode_http2_request_headers[
         authority^,
         headers^,
     )
+
+
+def decode_http2_trailers[
+    origin: Origin
+](encoded: Span[Byte, origin], expected_fields: Int) raises -> Http2TrailersResult:
+    if expected_fields < 0:
+        return Http2TrailersResult.error()
+
+    var trailers = Headers()
+    var field_count = 0
+    var offset = 0
+    while offset < len(encoded):
+        if len(encoded) - offset < 8:
+            return Http2TrailersResult.error()
+        var name_length = (
+            (Int(encoded[offset]) << 24)
+            | (Int(encoded[offset + 1]) << 16)
+            | (Int(encoded[offset + 2]) << 8)
+            | Int(encoded[offset + 3])
+        )
+        var value_length = (
+            (Int(encoded[offset + 4]) << 24)
+            | (Int(encoded[offset + 5]) << 16)
+            | (Int(encoded[offset + 6]) << 8)
+            | Int(encoded[offset + 7])
+        )
+        offset += 8
+        if (
+            name_length == 0
+            or name_length > len(encoded) - offset
+            or value_length > len(encoded) - offset - name_length
+        ):
+            return Http2TrailersResult.error()
+
+        var name = encoded[offset : offset + name_length]
+        offset += name_length
+        var value = encoded[offset : offset + value_length]
+        offset += value_length
+        field_count += 1
+        if field_count > expected_fields or name[0] == Byte(ord(":")):
+            return Http2TrailersResult.error()
+        if not _valid_value(value):
+            return Http2TrailersResult.error()
+        for i in range(len(name)):
+            if name[i] >= Byte(127) or (
+                name[i] >= Byte(ord("A")) and name[i] <= Byte(ord("Z"))
+            ) or not _is_token_byte(name[i]):
+                return Http2TrailersResult.error()
+        var name_string = String(from_utf8_lossy=name)
+        if (
+            name_string == "connection"
+            or name_string == "proxy-connection"
+            or name_string == "keep-alive"
+            or name_string == "transfer-encoding"
+            or name_string == "upgrade"
+            or name_string == "content-length"
+            or name_string == "host"
+            or name_string == "te"
+        ):
+            return Http2TrailersResult.error()
+        trailers.add_bytes(name_string, value)
+
+    if field_count != expected_fields:
+        return Http2TrailersResult.error()
+    return Http2TrailersResult.valid(trailers^)

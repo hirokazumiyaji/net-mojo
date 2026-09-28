@@ -25,7 +25,10 @@ from net.http._http2.control_frames import (
     parse_ping_frame,
     parse_rst_stream_frame,
 )
-from net.http._http2.request_headers import decode_http2_request_headers
+from net.http._http2.request_headers import (
+    decode_http2_request_headers,
+    decode_http2_trailers,
+)
 
 
 def test_header_block_collects_headers_payload_until_end_headers() raises:
@@ -438,6 +441,33 @@ def test_http2_request_headers_validate_authority_port_syntax() raises:
 def test_http2_request_headers_reject_truncated_serialized_fields() raises:
     var encoded: List[Byte] = [Byte(0), Byte(0), Byte(0), Byte(7)]
     assert_true(decode_http2_request_headers(Span(encoded), 1).is_error())
+
+
+def test_http2_trailers_preserve_regular_fields() raises:
+    var encoded = List[Byte]()
+    _append_hpack_field(encoded, String("grpc-status"), String("0"))
+    _append_hpack_field(encoded, String("x-tag"), String("done"))
+    var parsed = decode_http2_trailers(Span(encoded), 2)
+    assert_true(parsed.is_valid())
+    assert_equal(parsed.trailers.get_first("grpc-status"), Optional[String]("0"))
+    assert_equal(parsed.trailers.get_first("x-tag"), Optional[String]("done"))
+
+
+def test_http2_trailers_reject_pseudo_forbidden_and_truncated_fields() raises:
+    var pseudo = List[Byte]()
+    _append_hpack_field(pseudo, String(":method"), String("GET"))
+    assert_true(decode_http2_trailers(Span(pseudo), 1).is_error())
+
+    var framing = List[Byte]()
+    _append_hpack_field(framing, String("content-length"), String("4"))
+    assert_true(decode_http2_trailers(Span(framing), 1).is_error())
+
+    var uppercase = List[Byte]()
+    _append_hpack_field(uppercase, String("X-Tag"), String("value"))
+    assert_true(decode_http2_trailers(Span(uppercase), 1).is_error())
+
+    var truncated: List[Byte] = [Byte(0), Byte(0), Byte(0)]
+    assert_true(decode_http2_trailers(Span(truncated), 1).is_error())
 
 
 def test_partial_client_preface_needs_more_data() raises:

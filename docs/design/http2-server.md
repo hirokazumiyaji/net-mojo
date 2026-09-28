@@ -113,6 +113,8 @@ limit and error code.
 Decoded HPACK fields are validated for pseudo-header ordering and uniqueness,
 lowercase regular names, forbidden connection-specific fields, `TE: trailers`,
 and matching Host/authority before conversion to the shared `Request` type.
+Trailing header blocks are decoded separately and reject pseudo-headers and
+fields that affect framing or routing.
 
 ## Follow-up connection work
 
