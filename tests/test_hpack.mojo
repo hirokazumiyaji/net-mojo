@@ -872,6 +872,46 @@ def test_http2_request_session_reports_reset_stream_for_response_cancel() raises
     assert_equal(result.reset_stream_id, UInt32(1))
 
 
+def test_http2_request_session_rejects_reset_on_idle_stream() raises:
+    var session = Http2RequestSession("build/http2/libnet_hpack", 4, 1024)
+    var wire = List[Byte]()
+    var preface = "PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n".as_bytes()
+    for i in range(len(preface)):
+        wire.append(preface[i])
+    var empty = List[Byte]()
+    _append_frame(wire, Byte(4), Byte(0), UInt32(0), Span(empty))
+    var reset_payload: List[Byte] = [Byte(0), Byte(0), Byte(0), Byte(0)]
+    _append_frame(wire, Byte(3), Byte(0), UInt32(1), Span(reset_payload))
+
+    var result = session.consume(Span(wire))
+    assert_true(result.is_error())
+
+
+def test_http2_request_session_rejects_reset_on_idle_server_stream() raises:
+    var session = Http2RequestSession("build/http2/libnet_hpack", 4, 1024)
+    var wire = List[Byte]()
+    var preface = "PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n".as_bytes()
+    for i in range(len(preface)):
+        wire.append(preface[i])
+    var empty = List[Byte]()
+    _append_frame(wire, Byte(4), Byte(0), UInt32(0), Span(empty))
+    var compressed: List[Byte] = [
+        Byte(0x82), Byte(0x86), Byte(0x84), Byte(0x41), Byte(0x0F),
+        Byte(ord("w")), Byte(ord("w")), Byte(ord("w")), Byte(ord(".")),
+        Byte(ord("e")), Byte(ord("x")), Byte(ord("a")), Byte(ord("m")),
+        Byte(ord("p")), Byte(ord("l")), Byte(ord("e")), Byte(ord(".")),
+        Byte(ord("c")), Byte(ord("o")), Byte(ord("m")),
+    ]
+    _append_frame(wire, Byte(1), Byte(5), UInt32(3), Span(compressed))
+    var request = session.consume(Span(wire))
+    assert_true(request.is_request())
+
+    var reset_payload: List[Byte] = [Byte(0), Byte(0), Byte(0), Byte(0)]
+    var reset = List[Byte]()
+    _append_frame(reset, Byte(3), Byte(0), UInt32(2), Span(reset_payload))
+    assert_true(session.consume(Span(reset)).is_error())
+
+
 def test_http2_request_session_returns_padding_flow_credit() raises:
     var session = Http2RequestSession("build/http2/libnet_hpack", 4, 1024)
     var wire = List[Byte]()

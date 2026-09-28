@@ -224,6 +224,14 @@ struct Http2RequestSession(Movable):
                             consumed, input.stream_id, output^, request^
                         )
             elif input.is_reset():
+                if (
+                    input.stream_id > self._last_stream_id
+                    or (input.stream_id & UInt32(1)) == UInt32(0)
+                ):
+                    self._failed = True
+                    return Http2RequestSessionResult.error(
+                        consumed, output^
+                    )
                 self._remove_stream(input.stream_id)
                 return Http2RequestSessionResult.pending(
                     consumed, output^, input.stream_id

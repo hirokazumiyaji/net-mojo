@@ -77,6 +77,12 @@
 - [x] Drive client and server QUIC timers until the HTTP/3 ALPN handshake completes.
 - [x] Inspect the test and commit this slice.
 
+## HTTP/2 idle stream reset conformance slice
+
+- [x] Add request-session tests for future peer IDs and server-initiated idle IDs.
+- [x] Reject both forms of idle-stream reset while preserving closed peer-stream cancellation.
+- [x] Run HPACK/HTTP/2 suites, inspect the diff, and commit this slice.
+
 ## QUIC transport review
 
 - `QuicServer` accepts Initial datagrams, routes later packets by connection ID, emits pending packets with their destination, and reports/advances connection timeouts.
