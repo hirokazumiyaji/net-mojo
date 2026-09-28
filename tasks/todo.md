@@ -109,6 +109,17 @@
 - `docs/design/http3-server.md` documents the implemented Mojo UDP ownership and Rust quiche protocol boundary, request/trailer mapping, and the limits configured in code.
 - `git diff --check` passed.
 
+## HTTP/2 stream admission refusal plan
+
+- [x] Add a session test where an over-limit stream is reset with `REFUSED_STREAM` while an existing stream remains completable.
+- [x] Consume the refused stream ID monotonically, emit a stream-scoped reset, and keep the HTTP/2 connection usable.
+- [x] Run HPACK/session, HTTP/2 protocol, HTTPS state, and independent TLS client suites.
+
+## Review
+
+- The tests failed before the fix because the session returned a connection error, closed the stream cap when request assembly finished, and treated raced DATA as connection-fatal. They now verify `REFUSED_STREAM`, ignore trailing DATA on that reset stream, hold the admission slot until the response completes, and admit a later stream after capacity is released.
+- `hpack-mojo-test` passed 25/25, `test-http2` passed 97/97, `https-state-test` passed 2/2, and `https-client-test` passed its HTTP/2 bootstrap and HTTPS roundtrips.
+
 ## HTTP/3 request trailers plan
 
 - [x] Extend the independent concurrent-stream test to send a trailer on one request and assert the handler can read it separately from regular headers.

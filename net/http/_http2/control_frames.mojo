@@ -96,6 +96,20 @@ def parse_rst_stream_frame[
     return RstStreamFrameResult.valid(frame.stream_id, error_code)
 
 
+def encode_rst_stream_frame(
+    stream_id: UInt32, error_code: UInt32
+) -> FrameEncodeResult:
+    if stream_id == UInt32(0) or stream_id > UInt32(0x7FFFFFFF):
+        return FrameEncodeResult.failure()
+    var payload: List[Byte] = [
+        Byte((error_code >> 24) & UInt32(0xFF)),
+        Byte((error_code >> 16) & UInt32(0xFF)),
+        Byte((error_code >> 8) & UInt32(0xFF)),
+        Byte(error_code & UInt32(0xFF)),
+    ]
+    return encode_frame(Byte(3), Byte(0), stream_id, Span(payload))
+
+
 def parse_ping_frame[
     origin: Origin
 ](frame: FrameParseResult, payload: Span[Byte, origin]) -> PingFrameResult:

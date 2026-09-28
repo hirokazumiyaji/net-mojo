@@ -6,6 +6,7 @@ from net.http._http2.header_decoder import Http2HeaderDecoder
 from net.http._http2.request_session import Http2RequestSession
 from net.http._http2.response_scheduler import Http2ResponseScheduler
 from net.http._http2.frame_encoder import encode_frame
+from net.http._http2.control_frames import parse_rst_stream_frame
 from net.http._http2.response_encoder import encode_http2_response
 from net.http._http2.request_headers import decode_http2_request_headers
 from net.http.response import ResponseWriter
@@ -446,6 +447,76 @@ def test_http2_request_session_keeps_interleaved_bodies_on_their_streams() raise
     assert_equal(second.stream_id, UInt32(3))
     assert_equal(second.request.body[0], Byte(ord("b")))
     assert_equal(second.request.body[1], Byte(ord("d")))
+
+
+def test_http2_request_session_refuses_over_limit_stream_without_failing_connection() raises:
+    var session = Http2RequestSession("build/http2/libnet_hpack", 1, 1024)
+    var wire = List[Byte]()
+    var preface = "PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n".as_bytes()
+    for i in range(len(preface)):
+        wire.append(preface[i])
+    var empty: List[Byte] = List[Byte]()
+    _append_frame(wire, Byte(4), Byte(0), UInt32(0), Span(empty))
+    var compressed: List[Byte] = [
+        Byte(0x82), Byte(0x86), Byte(0x84), Byte(0x41), Byte(0x0F),
+        Byte(ord("w")), Byte(ord("w")), Byte(ord("w")), Byte(ord(".")),
+        Byte(ord("e")), Byte(ord("x")), Byte(ord("a")), Byte(ord("m")),
+        Byte(ord("p")), Byte(ord("l")), Byte(ord("e")), Byte(ord(".")),
+        Byte(ord("c")), Byte(ord("o")), Byte(ord("m")),
+    ]
+    _append_frame(wire, Byte(1), Byte(4), UInt32(1), Span(compressed))
+    _append_frame(wire, Byte(1), Byte(4), UInt32(3), Span(compressed))
+    var refused_body: List[Byte] = [Byte(ord("b"))]
+    _append_frame(wire, Byte(0), Byte(1), UInt32(3), Span(refused_body))
+
+    var refused = session.consume(Span(wire))
+    assert_true(refused.is_pending())
+    var server_settings = parse_frame(Span(refused.output))
+    assert_true(server_settings.is_complete())
+    assert_equal(server_settings.frame_type, Byte(4))
+    var server_ack = parse_frame(
+        Span(refused.output)[server_settings.consumed:]
+    )
+    assert_true(server_ack.is_complete())
+    assert_equal(server_ack.flags, Byte(1))
+    var rst_offset = server_settings.consumed + server_ack.consumed
+    var rst = parse_frame(Span(refused.output)[rst_offset:])
+    assert_true(rst.is_complete())
+    assert_equal(rst.frame_type, Byte(3))
+    assert_equal(rst.stream_id, UInt32(3))
+    var rst_fields = parse_rst_stream_frame(
+        rst, Span(refused.output)[rst_offset + 9:]
+    )
+    assert_true(rst_fields.is_valid())
+    assert_equal(rst_fields.error_code, UInt32(7))
+
+    var body: List[Byte] = [Byte(ord("a"))]
+    var first_body = List[Byte]()
+    _append_frame(first_body, Byte(0), Byte(1), UInt32(1), Span(body))
+    var first = session.consume(Span(first_body))
+    assert_true(first.is_request())
+    assert_equal(first.stream_id, UInt32(1))
+
+    var queued = List[Byte]()
+    _append_frame(queued, Byte(1), Byte(5), UInt32(5), Span(compressed))
+    var queued_result = session.consume(Span(queued))
+    assert_true(queued_result.is_pending())
+    var queued_reset = parse_frame(Span(queued_result.output))
+    assert_true(queued_reset.is_complete())
+    assert_equal(queued_reset.stream_id, UInt32(5))
+    var queued_reset_fields = parse_rst_stream_frame(
+        queued_reset, Span(queued_result.output)[9:]
+    )
+    assert_true(queued_reset_fields.is_valid())
+    assert_equal(queued_reset_fields.error_code, UInt32(7))
+
+    session.finish_response(UInt32(1))
+
+    var later = List[Byte]()
+    _append_frame(later, Byte(1), Byte(5), UInt32(7), Span(compressed))
+    var accepted = session.consume(Span(later))
+    assert_true(accepted.is_request())
+    assert_equal(accepted.stream_id, UInt32(7))
 
 
 def test_http2_request_session_rejects_body_over_limit() raises:

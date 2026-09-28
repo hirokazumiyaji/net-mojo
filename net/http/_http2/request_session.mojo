@@ -5,6 +5,7 @@ from net.http.request import HttpVersion, Request
 from .connection_input import (
     Http2ServerConnectionInput,
 )
+from .control_frames import encode_rst_stream_frame
 from .data_frame import parse_data_frame
 from .frame import FrameParseResult
 from .frame_encoder import encode_frame
@@ -173,6 +174,17 @@ struct Http2RequestSession(Movable):
                             return Http2RequestSessionResult.error(
                                 consumed, output^
                             )
+                        if request_result.is_refused():
+                            var reset = encode_rst_stream_frame(
+                                decoded.stream_id, UInt32(7)
+                            )
+                            if not reset.is_complete():
+                                self._failed = True
+                                return Http2RequestSessionResult.error(
+                                    consumed, output^
+                                )
+                            _append_session_output(output, Span(reset.wire))
+                            continue
                         if request_result.is_complete():
                             var request = self._take_request(decoded.stream_id)
                             return Http2RequestSessionResult.complete(
@@ -252,10 +264,11 @@ struct Http2RequestSession(Movable):
                 decoded.stream_id == UInt32(0)
                 or (decoded.stream_id & UInt32(1)) == UInt32(0)
                 or decoded.stream_id <= self._last_stream_id
-                or len(self._streams) >= self._max_active_streams
             ):
                 return Http2RequestStreamResult.error()
             self._last_stream_id = decoded.stream_id
+            if len(self._send_streams) >= self._max_active_streams:
+                return Http2RequestStreamResult.refused()
             var stream = Http2RequestStream(self._max_body_size)
             var receive_window = Http2FlowWindow(65535, 65535)
             var entry = _Http2RequestEntry(
@@ -289,10 +302,15 @@ struct Http2RequestSession(Movable):
         mut output: List[Byte],
     ) -> Http2RequestStreamResult:
         var index = self._find_stream(frame.stream_id)
-        if index < 0:
-            return Http2RequestStreamResult.error()
         var data = parse_data_frame(frame, payload)
         if not data.is_valid():
+            return Http2RequestStreamResult.error()
+        if index < 0:
+            if (
+                (frame.stream_id & UInt32(1)) == UInt32(1)
+                and frame.stream_id <= self._last_stream_id
+            ):
+                return Http2RequestStreamResult.pending()
             return Http2RequestStreamResult.error()
         if (
             not self._receive_window.receive_data(frame.payload_length)

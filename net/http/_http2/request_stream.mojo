@@ -28,6 +28,10 @@ struct Http2RequestStreamResult(Movable):
         return Self(kind=3)
 
     @staticmethod
+    def refused() -> Self:
+        return Self(kind=5)
+
+    @staticmethod
     def error() -> Self:
         return Self(kind=4)
 
@@ -39,6 +43,9 @@ struct Http2RequestStreamResult(Movable):
 
     def is_too_large(self) -> Bool:
         return self.kind == 3
+
+    def is_refused(self) -> Bool:
+        return self.kind == 5
 
     def is_error(self) -> Bool:
         return self.kind == 4

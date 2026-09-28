@@ -174,6 +174,12 @@ whose initial send window is zero before later granting credit. Unit tests cover
 round-robin DATA scheduling, bounded payloads, header-once behavior, completion,
 credit exhaustion, resumption, and reset cancellation.
 
+Stream admission counts request streams until their response finishes. When the
+local cap is reached, the server advances the client stream ID and sends
+`RST_STREAM(REFUSED_STREAM)` for that stream while keeping admitted streams and
+the connection usable. DATA that races with the refusal is ignored for that
+closed stream.
+
 GOAWAY handling and graceful connection drain remain follow-up work. The current
 server has no shutdown API that stops new HTTP/2 streams while allowing admitted
 streams to finish within a configured grace period.
