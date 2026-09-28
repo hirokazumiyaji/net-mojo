@@ -186,6 +186,12 @@
 - [x] Verify QUIC retransmission recovers the request and later streams complete on the same connection.
 - [x] Run the independent aioquic HTTP/3 test and Python syntax check.
 
+## macOS optional HTTP provider CI slice
+
+- [x] Add macOS arm64 to the HTTP/2 and HTTP/3 provider CI matrices.
+- [x] Run HTTP/2 HPACK, TLS, and independent-client suites on macOS arm64.
+- [x] Confirm HTTP/3 provider and aioquic packet-loss interoperability suites on macOS arm64.
+
 ## QUIC transport review
 
 - `QuicServer` accepts Initial datagrams, routes later packets by connection ID, emits pending packets with their destination, and reports/advances connection timeouts.
