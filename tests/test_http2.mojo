@@ -4,6 +4,7 @@ from net.http.request import HttpVersion
 from net.http._http2.frame import FrameParseResult, parse_frame
 from net.http._http2.frame_encoder import encode_frame
 from net.http._http2.data_frame import parse_data_frame
+from net.http._http2.request_body import Http2RequestBody
 from net.http._http2.bootstrap import Http2ServerBootstrap
 from net.http._http2.settings_state import Http2PeerSettings
 from net.http._http2.stream_state import Http2StreamState
@@ -224,6 +225,44 @@ def test_http2_data_frame_rejects_invalid_padding_and_shape() raises:
     assert_true(parse_data_frame(connection, Span(payload)).is_error())
     var mismatched = FrameParseResult.complete(Byte(0), Byte(0), UInt32(1), 2)
     assert_true(parse_data_frame(mismatched, Span(payload)).is_error())
+
+
+def test_http2_request_body_collects_data_until_end_stream() raises:
+    var body = Http2RequestBody(4)
+    var first_payload: List[Byte] = [Byte(1), Byte(2)]
+    var first_frame = FrameParseResult.complete(Byte(0), Byte(0), UInt32(1), 2)
+    var first_data = parse_data_frame(first_frame, Span(first_payload))
+    assert_true(body.append_data(first_data, Span(first_payload)).is_accepted())
+    assert_false(body.is_complete())
+
+    var final_payload: List[Byte] = [Byte(1), Byte(3), Byte(4), Byte(0)]
+    var final_frame = FrameParseResult.complete(Byte(0), Byte(9), UInt32(1), 4)
+    var final_data = parse_data_frame(final_frame, Span(final_payload))
+    assert_true(body.append_data(final_data, Span(final_payload)).is_accepted())
+    assert_true(body.is_complete())
+    var collected = body.bytes()
+    assert_equal(len(collected), 4)
+    assert_equal(collected[0], Byte(1))
+    assert_equal(collected[1], Byte(2))
+    assert_equal(collected[2], Byte(3))
+    assert_equal(collected[3], Byte(4))
+
+
+def test_http2_request_body_enforces_limit_and_completion() raises:
+    var body = Http2RequestBody(1)
+    var oversized_payload: List[Byte] = [Byte(1), Byte(2)]
+    var oversized_frame = FrameParseResult.complete(
+        Byte(0), Byte(1), UInt32(1), 2
+    )
+    var oversized = parse_data_frame(oversized_frame, Span(oversized_payload))
+    assert_true(body.append_data(oversized, Span(oversized_payload)).is_too_large())
+
+    var complete = Http2RequestBody(1)
+    var payload: List[Byte] = [Byte(9)]
+    var frame = FrameParseResult.complete(Byte(0), Byte(1), UInt32(1), 1)
+    var data = parse_data_frame(frame, Span(payload))
+    assert_true(complete.append_data(data, Span(payload)).is_accepted())
+    assert_true(complete.append_data(data, Span(payload)).is_invalid_state())
 
 
 def test_http2_window_update_parses_connection_and_stream_credit() raises:
