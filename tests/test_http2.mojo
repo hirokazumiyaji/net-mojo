@@ -14,7 +14,11 @@ from net.http._http2.response_headers import encode_http2_response_headers
 from net.http.response import ResponseWriter
 from net.http._http2.bootstrap import Http2ServerBootstrap
 from net.http._http2.connection_bootstrap import Http2ConnectionBootstrap
-from net.http._http2.settings_state import Http2PeerSettings
+from net.http._http2.frame_dispatcher import Http2FrameDispatcher
+from net.http._http2.settings_state import (
+    Http2PeerSettings,
+    Http2PeerSettingsSnapshot,
+)
 from net.http._http2.stream_state import Http2StreamState
 from net.http._http2.stream_table import Http2ActiveStreams
 from net.http._http2.preface import parse_client_preface
@@ -439,6 +443,66 @@ def test_http2_goaway_rejects_invalid_shape_or_stream() raises:
     var wrong_stream = FrameParseResult.complete(Byte(7), Byte(0), UInt32(1), 8)
     assert_true(parse_goaway_frame(wrong_stream, Span(payload[0:7])).is_error())
 
+
+
+def test_http2_dispatcher_acknowledges_ping_and_rejects_interleaving() raises:
+    var dispatcher = Http2FrameDispatcher(Http2PeerSettings().snapshot())
+    var payload: List[Byte] = [Byte(1), Byte(2), Byte(3), Byte(4), Byte(5), Byte(6), Byte(7), Byte(8)]
+    var ping = FrameParseResult.complete(Byte(6), Byte(0), UInt32(0), 8)
+    var result = dispatcher.accept(ping, Span(payload))
+    assert_true(result.is_output())
+    assert_equal(result.output[4], Byte(1))
+    assert_equal(result.output[16], Byte(8))
+
+    var headers = FrameParseResult.complete(Byte(1), Byte(0), UInt32(3), 1)
+    var empty: List[Byte] = [Byte(0)]
+    result = dispatcher.accept(headers, Span(empty))
+    assert_true(result.is_ignored())
+    result = dispatcher.accept(ping, Span(payload))
+    assert_true(result.is_error())
+
+
+def test_http2_dispatcher_applies_peer_settings_and_emits_ack() raises:
+    var initial = Http2PeerSettingsSnapshot(
+        header_table_size=UInt32(128),
+        max_concurrent_streams=UInt32(64),
+        initial_window_size=UInt32(65535),
+        max_frame_size=UInt32(16384),
+        max_header_list_size=UInt32(4096),
+    )
+    var dispatcher = Http2FrameDispatcher(initial)
+    var payload: List[Byte] = [Byte(0), Byte(5), Byte(0), Byte(0), Byte(128), Byte(0)]
+    var frame = FrameParseResult.complete(Byte(4), Byte(0), UInt32(0), 6)
+    var result = dispatcher.accept(frame, Span(payload))
+    assert_true(result.is_output())
+    assert_equal(result.output[4], Byte(1))
+    var settings = dispatcher.peer_settings()
+    assert_equal(settings.header_table_size, UInt32(128))
+    assert_equal(settings.max_frame_size, UInt32(32768))
+
+
+def test_http2_dispatcher_returns_window_reset_and_goaway_events() raises:
+    var dispatcher = Http2FrameDispatcher(Http2PeerSettings().snapshot())
+    var window_payload: List[Byte] = [Byte(0), Byte(0), Byte(0), Byte(9)]
+    var window = FrameParseResult.complete(Byte(8), Byte(0), UInt32(3), 4)
+    var result = dispatcher.accept(window, Span(window_payload))
+    assert_true(result.is_window_update())
+    assert_equal(result.stream_id, UInt32(3))
+    assert_equal(result.value, UInt32(9))
+
+    var reset_payload: List[Byte] = [Byte(0), Byte(0), Byte(0), Byte(8)]
+    var reset = FrameParseResult.complete(Byte(3), Byte(0), UInt32(3), 4)
+    result = dispatcher.accept(reset, Span(reset_payload))
+    assert_true(result.is_reset())
+    assert_equal(result.stream_id, UInt32(3))
+    assert_equal(result.value, UInt32(8))
+
+    var goaway_payload: List[Byte] = [Byte(0), Byte(0), Byte(0), Byte(3), Byte(0), Byte(0), Byte(0), Byte(2)]
+    var goaway = FrameParseResult.complete(Byte(7), Byte(0), UInt32(0), 8)
+    result = dispatcher.accept(goaway, Span(goaway_payload))
+    assert_true(result.is_goaway())
+    assert_equal(result.stream_id, UInt32(3))
+    assert_equal(result.value, UInt32(2))
 
 def _append_hpack_field(mut wire: List[Byte], name: String, value: String):
     var name_bytes = name.as_bytes()

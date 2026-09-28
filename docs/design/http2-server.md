@@ -107,6 +107,8 @@ restored only for bytes the application has consumed. The debit includes the
 full DATA payload, including padding. SETTINGS initial-window changes adjust
 stream send windows; the connection send window remains fixed.
 
+`Http2FrameDispatcher` is initialized with the bootstrap peer-settings snapshot, receives complete frames, and applies the connection-wide continuation sequence before dispatching control frames. It applies later SETTINGS and returns an ACK, echoes non-ACK PING frames, and reports WINDOW_UPDATE, RST_STREAM, and GOAWAY events to the stream/connection owner. Unknown and stream-specific frames remain available to their protocol layer.
+
 `Http2ContinuationSequence` is checked before dispatching each complete frame.
 It rejects orphan CONTINUATION frames, stream changes, interleaved frames while
 a header block is open, and client-sent PUSH_PROMISE frames.
