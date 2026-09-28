@@ -253,11 +253,10 @@ section records only the package-level boundaries.
   period.
 - `serve_tls` opts into OpenSSL-backed TLS and accepts HTTP/1.1 only after
   ALPN selects `http/1.1`; a handshake deadline bounds incomplete peers. Core
-  `net` and plaintext server builds remain OpenSSL-free. HTTP/2 and HTTP/3 are
-  still pending. Shared `Request`/`Headers`/`Handler`/`ResponseWriter` semantics are kept
-  protocol-agnostic (scheme/authority/path/query/trailers from Phase 0)
-  so future `_http2/` and `_http3/` adapters can reuse them; wire
-  formats and state machines stay per protocol.
+  `net` and plaintext server builds remain OpenSSL-free. Optional HTTP/2 and
+  HTTP/3 environments provide TLS/ALPN and QUIC-backed protocol adapters while
+  preserving the shared `Request`/`Headers`/`Handler`/`ResponseWriter`
+  semantics; wire formats and state machines stay per protocol.
 
 ## Testing
 
@@ -276,6 +275,8 @@ randomized fragmentation case, a
 malformed corpus mapped to 400/413/414/431/505/417, and overflow/limit
 tables. `package_smoke` verifies the precompiled `build/net.mojoc`
 artifact serves both the TCP round-trip and the `net.http` codec.
+`tls-http2 http2-package-smoke` and `tls-http3 http3-package-smoke` also load
+the optional HPACK and QUIC providers through that precompiled artifact.
 Sanitizer steps (`sanitize-sys`, `sanitize-tcp`, `sanitize-udp`, `sanitize-unix`,
 `sanitize-actor`, `sanitize-http2`, `sanitize-http-detach`) and fd-leak checks
 (`test_sys`, `test_reactor`) keep

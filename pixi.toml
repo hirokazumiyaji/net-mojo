@@ -88,6 +88,10 @@ hpack-test = "bash scripts/build_hpack_shim.sh"
 hpack-mojo-test = { cmd = "mojo run --Werror -I . tests/test_hpack.mojo", depends-on = [
   "hpack-test",
 ] }
+http2-package-smoke = { cmd = "mojo run --Werror -I build tests/http2_package_smoke.mojo", depends-on = [
+  "package",
+  "hpack-test",
+] }
 
 [feature.http3.dependencies]
 binutils = "*"
@@ -120,6 +124,11 @@ quic-rust-test = { cmd = "bash scripts/test_quic_provider.sh", depends-on = [
 ] }
 quic-suite = { depends-on = ["quic-test", "quic-mojo-test", "quic-rust-test"] }
 http3-client-test = { cmd = "python3 scripts/test_http3_server.py", depends-on = [
+  "tls-build",
+  "quic-build",
+] }
+http3-package-smoke = { cmd = "mojo run --Werror -I build tests/http3_package_smoke.mojo", depends-on = [
+  "package",
   "tls-build",
   "quic-build",
 ] }

@@ -35,6 +35,8 @@ jobs:
         run: pixi run -e tls-http2 hpack-mojo-test
       - name: Test TLS and independent HTTP/2 client
         run: pixi run -e tls-http2 tls-suite
+      - name: Test packaged HTTP/2 provider
+        run: pixi run -e tls-http2 http2-package-smoke
 
   http3:
     name: HTTP/3 (${{ matrix.os }})
@@ -57,6 +59,8 @@ jobs:
         run: pixi run -e tls-http3 quic-suite
       - name: Test independent HTTP/3 client
         run: pixi run -e tls-http3 http3-client-test
+      - name: Test packaged HTTP/3 provider
+        run: pixi run -e tls-http3 http3-package-smoke
 
   test:
     name: Test (${{ matrix.os }})

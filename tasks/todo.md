@@ -168,6 +168,12 @@
 
 - Request and response queues each have a 64 MiB aggregate provider limit. The Rust suite passed 6/6 on macOS arm64; full `/review` remains pending because the configured OCR review request times out.
 
+## Optional HTTP provider package smoke slice
+
+- [x] Add package smoke tests for the HTTP/2 HPACK and HTTP/3 QUIC providers.
+- [x] Run the smoke tasks in the Linux CI provider jobs.
+- [x] Verify both packaged provider smokes locally on macOS arm64 and update package docs.
+
 ## QUIC transport review
 
 - `QuicServer` accepts Initial datagrams, routes later packets by connection ID, emits pending packets with their destination, and reports/advances connection timeouts.
