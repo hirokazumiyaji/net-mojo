@@ -189,7 +189,7 @@
 ## macOS optional HTTP provider CI slice
 
 - [x] Add macOS arm64 to the HTTP/2 and HTTP/3 provider CI matrices.
-- [x] Run HTTP/2 HPACK, TLS, and independent-client suites on macOS arm64.
+- [x] Run HTTP/2 protocol 97/97, HPACK 29/29, TLS, and independent-client suites on macOS arm64.
 - [x] Confirm HTTP/3 provider and aioquic packet-loss interoperability suites on macOS arm64.
 
 ## QUIC transport review
