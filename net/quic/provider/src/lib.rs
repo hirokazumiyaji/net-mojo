@@ -221,6 +221,11 @@ pub unsafe extern "C" fn net_quic_server_next_request(
         append_bytes(&mut record, name);
         append_bytes(&mut record, value);
     }
+    append_u32(&mut record, request.trailers.len() as u32);
+    for (name, value) in &request.trailers {
+        append_bytes(&mut record, name);
+        append_bytes(&mut record, value);
+    }
     append_bytes(&mut record, &request.body);
     if output.is_null() || output_capacity < record.len() {
         return -i32::try_from(record.len()).unwrap_or(i32::MAX);
@@ -345,6 +350,9 @@ struct PendingRequest {
     scheme: Vec<u8>,
     authority: Vec<u8>,
     headers: Vec<(Vec<u8>, Vec<u8>)>,
+    trailers: Vec<(Vec<u8>, Vec<u8>)>,
+    header_bytes: usize,
+    header_count: usize,
     body: Vec<u8>,
 }
 
@@ -356,6 +364,7 @@ pub struct CompletedRequest {
     pub scheme: Vec<u8>,
     pub authority: Vec<u8>,
     pub headers: Vec<(Vec<u8>, Vec<u8>)>,
+    pub trailers: Vec<(Vec<u8>, Vec<u8>)>,
     pub body: Vec<u8>,
 }
 
@@ -478,6 +487,7 @@ impl QuicServer {
                 scheme: request.scheme,
                 authority: request.authority,
                 headers: request.headers,
+                trailers: request.trailers,
                 body: request.body,
             });
         }
@@ -494,12 +504,57 @@ impl QuicServer {
         loop {
             match http3.poll(&mut connection.transport) {
                 Ok((stream_id, quiche::h3::Event::Headers { list, .. })) => {
+                    if let Some(request) = connection.requests.get_mut(&stream_id) {
+                        let mut invalid = false;
+                        for header in list {
+                            request.header_count += 1;
+                            request.header_bytes += header.name().len() + header.value().len();
+                            let name = header.name();
+                            if request.header_count > 100
+                                || request.header_bytes > 32_768
+                                || name.starts_with(b":")
+                                || matches!(
+                                    name,
+                                    b"connection"
+                                        | b"content-length"
+                                        | b"host"
+                                        | b"keep-alive"
+                                        | b"proxy-connection"
+                                        | b"te"
+                                        | b"transfer-encoding"
+                                        | b"upgrade"
+                                )
+                            {
+                                invalid = true;
+                            }
+                            request
+                                .trailers
+                                .push((name.to_vec(), header.value().to_vec()));
+                        }
+                        if invalid {
+                            let code = if request.header_bytes > 32_768 {
+                                0x107
+                            } else {
+                                0x10e
+                            };
+                            let _ = connection.transport.stream_shutdown(
+                                stream_id,
+                                quiche::Shutdown::Read,
+                                code,
+                            );
+                            connection.requests.remove(&stream_id);
+                        }
+                        continue;
+                    }
                     let mut request = PendingRequest {
                         method: Vec::new(),
                         target: Vec::new(),
                         scheme: Vec::new(),
                         authority: Vec::new(),
                         headers: Vec::new(),
+                        trailers: Vec::new(),
+                        header_bytes: 0,
+                        header_count: 0,
                         body: Vec::new(),
                     };
                     let mut seen_pseudo_headers = 0u8;
@@ -563,6 +618,8 @@ impl QuicServer {
                             }
                         }
                     }
+                    request.header_bytes = header_bytes;
+                    request.header_count = header_count;
                     if invalid
                         || seen_pseudo_headers != 15
                         || request.method == b"CONNECT"
@@ -615,6 +672,7 @@ impl QuicServer {
                             scheme: request.scheme,
                             authority: request.authority,
                             headers: request.headers,
+                            trailers: request.trailers,
                             body: request.body,
                         });
                     }
@@ -1349,10 +1407,19 @@ mod tests {
             .unwrap();
         assert_eq!(
             client_h3
-                .send_body(&mut client, first_stream_id, b"data", true)
+                .send_body(&mut client, first_stream_id, b"data", false)
                 .unwrap(),
             4
         );
+        client_h3
+            .send_additional_headers(
+                &mut client,
+                first_stream_id,
+                &[quiche::h3::Header::new(b"x-check", b"done")],
+                true,
+                true,
+            )
+            .unwrap();
         let second_stream_id = client_h3
             .send_request(&mut client, &request_headers, false)
             .unwrap();
@@ -1421,7 +1488,7 @@ mod tests {
 
         assert_eq!(statuses.get(&first_stream_id), Some(&b"200".to_vec()));
         assert_eq!(statuses.get(&second_stream_id), Some(&b"200".to_vec()));
-        assert_eq!(response_bodies[&first_stream_id], b"handled:data");
+        assert_eq!(response_bodies[&first_stream_id], b"handled:data:done");
         assert_eq!(response_bodies[&second_stream_id], b"handled:data");
         assert!(fixture.wait().unwrap().success());
     }

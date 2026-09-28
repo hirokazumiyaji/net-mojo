@@ -99,6 +99,19 @@
 - `quic-rust-test` passed all three provider tests; `cargo fmt` and `git diff --check` passed.
 - `/review` and PR publication remain pending the user's response about external diff upload.
 
+## HTTP/3 request trailers plan
+
+- [x] Extend the independent concurrent-stream test to send a trailer on one request and assert the handler can read it separately from regular headers.
+- [x] Carry trailer fields through the QUIC provider record and construct `Request.trailers` in the shared server path.
+- [x] Run QUIC provider and HTTP server suites, Rust formatting, and diff checks.
+
+## Review
+
+- The first test run failed as expected because the HTTP/3 adapter dropped request trailers; after the adapter change, both concurrent responses passed and the first included the handler's `:done` suffix.
+- `quic-suite` passed the C provider smoke test, Mojo FFI test, and all three Rust provider tests; `test-http-server` passed 27/27.
+- `cargo fmt` and `git diff --check` passed.
+- `/review` and PR publication remain pending the user's response about external diff upload.
+
 ## Current slice
 
 - Integrate QUIC transport with `Server.tick()`; then add HTTP/3 request streams and shared-handler dispatch.

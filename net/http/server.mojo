@@ -688,6 +688,11 @@ struct Server(Movable):
                     request.headers.add_bytes(
                         name^, Span(quic_request.headers[i].value)
                     )
+                for i in range(len(quic_request.trailers)):
+                    var name = quic_request.trailers[i].name.copy()
+                    request.trailers.add_bytes(
+                        name^, Span(quic_request.trailers[i].value)
+                    )
                 request.body = quic_request.take_body()
                 try:
                     handler.handle(request^, response)

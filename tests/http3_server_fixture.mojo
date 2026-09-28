@@ -20,6 +20,9 @@ struct _Http3Handler(Handler):
         assert len(req.body) == 4
         writer.write_string("handled:")
         writer.write(Span(req.body))
+        if len(req.trailers) > 0:
+            assert req.trailers.get_first("x-check") == Optional[String]("done")
+            writer.write_string(":done")
         self.requests += 1
 
 

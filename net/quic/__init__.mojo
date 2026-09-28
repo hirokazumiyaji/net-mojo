@@ -215,6 +215,7 @@ struct QuicRequest(Movable):
     var scheme: String
     var authority: String
     var headers: List[QuicRequestHeader]
+    var trailers: List[QuicRequestHeader]
     var body: List[Byte]
 
     def take_body(mut self) -> List[Byte]:
@@ -317,6 +318,7 @@ struct QuicUDPEndpoint(Movable):
                 scheme=String(),
                 authority=String(),
                 headers=List[QuicRequestHeader](),
+                trailers=List[QuicRequestHeader](),
                 body=List[Byte](),
             )
         if length < 0:
@@ -392,6 +394,12 @@ def _decode_request_record[
         var name = String(from_utf8_lossy=Span(_read_request_bytes(data, offset)))
         var value = _read_request_bytes(data, offset)
         headers.append(QuicRequestHeader(name=name^, value=value^))
+    var trailer_count = Int(_read_request_u32(data, offset))
+    var trailers = List[QuicRequestHeader]()
+    for _ in range(trailer_count):
+        var name = String(from_utf8_lossy=Span(_read_request_bytes(data, offset)))
+        var value = _read_request_bytes(data, offset)
+        trailers.append(QuicRequestHeader(name=name^, value=value^))
     var body = _read_request_bytes(data, offset)
     return QuicRequest(
         id=id,
@@ -401,6 +409,7 @@ def _decode_request_record[
         scheme=scheme^,
         authority=authority^,
         headers=headers^,
+        trailers=trailers^,
         body=body^,
     )
 
