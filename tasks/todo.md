@@ -40,6 +40,12 @@
 - [x] Pass `ServerConfig.max_connections` through the Mojo endpoint to the provider.
 - [x] Run QUIC provider and HTTP server suites, inspect the diff, and commit this slice.
 
+## HTTP/2 oversized request stream slice
+
+- [x] Add a regression test proving an oversized DATA frame resets only its stream and a later stream still completes.
+- [x] Return connection-level receive credit and emit a stream reset for the oversized request.
+- [x] Run HPACK/HTTP/2 suites, inspect the diff, and commit this slice.
+
 ## QUIC transport review
 
 - `QuicServer` accepts Initial datagrams, routes later packets by connection ID, emits pending packets with their destination, and reports/advances connection timeouts.

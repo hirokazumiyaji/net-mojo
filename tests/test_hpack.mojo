@@ -7,6 +7,7 @@ from net.http._http2.request_session import Http2RequestSession
 from net.http._http2.response_scheduler import Http2ResponseScheduler
 from net.http._http2.frame_encoder import encode_frame
 from net.http._http2.control_frames import parse_rst_stream_frame
+from net.http._http2.window_update import parse_window_update_frame
 from net.http._http2.response_encoder import encode_http2_response
 from net.http._http2.request_headers import decode_http2_request_headers
 from net.http.response import ResponseWriter
@@ -519,7 +520,7 @@ def test_http2_request_session_refuses_over_limit_stream_without_failing_connect
     assert_equal(accepted.stream_id, UInt32(7))
 
 
-def test_http2_request_session_rejects_body_over_limit() raises:
+def test_http2_request_session_resets_only_stream_for_oversized_body() raises:
     var session = Http2RequestSession("build/http2/libnet_hpack", 4, 2)
     var wire = List[Byte]()
     var preface = "PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n".as_bytes()
@@ -537,10 +538,42 @@ def test_http2_request_session_rejects_body_over_limit() raises:
     _append_frame(wire, Byte(1), Byte(4), UInt32(1), Span(compressed))
     var body: List[Byte] = [Byte(1), Byte(2), Byte(3)]
     _append_frame(wire, Byte(0), Byte(1), UInt32(1), Span(body))
+    _append_frame(wire, Byte(1), Byte(4), UInt32(3), Span(compressed))
+    var next_body: List[Byte] = [Byte(4)]
+    _append_frame(wire, Byte(0), Byte(1), UInt32(3), Span(next_body))
 
     var result = session.consume(Span(wire))
-    assert_true(result.is_error())
-    assert_equal(result.consumed, len(wire))
+    assert_true(result.is_request())
+    assert_equal(result.stream_id, UInt32(3))
+    assert_equal(result.request.body[0], Byte(4))
+    var output_offset = 0
+    var reset_found = False
+    var connection_credit_found = False
+    while output_offset < len(result.output):
+        var output_frame = parse_frame(
+            Span(result.output)[output_offset:]
+        )
+        assert_true(output_frame.is_complete())
+        if output_frame.frame_type == Byte(3):
+            var reset_fields = parse_rst_stream_frame(
+                output_frame,
+                Span(result.output)[output_offset + 9 : output_offset + 13],
+            )
+            assert_true(reset_fields.is_valid())
+            assert_equal(output_frame.stream_id, UInt32(1))
+            assert_equal(reset_fields.error_code, UInt32(11))
+            reset_found = True
+        if output_frame.frame_type == Byte(8) and output_frame.stream_id == 0:
+            var update = parse_window_update_frame(
+                output_frame,
+                Span(result.output)[output_offset + 9 : output_offset + 13],
+            )
+            assert_true(update.is_valid())
+            if update.increment == 3:
+                connection_credit_found = True
+        output_offset += output_frame.consumed
+    assert_true(reset_found)
+    assert_true(connection_credit_found)
 
 
 def test_http2_request_session_bootstraps_before_loading_hpack() raises:

@@ -199,14 +199,23 @@ struct Http2RequestSession(Movable):
                     var request_result = self._receive_data(
                         frame, Span(input.payload), output
                     )
-                    if (
-                        request_result.is_error()
-                        or request_result.is_too_large()
-                    ):
+                    if request_result.is_error():
                         self._failed = True
                         return Http2RequestSessionResult.error(
                             consumed, output^
                         )
+                    if request_result.is_too_large():
+                        var reset = encode_rst_stream_frame(
+                            input.stream_id, UInt32(11)
+                        )
+                        if not reset.is_complete():
+                            self._failed = True
+                            return Http2RequestSessionResult.error(
+                                consumed, output^
+                            )
+                        _append_session_output(output, Span(reset.wire))
+                        self._remove_stream(input.stream_id)
+                        continue
                     if request_result.is_complete():
                         var request = self._take_request(input.stream_id)
                         return Http2RequestSessionResult.complete(
@@ -320,6 +329,11 @@ struct Http2RequestSession(Movable):
         ):
             return Http2RequestStreamResult.error()
         var received = self._streams[index].stream.receive_data(data, payload)
+        if received.is_too_large():
+            if not self._receive_window.release_received(frame.payload_length):
+                return Http2RequestStreamResult.error()
+            _append_window_update(output, UInt32(0), frame.payload_length)
+            return received^
         if not received.is_pending() and not received.is_complete():
             return received^
         if frame.payload_length > 0:
