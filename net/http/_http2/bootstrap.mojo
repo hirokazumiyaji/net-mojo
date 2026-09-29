@@ -73,7 +73,7 @@ struct Http2ServerBootstrap(Movable):
         if settings.is_error():
             self.failed = True
             self.error_code = settings.error_code
-            return FrameEncodeResult.failure()
+            return FrameEncodeResult.failure(settings.error_code)
         if not settings.is_settings():
             self.failed = True
             self.error_code = UInt32(1)
