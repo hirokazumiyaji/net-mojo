@@ -821,6 +821,17 @@ struct Server(Movable):
                     response.body.clear()
                 self._budget.release(body_size)
             if response.is_detached():
+                var addr = response._detach_state_addr
+                if addr != 0:
+                    var ptr = Pointer[Byte, MutUntrackedOrigin](
+                        unsafe_from_address=addr
+                    )
+                    var s_ptr = ptr.unsafe_bitcast[_SharedDetachState]()
+                    s_ptr[].mutex.lock()
+                    s_ptr[].cancelled = True
+                    s_ptr[].mutex.unlock()
+                    _release_detach_state(addr, from_sender=False)
+                    response._detach_state_addr = 0
                 response.status = 500
                 response.body.clear()
             if response.status < 100 or response.status > 599:

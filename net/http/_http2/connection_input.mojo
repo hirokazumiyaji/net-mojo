@@ -232,3 +232,6 @@ struct Http2ServerConnectionInput(Movable):
 
     def peer_settings(self) -> Http2PeerSettingsSnapshot:
         return self._dispatcher.peer_settings()
+
+    def assembling_headers_stream(self) -> UInt32:
+        return self._reader.assembling_headers_stream()

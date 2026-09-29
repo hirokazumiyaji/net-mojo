@@ -71,6 +71,24 @@ struct Http2FrameReader(Movable):
         self._frame = List[Byte]()
         self._failed = max_frame_size < 0 or max_frame_size > 0xFFFFFF
 
+    def assembling_headers_stream(self) -> UInt32:
+        """Stream id of an incomplete HEADERS frame, else 0.
+
+        Exposed so sessions can arm the header deadline as soon as the
+        9-byte frame header arrives, before the full payload is buffered.
+        """
+        if self._failed or len(self._frame) < 9:
+            return UInt32(0)
+        if self._frame[3] != Byte(1):
+            return UInt32(0)
+        var stream_word = (
+            (UInt32(self._frame[5]) << 24)
+            | (UInt32(self._frame[6]) << 16)
+            | (UInt32(self._frame[7]) << 8)
+            | UInt32(self._frame[8])
+        )
+        return stream_word & UInt32(0x7FFFFFFF)
+
     def consume[
         origin: Origin
     ](mut self, data: Span[Byte, origin]) -> Http2FrameReadResult:

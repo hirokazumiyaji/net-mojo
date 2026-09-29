@@ -39,13 +39,13 @@ struct Http2HeaderDecodeResult(Copyable):
         )
 
     @staticmethod
-    def too_large(decoded: HpackDecodeResult) -> Self:
+    def too_large(decoded: HpackDecodeResult, stream_id: UInt32) -> Self:
         return Self(
             status=2,
             output_length=decoded.output_length,
             field_count=decoded.field_count,
             decoded_size=decoded.decoded_size,
-            stream_id=UInt32(0),
+            stream_id=stream_id,
             end_stream=False,
         )
 
@@ -141,6 +141,6 @@ struct Http2HeaderDecoder(Movable):
                 decoded, stream_id, end_stream
             )
         if decoded.is_too_large():
-            return Http2HeaderDecodeResult.too_large(decoded)
+            return Http2HeaderDecodeResult.too_large(decoded, stream_id)
         self._failed = True
         return Http2HeaderDecodeResult.compression_error()

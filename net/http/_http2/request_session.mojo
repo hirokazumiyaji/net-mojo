@@ -243,6 +243,14 @@ struct Http2RequestSession(Movable):
                     return Http2RequestSessionResult.error(consumed, output^)
             _append_session_output(output, Span(input.output))
 
+            if (
+                self._pending_headers_at == NO_DEADLINE
+                and self._input.assembling_headers_stream() != UInt32(0)
+            ):
+                self._pending_headers_at = deadline_from_now(
+                    self._header_deadline
+                )
+
             if input.is_frame():
                 var frame = FrameParseResult.complete(
                     input.frame_type,
@@ -301,6 +309,24 @@ struct Http2RequestSession(Movable):
                             self._pending_headers_at = deadline_from_now(
                                 self._header_deadline
                             )
+                    elif decoded.is_too_large():
+                        self._pending_headers_at = NO_DEADLINE
+                        var stream_id = decoded.stream_id
+                        if stream_id == UInt32(0):
+                            stream_id = input.stream_id
+                        if stream_id > self._last_stream_id:
+                            self._last_stream_id = stream_id
+                        var reset = encode_rst_stream_frame(
+                            stream_id, UInt32(11)
+                        )
+                        if not reset.is_complete():
+                            self._failed = True
+                            return Http2RequestSessionResult.error(
+                                consumed, output^
+                            )
+                        _append_session_output(output, Span(reset.wire))
+                        self._remove_stream(stream_id)
+                        continue
                     else:
                         self._failed = True
                         return Http2RequestSessionResult.error(

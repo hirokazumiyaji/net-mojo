@@ -551,6 +551,9 @@ struct QuicConnection {
     transport: Connection,
     http3: Option<quiche::h3::Connection>,
     requests: HashMap<u64, PendingRequest>,
+    /// Deadlines for request streams that have become readable but have not
+    /// yet emitted a completed `Headers` event (incomplete QPACK sections).
+    header_deadlines: HashMap<u64, Instant>,
     responses: HashMap<u64, PendingResponse>,
     goaway_sent: bool,
     final_goaway_sent: bool,
@@ -748,6 +751,7 @@ impl QuicServer {
                         transport: connection,
                         http3: None,
                         requests: HashMap::new(),
+                        header_deadlines: HashMap::new(),
                         responses: HashMap::new(),
                         goaway_sent: false,
                         final_goaway_sent: false,
@@ -930,14 +934,16 @@ impl QuicServer {
         body_deadline: Duration,
         idle_timeout: Duration,
     ) -> Result<Vec<CompletedRequest>, QuicServerError> {
-        let _ = header_deadline;
         let mut completed = Vec::new();
-        let Some(http3) = connection.http3.as_mut() else {
+        if connection.http3.is_none() {
             return Ok(completed);
-        };
+        }
+        Self::arm_header_deadlines(connection, header_deadline);
+        let http3 = connection.http3.as_mut().unwrap();
         loop {
             match http3.poll(&mut connection.transport) {
                 Ok((stream_id, quiche::h3::Event::Headers { list, .. })) => {
+                    connection.header_deadlines.remove(&stream_id);
                     if connection
                         .final_goaway_last_stream_id
                         .is_some_and(|last| stream_id > last)
@@ -1344,7 +1350,7 @@ impl QuicServer {
 
     pub fn timeout(&self) -> Option<Duration> {
         let now = Instant::now();
-        let stream_timeout = self
+        let request_timeout = self
             .connections
             .values()
             .flat_map(|connection| connection.requests.values())
@@ -1360,6 +1366,17 @@ impl QuicServer {
                 .min()
             })
             .min();
+        let header_timeout = self
+            .connections
+            .values()
+            .flat_map(|connection| connection.header_deadlines.values())
+            .map(|deadline| deadline.saturating_duration_since(now))
+            .min();
+        let stream_timeout = match (request_timeout, header_timeout) {
+            (Some(left), Some(right)) => Some(left.min(right)),
+            (Some(timeout), None) | (None, Some(timeout)) => Some(timeout),
+            (None, None) => None,
+        };
         let transport_timeout = self
             .connections
             .values()
@@ -1413,6 +1430,7 @@ impl QuicServer {
                 })
                 .collect();
             for stream_id in expired {
+                connection.header_deadlines.remove(&stream_id);
                 if let Some(rejected) = connection.requests.remove(&stream_id) {
                     self.buffered_request_bytes -= rejected.body.len();
                     let _ = connection.transport.stream_shutdown(
@@ -1427,6 +1445,44 @@ impl QuicServer {
                     );
                 }
             }
+            let expired_headers: Vec<u64> = connection
+                .header_deadlines
+                .iter()
+                .filter_map(|(stream_id, deadline)| {
+                    (now >= *deadline).then_some(*stream_id)
+                })
+                .collect();
+            for stream_id in expired_headers {
+                connection.header_deadlines.remove(&stream_id);
+                let _ = connection.transport.stream_shutdown(
+                    stream_id,
+                    quiche::Shutdown::Read,
+                    H3_REQUEST_REJECTED,
+                );
+                let _ = connection.transport.stream_shutdown(
+                    stream_id,
+                    quiche::Shutdown::Write,
+                    H3_REQUEST_REJECTED,
+                );
+            }
+        }
+    }
+
+    fn arm_header_deadlines(connection: &mut QuicConnection, header_deadline: Duration) {
+        let now = Instant::now();
+        let readable: Vec<u64> = connection.transport.readable().collect();
+        for stream_id in readable {
+            // Client-initiated bidirectional streams carry HTTP/3 requests.
+            if stream_id % 4 != 0 {
+                continue;
+            }
+            if connection.requests.contains_key(&stream_id) {
+                continue;
+            }
+            connection
+                .header_deadlines
+                .entry(stream_id)
+                .or_insert_with(|| now + header_deadline);
         }
     }
 }
