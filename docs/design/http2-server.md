@@ -29,6 +29,23 @@ The separate client preface parser compares incrementally against the fixed
 following frame bytes with the caller. It does not enforce when the preface is
 required in connection state.
 
+The SETTINGS payload codec reads and writes six-byte identifier/value entries
+in network byte order. Parsing rejects a trailing partial entry and preserves
+unknown identifiers unchanged; connection-level validation, duplicate handling,
+and negotiation remain with the connection state machine.
+
+## Outbound frame encoding
+
+The socket-independent frame encoder writes the nine-byte frame header and
+payload in network byte order. It rejects a payload above the configured frame
+limit or the 24-bit protocol maximum, and rejects stream identifiers with the
+reserved bit set. It does not validate frame-type-specific flags or lengths.
+
+The SETTINGS frame validator requires stream zero, checks that the parsed
+payload length matches the supplied bytes, and rejects a non-empty ACK frame.
+Unknown flag bits are ignored. It leaves setting-value rules and connection
+sequencing to the connection state machine.
+
 ## Follow-up connection work
 
 The connection layer will require the client connection preface, send server
