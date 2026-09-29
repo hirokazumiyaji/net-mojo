@@ -277,6 +277,18 @@ struct Http2RequestSession(Movable):
                             _append_session_output(output, Span(reset.wire))
                             continue
                         var request_result = self._receive_headers(decoded)
+                        if request_result.is_malformed():
+                            var reset = encode_rst_stream_frame(
+                                decoded.stream_id, UInt32(1)
+                            )
+                            if not reset.is_complete():
+                                self._failed = True
+                                return Http2RequestSessionResult.error(
+                                    consumed, output^
+                                )
+                            _append_session_output(output, Span(reset.wire))
+                            self._remove_stream(decoded.stream_id)
+                            continue
                         if request_result.is_error():
                             self._failed = True
                             return Http2RequestSessionResult.error(
@@ -336,6 +348,18 @@ struct Http2RequestSession(Movable):
                     var request_result = self._receive_data(
                         frame, Span(input.payload), output
                     )
+                    if request_result.is_malformed():
+                        var reset = encode_rst_stream_frame(
+                            input.stream_id, UInt32(1)
+                        )
+                        if not reset.is_complete():
+                            self._failed = True
+                            return Http2RequestSessionResult.error(
+                                consumed, output^
+                            )
+                        _append_session_output(output, Span(reset.wire))
+                        self._remove_stream(input.stream_id)
+                        continue
                     if request_result.is_error():
                         self._failed = True
                         return Http2RequestSessionResult.error(

@@ -35,6 +35,10 @@ struct Http2RequestStreamResult(Movable):
     def error() -> Self:
         return Self(kind=4)
 
+    @staticmethod
+    def malformed() -> Self:
+        return Self(kind=6)
+
     def is_pending(self) -> Bool:
         return self.kind == 1
 
@@ -49,6 +53,41 @@ struct Http2RequestStreamResult(Movable):
 
     def is_error(self) -> Bool:
         return self.kind == 4
+
+    def is_malformed(self) -> Bool:
+        return self.kind == 6
+
+
+def _parse_content_length(value: String) -> Int:
+    var bytes = value.as_bytes()
+    if len(bytes) == 0:
+        return -1
+    var parsed = 0
+    for i in range(len(bytes)):
+        var byte = bytes[i]
+        if byte < Byte(ord("0")) or byte > Byte(ord("9")):
+            return -1
+        var digit = Int(byte - Byte(ord("0")))
+        if parsed > (Int.MAX - digit) // 10:
+            return -1
+        parsed = parsed * 10 + digit
+    return parsed
+
+
+def _content_length_matches_body(request: Request, body_len: Int) -> Bool:
+    var values = request.headers.get_all("content-length")
+    if len(values) == 0:
+        return True
+    var expected = -1
+    for i in range(len(values)):
+        var parsed = _parse_content_length(values[i])
+        if parsed < 0:
+            return False
+        if expected < 0:
+            expected = parsed
+        elif expected != parsed:
+            return False
+    return expected == body_len
 
 
 struct Http2RequestStream(Movable):
@@ -87,10 +126,13 @@ struct Http2RequestStream(Movable):
             var parsed = decode_http2_request_headers(encoded, expected_fields)
             if not parsed.is_valid():
                 self._failed = True
-                return Http2RequestStreamResult.error()
+                return Http2RequestStreamResult.malformed()
             self._request = parsed^.into_request()
             self._headers_received = True
             if end_stream:
+                if not _content_length_matches_body(self._request, 0):
+                    self._failed = True
+                    return Http2RequestStreamResult.malformed()
                 self._ready = True
                 return Http2RequestStreamResult.complete()
             return Http2RequestStreamResult.pending()
@@ -101,9 +143,14 @@ struct Http2RequestStream(Movable):
         var trailers = decode_http2_trailers(encoded, expected_fields)
         if not trailers.is_valid():
             self._failed = True
-            return Http2RequestStreamResult.error()
+            return Http2RequestStreamResult.malformed()
         self._request.trailers = trailers^.take_trailers()
         self._request.body = self._body.bytes()
+        if not _content_length_matches_body(
+            self._request, self._body.size()
+        ):
+            self._failed = True
+            return Http2RequestStreamResult.malformed()
         self._ready = True
         return Http2RequestStreamResult.complete()
 
@@ -131,6 +178,11 @@ struct Http2RequestStream(Movable):
             self._failed = True
             return Http2RequestStreamResult.error()
         if frame.end_stream:
+            if not _content_length_matches_body(
+                self._request, self._body.size()
+            ):
+                self._failed = True
+                return Http2RequestStreamResult.malformed()
             self._request.body = self._body.bytes()
             self._ready = True
             return Http2RequestStreamResult.complete()

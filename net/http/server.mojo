@@ -1384,6 +1384,17 @@ struct Server(Movable):
         self._conns[idx].http2_body_reserved -= request_body_bytes
 
         if writer.is_detached():
+            var addr = writer._detach_state_addr
+            if addr != 0:
+                var ptr = Pointer[Byte, MutUntrackedOrigin](
+                    unsafe_from_address=addr
+                )
+                var s_ptr = ptr.unsafe_bitcast[_SharedDetachState]()
+                s_ptr[].mutex.lock()
+                s_ptr[].cancelled = True
+                s_ptr[].mutex.unlock()
+                _release_detach_state(addr, from_sender=False)
+                writer._detach_state_addr = 0
             self._close_conn(idx)
             return
         if len(writer.body) > cap:
@@ -1422,13 +1433,22 @@ struct Server(Movable):
 
         var compressed = List[Byte](length=65536, fill=0)
         var available = self._budget.remaining() - len(control_output)
+        var max_response_header_bytes = self.config.max_response_headers_bytes
+        var peer_header_list_size = Int(
+            self._conns[idx]
+            .http2_session.value()
+            .peer_settings()
+            .max_header_list_size
+        )
+        if peer_header_list_size < max_response_header_bytes:
+            max_response_header_bytes = peer_header_list_size
         var encoded = encode_http2_response_header_frames(
             self._conns[idx].http2_deflater.value(),
             writer,
             is_head,
             self._tick_date,
             stream_id,
-            self.config.max_response_headers_bytes,
+            max_response_header_bytes,
             self.config.max_response_headers_count,
             16384,
             available,

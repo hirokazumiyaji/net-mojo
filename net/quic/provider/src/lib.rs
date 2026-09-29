@@ -515,6 +515,135 @@ fn is_valid_http_field_value(value: &[u8]) -> bool {
     })
 }
 
+fn is_valid_http_method(method: &[u8]) -> bool {
+    !method.is_empty() && method.iter().copied().all(is_http_tchar)
+}
+
+fn is_valid_http_scheme(scheme: &[u8]) -> bool {
+    let Some((first, rest)) = scheme.split_first() else {
+        return false;
+    };
+    if !first.is_ascii_alphabetic() {
+        return false;
+    }
+    rest.iter().copied().all(|byte| {
+        byte.is_ascii_alphanumeric() || matches!(byte, b'+' | b'-' | b'.')
+    })
+}
+
+fn is_valid_http_path(path: &[u8]) -> bool {
+    if path.is_empty() {
+        return false;
+    }
+    if path[0] != b'/' && path != b"*" {
+        return false;
+    }
+    path.iter().copied().all(|byte| byte > 0x20 && byte < 0x7f && byte != b'#')
+}
+
+fn is_valid_port(port: &[u8]) -> bool {
+    if port.is_empty() || port.len() > 5 || !port.iter().all(u8::is_ascii_digit) {
+        return false;
+    }
+    let Ok(text) = std::str::from_utf8(port) else {
+        return false;
+    };
+    let Ok(value) = text.parse::<u32>() else {
+        return false;
+    };
+    value <= 65535
+}
+
+fn is_reg_name(hostname: &[u8]) -> bool {
+    if hostname.is_empty() {
+        return false;
+    }
+    let mut i = 0;
+    while i < hostname.len() {
+        let byte = hostname[i];
+        if byte == b'%' {
+            if i + 2 >= hostname.len()
+                || !hostname[i + 1].is_ascii_hexdigit()
+                || !hostname[i + 2].is_ascii_hexdigit()
+            {
+                return false;
+            }
+            i += 3;
+            continue;
+        }
+        if !(byte.is_ascii_alphanumeric()
+            || matches!(
+                byte,
+                b'-' | b'.' | b'_' | b'~' | b'!' | b'$' | b'&' | b'\'' | b'(' | b')'
+                    | b'*' | b'+' | b',' | b';' | b'='
+            ))
+        {
+            return false;
+        }
+        i += 1;
+    }
+    true
+}
+
+fn is_bracket_inner_valid(inner: &[u8]) -> bool {
+    !inner.is_empty()
+        && inner.iter().copied().all(|byte| {
+            byte.is_ascii_hexdigit()
+                || matches!(byte, b':' | b'.' | b'%' | b'-' | b'_' | b'~')
+                || byte.is_ascii_alphabetic()
+        })
+}
+
+fn is_valid_http_authority(authority: &[u8]) -> bool {
+    if authority.is_empty() {
+        return false;
+    }
+    if authority.iter().any(|byte| {
+        *byte <= 0x20
+            || *byte == 0x7f
+            || matches!(*byte, b'/' | b'?' | b'#' | b'\r' | b'\n')
+    }) {
+        return false;
+    }
+    if authority[0] == b'[' {
+        let Some(close) = authority.iter().position(|byte| *byte == b']') else {
+            return false;
+        };
+        if close == 0 || !is_bracket_inner_valid(&authority[1..close]) {
+            return false;
+        }
+        if close + 1 == authority.len() {
+            return true;
+        }
+        return authority.get(close + 1) == Some(&b':')
+            && is_valid_port(&authority[close + 2..]);
+    }
+    if authority.iter().any(|byte| matches!(*byte, b'[' | b']' | b'@')) {
+        return false;
+    }
+    let colon_positions: Vec<usize> = authority
+        .iter()
+        .enumerate()
+        .filter_map(|(index, byte)| (*byte == b':').then_some(index))
+        .collect();
+    if colon_positions.len() > 1 {
+        return false;
+    }
+    if let Some(&colon) = colon_positions.first() {
+        if colon == 0 || colon + 1 >= authority.len() {
+            return false;
+        }
+        if authority[..colon].contains(&b'%') {
+            return false;
+        }
+        if !is_valid_port(&authority[colon + 1..]) {
+            return false;
+        }
+        return is_reg_name(&authority[..colon]);
+    }
+    is_reg_name(authority)
+}
+
 pub struct QuicServer {
     config: quiche::Config,
     http3_config: quiche::h3::Config,
@@ -1030,6 +1159,9 @@ impl QuicServer {
                                     invalid = true;
                                 }
                                 seen_pseudo_headers |= 1;
+                                if !is_valid_http_method(header.value()) {
+                                    invalid = true;
+                                }
                                 request.method = header.value().to_vec();
                             }
                             b":path" => {
@@ -1037,6 +1169,9 @@ impl QuicServer {
                                     invalid = true;
                                 }
                                 seen_pseudo_headers |= 2;
+                                if !is_valid_http_path(header.value()) {
+                                    invalid = true;
+                                }
                                 request.target = header.value().to_vec();
                             }
                             b":scheme" => {
@@ -1044,6 +1179,9 @@ impl QuicServer {
                                     invalid = true;
                                 }
                                 seen_pseudo_headers |= 4;
+                                if !is_valid_http_scheme(header.value()) {
+                                    invalid = true;
+                                }
                                 request.scheme = header.value().to_vec();
                             }
                             b":authority" => {
@@ -1051,6 +1189,9 @@ impl QuicServer {
                                     invalid = true;
                                 }
                                 seen_pseudo_headers |= 8;
+                                if !is_valid_http_authority(header.value()) {
+                                    invalid = true;
+                                }
                                 request.authority = header.value().to_vec()
                             }
                             b":protocol" => invalid = true,
