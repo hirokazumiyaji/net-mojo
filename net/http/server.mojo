@@ -493,6 +493,25 @@ struct Server(Movable):
             if self._conns[idx].write_at != NO_DEADLINE:
                 return self._conns[idx].write_at
             return self._conns[idx].detach_at
+        if self._conns[idx].protocol == PROTOCOL_HTTP2:
+            var best = NO_DEADLINE
+            if self._conns[idx].write_at != NO_DEADLINE:
+                best = self._conns[idx].write_at
+            if self._conns[idx].http2_session:
+                var stream_deadline = (
+                    self._conns[idx].http2_session.value().next_deadline()
+                )
+                if stream_deadline != NO_DEADLINE:
+                    if best == NO_DEADLINE or stream_deadline < best:
+                        best = stream_deadline
+            if (
+                self._conns[idx].state == STATE_READING
+                and self._conns[idx].pending_remaining() == 0
+                and self._conns[idx].http2_responses.queued_count() == 0
+            ):
+                if best == NO_DEADLINE or self._conns[idx].idle_at < best:
+                    best = self._conns[idx].idle_at
+            return best
         if self._conns[idx].state == STATE_READING:
             if self._conns[idx].buffered_len() > 0:
                 var best = NO_DEADLINE
@@ -621,6 +640,28 @@ struct Server(Movable):
                 continue
             if self._conns[idx].state == STATE_STREAMING:
                 self._handle_detached_timeout(idx)
+                continue
+            if (
+                self._conns[idx].protocol == PROTOCOL_HTTP2
+                and self._conns[idx].http2_session
+            ):
+                var expired = self._conns[idx].http2_session.value().expire(now)
+                if self._conns[idx].http2_session.value().is_failed():
+                    self._close_conn(idx)
+                    continue
+                if len(expired) > 0:
+                    if not self._budget.try_reserve(len(expired)):
+                        self._close_conn(idx)
+                        continue
+                    self._conns[idx].append_pending(expired^)
+                    self._conns[idx].state = STATE_SENDING_HTTP2_CONTROL
+                    self._conns[idx].write_at = deadline_from_now(
+                        self.config.write_deadline
+                    )
+                    self._arm_deadline(idx)
+                    self._sync_interests(idx)
+                    continue
+                self._arm_deadline(idx)
                 continue
             self._close_conn(idx)
 
@@ -1011,6 +1052,8 @@ struct Server(Movable):
                             self.config.max_headers_count,
                             self.config.max_trailer_bytes,
                             self.config.max_trailer_count,
+                            self.config.header_deadline,
+                            self.config.body_deadline,
                         )
                     )
                 elif protocol != "http/1.1":
@@ -1084,6 +1127,20 @@ struct Server(Movable):
                 self._drive_tls_shutdown(idx)
             return
         if self._conns[idx].protocol == PROTOCOL_HTTP2:
+            if self._conns[idx].http2_session:
+                var expired = self._conns[idx].http2_session.value().expire(now)
+                if self._conns[idx].http2_session.value().is_failed():
+                    self._close_conn(idx)
+                    return
+                if len(expired) > 0:
+                    if not self._budget.try_reserve(len(expired)):
+                        self._close_conn(idx)
+                        return
+                    self._conns[idx].append_pending(expired^)
+                    self._conns[idx].state = STATE_SENDING_HTTP2_CONTROL
+                    self._conns[idx].write_at = deadline_from_now(
+                        self.config.write_deadline
+                    )
             if self._conns[idx].state == STATE_SENDING_HTTP2_CONTROL:
                 self._pump_send(
                     idx, self._conns[idx].write_ready(readable, writable)

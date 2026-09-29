@@ -930,6 +930,7 @@ impl QuicServer {
         body_deadline: Duration,
         idle_timeout: Duration,
     ) -> Result<Vec<CompletedRequest>, QuicServerError> {
+        let _ = header_deadline;
         let mut completed = Vec::new();
         let Some(http3) = connection.http3.as_mut() else {
             return Ok(completed);
@@ -1093,7 +1094,9 @@ impl QuicServer {
                         continue;
                     }
                     let now = Instant::now();
-                    request.headers_deadline_at = Some(now + header_deadline);
+                    // Headers are already complete when quiche emits this event,
+                    // so arm the body deadline immediately for incomplete requests.
+                    request.body_deadline_at = Some(now + body_deadline);
                     request.idle_deadline_at = Some(now + idle_timeout);
                     connection.last_request_stream_id = Some(
                         connection
@@ -1123,10 +1126,6 @@ impl QuicServer {
                         continue;
                     };
                     let now = Instant::now();
-                    if request.body_deadline_at.is_none() {
-                        request.headers_deadline_at = None;
-                        request.body_deadline_at = Some(now + body_deadline);
-                    }
                     request.idle_deadline_at = Some(now + idle_timeout);
                     let mut body = [0; 16 * 1024];
                     loop {

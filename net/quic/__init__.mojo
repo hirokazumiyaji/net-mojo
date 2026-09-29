@@ -359,6 +359,9 @@ struct QuicUDPEndpoint(Movable):
         self._server.set_request_limits(
             max_body_bytes, max_headers_bytes, max_headers_count
         )
+        self._ensure_request_buffer(
+            max_body_bytes, max_headers_bytes, max_headers_count
+        )
 
     def set_response_limits(
         mut self,
@@ -468,6 +471,13 @@ struct QuicUDPEndpoint(Movable):
         var length = self._server.next_request(
             Span[mut=True](self._request_buffer)
         )
+        if length < 0:
+            var needed = -length
+            if needed > len(self._request_buffer):
+                self._request_buffer = List[Byte](length=needed, fill=0)
+                length = self._server.next_request(
+                    Span[mut=True](self._request_buffer)
+                )
         if length == 0:
             return QuicRequest(
                 id=0,
@@ -490,6 +500,27 @@ struct QuicUDPEndpoint(Movable):
         return _decode_request_record(
             Span(self._request_buffer)[0:length]
         )
+
+    def _ensure_request_buffer(
+        mut self,
+        max_body_bytes: Int,
+        max_headers_bytes: Int,
+        max_headers_count: Int,
+    ):
+        # ids + routing fields + header/trailer length prefixes + body
+        var capacity = (
+            64
+            + 16384
+            + max_headers_bytes
+            + max_headers_count * 8
+            + 8192
+            + 32 * 8
+            + max_body_bytes
+        )
+        if capacity < 1_200_000:
+            capacity = 1_200_000
+        if capacity > len(self._request_buffer):
+            self._request_buffer = List[Byte](length=capacity, fill=0)
 
     def respond[
         headers_origin: Origin, body_origin: Origin

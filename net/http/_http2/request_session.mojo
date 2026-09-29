@@ -1,6 +1,8 @@
 """Assembles completed HTTP/2 requests for one connection."""
 
+from net import Timeout
 from net.http.request import HttpVersion, Request
+from net.http._deadline import NO_DEADLINE, deadline_from_now
 
 from .connection_input import (
     Http2ServerConnectionInput,
@@ -88,6 +90,7 @@ struct _Http2RequestEntry(Movable):
     var stream_id: UInt32
     var stream: Http2RequestStream
     var receive_window: Http2FlowWindow
+    var body_at: Int
 
     def take_request(deinit self) -> Request:
         return self.stream^.take_request()
@@ -114,6 +117,9 @@ struct Http2RequestSession(Movable):
     var _max_headers_count: Int
     var _max_trailer_bytes: Int
     var _max_trailer_count: Int
+    var _header_deadline: Timeout
+    var _body_deadline: Timeout
+    var _pending_headers_at: Int
     var _last_stream_id: UInt32
     var _draining: Bool
     var _failed: Bool
@@ -127,6 +133,8 @@ struct Http2RequestSession(Movable):
         max_headers_count: Int = 100,
         max_trailer_bytes: Int = 8192,
         max_trailer_count: Int = 32,
+        header_deadline: Timeout = Timeout.nanoseconds(5_000_000_000),
+        body_deadline: Timeout = Timeout.nanoseconds(30_000_000_000),
     ):
         self._input = Http2ServerConnectionInput(
             max_concurrent_streams=max_active_streams
@@ -150,6 +158,9 @@ struct Http2RequestSession(Movable):
         self._max_headers_count = max_headers_count
         self._max_trailer_bytes = max_trailer_bytes
         self._max_trailer_count = max_trailer_count
+        self._header_deadline = header_deadline.copy()
+        self._body_deadline = body_deadline.copy()
+        self._pending_headers_at = NO_DEADLINE
         self._last_stream_id = UInt32(0)
         self._draining = False
         self._failed = (
@@ -168,6 +179,43 @@ struct Http2RequestSession(Movable):
         var goaway = encode_goaway_frame(self._last_stream_id, UInt32(0))
         var output = List[Byte]()
         _append_session_output(output, Span(goaway.wire))
+        return output^
+
+    def next_deadline(self) -> Int:
+        var best = self._pending_headers_at
+        for i in range(len(self._streams)):
+            var body_at = self._streams[i].body_at
+            if body_at == NO_DEADLINE:
+                continue
+            if best == NO_DEADLINE or body_at < best:
+                best = body_at
+        return best
+
+    def expire(mut self, now: Int) -> List[Byte]:
+        var output = List[Byte]()
+        if self._failed:
+            return output^
+        if (
+            self._pending_headers_at != NO_DEADLINE
+            and now >= self._pending_headers_at
+        ):
+            self._failed = True
+            self._pending_headers_at = NO_DEADLINE
+            return output^
+
+        var expired = List[UInt32]()
+        for i in range(len(self._streams)):
+            var body_at = self._streams[i].body_at
+            if body_at != NO_DEADLINE and now >= body_at:
+                expired.append(self._streams[i].stream_id)
+        for i in range(len(expired)):
+            var stream_id = expired[i]
+            var reset = encode_rst_stream_frame(stream_id, UInt32(8))
+            if not reset.is_complete():
+                self._failed = True
+                return output^
+            _append_session_output(output, Span(reset.wire))
+            self._remove_stream(stream_id)
         return output^
 
     def consume[
@@ -207,6 +255,7 @@ struct Http2RequestSession(Movable):
                         frame, Span(input.payload)
                     )
                     if decoded.is_complete():
+                        self._pending_headers_at = NO_DEADLINE
                         var is_new_stream = self._find_stream(decoded.stream_id) < 0
                         if self._draining and is_new_stream:
                             var reset = encode_rst_stream_frame(
@@ -241,7 +290,18 @@ struct Http2RequestSession(Movable):
                             return Http2RequestSessionResult.complete(
                                 consumed, decoded.stream_id, output^, request^
                             )
-                    elif not decoded.is_pending():
+                        if request_result.is_pending():
+                            var index = self._find_stream(decoded.stream_id)
+                            if index >= 0 and self._streams[index].body_at == NO_DEADLINE:
+                                self._streams[index].body_at = deadline_from_now(
+                                    self._body_deadline
+                                )
+                    elif decoded.is_pending():
+                        if self._pending_headers_at == NO_DEADLINE:
+                            self._pending_headers_at = deadline_from_now(
+                                self._header_deadline
+                            )
+                    else:
                         self._failed = True
                         return Http2RequestSessionResult.error(
                             consumed, output^
@@ -351,6 +411,7 @@ struct Http2RequestSession(Movable):
                 stream_id=decoded.stream_id,
                 stream=stream^,
                 receive_window=receive_window^,
+                body_at=NO_DEADLINE,
             )
             self._streams.append(entry^)
             var initial_send_window = Http2FlowWindow(
@@ -426,6 +487,9 @@ struct Http2RequestSession(Movable):
         for i in range(len(self._streams)):
             total += self._streams[i].stream.buffered_body_bytes()
         return total
+
+    def is_failed(self) -> Bool:
+        return self._failed
 
     def peer_settings(self) -> Http2PeerSettingsSnapshot:
         return self._input.peer_settings()
