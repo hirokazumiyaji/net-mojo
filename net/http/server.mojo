@@ -82,6 +82,7 @@ from net.http._http2.request_session import (
     Http2RequestSession,
     Http2RequestSessionResult,
 )
+from net.http._http2.response_headers import _content_length_matches
 from net.http._http2.response_encoder import (
     encode_http2_response_header_frames,
 )
@@ -874,7 +875,7 @@ struct Server(Movable):
                     "content-length"
                 )
                 for i in range(len(declared_lengths)):
-                    if not _quic_content_length_matches(
+                    if not _content_length_matches(
                         declared_lengths[i], wire_length
                     ):
                         response.status = 500
@@ -2481,24 +2482,6 @@ def _append_quic_u32(mut output: List[Byte], value: UInt32):
     output.append(Byte((value >> 16) & UInt32(0xFF)))
     output.append(Byte((value >> 8) & UInt32(0xFF)))
     output.append(Byte(value & UInt32(0xFF)))
-
-
-def _quic_content_length_matches(value: String, expected: Int) -> Bool:
-    if expected < 0:
-        return False
-    var bytes = value.as_bytes()
-    if len(bytes) == 0:
-        return False
-    var parsed = 0
-    for i in range(len(bytes)):
-        var byte = bytes[i]
-        if byte < Byte(ord("0")) or byte > Byte(ord("9")):
-            return False
-        var digit = Int(byte - Byte(ord("0")))
-        if parsed > (expected - digit) // 10:
-            return False
-        parsed = parsed * 10 + digit
-    return parsed == expected
 
 
 def _append_quic_field[

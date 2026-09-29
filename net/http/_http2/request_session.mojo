@@ -607,19 +607,8 @@ struct Http2RequestSession(Movable):
         return -1
 
     def _take_request(mut self, stream_id: UInt32) -> Request:
-        var retained = List[_Http2RequestEntry]()
-        var request = Request(
-            String(), String(), String(), String(), HttpVersion.http2()
-        )
-        while len(self._streams) > 0:
-            var entry = self._streams.pop()
-            if entry.stream_id == stream_id:
-                request = entry^.take_request()
-            else:
-                retained.append(entry^)
-        while len(retained) > 0:
-            self._streams.append(retained.pop())
-        return request^
+        var entry = self._streams.pop(self._find_stream(stream_id))
+        return entry^.take_request()
 
     def _remove_stream(mut self, stream_id: UInt32):
         var index = self._find_stream(stream_id)
@@ -640,8 +629,7 @@ struct Http2RequestSession(Movable):
 def _append_session_output[
     origin: Origin
 ](mut output: List[Byte], bytes: Span[Byte, origin]):
-    for i in range(len(bytes)):
-        output.append(bytes[i])
+    output.extend(bytes)
 
 
 def _append_window_update(

@@ -119,5 +119,4 @@ struct Http2ConnectionBootstrap(Movable):
 def _append_wire[
     origin: Origin
 ](mut output: List[Byte], wire: Span[Byte, origin]):
-    for i in range(len(wire)):
-        output.append(wire[i])
+    output.extend(wire)

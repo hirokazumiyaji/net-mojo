@@ -4,8 +4,7 @@ from .frame_encoder import FrameEncodeResult, encode_frame
 
 
 def _append_wire(mut output: List[Byte], frame: List[Byte]):
-    for i in range(len(frame)):
-        output.append(frame[i])
+    output.extend(Span(frame))
 
 
 def encode_headers_block[

@@ -51,6 +51,5 @@ def encode_frame[
     wire.append(Byte((stream_id >> 16) & UInt32(0xFF)))
     wire.append(Byte((stream_id >> 8) & UInt32(0xFF)))
     wire.append(Byte(stream_id & UInt32(0xFF)))
-    for i in range(payload_length):
-        wire.append(payload[i])
+    wire.extend(payload[:payload_length])
     return FrameEncodeResult.complete(wire^)
