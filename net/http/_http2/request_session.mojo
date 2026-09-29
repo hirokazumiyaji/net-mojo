@@ -563,6 +563,13 @@ struct Http2RequestSession(Movable):
             total += self._streams[i].stream.buffered_body_bytes()
         return total
 
+    def buffered_request_bytes(self) -> Int:
+        var total = 0
+        for i in range(len(self._streams)):
+            total += self._streams[i].stream.buffered_body_bytes()
+            total += self._streams[i].stream.buffered_header_bytes()
+        return total
+
     def is_failed(self) -> Bool:
         return self._failed
 

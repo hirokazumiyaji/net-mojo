@@ -1362,7 +1362,7 @@ struct Server(Movable):
             if result.is_request():
                 request_body_bytes = len(result.request.body)
             var target_body_reservation = (
-                self._conns[idx].http2_session.value().buffered_body_bytes()
+                self._conns[idx].http2_session.value().buffered_request_bytes()
                 + request_body_bytes
             )
             if target_body_reservation > self._conns[idx].http2_body_reserved:

@@ -1,5 +1,6 @@
 """One HTTP/2 request stream's headers, body, and trailers."""
 
+from net.http.headers import Headers
 from net.http.request import HttpVersion, Request
 
 from .data_frame import DataFrameResult
@@ -193,3 +194,22 @@ struct Http2RequestStream(Movable):
 
     def buffered_body_bytes(self) -> Int:
         return self._body.size()
+
+    def buffered_header_bytes(self) -> Int:
+        if not self._headers_received:
+            return 0
+        var total = _headers_retained_bytes(self._request.headers)
+        total += _headers_retained_bytes(self._request.trailers)
+        total += self._request.method.byte_length()
+        total += self._request.target.byte_length()
+        total += self._request.scheme.byte_length()
+        total += self._request.authority.byte_length()
+        return total
+
+
+def _headers_retained_bytes(headers: Headers) -> Int:
+    var total = 0
+    for i in range(len(headers)):
+        total += headers.name_at(i).byte_length()
+        total += headers.value_byte_length(i)
+    return total

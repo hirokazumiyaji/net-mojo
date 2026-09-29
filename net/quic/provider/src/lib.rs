@@ -349,7 +349,10 @@ pub unsafe extern "C" fn net_quic_server_next_request(
     }
     unsafe { ptr::copy_nonoverlapping(record.as_ptr(), output, record.len()) };
     if let Some(request) = server._inner.requests.pop_front() {
-        server._inner.buffered_request_bytes -= request.body.len();
+        server._inner.buffered_request_bytes = server
+            ._inner
+            .buffered_request_bytes
+            .saturating_sub(completed_request_retained_bytes(&request));
     }
     i32::try_from(record.len()).unwrap_or(-1)
 }
@@ -450,6 +453,37 @@ fn reserve_bytes(used: &mut usize, amount: usize, limit: usize) -> bool {
     true
 }
 
+fn field_pair_bytes(fields: &[(Vec<u8>, Vec<u8>)]) -> usize {
+    fields
+        .iter()
+        .map(|(name, value)| name.len() + value.len())
+        .sum()
+}
+
+fn pending_request_retained_bytes(request: &PendingRequest) -> usize {
+    request.method.len()
+        + request.target.len()
+        + request.scheme.len()
+        + request.authority.len()
+        + field_pair_bytes(&request.headers)
+        + field_pair_bytes(&request.trailers)
+        + request.body.len()
+}
+
+fn completed_request_retained_bytes(request: &CompletedRequest) -> usize {
+    request.method.len()
+        + request.target.len()
+        + request.scheme.len()
+        + request.authority.len()
+        + field_pair_bytes(&request.headers)
+        + field_pair_bytes(&request.trailers)
+        + request.body.len()
+}
+
+fn release_pending_request_bytes(used: &mut usize, request: &PendingRequest) {
+    *used = used.saturating_sub(request.retained_bytes);
+}
+
 fn append_request_body(
     request: &mut PendingRequest,
     bytes: &[u8],
@@ -463,6 +497,7 @@ fn append_request_body(
         return false;
     }
     request.body.extend_from_slice(bytes);
+    request.retained_bytes = request.retained_bytes.saturating_add(bytes.len());
     true
 }
 
@@ -771,6 +806,8 @@ struct PendingRequest {
     trailer_bytes: usize,
     trailer_count: usize,
     body: Vec<u8>,
+    /// Bytes currently charged to `buffered_request_bytes`.
+    retained_bytes: usize,
     headers_deadline_at: Option<Instant>,
     body_deadline_at: Option<Instant>,
     idle_deadline_at: Option<Instant>,
@@ -1005,7 +1042,8 @@ impl QuicServer {
             }
         };
         let Some(completed) = completed else {
-            self.force_drop_connection(&key);
+            // CONNECTION_CLOSE is queued; keep the connection until send/drain
+            // emits it and quiche reports the transport closed.
             return Ok(());
         };
         for request_id in cancelled_requests {
@@ -1084,7 +1122,7 @@ impl QuicServer {
         let in_flight_bytes: usize = connection
             .requests
             .values()
-            .map(|request| request.body.len())
+            .map(|request| request.retained_bytes)
             .sum();
         self.buffered_request_bytes -= in_flight_bytes;
         let response_bytes: usize = connection
@@ -1108,7 +1146,7 @@ impl QuicServer {
             .requests
             .iter()
             .filter(|request| request_ids.contains(&request.id))
-            .map(|request| request.body.len())
+            .map(completed_request_retained_bytes)
             .sum();
         self.buffered_request_bytes -= queued_bytes;
         self.requests
@@ -1197,9 +1235,34 @@ impl QuicServer {
                                 code,
                             );
                             if let Some(rejected) = connection.requests.remove(&stream_id) {
-                                *buffered_request_bytes -= rejected.body.len();
+                                release_pending_request_bytes(buffered_request_bytes, &rejected);
                             }
                         } else {
+                            let new_retained = pending_request_retained_bytes(request);
+                            if new_retained > request.retained_bytes {
+                                let delta = new_retained - request.retained_bytes;
+                                if !reserve_bytes(
+                                    buffered_request_bytes,
+                                    delta,
+                                    MAX_HTTP3_BUFFERED_REQUEST_BYTES,
+                                ) {
+                                    let _ = connection.transport.stream_shutdown(
+                                        stream_id,
+                                        quiche::Shutdown::Read,
+                                        H3_EXCESSIVE_LOAD,
+                                    );
+                                    if let Some(rejected) =
+                                        connection.requests.remove(&stream_id)
+                                    {
+                                        release_pending_request_bytes(
+                                            buffered_request_bytes,
+                                            &rejected,
+                                        );
+                                    }
+                                    continue;
+                                }
+                                request.retained_bytes = new_retained;
+                            }
                             let now = Instant::now();
                             request.idle_deadline_at = Some(now + idle_timeout);
                         }
@@ -1328,6 +1391,20 @@ impl QuicServer {
                     // so arm the body deadline immediately for incomplete requests.
                     request.body_deadline_at = Some(now + body_deadline);
                     request.idle_deadline_at = Some(now + idle_timeout);
+                    let retained = pending_request_retained_bytes(&request);
+                    if !reserve_bytes(
+                        buffered_request_bytes,
+                        retained,
+                        MAX_HTTP3_BUFFERED_REQUEST_BYTES,
+                    ) {
+                        let _ = connection.transport.stream_shutdown(
+                            stream_id,
+                            quiche::Shutdown::Read,
+                            H3_EXCESSIVE_LOAD,
+                        );
+                        continue;
+                    }
+                    request.retained_bytes = retained;
                     connection.last_request_stream_id = Some(
                         connection
                             .last_request_stream_id
@@ -1374,7 +1451,10 @@ impl QuicServer {
                                         H3_EXCESSIVE_LOAD,
                                     );
                                     if let Some(rejected) = connection.requests.remove(&stream_id) {
-                                        *buffered_request_bytes -= rejected.body.len();
+                                        release_pending_request_bytes(
+                                            buffered_request_bytes,
+                                            &rejected,
+                                        );
                                     }
                                     break;
                                 }
@@ -1387,7 +1467,7 @@ impl QuicServer {
                 Ok((stream_id, quiche::h3::Event::Finished)) => {
                     if let Some(request) = connection.requests.remove(&stream_id) {
                         if !content_length_matches_body(&request.headers, request.body.len()) {
-                            *buffered_request_bytes -= request.body.len();
+                            release_pending_request_bytes(buffered_request_bytes, &request);
                             let _ = connection.transport.stream_shutdown(
                                 stream_id,
                                 quiche::Shutdown::Read,
@@ -1415,7 +1495,7 @@ impl QuicServer {
                 }
                 Ok((stream_id, quiche::h3::Event::Reset(_))) => {
                     if let Some(reset) = connection.requests.remove(&stream_id) {
-                        *buffered_request_bytes -= reset.body.len();
+                        release_pending_request_bytes(buffered_request_bytes, &reset);
                     }
                     if let Some(reset) = connection.responses.remove(&stream_id) {
                         *buffered_response_bytes -= reset.buffered_bytes;
@@ -1432,7 +1512,9 @@ impl QuicServer {
 
     pub fn next_request(&mut self) -> Option<CompletedRequest> {
         let request = self.requests.pop_front()?;
-        self.buffered_request_bytes -= request.body.len();
+        self.buffered_request_bytes = self
+            .buffered_request_bytes
+            .saturating_sub(completed_request_retained_bytes(&request));
         Some(request)
     }
 
@@ -1707,7 +1789,8 @@ impl QuicServer {
             for stream_id in expired {
                 connection.header_deadlines.remove(&stream_id);
                 if let Some(rejected) = connection.requests.remove(&stream_id) {
-                    self.buffered_request_bytes -= rejected.body.len();
+                    self.buffered_request_bytes =
+                        self.buffered_request_bytes.saturating_sub(rejected.retained_bytes);
                     let _ = connection.transport.stream_shutdown(
                         stream_id,
                         quiche::Shutdown::Read,
@@ -1799,8 +1882,9 @@ mod tests {
 
     use super::{
         MAX_HTTP3_BUFFERED_RESPONSE_BYTES, MAX_HTTP3_REQUEST_BODY_BYTES, NetQuicServerConfig,
-        PendingRequest, append_bytes, append_request_body, append_u32, net_quic_server_free,
-        net_quic_server_new, reserve_response_bytes,
+        PendingRequest, append_bytes, append_request_body, append_u32,
+        completed_request_retained_bytes, net_quic_server_free, net_quic_server_new,
+        reserve_response_bytes,
     };
     use quiche::h3::NameValue;
 
@@ -2212,7 +2296,7 @@ mod tests {
         assert_eq!(request.body, b"payload");
         assert_eq!(
             server_state._inner.buffered_request_bytes,
-            request.body.len()
+            completed_request_retained_bytes(request)
         );
         let mut request_record = vec![0; 1_200_000];
         let request_record_length = unsafe {
