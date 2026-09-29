@@ -53,12 +53,13 @@ graceful shutdown. C and Mojo FFI smoke tests exercise the provider boundary.
 ## Graceful shutdown
 
 Shutdown first sends GOAWAY with the maximum request stream ID, then sends a
-second GOAWAY after a short interval with the highest request stream ID already
-accepted by the server. Streams above that final boundary receive
-`H3_REQUEST_REJECTED`. The server keeps the UDP endpoint active during the
-configured grace period, sends a QUIC close with `H3_NO_ERROR` when the period
-ends, and continues driving transport timers and packets until the provider
-reports the connections closed or the drain cap expires.
+second GOAWAY after a short interval advertising the first rejected request
+stream (`last_accepted + 4`, or `0` when none were accepted). Streams at or
+above that final boundary receive `H3_REQUEST_REJECTED`. The server keeps the
+UDP endpoint active during the configured grace period, sends a QUIC close with
+`H3_NO_ERROR` when the period ends, and continues driving transport timers and
+packets until the provider reports the connections closed or the drain cap
+expires.
 
 ## Remaining protocol work
 

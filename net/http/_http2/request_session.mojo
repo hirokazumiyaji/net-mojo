@@ -500,6 +500,20 @@ struct Http2RequestSession(Movable):
                 (frame.stream_id & UInt32(1)) == UInt32(1)
                 and frame.stream_id <= self._last_stream_id
             ):
+                # DATA may already be in flight before the peer sees RST/END.
+                # Still account for connection flow control and return credit.
+                if frame.payload_length > 0:
+                    if not self._receive_window.receive_data(
+                        frame.payload_length
+                    ):
+                        return Http2RequestStreamResult.error()
+                    if not self._receive_window.release_received(
+                        frame.payload_length
+                    ):
+                        return Http2RequestStreamResult.error()
+                    _append_window_update(
+                        output, UInt32(0), frame.payload_length
+                    )
                 return Http2RequestStreamResult.pending()
             return Http2RequestStreamResult.error()
         if (

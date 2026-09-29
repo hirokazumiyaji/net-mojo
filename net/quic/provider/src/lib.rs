@@ -868,11 +868,17 @@ impl QuicServer {
             let Some(http3) = connection.http3.as_mut() else {
                 continue;
             };
-            let last_stream_id = connection.last_request_stream_id.unwrap_or(0);
-            match http3.send_goaway(&mut connection.transport, last_stream_id) {
+            // RFC 9114 §5.2: streams with the GOAWAY ID or greater are rejected.
+            // Advertise the first rejected client request stream (N+4), or 0
+            // when no request streams were accepted.
+            let goaway_id = match connection.last_request_stream_id {
+                Some(last) => last.saturating_add(4),
+                None => 0,
+            };
+            match http3.send_goaway(&mut connection.transport, goaway_id) {
                 Ok(()) => {
                     connection.final_goaway_sent = true;
-                    connection.final_goaway_last_stream_id = Some(last_stream_id);
+                    connection.final_goaway_last_stream_id = Some(goaway_id);
                 }
                 Err(quiche::h3::Error::StreamBlocked | quiche::h3::Error::Done) => (),
                 Err(error) => return Err(error.into()),
@@ -1135,7 +1141,7 @@ impl QuicServer {
                     connection.header_deadlines.remove(&stream_id);
                     if connection
                         .final_goaway_last_stream_id
-                        .is_some_and(|last| stream_id > last)
+                        .is_some_and(|last| stream_id >= last)
                     {
                         let _ = connection.transport.stream_shutdown(
                             stream_id,
@@ -1332,7 +1338,7 @@ impl QuicServer {
                 Ok((stream_id, quiche::h3::Event::Data)) => {
                     if connection
                         .final_goaway_last_stream_id
-                        .is_some_and(|last| stream_id > last)
+                        .is_some_and(|last| stream_id >= last)
                     {
                         continue;
                     }

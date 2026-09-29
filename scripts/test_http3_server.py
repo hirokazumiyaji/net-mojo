@@ -182,7 +182,7 @@ async def run_client(address):
             if bytes(response["body"]) != expected_body:
                 raise RuntimeError(f"unexpected HTTP/3 response body: {response}")
         await asyncio.wait_for(client.http.wait_for_goaways(2), timeout=5)
-        expected_goaways = [(1 << 62) - 4, second["stream_id"]]
+        expected_goaways = [(1 << 62) - 4, second["stream_id"] + 4]
         if client.http.goaways != expected_goaways:
             raise RuntimeError(
                 f"unexpected HTTP/3 GOAWAY IDs: {client.http.goaways}"
