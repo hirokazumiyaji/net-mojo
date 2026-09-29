@@ -14,11 +14,16 @@ underscore (see README "Versioning and compatibility"). Anything under
 
 ### Added
 
-- Bounded, socket-independent HTTP/2 frame parsing under `net.http._http2`.
-  This first Phase 7 slice validates the fixed header and configured payload
-  limit; connection state, HPACK, and HTTP/2 serving remain follow-up work.
+- HTTP/2 server support over TLS ALPN `h2`, including bounded request streams,
+  HPACK, connection and stream flow control, fair response scheduling, stream
+  refusal, and GOAWAY during graceful shutdown. The optional libnghttp2 shim is
+  built in the `http2` environment.
+- HTTP/3 server support over a separately configured UDP endpoint using the
+  optional quiche provider. Requests share the HTTP handler; shutdown sends
+  staged GOAWAY frames, rejects streams above the final boundary, and sends an
+  `H3_NO_ERROR` close after the configured grace period.
 - Optional OpenSSL-backed nonblocking TLS server transport in the Pixi `tls`
-  environment. HTTP server integration follows separately.
+  environment, used by HTTPS HTTP/1.1 and HTTP/2 ALPN `h2`.
 - `net.http` plaintext HTTP/1.1 origin server (single event loop, epoll
   on Linux / kqueue on macOS): `Handler`, `Request`, `Headers`,
   `ResponseWriter`, `Server`, `ServerConfig`, `ServerControl`,

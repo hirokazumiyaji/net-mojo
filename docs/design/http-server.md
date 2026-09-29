@@ -371,6 +371,7 @@ struct HttpError(Copyable, Movable, Writable):
 # net/http/config.mojo
 struct ServerConfig(Copyable, Movable):
     var max_connections: Int              # 10,000
+    var max_http2_streams_per_connection: Int # 100
     var max_request_line: Int             # 8 KiB
     var max_headers_bytes: Int            # 32 KiB
     var max_headers_count: Int            # 100

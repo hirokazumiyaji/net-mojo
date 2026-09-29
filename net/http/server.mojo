@@ -34,14 +34,17 @@ from net import SocketAddress, TCPConn, TCPListener, Timeout, listen_tcp
 from net._actor import WakeupChannel
 from net._reactor import Reactor, ReactorToken
 from net.error import NetError, NetErrorKind
+from net.quic import QuicUDPEndpoint
 
 from ._buffer import BufferBudget
 from ._connection import (
     HttpConnection,
+    PROTOCOL_HTTP2,
     STATE_DETACHED,
     STATE_HANDSHAKING,
     STATE_READING,
     STATE_SENDING,
+    STATE_SENDING_HTTP2_CONTROL,
     STATE_SENDING_100,
     STATE_STREAMING,
     STATE_TLS_SHUTDOWN,
@@ -72,11 +75,23 @@ from .config import ServerConfig
 from .handler import Handler
 from .headers import Headers
 from .response import ResponseWriter, has_body_for_status
+from .request import HttpVersion, Request, split_path_query
 from net.tls import TLSConnection, TLSContext
+from net.http._http2.hpack import Http2HpackDeflater
+from net.http._http2.request_session import (
+    Http2RequestSession,
+    Http2RequestSessionResult,
+)
+from net.http._http2.response_headers import _content_length_matches
+from net.http._http2.response_encoder import (
+    encode_http2_response_header_frames,
+)
 
 
 comptime _TICK_POLL_CAP_MS: Int = 100
 comptime _SHUTDOWN_QUIET_MS: Int = 10
+comptime _QUIC_GOAWAY_DELAY_NS: Int = 1_000_000_000
+comptime _QUIC_CLOSE_DRAIN_NS: Int = 3_000_000_000
 
 
 @fieldwise_init
@@ -125,12 +140,16 @@ struct Server(Movable):
     var _tls_context: Optional[TLSContext]
     var _listener_token: ReactorToken
     var _listener_paused: Bool
+    var _quic_endpoint: Optional[QuicUDPEndpoint]
+    var _quic_token: ReactorToken
     var _conns: List[HttpConnection]
     var _conn_free: List[Int]
     var _slot_map: List[Int]
     var _active_conns: Int
     var _budget: BufferBudget
     var _shutdown_at: Int
+    var _quic_finish_at: Int
+    var _quic_close_at: Int
     var _tick_date: String
     # Phase 4: no per-tick full-table scans. Fairness counters reset lazily
     # via _tick_seen, capped pipelines re-drive via _urgent, and deadlines
@@ -155,12 +174,16 @@ struct Server(Movable):
         self._tls_context = None
         self._listener_token = ReactorToken(slot=-1, generation=0)
         self._listener_paused = False
+        self._quic_endpoint = None
+        self._quic_token = ReactorToken(slot=-1, generation=0)
         self._conns = List[HttpConnection]()
         self._conn_free = List[Int]()
         self._slot_map = List[Int]()
         self._active_conns = 0
         self._budget = BufferBudget(budget_total)
         self._shutdown_at = NO_DEADLINE
+        self._quic_finish_at = NO_DEADLINE
+        self._quic_close_at = NO_DEADLINE
         self._tick_date = String("")
         self._tick_id = 0
         self._tick_seen = List[Int]()
@@ -218,6 +241,39 @@ struct Server(Movable):
         self.add_listener(listener^)
         self._tls_context = Optional[TLSContext](tls_context^)
 
+    def add_quic_endpoint(
+        mut self, var endpoint: QuicUDPEndpoint
+    ) raises:
+        if self._quic_endpoint:
+            raise NetError(
+                NetErrorKind.invalid_state(),
+                "add QUIC endpoint",
+                None,
+                "server already has a QUIC endpoint",
+            )
+        endpoint.set_connection_limit(self.config.max_connections)
+        endpoint.set_request_limits(
+            self.config.max_body_bytes,
+            self.config.max_headers_bytes,
+            self.config.max_headers_count,
+            self.config.max_trailer_bytes,
+            self.config.max_trailer_count,
+        )
+        endpoint.set_response_limits(
+            self.config.max_response_body,
+            self.config.max_response_headers_bytes,
+            self.config.max_response_headers_count,
+        )
+        endpoint.set_stream_deadlines(
+            self.config.header_deadline,
+            self.config.body_deadline,
+            self.config.idle_timeout,
+            self.config.write_deadline,
+        )
+        var token = self._reactor.register(endpoint.raw_fd())
+        self._quic_token = token.copy()
+        self._quic_endpoint = Optional[QuicUDPEndpoint](endpoint^)
+
     def tick[
         H: Handler
     ](
@@ -229,7 +285,7 @@ struct Server(Movable):
         var now = now_ns()
         self._tick_date = current_http_date()
         self._note_shutdown(now)
-        if not self._listener and self._active_conns == 0:
+        if not self._listener and not self._quic_endpoint and self._active_conns == 0:
             self.control.mark_exited()
             return False
         self._tick_id += 1
@@ -259,6 +315,10 @@ struct Server(Movable):
             wait_timeout = Timeout.nanoseconds(0)
         var events = self._reactor.wait(wait_timeout)
         now = now_ns()
+        self._drive_quic()
+        self._dispatch_quic_requests(handler)
+        self._finish_quic_shutdown_if_due(now)
+        self._flush_quic()
         if self._listener:
             for i in range(len(events)):
                 if events[i].token == self._listener_token:
@@ -332,7 +392,7 @@ struct Server(Movable):
                 self._arm_deadline(idx)
         self._expire_deadlines(now_ns())
         self._process_detached_messages(now_ns())
-        if not self._listener and self._active_conns == 0:
+        if not self._listener and not self._quic_endpoint and self._active_conns == 0:
             self.control.mark_exited()
             return False
         return True
@@ -437,6 +497,25 @@ struct Server(Movable):
             if self._conns[idx].write_at != NO_DEADLINE:
                 return self._conns[idx].write_at
             return self._conns[idx].detach_at
+        if self._conns[idx].protocol == PROTOCOL_HTTP2:
+            var best = NO_DEADLINE
+            if self._conns[idx].write_at != NO_DEADLINE:
+                best = self._conns[idx].write_at
+            if self._conns[idx].http2_session:
+                var stream_deadline = (
+                    self._conns[idx].http2_session.value().next_deadline()
+                )
+                if stream_deadline != NO_DEADLINE:
+                    if best == NO_DEADLINE or stream_deadline < best:
+                        best = stream_deadline
+            if (
+                self._conns[idx].state == STATE_READING
+                and self._conns[idx].pending_remaining() == 0
+                and self._conns[idx].http2_responses.queued_count() == 0
+            ):
+                if best == NO_DEADLINE or self._conns[idx].idle_at < best:
+                    best = self._conns[idx].idle_at
+            return best
         if self._conns[idx].state == STATE_READING:
             if self._conns[idx].buffered_len() > 0:
                 var best = NO_DEADLINE
@@ -516,12 +595,28 @@ struct Server(Movable):
         return top^
 
     def _expire_deadlines(mut self, now: Int) raises NetError:
+        if self._quic_close_at != NO_DEADLINE:
+            if (
+                not self._quic_endpoint
+                or self._quic_endpoint.value().shutdown_complete()
+                or now >= self._quic_close_at
+            ):
+                self._drop_quic_endpoint()
+                self._quic_close_at = NO_DEADLINE
+            return
         if self._shutdown_at != NO_DEADLINE and now >= self._shutdown_at:
             # Shutdown expiry is global and runs once: close everything.
             # O(N) here is fine; it is not a per-tick hot path.
             for i in range(len(self._conns)):
                 if self._conns[i].active:
                     self._close_conn(i)
+            self._finish_quic_shutdown()
+            if self._quic_endpoint:
+                self._quic_endpoint.value().close_connections()
+                self._flush_quic()
+                self._quic_close_at = now + _QUIC_CLOSE_DRAIN_NS
+            else:
+                self._drop_quic_endpoint()
             return
         while len(self._deadline_heap) > 0:
             var top = self._deadline_heap[0]
@@ -550,13 +645,64 @@ struct Server(Movable):
             if self._conns[idx].state == STATE_STREAMING:
                 self._handle_detached_timeout(idx)
                 continue
+            if (
+                self._conns[idx].protocol == PROTOCOL_HTTP2
+                and self._conns[idx].http2_session
+            ):
+                if (
+                    self._conns[idx].write_at != NO_DEADLINE
+                    and now >= self._conns[idx].write_at
+                ):
+                    self._close_conn(idx)
+                    continue
+                var expired = self._conns[idx].http2_session.value().expire(now)
+                if self._conns[idx].http2_session.value().is_failed():
+                    self._close_conn(idx)
+                    continue
+                if len(expired) > 0:
+                    if not self._budget.try_reserve(len(expired)):
+                        self._close_conn(idx)
+                        continue
+                    self._conns[idx].append_pending(expired^)
+                    self._conns[idx].state = STATE_SENDING_HTTP2_CONTROL
+                    self._conns[idx].write_at = deadline_from_now(
+                        self.config.write_deadline
+                    )
+                    self._arm_deadline(idx)
+                    self._sync_interests(idx)
+                    continue
+                self._arm_deadline(idx)
+                continue
             self._close_conn(idx)
 
-    def _note_shutdown(mut self, now: Int):
+    def _note_shutdown(mut self, now: Int) raises NetError:
         if self.control.is_shutdown_requested():
             if self._shutdown_at == NO_DEADLINE:
                 self._shutdown_at = now + Int(self.config.shutdown_grace._value)
                 self._drop_listener()
+                if self._quic_endpoint:
+                    self._quic_endpoint.value().begin_shutdown()
+                    var delay = _QUIC_GOAWAY_DELAY_NS
+                    var half_grace = Int(self.config.shutdown_grace._value) // 2
+                    if half_grace < delay:
+                        delay = half_grace
+                    self._quic_finish_at = now + delay
+                for i in range(len(self._conns)):
+                    if (
+                        not self._conns[i].active
+                        or self._conns[i].protocol != PROTOCOL_HTTP2
+                        or not self._conns[i].http2_session
+                    ):
+                        continue
+                    var goaway = self._conns[i].http2_session.value().begin_shutdown()
+                    if not self._budget.try_reserve(len(goaway)):
+                        self._close_conn(i)
+                        continue
+                    self._conns[i].append_pending(goaway^)
+                    self._conns[i].state = STATE_SENDING_HTTP2_CONTROL
+                    self._conns[i].write_at = deadline_from_now(
+                        self.config.write_deadline
+                    )
                 # Idle connections (nothing buffered, nothing queued)
                 # stop waiting out their long keep-alive clock: give
                 # them a short cushion instead. Anything with bytes in
@@ -577,6 +723,18 @@ struct Server(Movable):
                         self._conns[i].idle_at = quiet
                         self._arm_deadline(i)
 
+    def _finish_quic_shutdown_if_due(mut self, now: Int) raises NetError:
+        if self._quic_finish_at != NO_DEADLINE and now >= self._quic_finish_at:
+            self._finish_quic_shutdown()
+
+    def _finish_quic_shutdown(mut self) raises NetError:
+        if self._quic_finish_at == NO_DEADLINE:
+            return
+        if self._quic_endpoint:
+            self._quic_endpoint.value().finish_shutdown()
+            self._flush_quic()
+        self._quic_finish_at = NO_DEADLINE
+
     def _drop_listener(mut self):
         if self._listener:
             _ = self._reactor.remove(self._listener_token)
@@ -587,6 +745,188 @@ struct Server(Movable):
             self._listener = None
             self._listener_token = ReactorToken(slot=-1, generation=0)
             self._listener_paused = False
+
+    def _drop_quic_endpoint(mut self):
+        if self._quic_endpoint:
+            _ = self._reactor.remove(self._quic_token)
+            self._quic_endpoint = None
+            self._quic_token = ReactorToken(slot=-1, generation=0)
+
+    def _drive_quic(mut self) raises NetError:
+        if not self._quic_endpoint:
+            return
+        # The QUIC descriptor is handled separately from HTTP connection slots.
+        var received = 0
+        while received < 16:
+            if not self._quic_endpoint.value().try_receive():
+                break
+            received += 1
+        var remaining = self._quic_endpoint.value().timeout_micros()
+        if remaining == 0:
+            self._quic_endpoint.value().on_timeout()
+        self._flush_quic()
+
+    def _flush_quic(mut self) raises NetError:
+        if not self._quic_endpoint:
+            return
+        var sent = 0
+        while sent < 16:
+            if not self._quic_endpoint.value().try_send():
+                break
+            sent += 1
+        var want_write = self._quic_endpoint.value().wants_write()
+        _ = self._reactor.modify(self._quic_token, True, want_write)
+
+    def _dispatch_quic_requests[
+        H: Handler
+    ](mut self, mut handler: H) raises NetError:
+        if not self._quic_endpoint:
+            return
+        var processed = 0
+        while processed < self.config.max_requests_per_tick:
+            var quic_request = self._quic_endpoint.value().try_next_request()
+            if quic_request.id == 0:
+                break
+            var request_id = quic_request.id
+            var is_head = quic_request.method == "HEAD"
+            var target = quic_request.target.copy()
+            var path, query = split_path_query(target)
+            var request = Request(
+                quic_request.method.copy(),
+                target^,
+                path^,
+                query^,
+                HttpVersion.http3(),
+            )
+            request.scheme = quic_request.scheme.copy()
+            request.authority = quic_request.authority.copy()
+            var response = ResponseWriter(self.config.max_response_body)
+            var body_size = len(quic_request.body)
+            if body_size > self.config.max_body_bytes:
+                response.status = 413
+            elif not self._budget.try_reserve(body_size):
+                response.status = 503
+            else:
+                try:
+                    for i in range(len(quic_request.headers)):
+                        var name = quic_request.headers[i].name.copy()
+                        request.headers.add_bytes(
+                            name^, Span(quic_request.headers[i].value)
+                        )
+                    for i in range(len(quic_request.trailers)):
+                        var name = quic_request.trailers[i].name.copy()
+                        request.trailers.add_bytes(
+                            name^, Span(quic_request.trailers[i].value)
+                        )
+                    request.body = quic_request.take_body()
+                    try:
+                        handler.handle(request^, response)
+                    except e:
+                        _ = e
+                        response.status = 500
+                        response.body.clear()
+                except e:
+                    _ = e
+                    response.status = 400
+                    response.body.clear()
+                self._budget.release(body_size)
+            if response.is_detached():
+                var addr = response._detach_state_addr
+                if addr != 0:
+                    var ptr = Pointer[Byte, MutUntrackedOrigin](
+                        unsafe_from_address=addr
+                    )
+                    var s_ptr = ptr.unsafe_bitcast[_SharedDetachState]()
+                    s_ptr[].mutex.lock()
+                    s_ptr[].cancelled = True
+                    s_ptr[].mutex.unlock()
+                    _release_detach_state(addr, from_sender=False)
+                    response._detach_state_addr = 0
+                response.status = 500
+                response.body.clear()
+            if response.status < 100 or response.status > 599:
+                response.status = 500
+                response.body.clear()
+            var response_header_bytes = 0
+            for i in range(len(response.headers)):
+                response_header_bytes += (
+                    response.headers.name_at(i).byte_length()
+                    + response.headers.value_byte_length(i)
+                    + 4
+                )
+            if (
+                len(response.headers) > self.config.max_response_headers_count
+                or response_header_bytes
+                > self.config.max_response_headers_bytes
+            ):
+                response.status = 500
+                response.headers.clear()
+                response.body.clear()
+            var wire_length = -1
+            if (
+                response.status >= 200
+                and response.status != 204
+                and response.status != 205
+                and response.status != 304
+            ):
+                wire_length = len(response.body)
+            if wire_length >= 0:
+                var declared_lengths = response.headers.get_all(
+                    "content-length"
+                )
+                for i in range(len(declared_lengths)):
+                    if not _content_length_matches(
+                        declared_lengths[i], wire_length
+                    ):
+                        response.status = 500
+                        response.headers.clear()
+                        response.body.clear()
+                        wire_length = -1
+                        break
+            var headers = List[Byte]()
+            var header_count = 0
+            for i in range(len(response.headers)):
+                var name = response.headers.name_at(i)
+                if name.lower() == "content-length":
+                    continue
+                header_count += 1
+            if wire_length >= 0:
+                header_count += 1
+            _append_quic_u32(headers, UInt32(header_count))
+            for i in range(len(response.headers)):
+                var name = response.headers.name_at(i)
+                if name.lower() == "content-length":
+                    continue
+                var name_bytes = name.as_bytes()
+                var value = response.headers.value_bytes_at(i)
+                _append_quic_field(headers, name_bytes)
+                _append_quic_field(headers, Span(value))
+            if wire_length >= 0:
+                var length = String(wire_length)
+                _append_quic_field(headers, String("content-length").as_bytes())
+                _append_quic_field(headers, length.as_bytes())
+            var response_body = response.body.copy()
+            if not has_body_for_status(response.status, is_head):
+                response_body.clear()
+            if (
+                len(response_body) > self.config.max_response_body
+                or len(headers) > self.config.max_response_headers_bytes
+                or header_count > self.config.max_response_headers_count
+            ):
+                response.status = 500
+                headers.clear()
+                _append_quic_u32(headers, UInt32(0))
+                response_body.clear()
+            try:
+                self._quic_endpoint.value().respond(
+                    request_id,
+                    response.status,
+                    Span(headers),
+                    Span(response_body),
+                )
+            except e:
+                _ = e
+            processed += 1
 
     def _pause_listener(mut self):
         if self._listener and not self._listener_paused:
@@ -703,6 +1043,10 @@ struct Server(Movable):
         )
         self._budget.release(self._conns[idx].reserved)
         self._conns[idx].reserved = 0
+        self._budget.release(self._conns[idx].http2_body_reserved)
+        self._conns[idx].http2_body_reserved = 0
+        self._budget.release(self._conns[idx].http2_response_bytes_reserved)
+        self._conns[idx].http2_response_bytes_reserved = 0
         if self._conns[idx].is_tls():
             self._budget.release(READ_BUFFER_SIZE)
         try:
@@ -752,7 +1096,23 @@ struct Server(Movable):
         try:
             var progress = self._conns[idx].tls.value().handshake()
             if progress.is_complete():
-                if self._conns[idx].tls.value().selected_alpn() != "http/1.1":
+                var protocol = self._conns[idx].tls.value().selected_alpn()
+                if protocol == "h2":
+                    self._conns[idx].protocol = PROTOCOL_HTTP2
+                    self._conns[idx].http2_session = Optional(
+                        Http2RequestSession(
+                            String(self.config.hpack_library_path),
+                            self.config.max_http2_streams_per_connection,
+                            self.config.max_body_bytes,
+                            self.config.max_headers_bytes,
+                            self.config.max_headers_count,
+                            self.config.max_trailer_bytes,
+                            self.config.max_trailer_count,
+                            self.config.header_deadline,
+                            self.config.body_deadline,
+                        )
+                    )
+                elif protocol != "http/1.1":
                     self._close_conn(idx)
                     return
                 self._conns[idx].state = STATE_READING
@@ -821,6 +1181,72 @@ struct Server(Movable):
                 not self._conns[idx].tls_shutdown_wants_write and readable
             ):
                 self._drive_tls_shutdown(idx)
+            return
+        if self._conns[idx].protocol == PROTOCOL_HTTP2:
+            if self._conns[idx].http2_session:
+                var expired = self._conns[idx].http2_session.value().expire(now)
+                if self._conns[idx].http2_session.value().is_failed():
+                    self._close_conn(idx)
+                    return
+                if len(expired) > 0:
+                    if not self._budget.try_reserve(len(expired)):
+                        self._close_conn(idx)
+                        return
+                    self._conns[idx].append_pending(expired^)
+                    self._conns[idx].state = STATE_SENDING_HTTP2_CONTROL
+                    self._conns[idx].write_at = deadline_from_now(
+                        self.config.write_deadline
+                    )
+            if self._conns[idx].state == STATE_SENDING_HTTP2_CONTROL:
+                self._pump_send(
+                    idx, self._conns[idx].write_ready(readable, writable)
+                )
+                if not self._conns[idx].active:
+                    return
+            var read_event = (
+                self._conns[idx].read_ready(readable, writable)
+                or self._conns[idx].tls_pending() > 0
+            )
+            self._pump_read(idx, read_event, now)
+            if not self._conns[idx].active:
+                return
+            var http2_activity = read_event
+            while (
+                self._conns[idx].active
+                and self._conns[idx].buffered_len() > 0
+            ):
+                if (
+                    self._conns[idx].requests_this_tick
+                    >= self.config.max_requests_per_tick
+                ):
+                    self._conns[idx].more_work = True
+                    break
+                var buffered_before = self._conns[idx].buffered_len()
+                self._pump_http2_input(idx, handler)
+                http2_activity = True
+                if not self._conns[idx].active:
+                    return
+                if self._conns[idx].buffered_len() >= buffered_before:
+                    break
+            if (
+                self._conns[idx].read_eof
+                and self._conns[idx].buffered_len() == 0
+                and self._conns[idx].pending_remaining() == 0
+                and self._conns[idx].http2_responses.queued_count() == 0
+            ):
+                self._close_conn(idx)
+                return
+            if (
+                self._conns[idx].active
+                and self._conns[idx].state == STATE_READING
+                and self._conns[idx].pending_remaining() == 0
+                and self._conns[idx].http2_responses.queued_count() == 0
+                and http2_activity
+            ):
+                self._conns[idx].idle_at = deadline_from_now(
+                    self.config.idle_timeout
+                )
+            self._sync_interests(idx)
             return
         if (
             self._conns[idx].state == STATE_SENDING
@@ -899,6 +1325,265 @@ struct Server(Movable):
                 if not self._conns[idx].active:
                     return
         self._sync_interests(idx)
+
+    def _pump_http2_input[
+        H: Handler
+    ](mut self, idx: Int, mut handler: H) raises NetError:
+        while self._conns[idx].active and self._conns[idx].buffered_len() > 0:
+            var result: Http2RequestSessionResult
+            try:
+                result = self._conns[idx].http2_session.value().consume(
+                    Span(self._conns[idx].buf)
+                )
+            except e:
+                _ = e
+                self._close_conn(idx)
+                return
+            if result.is_error():
+                self._close_conn(idx)
+                return
+            if result.consumed > 0:
+                self._conns[idx].drain_prefix(result.consumed)
+                self._budget.release(result.consumed)
+            if result.reset_stream_id != UInt32(0):
+                var dropped_unsent = self._conns[
+                    idx
+                ].http2_responses.has_unsent_headers(result.reset_stream_id)
+                var released = self._conns[idx].http2_responses.cancel(
+                    result.reset_stream_id
+                )
+                self._budget.release(released)
+                self._conns[idx].http2_response_bytes_reserved -= released
+                if dropped_unsent:
+                    # Encoded headers mutated the deflater but never reached
+                    # the peer; keep compression state consistent by closing.
+                    self._close_conn(idx)
+                    return
+            var request_body_bytes = 0
+            if result.is_request():
+                request_body_bytes = len(result.request.body)
+            var target_body_reservation = (
+                self._conns[idx].http2_session.value().buffered_request_bytes()
+                + request_body_bytes
+            )
+            if target_body_reservation > self._conns[idx].http2_body_reserved:
+                var additional = (
+                    target_body_reservation
+                    - self._conns[idx].http2_body_reserved
+                )
+                if not self._budget.try_reserve(additional):
+                    self._close_conn(idx)
+                    return
+            elif target_body_reservation < self._conns[idx].http2_body_reserved:
+                self._budget.release(
+                    self._conns[idx].http2_body_reserved
+                    - target_body_reservation
+                )
+            self._conns[idx].http2_body_reserved = target_body_reservation
+            if result.is_request():
+                self._respond_http2(idx, result^, request_body_bytes, handler)
+                return
+            if len(result.output) > 0:
+                var output = result.output.copy()
+                if not self._budget.try_reserve(len(output)):
+                    self._close_conn(idx)
+                    return
+                self._conns[idx].append_pending(output^)
+                self._conns[idx].state = STATE_SENDING_HTTP2_CONTROL
+                self._conns[idx].write_at = deadline_from_now(
+                    self.config.write_deadline
+                )
+                return
+            if result.is_pending():
+                self._drain_http2_responses(idx)
+                return
+
+    def _respond_http2[
+        H: Handler
+    ](
+        mut self,
+        idx: Int,
+        var result: Http2RequestSessionResult,
+        request_body_bytes: Int,
+        mut handler: H,
+    ) raises NetError:
+        var stream_id = result.stream_id
+        var control_output = result.output.copy()
+        var request = result^.take_request()
+        var is_head = request.method == "HEAD"
+        var cap = self.config.max_response_body
+        var room = (
+            self._budget.remaining()
+            - len(control_output)
+            - self.config.max_response_headers_bytes
+            - 16384
+            - 256
+        )
+        if room < cap:
+            cap = room
+        if cap < 0:
+            cap = 0
+        var writer = ResponseWriter(cap)
+        self._conns[idx].requests_this_tick += 1
+        self._conns[idx].requests_served += 1
+        try:
+            handler.handle(request^, writer)
+        except e:
+            _ = e
+            writer.set_status(500)
+            writer.headers.clear()
+            writer.body.clear()
+
+        self._budget.release(request_body_bytes)
+        self._conns[idx].http2_body_reserved -= request_body_bytes
+
+        if writer.is_detached():
+            var addr = writer._detach_state_addr
+            if addr != 0:
+                var ptr = Pointer[Byte, MutUntrackedOrigin](
+                    unsafe_from_address=addr
+                )
+                var s_ptr = ptr.unsafe_bitcast[_SharedDetachState]()
+                s_ptr[].mutex.lock()
+                s_ptr[].cancelled = True
+                s_ptr[].mutex.unlock()
+                _release_detach_state(addr, from_sender=False)
+                writer._detach_state_addr = 0
+            self._close_conn(idx)
+            return
+        if len(writer.body) > cap:
+            writer.set_status(500)
+            writer.headers.clear()
+            writer.body.clear()
+
+        if not self._conns[idx].http2_deflater:
+            try:
+                var table_size = Int(
+                    self._conns[idx]
+                    .http2_session.value()
+                    .peer_settings()
+                    .header_table_size
+                )
+                self._conns[idx].http2_deflater = Optional(
+                    Http2HpackDeflater(
+                        String(self.config.hpack_library_path), table_size
+                    )
+                )
+            except e:
+                _ = e
+                self._close_conn(idx)
+                return
+        else:
+            var table_size = Int(
+                self._conns[idx]
+                .http2_session.value()
+                .peer_settings()
+                .header_table_size
+            )
+            if not self._conns[idx].http2_deflater.value().set_max_table_size(
+                table_size
+            ):
+                self._close_conn(idx)
+                return
+
+        var available = self._budget.remaining() - len(control_output)
+        var max_response_header_bytes = self.config.max_response_headers_bytes
+        var peer_header_list_size = Int(
+            self._conns[idx]
+            .http2_session.value()
+            .peer_settings()
+            .max_header_list_size
+        )
+        if peer_header_list_size < max_response_header_bytes:
+            max_response_header_bytes = peer_header_list_size
+        var compressed_capacity = max_response_header_bytes
+        if compressed_capacity < 256:
+            compressed_capacity = 256
+        var compressed = List[Byte](length=compressed_capacity, fill=0)
+        var encoded = encode_http2_response_header_frames(
+            self._conns[idx].http2_deflater.value(),
+            writer,
+            is_head,
+            self._tick_date,
+            stream_id,
+            max_response_header_bytes,
+            self.config.max_response_headers_count,
+            16384,
+            available,
+            Span(compressed),
+        )
+        if not encoded.is_complete():
+            self._close_conn(idx)
+            return
+
+        var response_body = writer.body.copy()
+        if not has_body_for_status(writer.status, is_head):
+            response_body.clear()
+        var headers_wire = encoded.wire.copy()
+        var response_reservation = len(headers_wire) + len(response_body)
+        if not self._budget.try_reserve(response_reservation):
+            self._close_conn(idx)
+            return
+        if not self._conns[idx].http2_responses.enqueue(
+            stream_id, headers_wire^, response_body^
+        ):
+            self._budget.release(response_reservation)
+            self._close_conn(idx)
+            return
+        self._conns[idx].http2_response_bytes_reserved += response_reservation
+        self._conns[idx].write_at = deadline_from_now(
+            self.config.write_deadline
+        )
+        if len(control_output) > 0:
+            if not self._budget.try_reserve(len(control_output)):
+                self._close_conn(idx)
+                return
+            self._conns[idx].append_pending(control_output^)
+            self._conns[idx].state = STATE_SENDING_HTTP2_CONTROL
+        self._drain_http2_responses(idx)
+
+    def _drain_http2_responses(mut self, idx: Int) raises NetError:
+        if (
+            not self._conns[idx].active
+            or self._conns[idx].pending_remaining() > 0
+        ):
+            return
+        var batch = self._conns[idx].http2_responses.drain(
+            self._conns[idx].http2_session.value(), 16384, 65536
+        )
+        if batch.released_bytes > 0:
+            self._budget.release(batch.released_bytes)
+            self._conns[idx].http2_response_bytes_reserved -= (
+                batch.released_bytes
+            )
+        if len(batch.wire) == 0:
+            if self._conns[idx].http2_responses.queued_count() > 0:
+                # Still waiting for WINDOW_UPDATE credit; keep the write
+                # deadline so stalled responses cannot pin budget forever.
+                if self._conns[idx].write_at == NO_DEADLINE:
+                    self._conns[idx].write_at = deadline_from_now(
+                        self.config.write_deadline
+                    )
+                self._conns[idx].state = STATE_READING
+                return
+            self._conns[idx].state = STATE_READING
+            self._conns[idx].write_at = NO_DEADLINE
+            self._conns[idx].idle_at = deadline_from_now(
+                self.config.idle_timeout
+            )
+            return
+        if not self._budget.try_reserve(len(batch.wire)):
+            self._close_conn(idx)
+            return
+        var output = batch.wire.copy()
+        self._conns[idx].append_pending(output^)
+        self._conns[idx].state = STATE_SENDING_HTTP2_CONTROL
+        # Preserve the deadline armed when the response was enqueued so a
+        # peer cannot extend it forever by dribbling credit between batches.
+        if self._conns[idx].write_at == NO_DEADLINE:
+            self._conns[idx].write_at = deadline_from_now(
+                self.config.write_deadline
+            )
 
     def _pump_read(mut self, idx: Int, event: Bool, now: Int) raises NetError:
         if not event:
@@ -1307,9 +1992,21 @@ struct Server(Movable):
             return
         var sent = len(self._conns[idx].pending)
         self._budget.release(sent)
+        var was_http2_control = (
+            self._conns[idx].state == STATE_SENDING_HTTP2_CONTROL
+        )
         var was_100 = self._conns[idx].state == STATE_SENDING_100
         var was_streaming = self._conns[idx].state == STATE_STREAMING
         self._conns[idx].clear_pending()
+        if was_http2_control:
+            self._conns[idx].state = STATE_READING
+            if self._conns[idx].http2_responses.queued_count() == 0:
+                self._conns[idx].write_at = NO_DEADLINE
+                self._conns[idx].idle_at = deadline_from_now(
+                    self.config.idle_timeout
+                )
+            self._drain_http2_responses(idx)
+            return
         if was_100:
             self._conns[idx].state = STATE_READING
             self._conns[idx].sent_100 = True
@@ -1710,12 +2407,23 @@ struct Server(Movable):
         var best = _TICK_POLL_CAP_MS
         if explicit < best:
             best = explicit
-        if self._shutdown_at != NO_DEADLINE:
+        if self._quic_endpoint:
+            var quic_timeout = self._quic_endpoint.value().timeout_micros()
+            if quic_timeout != UInt64.MAX:
+                var quic_ms = Int((quic_timeout + 999) // 1000)
+                if quic_ms < best:
+                    best = quic_ms
+        if (
+            self._shutdown_at != NO_DEADLINE
+            and self._quic_close_at == NO_DEADLINE
+        ):
             var left_ms = (self._shutdown_at - now) // 1_000_000
             if left_ms < 0:
                 left_ms = 0
             if left_ms < best:
                 best = Int(left_ms)
+        if self._quic_close_at != NO_DEADLINE:
+            best = _sooner(best, self._quic_close_at, now)
         # Heap peek only: no scan over idle connections. Stale entries are
         # skipped without popping so a burst of invalidations never costs
         # more than the live minimum.
@@ -1767,6 +2475,21 @@ def _Deadline_from_optional_ms(timeout: Optional[Timeout]) -> Int:
     if ms > UInt64(Int.MAX):
         return Int.MAX
     return Int(ms)
+
+
+def _append_quic_u32(mut output: List[Byte], value: UInt32):
+    output.append(Byte((value >> 24) & UInt32(0xFF)))
+    output.append(Byte((value >> 16) & UInt32(0xFF)))
+    output.append(Byte((value >> 8) & UInt32(0xFF)))
+    output.append(Byte(value & UInt32(0xFF)))
+
+
+def _append_quic_field[
+    origin: Origin
+](mut output: List[Byte], value: Span[Byte, origin]):
+    _append_quic_u32(output, UInt32(len(value)))
+    for i in range(len(value)):
+        output.append(value[i])
 
 
 def listen_and_serve[

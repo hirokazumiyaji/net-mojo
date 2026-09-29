@@ -141,8 +141,13 @@ def test_no_body_statuses_have_no_frame_body() raises:
 def test_version_rendering_distinguishes_unsupported() raises:
     assert_equal(String(HttpVersion.http10()), "HTTP/1.0")
     assert_equal(String(HttpVersion.http11()), "HTTP/1.1")
+    assert_equal(String(HttpVersion.http2()), "HTTP/2")
+    assert_equal(String(HttpVersion.http3()), "HTTP/3")
     assert_equal(String(HttpVersion(value=9)), "HTTP/unknown")
     assert_true(HttpVersion.http11().is_supported())
+    assert_true(HttpVersion.http2().is_supported())
+    assert_true(HttpVersion.http3().is_supported())
+    assert_false(HttpVersion.http10().is_supported())
     assert_false(HttpVersion(value=9).is_supported())
 
 
@@ -258,6 +263,7 @@ def test_path_query_split_has_no_percent_decoding() raises:
 def test_server_config_defaults_match_design_table() raises:
     var config = ServerConfig.default()
     assert_equal(config.max_connections, 10000)
+    assert_equal(config.max_http2_streams_per_connection, 100)
     assert_equal(config.max_request_line, 8192)
     assert_equal(config.max_headers_bytes, 32768)
     assert_equal(config.max_headers_count, 100)
@@ -276,6 +282,7 @@ def test_server_config_defaults_match_design_table() raises:
     assert_equal(config.max_accept_per_tick, 64)
     assert_equal(config.max_bytes_per_tick, 65536)
     assert_equal(config.max_requests_per_tick, 16)
+    assert_equal(config.hpack_library_path, String("build/http2/libnet_hpack"))
 
 
 def test_control_shutdown_is_idempotent() raises:

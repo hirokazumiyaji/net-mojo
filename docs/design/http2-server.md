@@ -29,10 +29,30 @@ The separate client preface parser compares incrementally against the fixed
 following frame bytes with the caller. It does not enforce when the preface is
 required in connection state.
 
+`Http2FrameReader` retains partial bytes for one bounded frame, returns an owned
+payload and exact consumed byte count, and leaves coalesced following frames
+with the caller.
+
+`Http2ServerConnectionInput` composes preface/SETTINGS bootstrap, the frame
+reader, and control dispatcher. It emits protocol output, returns stream frames
+for the request layer, and preserves exact input consumption across calls.
+
 The SETTINGS payload codec reads and writes six-byte identifier/value entries
 in network byte order. Parsing rejects a trailing partial entry and preserves
 unknown identifiers unchanged; connection-level validation, duplicate handling,
 and negotiation remain with the connection state machine.
+
+## TLS server entry
+
+After TLS selects ALPN `h2`, `Server` uses `Http2RequestSession` to exchange
+the client preface and SETTINGS, assemble bounded requests, and call the shared
+handler. It encodes each buffered response with a connection-owned HPACK
+deflater and queues its HEADERS and DATA frames through the reactor-owned
+connection. The optional HPACK shim is loaded when the first request headers
+arrive. It returns connection and stream receive credit after request DATA is
+copied into the bounded body buffer. Responses stay within current connection
+send credit and the peer's initial stream window; response bodies that do not
+fit that credit become an empty 500 response.
 
 ## Outbound frame encoding
 
@@ -46,26 +66,132 @@ payload length matches the supplied bytes, and rejects a non-empty ACK frame.
 Unknown flag bits are ignored. It leaves setting-value rules and connection
 sequencing to the connection state machine.
 
-## Follow-up connection work
+The bootstrap state waits for the full client preface, emits one empty server
+SETTINGS frame, then accepts the client's initial non-ACK SETTINGS frame and
+returns an empty SETTINGS ACK. Known setting values are validated before the
+ACK: `ENABLE_PUSH` must be 0 or 1, `INITIAL_WINDOW_SIZE` at most 2^31-1, and
+`MAX_FRAME_SIZE` in 16,384 through 16,777,215. Invalid values fail bootstrap
+with the corresponding HTTP/2 connection error code and do not acknowledge.
+The caller retains and extends preface bytes between incremental parse calls.
+Stream processing begins in a later layer.
+`Http2ConnectionBootstrap` drives that exchange over fragmented byte input,
+enforces the configured inbound frame cap, and returns unconsumed bytes after
+the first client SETTINGS for the frame dispatcher. It exposes a value snapshot
+of negotiated peer limits for the response encoder and stream admission logic.
 
-The connection layer will require the client connection preface, send server
-SETTINGS, validate frame sequencing and type-specific constraints, and map
-connection errors separately from stream errors. A bounded stream table and
-HPACK decoder will enforce concurrent stream, decoded header, and dynamic
-table limits before requests reach the shared handler.
+Initial client settings are applied in order, with duplicate identifiers using
+the last value and unknown identifiers ignored. `ENABLE_PUSH` values must be 0
+or 1; `INITIAL_WINDOW_SIZE` is limited to 2^31-1; `MAX_FRAME_SIZE` must be in
+the range 16,384 through 16,777,215. Invalid values terminate bootstrap with
+the corresponding HTTP/2 connection error code.
 
-Connection and stream flow-control windows are tracked independently. DATA
-consumption returns receive credit even while the bounded buffered handler is
-reading a body larger than the initial window. The writer schedules control
-frames promptly and rotates among writable streams so a stalled stream cannot
-block connection reads or unrelated responses. RST_STREAM, GOAWAY, and drain
-operate on stream or connection state as specified by RFC 9113.
+Later client SETTINGS frames are also applied in order and acknowledged. The
+client may acknowledge the server's initial SETTINGS after its own initial
+SETTINGS has been received.
+
+Per-stream state tracks remote and local closure independently. Initial remote
+HEADERS opens the request side; a later remote HEADERS block is accepted as
+trailers only when it ends that side. DATA requires an open direction, and the
+stream closes after both directions end or a reset is applied.
+
+The active stream table accepts only increasing, odd client stream IDs and
+keeps open and half-closed streams under an explicit local cap. Exceeding the
+cap returns a refusal result for the caller to encode as `REFUSED_STREAM`.
+`ServerConfig.max_http2_streams_per_connection` sets this cap and is advertised
+to the peer as `SETTINGS_MAX_CONCURRENT_STREAMS`. The cap is independent of the
+peer's setting, which limits streams initiated by this server.
+
+HPACK decoding uses an optional libnghttp2 dependency behind a narrow C shim.
+Each connection owns one inflater. The shim copies emitted fields into caller
+storage and never returns pointers into the compressed block or the inflater's
+dynamic table. It continues decoding after the decoded header-list or output
+limit is exceeded, then reports the limit result so the connection can reject
+the stream without desynchronizing later header blocks.
+The compressed block is assembled from HEADERS and matching CONTINUATION
+frames under a separate byte cap. Padding and HEADERS priority fields are
+removed before the block reaches HPACK. Exceeding the compressed cap fails the
+connection because skipping an HPACK block can desynchronize the dynamic table.
+`Http2HpackInflater` owns the native inflater and library handle for one
+connection. It writes copied fields into caller-owned output as repeated
+network-order 32-bit name and value lengths followed by their raw bytes. The
+caller sets the table size between blocks and applies protocol header semantics.
+`Http2HpackDeflater` applies the same encoded-field contract in the outbound
+direction, bounds decoded header size and field count before compression, and
+keeps its dynamic table for the connection lifetime.
+`Http2HeaderDecoder` combines frame assembly and decoding for one connection,
+preserves HPACK state after decoded limits are exceeded, and marks framing or
+compression errors as terminal for that decoder. A completed decode retains
+the original HEADERS stream ID and END_STREAM bit across CONTINUATION frames.
+
+`Http2FlowWindow` tracks send and receive credit separately for a connection
+or stream. DATA debits the corresponding window, and receive credit can be
+restored only for bytes the application has consumed. The debit includes the
+full DATA payload, including padding. SETTINGS initial-window changes adjust
+stream send windows; the connection send window remains fixed.
+
+`Http2FrameDispatcher` is initialized with the bootstrap peer-settings snapshot, receives complete frames, and applies the connection-wide continuation sequence before dispatching control frames. It applies later SETTINGS and returns an ACK, echoes non-ACK PING frames, and reports WINDOW_UPDATE, RST_STREAM, and GOAWAY events to the stream/connection owner. Unknown and stream-specific frames remain available to their protocol layer.
+
+`Http2ContinuationSequence` is checked before dispatching each complete frame.
+It rejects orphan CONTINUATION frames, stream changes, interleaved frames while
+a header block is open, and client-sent PUSH_PROMISE frames.
+WINDOW_UPDATE parsing accepts connection or stream IDs, masks the reserved bit,
+rejects zero increments, and applies the increment to the selected send window.
+DATA frame validation exposes the unpadded payload range and END_STREAM flag,
+and rejects connection-stream use, length mismatches, and invalid padding.
+A per-request body collector appends only that unpadded range, stops at
+END_STREAM, and enforces its configured byte limit.
+PING validation can generate an exact opaque-data ACK, RST_STREAM exposes the
+stream and error code, and GOAWAY parsing and encoding preserve the last-stream
+limit and error code.
+Decoded HPACK fields are validated for pseudo-header ordering and uniqueness,
+lowercase regular names, forbidden connection-specific fields, `TE: trailers`,
+and matching Host/authority before conversion to the shared `Request` type.
+Trailing header blocks are decoded separately and reject pseudo-headers and
+fields that affect framing or routing.
+Per-stream request assembly applies the stream half-close rules while attaching
+validated request headers, bounded body bytes, and separate trailers.
+`Http2RequestSession` owns the connection input, one header decoder, and the
+bounded in-progress request streams; each call yields at most one completed
+shared `Request` and leaves later coalesced frames for the next call.
+The response adapter emits `:status`, lowercases regular names, rejects
+connection-specific fields, and derives Content-Length from the buffered body.
+Outbound header blocks are split into HEADERS and CONTINUATION frames, and
+buffered bodies into DATA frames, under peer frame-size and total wire-byte caps.
+The shared response encoder composes header adaptation, connection-owned HPACK
+compression, and frame generation; output failure after compression makes that
+deflater terminal because the peer did not receive its updated table state.
+
+## Integrated flow control and response scheduling
+
+The server tracks connection and stream send windows independently and applies
+stream `WINDOW_UPDATE` and `SETTINGS_INITIAL_WINDOW_SIZE` changes. It buffers
+responses until the peer grants enough credit, then rotates among writable
+streams while continuing to read incoming connection frames. RST_STREAM cancels
+the corresponding queued response and releases its buffer reservation.
+
+TLS integration tests send requests on two streams before reading either
+response, verify that each response stays on its stream, and exercise a stream
+whose initial send window is zero before later granting credit. Unit tests cover
+round-robin DATA scheduling, bounded payloads, header-once behavior, completion,
+credit exhaustion, resumption, and reset cancellation.
+
+Stream admission counts request streams until their response finishes. When the
+local cap is reached, the server advances the client stream ID and sends
+`RST_STREAM(REFUSED_STREAM)` for that stream while keeping admitted streams and
+the connection usable. DATA that races with the refusal is ignored for that
+closed stream.
+
+When shutdown begins, the server sends GOAWAY with the highest admitted peer
+stream ID and refuses later streams with `REFUSED_STREAM`. GOAWAY is queued
+behind existing connection output, and admitted requests keep the configured
+shutdown grace period to finish. At the grace deadline, remaining TCP
+connections are closed.
 
 ## Verification sequence
 
 The frame parser slice uses wire fixtures for incomplete headers and payloads,
 maximum and oversized payload lengths, ignored reserved stream bits, unknown
 frame types, and multiple concatenated frames. The client preface parser tests
-every incomplete prefix, mismatch rejection, and the consumed byte count. Later
-connection PRs add protocol state, flow-control, shutdown, and independent-client
-interoperability tests.
+every incomplete prefix, mismatch rejection, and the consumed byte count.
+Independent TLS client tests verify response completion and the GOAWAY boundary
+during graceful HTTP/2 shutdown.

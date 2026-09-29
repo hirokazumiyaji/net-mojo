@@ -9,6 +9,7 @@ struct FrameParseResult(Movable):
     var stream_id: UInt32
     var payload_length: Int
     var consumed: Int
+    var error_code: UInt32
 
     @staticmethod
     def need_more() -> Self:
@@ -19,6 +20,7 @@ struct FrameParseResult(Movable):
             stream_id=UInt32(0),
             payload_length=0,
             consumed=0,
+            error_code=UInt32(0),
         )
 
     @staticmethod
@@ -35,10 +37,11 @@ struct FrameParseResult(Movable):
             stream_id=stream_id,
             payload_length=payload_length,
             consumed=9 + payload_length,
+            error_code=UInt32(0),
         )
 
     @staticmethod
-    def failure() -> Self:
+    def failure(error_code: UInt32 = UInt32(1)) -> Self:
         return Self(
             kind=2,
             frame_type=0,
@@ -46,6 +49,7 @@ struct FrameParseResult(Movable):
             stream_id=UInt32(0),
             payload_length=0,
             consumed=0,
+            error_code=error_code,
         )
 
     def is_need_more(self) -> Bool:
@@ -70,7 +74,7 @@ def parse_frame[
         (Int(data[0]) << 16) | (Int(data[1]) << 8) | Int(data[2])
     )
     if payload_length > max_frame_size:
-        return FrameParseResult.failure()
+        return FrameParseResult.failure(UInt32(6))
 
     var stream_word = (
         (UInt32(data[5]) << 24)

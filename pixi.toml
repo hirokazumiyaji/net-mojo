@@ -77,6 +77,70 @@ openssl = ">=3.2,<4"
 pkg-config = "*"
 python = ">=3.10,<3.15"
 
+[feature.http2.dependencies]
+c-compiler = "*"
+libnghttp2 = ">=1.64,<2"
+mojo = ">=1.0.0,<1.1"
+pkg-config = "*"
+
+[feature.http2.tasks]
+hpack-test = "bash scripts/build_hpack_shim.sh"
+hpack-mojo-test = { cmd = "mojo run --Werror -I . tests/test_hpack.mojo", depends-on = [
+  "hpack-test",
+] }
+http2-package-smoke = { cmd = "mojo run --Werror -I build tests/http2_package_smoke.mojo", depends-on = [
+  "package",
+  "hpack-test",
+] }
+http2-example-build = { cmd = "bash scripts/check_http2_example.sh", depends-on = [
+  "tls-build",
+  "hpack-test",
+] }
+
+[feature.http3.dependencies]
+binutils = "*"
+cmake = "*"
+c-compiler = "*"
+cxx-compiler = "*"
+git = "*"
+libclang = "*"
+make = "*"
+mojo = ">=1.0.0,<1.1"
+python = ">=3.10,<3.15"
+rust = ">=1.88,<2"
+
+[feature.http3.pypi-dependencies]
+aioquic = "==1.3.0"
+
+[feature.http3.tasks]
+quic-build = "bash scripts/build_quic_provider.sh"
+quic-test = { cmd = "build/quic/test_quic_provider build/tls/test-cert.pem build/tls/test-key.pem", depends-on = [
+  "tls-build",
+  "quic-build",
+] }
+quic-mojo-test = { cmd = "mojo run --Werror -I . tests/test_quic_provider.mojo", depends-on = [
+  "tls-build",
+  "quic-build",
+] }
+quic-rust-test = { cmd = "bash scripts/test_quic_provider.sh", depends-on = [
+  "tls-build",
+  "quic-build",
+] }
+quic-suite = { depends-on = ["quic-test", "quic-mojo-test", "quic-rust-test"] }
+http3-client-test = { cmd = "python3 scripts/test_http3_server.py", depends-on = [
+  "tls-build",
+  "quic-build",
+] }
+http3-package-smoke = { cmd = "mojo run --Werror -I build tests/http3_package_smoke.mojo", depends-on = [
+  "package",
+  "tls-build",
+  "quic-build",
+] }
+http3-example-build = { cmd = "bash scripts/check_http3_example.sh", depends-on = [
+  "tls-build",
+  "quic-build",
+] }
+
 [feature.tls.tasks]
 tls-build = "bash scripts/build_tls_shim.sh"
 tls-test = { cmd = "mojo run --Werror -I . tests/test_tls.mojo", depends-on = [
@@ -106,3 +170,7 @@ mojo = ">=1.0.0,<2"
 
 [environments]
 tls = ["tls"]
+http2 = ["http2"]
+http3 = ["http3"]
+tls-http2 = ["tls", "http2"]
+tls-http3 = ["tls", "http3"]

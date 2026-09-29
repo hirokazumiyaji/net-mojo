@@ -29,18 +29,28 @@ struct HttpVersion(Copyable, Equatable, Writable):
     def http11() -> Self:
         return Self(value=1)
 
+    @staticmethod
+    def http2() -> Self:
+        return Self(value=2)
+
+    @staticmethod
+    def http3() -> Self:
+        return Self(value=3)
+
     def is_supported(self) -> Bool:
-        return self.value == 1
+        return self.value == 1 or self.value == 2 or self.value == 3
 
     def write_to[W: Writer](self, mut writer: W):
         if self.value == 0:
             writer.write("HTTP/1.0")
         elif self.value == 1:
             writer.write("HTTP/1.1")
+        elif self.value == 2:
+            writer.write("HTTP/2")
+        elif self.value == 3:
+            writer.write("HTTP/3")
         else:
-            # Never misidentify an unsupported version as 1.1 in
-            # diagnostics: HTTP/2+ adapters will introduce their own
-            # version spellings.
+            # Never misidentify an unsupported version as HTTP/1.1 in diagnostics.
             writer.write("HTTP/unknown")
 
 

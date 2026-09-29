@@ -1,0 +1,10 @@
+[package]
+name = "net_quic_provider"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+crate-type = ["staticlib"]
+
+[dependencies]
+quiche = { version = "=0.29.3", features = ["ffi"] }

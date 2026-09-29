@@ -5,14 +5,15 @@
 struct FrameEncodeResult(Movable):
     var kind: UInt8
     var wire: List[Byte]
+    var error_code: UInt32
 
     @staticmethod
     def complete(var wire: List[Byte]) -> Self:
-        return Self(kind=1, wire=wire^)
+        return Self(kind=1, wire=wire^, error_code=UInt32(0))
 
     @staticmethod
-    def failure() -> Self:
-        return Self(kind=2, wire=List[Byte]())
+    def failure(error_code: UInt32 = UInt32(1)) -> Self:
+        return Self(kind=2, wire=List[Byte](), error_code=error_code)
 
     def is_complete(self) -> Bool:
         return self.kind == 1
@@ -50,6 +51,5 @@ def encode_frame[
     wire.append(Byte((stream_id >> 16) & UInt32(0xFF)))
     wire.append(Byte((stream_id >> 8) & UInt32(0xFF)))
     wire.append(Byte(stream_id & UInt32(0xFF)))
-    for i in range(payload_length):
-        wire.append(payload[i])
+    wire.extend(payload[:payload_length])
     return FrameEncodeResult.complete(wire^)

@@ -1,0 +1,134 @@
+"""Socket-independent HTTP/2 server preface and initial SETTINGS state."""
+
+from .frame import FrameParseResult
+from .frame_encoder import FrameEncodeResult, encode_frame
+from .preface import PrefaceParseResult, parse_client_preface
+from .settings import Setting, encode_settings_payload
+from .settings_frame import parse_settings_frame
+from .settings_state import Http2PeerSettings
+
+
+struct Http2ServerBootstrap(Movable):
+    var preface_complete: Bool
+    var server_settings_sent: Bool
+    var client_settings_received: Bool
+    var server_settings_acknowledged: Bool
+    var failed: Bool
+    var error_code: UInt32
+    var peer_settings: Http2PeerSettings
+    var max_concurrent_streams: Int
+
+    def __init__(out self, max_concurrent_streams: Int = 100):
+        self.preface_complete = False
+        self.server_settings_sent = False
+        self.client_settings_received = False
+        self.server_settings_acknowledged = False
+        self.failed = False
+        self.error_code = UInt32(0)
+        self.peer_settings = Http2PeerSettings()
+        self.max_concurrent_streams = max_concurrent_streams
+
+    def consume_client_preface[
+        origin: Origin
+    ](mut self, data: Span[Byte, origin]) -> PrefaceParseResult:
+        if self.failed or self.preface_complete:
+            return PrefaceParseResult.failure()
+
+        var result = parse_client_preface(data)
+        if result.is_error():
+            self.failed = True
+            self.error_code = UInt32(1)
+        elif result.is_complete():
+            self.preface_complete = True
+        return result^
+
+    def server_settings(mut self) -> FrameEncodeResult:
+        if (
+            self.failed
+            or not self.preface_complete
+            or self.server_settings_sent
+        ):
+            return FrameEncodeResult.failure()
+
+        var settings = List[Setting]()
+        settings.append(
+            Setting(
+                identifier=UInt16(3),
+                value=UInt32(self.max_concurrent_streams),
+            )
+        )
+        var payload = encode_settings_payload(Span(settings))
+        var frame = encode_frame(Byte(4), Byte(0), UInt32(0), Span(payload))
+        if frame.is_complete():
+            self.server_settings_sent = True
+            self.server_settings_acknowledged = False
+        return frame^
+
+    def accept_client_settings[
+        origin: Origin
+    ](
+        mut self,
+        frame: FrameParseResult,
+        payload: Span[Byte, origin],
+    ) -> FrameEncodeResult:
+        if (
+            self.failed
+            or not self.preface_complete
+            or not self.server_settings_sent
+        ):
+            self.failed = True
+            if self.error_code == UInt32(0):
+                self.error_code = UInt32(1)
+            return FrameEncodeResult.failure(self.error_code)
+
+        var settings = parse_settings_frame(frame, payload)
+        if settings.is_error():
+            self.failed = True
+            self.error_code = settings.error_code
+            return FrameEncodeResult.failure(settings.error_code)
+        if not settings.is_settings():
+            self.failed = True
+            self.error_code = UInt32(1)
+            return FrameEncodeResult.failure(self.error_code)
+
+        var applied = self.peer_settings.apply(Span(settings.parsed.settings))
+        if applied.is_error():
+            self.failed = True
+            self.error_code = applied.error_code
+            return FrameEncodeResult.failure(applied.error_code)
+
+        self.client_settings_received = True
+        var empty_payload = List[Byte]()
+        return encode_frame(Byte(4), Byte(1), UInt32(0), Span(empty_payload))
+
+    def accept_server_settings_ack[
+        origin: Origin
+    ](mut self, frame: FrameParseResult, payload: Span[Byte, origin]) -> Bool:
+        if (
+            self.failed
+            or not self.preface_complete
+            or not self.server_settings_sent
+            or not self.client_settings_received
+        ):
+            self.failed = True
+            return False
+
+        var settings = parse_settings_frame(frame, payload)
+        if settings.is_error() or not settings.is_ack():
+            self.failed = True
+            return False
+
+        self.server_settings_acknowledged = True
+        return True
+
+    def is_ready(self) -> Bool:
+        return self.client_settings_received and not self.failed
+
+    def is_failed(self) -> Bool:
+        return self.failed
+
+    def connection_error_code(self) -> UInt32:
+        return self.error_code
+
+    def is_server_settings_acknowledged(self) -> Bool:
+        return self.server_settings_acknowledged
