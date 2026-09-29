@@ -1430,6 +1430,7 @@ struct Server(Movable):
         except e:
             _ = e
             writer.set_status(500)
+            writer.headers.clear()
             writer.body.clear()
 
         self._budget.release(request_body_bytes)
@@ -1451,6 +1452,7 @@ struct Server(Movable):
             return
         if len(writer.body) > cap:
             writer.set_status(500)
+            writer.headers.clear()
             writer.body.clear()
 
         if not self._conns[idx].http2_deflater:
@@ -1997,10 +1999,11 @@ struct Server(Movable):
         self._conns[idx].clear_pending()
         if was_http2_control:
             self._conns[idx].state = STATE_READING
-            self._conns[idx].write_at = NO_DEADLINE
-            self._conns[idx].idle_at = deadline_from_now(
-                self.config.idle_timeout
-            )
+            if self._conns[idx].http2_responses.queued_count() == 0:
+                self._conns[idx].write_at = NO_DEADLINE
+                self._conns[idx].idle_at = deadline_from_now(
+                    self.config.idle_timeout
+                )
             self._drain_http2_responses(idx)
             return
         if was_100:

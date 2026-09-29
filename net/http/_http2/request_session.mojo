@@ -431,9 +431,12 @@ struct Http2RequestSession(Movable):
             max_bytes = self._max_trailer_bytes
             max_count = self._max_trailer_count
         if not self._decoder:
+            var assembler_limit = self._max_headers_bytes
+            if self._max_trailer_bytes > assembler_limit:
+                assembler_limit = self._max_trailer_bytes
             self._decoder = Optional(
                 Http2HeaderDecoder(
-                    String(self._library_path), 4096, max_bytes
+                    String(self._library_path), 4096, assembler_limit
                 )
             )
         return self._decoder.value().consume(

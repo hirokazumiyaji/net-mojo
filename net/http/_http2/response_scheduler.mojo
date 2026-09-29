@@ -10,6 +10,7 @@ struct _PendingHttp2Response(Movable):
     var headers: List[Byte]
     var body: List[Byte]
     var body_offset: Int
+    var headers_offset: Int
     var headers_sent: Bool
 
 
@@ -44,6 +45,7 @@ struct Http2ResponseScheduler(Movable):
             headers=headers^,
             body=body^,
             body_offset=0,
+            headers_offset=0,
             headers_sent=False,
         )
         self._responses.append(response^)
@@ -89,17 +91,29 @@ struct Http2ResponseScheduler(Movable):
             var index = self._next_index
             var stream_id = self._responses[index].stream_id
             if not self._responses[index].headers_sent:
-                var header_length = len(self._responses[index].headers)
-                if header_length > max_output_bytes - len(output):
+                var remaining_headers = len(self._responses[index].headers) - (
+                    self._responses[index].headers_offset
+                )
+                var header_room = max_output_bytes - len(output)
+                if header_room <= 0:
                     break
-                for i in range(header_length):
-                    output.append(self._responses[index].headers[i])
-                self._responses[index].headers_sent = True
+                var header_chunk = remaining_headers
+                if header_chunk > header_room:
+                    header_chunk = header_room
+                var start = self._responses[index].headers_offset
+                for i in range(header_chunk):
+                    output.append(self._responses[index].headers[start + i])
+                self._responses[index].headers_offset = start + header_chunk
                 skipped = 0
+                if self._responses[index].headers_offset < len(
+                    self._responses[index].headers
+                ):
+                    break
+                self._responses[index].headers_sent = True
                 if len(self._responses[index].body) == 0:
                     session.finish_response(stream_id)
                     completed.append(stream_id)
-                    released += header_length
+                    released += len(self._responses[index].headers)
                     self._remove(index)
                     continue
 

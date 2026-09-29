@@ -129,9 +129,8 @@ pub unsafe extern "C" fn net_quic_server_set_request_limits(
     inner.max_request_headers_count = max_headers_count;
     inner.max_request_trailer_bytes = max_trailer_bytes;
     inner.max_request_trailer_count = max_trailer_count;
-    inner
-        .http3_config
-        .set_max_field_section_size(max_headers_bytes as u64);
+    let field_section = max_headers_bytes.max(max_trailer_bytes) as u64;
+    inner.http3_config.set_max_field_section_size(field_section);
     1
 }
 
