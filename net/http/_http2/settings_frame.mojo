@@ -41,6 +41,8 @@ struct SettingsFrameResult(Movable):
 def parse_settings_frame[
     origin: Origin
 ](frame: FrameParseResult, payload: Span[Byte, origin]) -> SettingsFrameResult:
+    if frame.is_error():
+        return SettingsFrameResult.failure(frame.error_code)
     if (
         not frame.is_complete()
         or frame.frame_type != Byte(4)

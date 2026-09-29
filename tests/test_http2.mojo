@@ -101,6 +101,7 @@ def test_oversized_payload_is_rejected_from_header() raises:
     wire[2] = Byte(5)
     var result = parse_frame(Span(wire), 4)
     assert_true(result.is_error())
+    assert_equal(result.error_code, UInt32(6))
 
 
 def test_negative_frame_limit_is_rejected() raises:
@@ -389,6 +390,27 @@ def test_http2_bootstrap_rejects_partial_settings_with_frame_size_error() raises
     for byte in [Byte(0), Byte(1), Byte(0), Byte(0), Byte(0)]:
         payload.append(byte)
     var client_wire = _frame(4, 0, 0, payload)
+    assert_true(
+        bootstrap.accept_initial_client_settings(
+            parse_frame(Span(client_wire)), Span(client_wire)[9:]
+        ).is_error()
+    )
+    assert_true(bootstrap.is_failed())
+    assert_equal(bootstrap.connection_error_code(), UInt32(6))
+
+
+def test_http2_bootstrap_rejects_oversized_settings_with_frame_size_error(
+) raises:
+    var bootstrap = Http2ServerBootstrap()
+    var preface = "PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n".as_bytes()
+    assert_true(bootstrap.consume_client_preface(preface).is_complete())
+    assert_true(bootstrap.server_settings().is_complete())
+
+    var payload = List[Byte]()
+    var client_wire = _frame(4, 0, 0, payload)
+    client_wire[0] = Byte(0)
+    client_wire[1] = Byte(0x40)
+    client_wire[2] = Byte(1)
     assert_true(
         bootstrap.accept_initial_client_settings(
             parse_frame(Span(client_wire)), Span(client_wire)[9:]
