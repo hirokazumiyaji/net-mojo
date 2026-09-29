@@ -861,21 +861,56 @@ struct Server(Movable):
                 response.status = 500
                 response.headers.clear()
                 response.body.clear()
+            var wire_length = -1
+            if (
+                response.status >= 200
+                and response.status != 204
+                and response.status != 205
+                and response.status != 304
+            ):
+                wire_length = len(response.body)
+            if wire_length >= 0:
+                var declared_lengths = response.headers.get_all(
+                    "content-length"
+                )
+                for i in range(len(declared_lengths)):
+                    if not _quic_content_length_matches(
+                        declared_lengths[i], wire_length
+                    ):
+                        response.status = 500
+                        response.headers.clear()
+                        response.body.clear()
+                        wire_length = -1
+                        break
             var headers = List[Byte]()
-            _append_quic_u32(headers, UInt32(len(response.headers)))
+            var header_count = 0
             for i in range(len(response.headers)):
                 var name = response.headers.name_at(i)
+                if name.lower() == "content-length":
+                    continue
+                header_count += 1
+            if wire_length >= 0:
+                header_count += 1
+            _append_quic_u32(headers, UInt32(header_count))
+            for i in range(len(response.headers)):
+                var name = response.headers.name_at(i)
+                if name.lower() == "content-length":
+                    continue
                 var name_bytes = name.as_bytes()
                 var value = response.headers.value_bytes_at(i)
                 _append_quic_field(headers, name_bytes)
                 _append_quic_field(headers, Span(value))
+            if wire_length >= 0:
+                var length = String(wire_length)
+                _append_quic_field(headers, String("content-length").as_bytes())
+                _append_quic_field(headers, length.as_bytes())
             var response_body = response.body.copy()
             if not has_body_for_status(response.status, is_head):
                 response_body.clear()
             if (
                 len(response_body) > self.config.max_response_body
                 or len(headers) > self.config.max_response_headers_bytes
-                or len(response.headers) > self.config.max_response_headers_count
+                or header_count > self.config.max_response_headers_count
             ):
                 response.status = 500
                 headers.clear()
@@ -1529,9 +1564,12 @@ struct Server(Movable):
         var output = batch.wire.copy()
         self._conns[idx].append_pending(output^)
         self._conns[idx].state = STATE_SENDING_HTTP2_CONTROL
-        self._conns[idx].write_at = deadline_from_now(
-            self.config.write_deadline
-        )
+        # Preserve the deadline armed when the response was enqueued so a
+        # peer cannot extend it forever by dribbling credit between batches.
+        if self._conns[idx].write_at == NO_DEADLINE:
+            self._conns[idx].write_at = deadline_from_now(
+                self.config.write_deadline
+            )
 
     def _pump_read(mut self, idx: Int, event: Bool, now: Int) raises NetError:
         if not event:
@@ -2429,6 +2467,24 @@ def _append_quic_u32(mut output: List[Byte], value: UInt32):
     output.append(Byte((value >> 16) & UInt32(0xFF)))
     output.append(Byte((value >> 8) & UInt32(0xFF)))
     output.append(Byte(value & UInt32(0xFF)))
+
+
+def _quic_content_length_matches(value: String, expected: Int) -> Bool:
+    if expected < 0:
+        return False
+    var bytes = value.as_bytes()
+    if len(bytes) == 0:
+        return False
+    var parsed = 0
+    for i in range(len(bytes)):
+        var byte = bytes[i]
+        if byte < Byte(ord("0")) or byte > Byte(ord("9")):
+            return False
+        var digit = Int(byte - Byte(ord("0")))
+        if parsed > (expected - digit) // 10:
+            return False
+        parsed = parsed * 10 + digit
+    return parsed == expected
 
 
 def _append_quic_field[

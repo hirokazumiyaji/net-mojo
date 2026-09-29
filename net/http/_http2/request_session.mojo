@@ -512,6 +512,14 @@ struct Http2RequestSession(Movable):
                 return Http2RequestStreamResult.error()
             _append_window_update(output, UInt32(0), frame.payload_length)
             return received^
+        if received.is_malformed():
+            if frame.payload_length > 0:
+                if not self._receive_window.release_received(
+                    frame.payload_length
+                ):
+                    return Http2RequestStreamResult.error()
+                _append_window_update(output, UInt32(0), frame.payload_length)
+            return received^
         if not received.is_pending() and not received.is_complete():
             return received^
         if frame.payload_length > 0:

@@ -515,7 +515,12 @@ fn is_http_tchar(byte: u8) -> bool {
 }
 
 fn is_valid_http_field_name(name: &[u8]) -> bool {
-    !name.is_empty() && !name.starts_with(b":") && name.iter().copied().all(is_http_tchar)
+    !name.is_empty()
+        && !name.starts_with(b":")
+        && name
+            .iter()
+            .copied()
+            .all(|byte| is_http_tchar(byte) && !byte.is_ascii_uppercase())
 }
 
 fn is_valid_http_field_value(value: &[u8]) -> bool {
