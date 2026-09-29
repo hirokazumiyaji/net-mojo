@@ -4,6 +4,7 @@ from std.ffi import OwnedDLHandle, Pointer, c_int, c_size_t
 
 from net.address import SocketAddress
 from net.error import NetError, NetErrorKind
+from net.timeout import Timeout
 from net.udp import UDPConn
 
 
@@ -149,6 +150,66 @@ struct QuicServer(Movable):
                 "QUIC provider could not set the connection limit",
             )
 
+    def set_request_limits(
+        mut self,
+        max_body_bytes: Int,
+        max_headers_bytes: Int,
+        max_headers_count: Int,
+    ) raises NetError:
+        var result = self._library.call["net_quic_set_request_limits", c_int](
+            self._server,
+            c_size_t(max_body_bytes),
+            c_size_t(max_headers_bytes),
+            c_size_t(max_headers_count),
+        )
+        if result != 1:
+            raise NetError(
+                NetErrorKind.invalid_state(),
+                "set QUIC request limits",
+                None,
+                "QUIC provider could not set request limits",
+            )
+
+    def set_response_limits(
+        mut self,
+        max_body_bytes: Int,
+        max_headers_bytes: Int,
+        max_headers_count: Int,
+    ) raises NetError:
+        var result = self._library.call["net_quic_set_response_limits", c_int](
+            self._server,
+            c_size_t(max_body_bytes),
+            c_size_t(max_headers_bytes),
+            c_size_t(max_headers_count),
+        )
+        if result != 1:
+            raise NetError(
+                NetErrorKind.invalid_state(),
+                "set QUIC response limits",
+                None,
+                "QUIC provider could not set response limits",
+            )
+
+    def set_stream_deadlines(
+        mut self,
+        header_deadline: Timeout,
+        body_deadline: Timeout,
+        idle_timeout: Timeout,
+    ) raises NetError:
+        var result = self._library.call["net_quic_set_stream_deadlines", c_int](
+            self._server,
+            header_deadline._value,
+            body_deadline._value,
+            idle_timeout._value,
+        )
+        if result != 1:
+            raise NetError(
+                NetErrorKind.invalid_state(),
+                "set QUIC stream deadlines",
+                None,
+                "QUIC provider could not set stream deadlines",
+            )
+
     def recv_datagram[
         origin: MutOrigin
     ](
@@ -288,6 +349,36 @@ struct QuicUDPEndpoint(Movable):
 
     def set_connection_limit(mut self, limit: Int) raises NetError:
         self._server.set_connection_limit(limit)
+
+    def set_request_limits(
+        mut self,
+        max_body_bytes: Int,
+        max_headers_bytes: Int,
+        max_headers_count: Int,
+    ) raises NetError:
+        self._server.set_request_limits(
+            max_body_bytes, max_headers_bytes, max_headers_count
+        )
+
+    def set_response_limits(
+        mut self,
+        max_body_bytes: Int,
+        max_headers_bytes: Int,
+        max_headers_count: Int,
+    ) raises NetError:
+        self._server.set_response_limits(
+            max_body_bytes, max_headers_bytes, max_headers_count
+        )
+
+    def set_stream_deadlines(
+        mut self,
+        header_deadline: Timeout,
+        body_deadline: Timeout,
+        idle_timeout: Timeout,
+    ) raises NetError:
+        self._server.set_stream_deadlines(
+            header_deadline, body_deadline, idle_timeout
+        )
 
     def begin_shutdown(mut self) raises NetError:
         self._server.begin_shutdown()

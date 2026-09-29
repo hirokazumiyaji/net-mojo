@@ -35,6 +35,7 @@ struct ServerConfig(Copyable, Movable):
     var max_accept_per_tick: Int
     var max_bytes_per_tick: Int
     var max_requests_per_tick: Int
+    var hpack_library_path: String
 
     @staticmethod
     def default() raises -> Self:
@@ -64,4 +65,5 @@ struct ServerConfig(Copyable, Movable):
             max_accept_per_tick=64,
             max_bytes_per_tick=65536,
             max_requests_per_tick=16,
+            hpack_library_path=String("build/http2/libnet_hpack"),
         )

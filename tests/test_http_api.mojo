@@ -282,6 +282,7 @@ def test_server_config_defaults_match_design_table() raises:
     assert_equal(config.max_accept_per_tick, 64)
     assert_equal(config.max_bytes_per_tick, 65536)
     assert_equal(config.max_requests_per_tick, 16)
+    assert_equal(config.hpack_library_path, String("build/http2/libnet_hpack"))
 
 
 def test_control_shutdown_is_idempotent() raises:

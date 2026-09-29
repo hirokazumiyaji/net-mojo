@@ -251,6 +251,21 @@ struct Server(Movable):
                 "server already has a QUIC endpoint",
             )
         endpoint.set_connection_limit(self.config.max_connections)
+        endpoint.set_request_limits(
+            self.config.max_body_bytes,
+            self.config.max_headers_bytes,
+            self.config.max_headers_count,
+        )
+        endpoint.set_response_limits(
+            self.config.max_response_body,
+            self.config.max_response_headers_bytes,
+            self.config.max_response_headers_count,
+        )
+        endpoint.set_stream_deadlines(
+            self.config.header_deadline,
+            self.config.body_deadline,
+            self.config.idle_timeout,
+        )
         var token = self._reactor.register(endpoint.raw_fd())
         self._quic_token = token.copy()
         self._quic_endpoint = Optional[QuicUDPEndpoint](endpoint^)
@@ -793,21 +808,27 @@ struct Server(Movable):
                 var value = response.headers.value_bytes_at(i)
                 _append_quic_field(headers, name_bytes)
                 _append_quic_field(headers, Span(value))
-            if has_body_for_status(response.status, is_head):
+            var response_body = response.body.copy()
+            if not has_body_for_status(response.status, is_head):
+                response_body.clear()
+            if (
+                len(response_body) > self.config.max_response_body
+                or len(headers) > self.config.max_response_headers_bytes
+                or len(response.headers) > self.config.max_response_headers_count
+            ):
+                response.status = 500
+                headers.clear()
+                _append_quic_u32(headers, UInt32(0))
+                response_body.clear()
+            try:
                 self._quic_endpoint.value().respond(
                     request_id,
                     response.status,
                     Span(headers),
-                    Span(response.body),
+                    Span(response_body),
                 )
-            else:
-                var empty = List[Byte]()
-                self._quic_endpoint.value().respond(
-                    request_id,
-                    response.status,
-                    Span(headers),
-                    Span(empty),
-                )
+            except e:
+                _ = e
             processed += 1
 
     def _pause_listener(mut self):
@@ -983,7 +1004,7 @@ struct Server(Movable):
                     self._conns[idx].protocol = PROTOCOL_HTTP2
                     self._conns[idx].http2_session = Optional(
                         Http2RequestSession(
-                            "build/http2/libnet_hpack",
+                            String(self.config.hpack_library_path),
                             self.config.max_http2_streams_per_connection,
                             self.config.max_body_bytes,
                             self.config.max_headers_bytes,
@@ -1076,6 +1097,7 @@ struct Server(Movable):
             self._pump_read(idx, read_event, now)
             if not self._conns[idx].active:
                 return
+            var http2_activity = read_event
             while (
                 self._conns[idx].active
                 and self._conns[idx].buffered_len() > 0
@@ -1088,6 +1110,7 @@ struct Server(Movable):
                     break
                 var buffered_before = self._conns[idx].buffered_len()
                 self._pump_http2_input(idx, handler)
+                http2_activity = True
                 if not self._conns[idx].active:
                     return
                 if self._conns[idx].buffered_len() >= buffered_before:
@@ -1100,6 +1123,16 @@ struct Server(Movable):
             ):
                 self._close_conn(idx)
                 return
+            if (
+                self._conns[idx].active
+                and self._conns[idx].state == STATE_READING
+                and self._conns[idx].pending_remaining() == 0
+                and self._conns[idx].http2_responses.queued_count() == 0
+                and http2_activity
+            ):
+                self._conns[idx].idle_at = deadline_from_now(
+                    self.config.idle_timeout
+                )
             self._sync_interests(idx)
             return
         if (
@@ -1298,7 +1331,9 @@ struct Server(Movable):
                     .header_table_size
                 )
                 self._conns[idx].http2_deflater = Optional(
-                    Http2HpackDeflater("build/http2/libnet_hpack", table_size)
+                    Http2HpackDeflater(
+                        String(self.config.hpack_library_path), table_size
+                    )
                 )
             except e:
                 _ = e
@@ -1378,6 +1413,9 @@ struct Server(Movable):
         if len(batch.wire) == 0:
             self._conns[idx].state = STATE_READING
             self._conns[idx].write_at = NO_DEADLINE
+            self._conns[idx].idle_at = deadline_from_now(
+                self.config.idle_timeout
+            )
             return
         if not self._budget.try_reserve(len(batch.wire)):
             self._close_conn(idx)
@@ -1805,6 +1843,9 @@ struct Server(Movable):
         if was_http2_control:
             self._conns[idx].state = STATE_READING
             self._conns[idx].write_at = NO_DEADLINE
+            self._conns[idx].idle_at = deadline_from_now(
+                self.config.idle_timeout
+            )
             self._drain_http2_responses(idx)
             return
         if was_100:

@@ -1420,7 +1420,7 @@ def test_http2_bootstrap_rejects_oversized_settings_with_frame_size_error(
     client_wire[1] = Byte(0x40)
     client_wire[2] = Byte(1)
     assert_true(
-        bootstrap.accept_initial_client_settings(
+        bootstrap.accept_client_settings(
             parse_frame(Span(client_wire)), Span(client_wire)[9:]
         ).is_error()
     )
