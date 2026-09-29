@@ -3,6 +3,7 @@
 from .frame import FrameParseResult
 from .frame_encoder import FrameEncodeResult, encode_frame
 from .preface import PrefaceParseResult, parse_client_preface
+from .settings import validate_settings_values
 from .settings_frame import parse_settings_frame
 
 
@@ -11,12 +12,14 @@ struct Http2ServerBootstrap(Movable):
     var server_settings_sent: Bool
     var client_settings_received: Bool
     var failed: Bool
+    var error_code: UInt32
 
     def __init__(out self):
         self.preface_complete = False
         self.server_settings_sent = False
         self.client_settings_received = False
         self.failed = False
+        self.error_code = UInt32(0)
 
     def consume_client_preface[
         origin: Origin
@@ -27,6 +30,7 @@ struct Http2ServerBootstrap(Movable):
         var result = parse_client_preface(data)
         if result.is_error():
             self.failed = True
+            self.error_code = UInt32(1)
         elif result.is_complete():
             self.preface_complete = True
         return result^
@@ -59,11 +63,20 @@ struct Http2ServerBootstrap(Movable):
             or self.client_settings_received
         ):
             self.failed = True
+            if self.error_code == UInt32(0):
+                self.error_code = UInt32(1)
             return FrameEncodeResult.failure()
 
         var settings = parse_settings_frame(frame, payload)
         if not settings.is_settings():
             self.failed = True
+            self.error_code = UInt32(1)
+            return FrameEncodeResult.failure()
+
+        var validated = validate_settings_values(Span(settings.parsed.settings))
+        if validated.is_error():
+            self.failed = True
+            self.error_code = validated.error_code
             return FrameEncodeResult.failure()
 
         self.client_settings_received = True
@@ -75,3 +88,6 @@ struct Http2ServerBootstrap(Movable):
 
     def is_failed(self) -> Bool:
         return self.failed
+
+    def connection_error_code(self) -> UInt32:
+        return self.error_code

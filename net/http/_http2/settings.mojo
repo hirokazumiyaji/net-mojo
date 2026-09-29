@@ -60,3 +60,41 @@ def encode_settings_payload[
         payload.append(Byte((value >> 8) & 0xFF))
         payload.append(Byte(value & 0xFF))
     return payload^
+
+
+@fieldwise_init
+struct SettingsValueResult(Movable):
+    var error_code: UInt32
+
+    @staticmethod
+    def success() -> Self:
+        return Self(error_code=UInt32(0))
+
+    @staticmethod
+    def failure(error_code: UInt32) -> Self:
+        return Self(error_code=error_code)
+
+    def is_success(self) -> Bool:
+        return self.error_code == UInt32(0)
+
+    def is_error(self) -> Bool:
+        return self.error_code != UInt32(0)
+
+
+def validate_settings_values[
+    origin: Origin
+](settings: Span[Setting, origin]) -> SettingsValueResult:
+    """Reject prohibited known SETTINGS values without applying state."""
+    for i in range(len(settings)):
+        var identifier = settings[i].identifier
+        var value = settings[i].value
+        if identifier == UInt16(2):
+            if value > UInt32(1):
+                return SettingsValueResult.failure(UInt32(1))
+        elif identifier == UInt16(4):
+            if value > UInt32(0x7FFFFFFF):
+                return SettingsValueResult.failure(UInt32(3))
+        elif identifier == UInt16(5):
+            if value < UInt32(16384) or value > UInt32(0xFFFFFF):
+                return SettingsValueResult.failure(UInt32(1))
+    return SettingsValueResult.success()

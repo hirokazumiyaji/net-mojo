@@ -48,8 +48,12 @@ sequencing to the connection state machine.
 
 The bootstrap state waits for the full client preface, emits one empty server
 SETTINGS frame, then accepts the client's initial non-ACK SETTINGS frame and
-returns an empty SETTINGS ACK. The caller retains and extends preface bytes
-between incremental parse calls. Stream processing begins in a later layer.
+returns an empty SETTINGS ACK. Known setting values are validated before the
+ACK: `ENABLE_PUSH` must be 0 or 1, `INITIAL_WINDOW_SIZE` at most 2^31-1, and
+`MAX_FRAME_SIZE` in 16,384 through 16,777,215. Invalid values fail bootstrap
+with the corresponding HTTP/2 connection error code and do not acknowledge.
+The caller retains and extends preface bytes between incremental parse calls.
+Stream processing begins in a later layer.
 
 ## Follow-up connection work
 
