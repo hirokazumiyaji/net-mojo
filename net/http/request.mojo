@@ -38,7 +38,7 @@ struct HttpVersion(Copyable, Equatable, Writable):
         return Self(value=3)
 
     def is_supported(self) -> Bool:
-        return self.value == 1
+        return self.value == 1 or self.value == 2 or self.value == 3
 
     def write_to[W: Writer](self, mut writer: W):
         if self.value == 0:

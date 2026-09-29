@@ -12,6 +12,7 @@ from .frame_encoder import encode_frame
 from .flow_window import Http2FlowWindow
 from .header_decoder import Http2HeaderDecodeResult, Http2HeaderDecoder
 from .request_stream import Http2RequestStream, Http2RequestStreamResult
+from .settings_state import Http2PeerSettingsSnapshot
 
 
 @fieldwise_init
@@ -391,6 +392,9 @@ struct Http2RequestSession(Movable):
         for i in range(len(self._streams)):
             total += self._streams[i].stream.buffered_body_bytes()
         return total
+
+    def peer_settings(self) -> Http2PeerSettingsSnapshot:
+        return self._input.peer_settings()
 
     def send_window(self, stream_id: UInt32) -> Int:
         var index = self._find_send_stream(stream_id)

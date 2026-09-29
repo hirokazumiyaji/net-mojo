@@ -1282,11 +1282,29 @@ struct Server(Movable):
 
         if not self._conns[idx].http2_deflater:
             try:
+                var table_size = Int(
+                    self._conns[idx]
+                    .http2_session.value()
+                    .peer_settings()
+                    .header_table_size
+                )
                 self._conns[idx].http2_deflater = Optional(
-                    Http2HpackDeflater("build/http2/libnet_hpack", 4096)
+                    Http2HpackDeflater("build/http2/libnet_hpack", table_size)
                 )
             except e:
                 _ = e
+                self._close_conn(idx)
+                return
+        else:
+            var table_size = Int(
+                self._conns[idx]
+                .http2_session.value()
+                .peer_settings()
+                .header_table_size
+            )
+            if not self._conns[idx].http2_deflater.value().set_max_table_size(
+                table_size
+            ):
                 self._close_conn(idx)
                 return
 

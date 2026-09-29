@@ -1340,7 +1340,7 @@ def test_http2_bootstrap_rejects_invalid_client_setting_value() raises:
     for byte in [Byte(0), Byte(4), Byte(128), Byte(0), Byte(0), Byte(0)]:
         payload.append(byte)
     var client_wire = _frame(4, 0, 0, payload)
-    var rejected = bootstrap.accept_initial_client_settings(
+    var rejected = bootstrap.accept_client_settings(
         parse_frame(Span(client_wire)), Span(client_wire)[9:]
     )
     assert_true(rejected.is_error())
@@ -1359,7 +1359,7 @@ def test_http2_bootstrap_rejects_invalid_max_frame_size() raises:
     for byte in [Byte(0), Byte(5), Byte(0), Byte(0), Byte(0), Byte(0)]:
         payload.append(byte)
     var client_wire = _frame(4, 0, 0, payload)
-    var rejected = bootstrap.accept_initial_client_settings(
+    var rejected = bootstrap.accept_client_settings(
         parse_frame(Span(client_wire)), Span(client_wire)[9:]
     )
     assert_true(rejected.is_error())

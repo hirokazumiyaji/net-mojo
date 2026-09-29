@@ -188,7 +188,9 @@ pub unsafe extern "C" fn net_quic_server_recv(
             | quiche::Error::UnknownVersion
             | quiche::Error::InvalidPacket,
         )) => 0,
-        Err(_) => -1,
+        // Protocol errors on one connection must not stop the whole server.
+        Err(QuicServerError::Quiche(_) | QuicServerError::Http3(_)) => 0,
+        Err(QuicServerError::Io(_)) => -1,
     }
 }
 
@@ -403,6 +405,32 @@ fn reserve_response_bytes(used: &mut usize, amount: usize) -> bool {
     reserve_bytes(used, amount, MAX_HTTP3_BUFFERED_RESPONSE_BYTES)
 }
 
+fn normalize_http3_response_header_name(name: &[u8]) -> Option<Vec<u8>> {
+    if name.is_empty() || name.starts_with(b":") {
+        return None;
+    }
+    let mut lower = Vec::with_capacity(name.len());
+    for &byte in name {
+        if !byte.is_ascii_lowercase()
+            && !byte.is_ascii_digit()
+            && byte != b'-'
+            && !(b'A'..=b'Z').contains(&byte)
+        {
+            return None;
+        }
+        lower.push(byte.to_ascii_lowercase());
+    }
+    match lower.as_slice() {
+        b"connection"
+        | b"proxy-connection"
+        | b"keep-alive"
+        | b"transfer-encoding"
+        | b"upgrade"
+        | b"te" => None,
+        _ => Some(lower),
+    }
+}
+
 pub struct QuicServer {
     config: quiche::Config,
     http3_config: quiche::h3::Config,
@@ -442,8 +470,10 @@ const MAX_HTTP3_BUFFERED_REQUEST_BYTES: usize = 64 * 1024 * 1024;
 const MAX_HTTP3_REQUEST_BODY_BYTES: usize = 1024 * 1024;
 const MAX_HTTP3_BUFFERED_RESPONSE_BYTES: usize = 64 * 1024 * 1024;
 const H3_EXCESSIVE_LOAD: u64 = 0x107;
-// RFC 9114 assigns 0x10b to H3_REQUEST_REJECTED.
+// RFC 9114 assigns 0x105 to H3_FRAME_UNEXPECTED and 0x10b to H3_REQUEST_REJECTED.
+const H3_FRAME_UNEXPECTED: u64 = 0x105;
 const H3_REQUEST_REJECTED: u64 = 0x10b;
+const H3_GENERAL_PROTOCOL_ERROR: u64 = 0x101;
 
 struct PendingResponse {
     request_id: u64,
@@ -625,39 +655,65 @@ impl QuicServer {
             None => return Err(quiche::Error::Done.into()),
         };
 
-        let connection = self.connections.get_mut(&key).unwrap();
-        connection.transport.recv(
-            packet,
-            RecvInfo {
-                from: remote,
-                to: local,
-            },
-        )?;
-        if connection.transport.is_established() && connection.http3.is_none() {
-            match quiche::h3::Connection::with_transport(
-                &mut connection.transport,
-                &self.http3_config,
-            ) {
-                Ok(http3) => connection.http3 = Some(http3),
-                Err(quiche::h3::Error::InternalError | quiche::h3::Error::Done) => (),
-                Err(error) => return Err(error.into()),
+        {
+            let connection = self.connections.get_mut(&key).unwrap();
+            connection.transport.recv(
+                packet,
+                RecvInfo {
+                    from: remote,
+                    to: local,
+                },
+            )?;
+            if connection.transport.is_established() && connection.http3.is_none() {
+                match quiche::h3::Connection::with_transport(
+                    &mut connection.transport,
+                    &self.http3_config,
+                ) {
+                    Ok(http3) => connection.http3 = Some(http3),
+                    Err(quiche::h3::Error::InternalError | quiche::h3::Error::Done) => (),
+                    Err(error) => return Err(error.into()),
+                }
             }
         }
+
         let mut cancelled_requests = Vec::new();
-        let completed = Self::poll_http3(
-            connection,
-            &mut self.buffered_request_bytes,
-            &mut self.buffered_response_bytes,
-            &mut cancelled_requests,
-        )?;
+        let completed = {
+            let connection = self.connections.get_mut(&key).unwrap();
+            match Self::poll_http3(
+                connection,
+                &mut self.buffered_request_bytes,
+                &mut self.buffered_response_bytes,
+                &mut cancelled_requests,
+            ) {
+                Ok(completed) => Some(completed),
+                Err(_) => {
+                    let _ = connection.transport.close(
+                        true,
+                        H3_GENERAL_PROTOCOL_ERROR,
+                        b"http/3 protocol error",
+                    );
+                    None
+                }
+            }
+        };
+        let Some(completed) = completed else {
+            self.force_drop_connection(&key);
+            return Ok(());
+        };
         for request_id in cancelled_requests {
             self.request_routes.remove(&request_id);
         }
-        let source_ids: Vec<Vec<u8>> = connection
-            .transport
-            .source_ids()
-            .map(|source_id| source_id.as_ref().to_vec())
-            .collect();
+        let source_ids: Vec<Vec<u8>> = self
+            .connections
+            .get(&key)
+            .map(|connection| {
+                connection
+                    .transport
+                    .source_ids()
+                    .map(|source_id| source_id.as_ref().to_vec())
+                    .collect()
+            })
+            .unwrap_or_default();
         for source_id in source_ids {
             self.routes.insert(source_id, key.clone());
         }
@@ -710,7 +766,13 @@ impl QuicServer {
         {
             return;
         }
-        let connection = self.connections.remove(connection_key).unwrap();
+        self.force_drop_connection(connection_key);
+    }
+
+    fn force_drop_connection(&mut self, connection_key: &[u8]) {
+        let Some(connection) = self.connections.remove(connection_key) else {
+            return;
+        };
         let in_flight_bytes: usize = connection
             .requests
             .values()
@@ -913,7 +975,17 @@ impl QuicServer {
                         continue;
                     }
                     let Some(request) = connection.requests.get_mut(&stream_id) else {
-                        return Err(quiche::h3::Error::FrameUnexpected.into());
+                        let _ = connection.transport.stream_shutdown(
+                            stream_id,
+                            quiche::Shutdown::Read,
+                            H3_FRAME_UNEXPECTED,
+                        );
+                        let _ = connection.transport.stream_shutdown(
+                            stream_id,
+                            quiche::Shutdown::Write,
+                            H3_FRAME_UNEXPECTED,
+                        );
+                        continue;
                     };
                     let mut body = [0; 16 * 1024];
                     loop {
@@ -1017,14 +1089,23 @@ impl QuicServer {
             self.request_routes.remove(&request_id);
             return true;
         }
-        let connection = self.connections.get_mut(&connection_key).unwrap();
         let mut response_headers = Vec::with_capacity(headers.len() + 1);
         response_headers.push(quiche::h3::Header::new(b":status", status_value.as_bytes()));
-        response_headers.extend(
-            headers
-                .into_iter()
-                .map(|(name, value)| quiche::h3::Header::new(&name, &value)),
-        );
+        for (name, value) in headers {
+            let Some(normalized) = normalize_http3_response_header_name(&name) else {
+                self.buffered_response_bytes -= buffered_bytes;
+                let connection = self.connections.get_mut(&connection_key).unwrap();
+                let _ = connection.transport.stream_shutdown(
+                    stream_id,
+                    quiche::Shutdown::Write,
+                    H3_GENERAL_PROTOCOL_ERROR,
+                );
+                self.request_routes.remove(&request_id);
+                return true;
+            };
+            response_headers.push(quiche::h3::Header::new(&normalized, &value));
+        }
+        let connection = self.connections.get_mut(&connection_key).unwrap();
         connection.responses.insert(
             stream_id,
             PendingResponse {
