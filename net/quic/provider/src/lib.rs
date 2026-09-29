@@ -62,6 +62,7 @@ pub unsafe extern "C" fn net_quic_server_config_new(
     config.set_initial_max_stream_data_uni(1_000_000);
     config.set_initial_max_streams_bidi(100);
     config.set_initial_max_streams_uni(3);
+    config.set_max_idle_timeout(60_000);
 
     Box::into_raw(Box::new(NetQuicServerConfig {
         _inner: Some(config),
@@ -116,6 +117,8 @@ pub unsafe extern "C" fn net_quic_server_set_request_limits(
     max_body_bytes: usize,
     max_headers_bytes: usize,
     max_headers_count: usize,
+    max_trailer_bytes: usize,
+    max_trailer_count: usize,
 ) -> i32 {
     if server.is_null() {
         return -1;
@@ -124,6 +127,8 @@ pub unsafe extern "C" fn net_quic_server_set_request_limits(
     inner.max_request_body_bytes = max_body_bytes;
     inner.max_request_headers_bytes = max_headers_bytes;
     inner.max_request_headers_count = max_headers_count;
+    inner.max_request_trailer_bytes = max_trailer_bytes;
+    inner.max_request_trailer_count = max_trailer_count;
     1
 }
 
@@ -150,6 +155,7 @@ pub unsafe extern "C" fn net_quic_server_set_stream_deadlines(
     header_deadline_ns: u64,
     body_deadline_ns: u64,
     idle_timeout_ns: u64,
+    write_deadline_ns: u64,
 ) -> i32 {
     if server.is_null() {
         return -1;
@@ -158,6 +164,9 @@ pub unsafe extern "C" fn net_quic_server_set_stream_deadlines(
     inner.header_deadline = Duration::from_nanos(header_deadline_ns);
     inner.body_deadline = Duration::from_nanos(body_deadline_ns);
     inner.idle_timeout = Duration::from_nanos(idle_timeout_ns);
+    inner.write_deadline = Duration::from_nanos(write_deadline_ns);
+    let idle_ms = u64::try_from(inner.idle_timeout.as_millis()).unwrap_or(u64::MAX);
+    inner.config.set_max_idle_timeout(idle_ms);
     1
 }
 
@@ -515,6 +524,30 @@ fn is_valid_http_field_value(value: &[u8]) -> bool {
     })
 }
 
+fn content_length_matches_body(headers: &[(Vec<u8>, Vec<u8>)], body_len: usize) -> bool {
+    let mut expected: Option<usize> = None;
+    for (name, value) in headers {
+        if !name.eq_ignore_ascii_case(b"content-length") {
+            continue;
+        }
+        if value.is_empty() || !value.iter().all(u8::is_ascii_digit) {
+            return false;
+        }
+        let Ok(text) = std::str::from_utf8(value) else {
+            return false;
+        };
+        let Ok(parsed) = text.parse::<usize>() else {
+            return false;
+        };
+        match expected {
+            Some(existing) if existing != parsed => return false,
+            Some(_) => {}
+            None => expected = Some(parsed),
+        }
+    }
+    expected.map_or(true, |length| length == body_len)
+}
+
 fn is_valid_http_method(method: &[u8]) -> bool {
     !method.is_empty() && method.iter().copied().all(is_http_tchar)
 }
@@ -657,12 +690,15 @@ pub struct QuicServer {
     max_request_body_bytes: usize,
     max_request_headers_bytes: usize,
     max_request_headers_count: usize,
+    max_request_trailer_bytes: usize,
+    max_request_trailer_count: usize,
     max_response_body_bytes: usize,
     max_response_headers_bytes: usize,
     max_response_headers_count: usize,
     header_deadline: Duration,
     body_deadline: Duration,
     idle_timeout: Duration,
+    write_deadline: Duration,
     buffered_request_bytes: usize,
     buffered_response_bytes: usize,
     shutdown: ShutdownState,
@@ -688,6 +724,7 @@ struct QuicConnection {
     final_goaway_sent: bool,
     last_request_stream_id: Option<u64>,
     final_goaway_last_stream_id: Option<u64>,
+    idle_deadline_at: Option<Instant>,
 }
 
 const MAX_HTTP3_REQUEST_STREAM_ID: u64 = (1 << 62) - 4;
@@ -707,6 +744,7 @@ struct PendingResponse {
     headers_sent: bool,
     body_offset: usize,
     buffered_bytes: usize,
+    write_deadline_at: Instant,
 }
 
 #[derive(Default)]
@@ -719,6 +757,8 @@ struct PendingRequest {
     trailers: Vec<(Vec<u8>, Vec<u8>)>,
     header_bytes: usize,
     header_count: usize,
+    trailer_bytes: usize,
+    trailer_count: usize,
     body: Vec<u8>,
     headers_deadline_at: Option<Instant>,
     body_deadline_at: Option<Instant>,
@@ -779,12 +819,15 @@ impl QuicServer {
             max_request_body_bytes: MAX_HTTP3_REQUEST_BODY_BYTES,
             max_request_headers_bytes: 32_768,
             max_request_headers_count: 100,
+            max_request_trailer_bytes: 8_192,
+            max_request_trailer_count: 32,
             max_response_body_bytes: MAX_HTTP3_REQUEST_BODY_BYTES,
             max_response_headers_bytes: 32_768,
             max_response_headers_count: 100,
             header_deadline: Duration::from_secs(5),
             body_deadline: Duration::from_secs(30),
             idle_timeout: Duration::from_secs(60),
+            write_deadline: Duration::from_secs(30),
             buffered_request_bytes: 0,
             buffered_response_bytes: 0,
             shutdown: ShutdownState::Active,
@@ -886,6 +929,7 @@ impl QuicServer {
                         final_goaway_sent: false,
                         last_request_stream_id: None,
                         final_goaway_last_stream_id: None,
+                        idle_deadline_at: Some(Instant::now() + self.idle_timeout),
                     },
                 );
                 key
@@ -902,6 +946,7 @@ impl QuicServer {
                     to: local,
                 },
             )?;
+            connection.idle_deadline_at = Some(Instant::now() + self.idle_timeout);
             if connection.transport.is_established() && connection.http3.is_none() {
                 match quiche::h3::Connection::with_transport(
                     &mut connection.transport,
@@ -925,6 +970,8 @@ impl QuicServer {
                 self.max_request_body_bytes,
                 self.max_request_headers_bytes,
                 self.max_request_headers_count,
+                self.max_request_trailer_bytes,
+                self.max_request_trailer_count,
                 self.header_deadline,
                 self.body_deadline,
                 self.idle_timeout,
@@ -1059,6 +1106,8 @@ impl QuicServer {
         max_request_body_bytes: usize,
         max_request_headers_bytes: usize,
         max_request_headers_count: usize,
+        max_request_trailer_bytes: usize,
+        max_request_trailer_count: usize,
         header_deadline: Duration,
         body_deadline: Duration,
         idle_timeout: Duration,
@@ -1092,12 +1141,12 @@ impl QuicServer {
                     if let Some(request) = connection.requests.get_mut(&stream_id) {
                         let mut invalid = false;
                         for header in list {
-                            request.header_count += 1;
-                            request.header_bytes += header.name().len() + header.value().len();
+                            request.trailer_count += 1;
+                            request.trailer_bytes += header.name().len() + header.value().len();
                             let name = header.name();
                             let value = header.value();
-                            if request.header_count > max_request_headers_count
-                                || request.header_bytes > max_request_headers_bytes
+                            if request.trailer_count > max_request_trailer_count
+                                || request.trailer_bytes > max_request_trailer_bytes
                                 || name.starts_with(b":")
                                 || !is_valid_http_field_name(name)
                                 || !is_valid_http_field_value(value)
@@ -1120,7 +1169,7 @@ impl QuicServer {
                                 .push((name.to_vec(), value.to_vec()));
                         }
                         if invalid {
-                            let code = if request.header_bytes > max_request_headers_bytes {
+                            let code = if request.trailer_bytes > max_request_trailer_bytes {
                                 0x107
                             } else {
                                 0x10e
@@ -1303,6 +1352,20 @@ impl QuicServer {
                 }
                 Ok((stream_id, quiche::h3::Event::Finished)) => {
                     if let Some(request) = connection.requests.remove(&stream_id) {
+                        if !content_length_matches_body(&request.headers, request.body.len()) {
+                            *buffered_request_bytes -= request.body.len();
+                            let _ = connection.transport.stream_shutdown(
+                                stream_id,
+                                quiche::Shutdown::Read,
+                                H3_GENERAL_PROTOCOL_ERROR,
+                            );
+                            let _ = connection.transport.stream_shutdown(
+                                stream_id,
+                                quiche::Shutdown::Write,
+                                H3_GENERAL_PROTOCOL_ERROR,
+                            );
+                            continue;
+                        }
                         completed.push(CompletedRequest {
                             id: 0,
                             stream_id,
@@ -1403,17 +1466,29 @@ impl QuicServer {
                 headers_sent: false,
                 body_offset: 0,
                 buffered_bytes,
+                write_deadline_at: Instant::now() + self.write_deadline,
             },
         );
         true
     }
 
     fn drive_responses(&mut self) -> Result<(), QuicServerError> {
+        let now = Instant::now();
         let mut completed = Vec::new();
+        let mut expired = Vec::new();
         for (connection_key, connection) in self.connections.iter_mut() {
             let stream_ids: Vec<u64> = connection.responses.keys().copied().collect();
             for stream_id in stream_ids {
                 let response = connection.responses.get_mut(&stream_id).unwrap();
+                if now >= response.write_deadline_at {
+                    expired.push((
+                        connection_key.clone(),
+                        stream_id,
+                        response.request_id,
+                        response.buffered_bytes,
+                    ));
+                    continue;
+                }
                 let Some(http3) = connection.http3.as_mut() else {
                     continue;
                 };
@@ -1453,6 +1528,18 @@ impl QuicServer {
                     Err(error) => return Err(error.into()),
                 }
             }
+        }
+        for (connection_key, stream_id, request_id, buffered_bytes) in expired {
+            if let Some(connection) = self.connections.get_mut(&connection_key) {
+                connection.responses.remove(&stream_id);
+                let _ = connection.transport.stream_shutdown(
+                    stream_id,
+                    quiche::Shutdown::Write,
+                    H3_REQUEST_REJECTED,
+                );
+            }
+            self.buffered_response_bytes -= buffered_bytes;
+            self.request_routes.remove(&request_id);
         }
         for (connection_key, stream_id, request_id) in completed {
             let response = self
@@ -1513,11 +1600,22 @@ impl QuicServer {
             .flat_map(|connection| connection.header_deadlines.values())
             .map(|deadline| deadline.saturating_duration_since(now))
             .min();
-        let stream_timeout = match (request_timeout, header_timeout) {
-            (Some(left), Some(right)) => Some(left.min(right)),
-            (Some(timeout), None) | (None, Some(timeout)) => Some(timeout),
-            (None, None) => None,
-        };
+        let response_timeout = self
+            .connections
+            .values()
+            .flat_map(|connection| connection.responses.values())
+            .map(|response| response.write_deadline_at.saturating_duration_since(now))
+            .min();
+        let connection_idle_timeout = self
+            .connections
+            .values()
+            .filter_map(|connection| connection.idle_deadline_at)
+            .map(|deadline| deadline.saturating_duration_since(now))
+            .min();
+        let stream_timeout = [request_timeout, header_timeout, response_timeout, connection_idle_timeout]
+            .into_iter()
+            .flatten()
+            .min();
         let transport_timeout = self
             .connections
             .values()
@@ -1532,6 +1630,8 @@ impl QuicServer {
 
     pub fn on_timeout(&mut self) {
         self.expire_incomplete_requests();
+        self.expire_idle_connections();
+        let _ = self.drive_responses();
         let mut closed = Vec::new();
         for connection in self.connections.values_mut() {
             if connection
@@ -1606,6 +1706,32 @@ impl QuicServer {
                     H3_REQUEST_REJECTED,
                 );
             }
+        }
+    }
+
+    fn expire_idle_connections(&mut self) {
+        let now = Instant::now();
+        let mut closed = Vec::new();
+        for (connection_key, connection) in &self.connections {
+            let Some(deadline) = connection.idle_deadline_at else {
+                continue;
+            };
+            if now < deadline {
+                continue;
+            }
+            if !connection.requests.is_empty()
+                || !connection.responses.is_empty()
+                || !connection.header_deadlines.is_empty()
+            {
+                continue;
+            }
+            closed.push(connection_key.clone());
+        }
+        for connection_key in closed {
+            if let Some(connection) = self.connections.get_mut(&connection_key) {
+                let _ = connection.transport.close(true, 0x00, b"idle timeout");
+            }
+            self.force_drop_connection(&connection_key);
         }
     }
 

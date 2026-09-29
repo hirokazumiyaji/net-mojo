@@ -255,6 +255,8 @@ struct Server(Movable):
             self.config.max_body_bytes,
             self.config.max_headers_bytes,
             self.config.max_headers_count,
+            self.config.max_trailer_bytes,
+            self.config.max_trailer_count,
         )
         endpoint.set_response_limits(
             self.config.max_response_body,
@@ -265,6 +267,7 @@ struct Server(Movable):
             self.config.header_deadline,
             self.config.body_deadline,
             self.config.idle_timeout,
+            self.config.write_deadline,
         )
         var token = self._reactor.register(endpoint.raw_fd())
         self._quic_token = token.copy()
@@ -645,6 +648,12 @@ struct Server(Movable):
                 self._conns[idx].protocol == PROTOCOL_HTTP2
                 and self._conns[idx].http2_session
             ):
+                if (
+                    self._conns[idx].write_at != NO_DEADLINE
+                    and now >= self._conns[idx].write_at
+                ):
+                    self._close_conn(idx)
+                    continue
                 var expired = self._conns[idx].http2_session.value().expire(now)
                 if self._conns[idx].http2_session.value().is_failed():
                     self._close_conn(idx)
@@ -1473,15 +1482,15 @@ struct Server(Movable):
             self._close_conn(idx)
             return
         self._conns[idx].http2_response_bytes_reserved += response_reservation
+        self._conns[idx].write_at = deadline_from_now(
+            self.config.write_deadline
+        )
         if len(control_output) > 0:
             if not self._budget.try_reserve(len(control_output)):
                 self._close_conn(idx)
                 return
             self._conns[idx].append_pending(control_output^)
             self._conns[idx].state = STATE_SENDING_HTTP2_CONTROL
-            self._conns[idx].write_at = deadline_from_now(
-                self.config.write_deadline
-            )
         self._drain_http2_responses(idx)
 
     def _drain_http2_responses(mut self, idx: Int) raises NetError:
@@ -1499,6 +1508,15 @@ struct Server(Movable):
                 batch.released_bytes
             )
         if len(batch.wire) == 0:
+            if self._conns[idx].http2_responses.queued_count() > 0:
+                # Still waiting for WINDOW_UPDATE credit; keep the write
+                # deadline so stalled responses cannot pin budget forever.
+                if self._conns[idx].write_at == NO_DEADLINE:
+                    self._conns[idx].write_at = deadline_from_now(
+                        self.config.write_deadline
+                    )
+                self._conns[idx].state = STATE_READING
+                return
             self._conns[idx].state = STATE_READING
             self._conns[idx].write_at = NO_DEADLINE
             self._conns[idx].idle_at = deadline_from_now(

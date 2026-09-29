@@ -28,9 +28,11 @@ int32_t net_quic_set_connection_limit(
 
 int32_t net_quic_set_request_limits(
     struct NetQuicServer *server, size_t max_body_bytes,
-    size_t max_headers_bytes, size_t max_headers_count) {
+    size_t max_headers_bytes, size_t max_headers_count,
+    size_t max_trailer_bytes, size_t max_trailer_count) {
     return net_quic_server_set_request_limits(
-        server, max_body_bytes, max_headers_bytes, max_headers_count);
+        server, max_body_bytes, max_headers_bytes, max_headers_count,
+        max_trailer_bytes, max_trailer_count);
 }
 
 int32_t net_quic_set_response_limits(
@@ -42,9 +44,11 @@ int32_t net_quic_set_response_limits(
 
 int32_t net_quic_set_stream_deadlines(
     struct NetQuicServer *server, uint64_t header_deadline_ns,
-    uint64_t body_deadline_ns, uint64_t idle_timeout_ns) {
+    uint64_t body_deadline_ns, uint64_t idle_timeout_ns,
+    uint64_t write_deadline_ns) {
     return net_quic_server_set_stream_deadlines(
-        server, header_deadline_ns, body_deadline_ns, idle_timeout_ns);
+        server, header_deadline_ns, body_deadline_ns, idle_timeout_ns,
+        write_deadline_ns);
 }
 
 int32_t net_quic_begin_shutdown(struct NetQuicServer *server) {

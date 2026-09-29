@@ -155,12 +155,16 @@ struct QuicServer(Movable):
         max_body_bytes: Int,
         max_headers_bytes: Int,
         max_headers_count: Int,
+        max_trailer_bytes: Int = 8192,
+        max_trailer_count: Int = 32,
     ) raises NetError:
         var result = self._library.call["net_quic_set_request_limits", c_int](
             self._server,
             c_size_t(max_body_bytes),
             c_size_t(max_headers_bytes),
             c_size_t(max_headers_count),
+            c_size_t(max_trailer_bytes),
+            c_size_t(max_trailer_count),
         )
         if result != 1:
             raise NetError(
@@ -195,12 +199,14 @@ struct QuicServer(Movable):
         header_deadline: Timeout,
         body_deadline: Timeout,
         idle_timeout: Timeout,
+        write_deadline: Timeout = Timeout.nanoseconds(30_000_000_000),
     ) raises NetError:
         var result = self._library.call["net_quic_set_stream_deadlines", c_int](
             self._server,
             header_deadline._value,
             body_deadline._value,
             idle_timeout._value,
+            write_deadline._value,
         )
         if result != 1:
             raise NetError(
@@ -355,9 +361,15 @@ struct QuicUDPEndpoint(Movable):
         max_body_bytes: Int,
         max_headers_bytes: Int,
         max_headers_count: Int,
+        max_trailer_bytes: Int = 8192,
+        max_trailer_count: Int = 32,
     ) raises NetError:
         self._server.set_request_limits(
-            max_body_bytes, max_headers_bytes, max_headers_count
+            max_body_bytes,
+            max_headers_bytes,
+            max_headers_count,
+            max_trailer_bytes,
+            max_trailer_count,
         )
         self._ensure_request_buffer(
             max_body_bytes, max_headers_bytes, max_headers_count
@@ -378,9 +390,10 @@ struct QuicUDPEndpoint(Movable):
         header_deadline: Timeout,
         body_deadline: Timeout,
         idle_timeout: Timeout,
+        write_deadline: Timeout = Timeout.nanoseconds(30_000_000_000),
     ) raises NetError:
         self._server.set_stream_deadlines(
-            header_deadline, body_deadline, idle_timeout
+            header_deadline, body_deadline, idle_timeout, write_deadline
         )
 
     def begin_shutdown(mut self) raises NetError:
