@@ -8,18 +8,25 @@ from .settings import SettingsParseResult, parse_settings_payload
 struct SettingsFrameResult(Movable):
     var kind: UInt8
     var parsed: SettingsParseResult
+    var error_code: UInt32
 
     @staticmethod
     def received(var parsed: SettingsParseResult) -> Self:
-        return Self(kind=1, parsed=parsed^)
+        return Self(kind=1, parsed=parsed^, error_code=UInt32(0))
 
     @staticmethod
     def ack() -> Self:
-        return Self(kind=2, parsed=SettingsParseResult.failure())
+        return Self(
+            kind=2, parsed=SettingsParseResult.failure(), error_code=UInt32(0)
+        )
 
     @staticmethod
-    def failure() -> Self:
-        return Self(kind=3, parsed=SettingsParseResult.failure())
+    def failure(error_code: UInt32 = UInt32(1)) -> Self:
+        return Self(
+            kind=3,
+            parsed=SettingsParseResult.failure(),
+            error_code=error_code,
+        )
 
     def is_settings(self) -> Bool:
         return self.kind == 1
@@ -40,14 +47,14 @@ def parse_settings_frame[
         or frame.stream_id != UInt32(0)
         or frame.payload_length != len(payload)
     ):
-        return SettingsFrameResult.failure()
+        return SettingsFrameResult.failure(UInt32(1))
 
     if (frame.flags & Byte(1)) != Byte(0):
         if len(payload) != 0:
-            return SettingsFrameResult.failure()
+            return SettingsFrameResult.failure(UInt32(6))
         return SettingsFrameResult.ack()
 
     var decoded = parse_settings_payload(payload)
     if decoded.is_error():
-        return SettingsFrameResult.failure()
+        return SettingsFrameResult.failure(UInt32(6))
     return SettingsFrameResult.received(decoded^)

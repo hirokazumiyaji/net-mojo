@@ -379,6 +379,44 @@ def test_http2_bootstrap_rejects_oversized_initial_window() raises:
     assert_true(not bootstrap.is_ready())
     assert_equal(bootstrap.connection_error_code(), UInt32(3))
 
+def test_http2_bootstrap_rejects_partial_settings_with_frame_size_error() raises:
+    var bootstrap = Http2ServerBootstrap()
+    var preface = "PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n".as_bytes()
+    assert_true(bootstrap.consume_client_preface(preface).is_complete())
+    assert_true(bootstrap.server_settings().is_complete())
+
+    var payload = List[Byte]()
+    for byte in [Byte(0), Byte(1), Byte(0), Byte(0), Byte(0)]:
+        payload.append(byte)
+    var client_wire = _frame(4, 0, 0, payload)
+    assert_true(
+        bootstrap.accept_initial_client_settings(
+            parse_frame(Span(client_wire)), Span(client_wire)[9:]
+        ).is_error()
+    )
+    assert_true(bootstrap.is_failed())
+    assert_equal(bootstrap.connection_error_code(), UInt32(6))
+
+
+def test_http2_bootstrap_rejects_nonempty_ack_with_frame_size_error() raises:
+    var bootstrap = Http2ServerBootstrap()
+    var preface = "PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n".as_bytes()
+    assert_true(bootstrap.consume_client_preface(preface).is_complete())
+    assert_true(bootstrap.server_settings().is_complete())
+
+    var payload = List[Byte]()
+    for byte in [Byte(0), Byte(1), Byte(0), Byte(0), Byte(0), Byte(1)]:
+        payload.append(byte)
+    var client_wire = _frame(4, 1, 0, payload)
+    assert_true(
+        bootstrap.accept_initial_client_settings(
+            parse_frame(Span(client_wire)), Span(client_wire)[9:]
+        ).is_error()
+    )
+    assert_true(bootstrap.is_failed())
+    assert_equal(bootstrap.connection_error_code(), UInt32(6))
+
+
 def test_http2_bootstrap_rejects_initial_settings_ack() raises:
     var bootstrap = Http2ServerBootstrap()
     var preface = "PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n".as_bytes()
