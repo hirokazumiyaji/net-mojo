@@ -75,12 +75,16 @@ struct Http2FrameReader(Movable):
         """Stream id of an incomplete HEADERS frame, else 0.
 
         Exposed so sessions can arm the header deadline as soon as the
-        9-byte frame header arrives, before the full payload is buffered.
+        frame type byte identifies HEADERS, before the full 9-byte header
+        or payload is buffered.
         """
-        if self._failed or len(self._frame) < 9:
+        if self._failed or len(self._frame) < 4:
             return UInt32(0)
         if self._frame[3] != Byte(1):
             return UInt32(0)
+        if len(self._frame) < 9:
+            # Type known; stream id not yet complete. Nonzero signals arming.
+            return UInt32(0xFFFFFFFF)
         var stream_word = (
             (UInt32(self._frame[5]) << 24)
             | (UInt32(self._frame[6]) << 16)

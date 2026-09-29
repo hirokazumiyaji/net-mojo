@@ -1345,11 +1345,19 @@ struct Server(Movable):
                 self._conns[idx].drain_prefix(result.consumed)
                 self._budget.release(result.consumed)
             if result.reset_stream_id != UInt32(0):
+                var dropped_unsent = self._conns[
+                    idx
+                ].http2_responses.has_unsent_headers(result.reset_stream_id)
                 var released = self._conns[idx].http2_responses.cancel(
                     result.reset_stream_id
                 )
                 self._budget.release(released)
                 self._conns[idx].http2_response_bytes_reserved -= released
+                if dropped_unsent:
+                    # Encoded headers mutated the deflater but never reached
+                    # the peer; keep compression state consistent by closing.
+                    self._close_conn(idx)
+                    return
             var request_body_bytes = 0
             if result.is_request():
                 request_body_bytes = len(result.request.body)
@@ -1475,7 +1483,6 @@ struct Server(Movable):
                 self._close_conn(idx)
                 return
 
-        var compressed = List[Byte](length=65536, fill=0)
         var available = self._budget.remaining() - len(control_output)
         var max_response_header_bytes = self.config.max_response_headers_bytes
         var peer_header_list_size = Int(
@@ -1486,6 +1493,10 @@ struct Server(Movable):
         )
         if peer_header_list_size < max_response_header_bytes:
             max_response_header_bytes = peer_header_list_size
+        var compressed_capacity = max_response_header_bytes
+        if compressed_capacity < 256:
+            compressed_capacity = 256
+        var compressed = List[Byte](length=compressed_capacity, fill=0)
         var encoded = encode_http2_response_header_frames(
             self._conns[idx].http2_deflater.value(),
             writer,

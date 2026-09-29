@@ -129,6 +129,9 @@ pub unsafe extern "C" fn net_quic_server_set_request_limits(
     inner.max_request_headers_count = max_headers_count;
     inner.max_request_trailer_bytes = max_trailer_bytes;
     inner.max_request_trailer_count = max_trailer_count;
+    inner
+        .http3_config
+        .set_max_field_section_size(max_headers_bytes as u64);
     1
 }
 
@@ -682,6 +685,10 @@ fn is_valid_http_authority(authority: &[u8]) -> bool {
     is_reg_name(authority)
 }
 
+fn authority_equals_ignore_ascii_case(left: &[u8], right: &[u8]) -> bool {
+    left.eq_ignore_ascii_case(right)
+}
+
 pub struct QuicServer {
     config: quiche::Config,
     http3_config: quiche::h3::Config,
@@ -1199,6 +1206,7 @@ impl QuicServer {
                     let mut header_bytes = 0usize;
                     let mut header_count = 0usize;
                     let mut invalid = false;
+                    let mut host: Option<Vec<u8>> = None;
                     for header in list {
                         header_count += 1;
                         header_bytes += header.name().len() + header.value().len();
@@ -1266,6 +1274,14 @@ impl QuicServer {
                                 {
                                     invalid = true;
                                 }
+                                if name == b"host" {
+                                    if host.is_some() || !is_valid_http_authority(header.value())
+                                    {
+                                        invalid = true;
+                                    } else {
+                                        host = Some(header.value().to_vec());
+                                    }
+                                }
                                 request
                                     .headers
                                     .push((name.to_vec(), header.value().to_vec()));
@@ -1274,6 +1290,14 @@ impl QuicServer {
                     }
                     request.header_bytes = header_bytes;
                     request.header_count = header_count;
+                    if let Some(host_value) = host.as_ref() {
+                        if !authority_equals_ignore_ascii_case(
+                            &request.authority,
+                            host_value,
+                        ) {
+                            invalid = true;
+                        }
+                    }
                     if invalid
                         || seen_pseudo_headers != 15
                         || request.method == b"CONNECT"

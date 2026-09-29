@@ -62,6 +62,12 @@ struct Http2ResponseScheduler(Movable):
         self._remove(index)
         return released
 
+    def has_unsent_headers(self, stream_id: UInt32) -> Bool:
+        var index = self._find(stream_id)
+        if index < 0:
+            return False
+        return not self._responses[index].headers_sent
+
     def drain(
         mut self,
         mut session: Http2RequestSession,
