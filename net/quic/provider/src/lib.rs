@@ -411,11 +411,7 @@ fn normalize_http3_response_header_name(name: &[u8]) -> Option<Vec<u8>> {
     }
     let mut lower = Vec::with_capacity(name.len());
     for &byte in name {
-        if !byte.is_ascii_lowercase()
-            && !byte.is_ascii_digit()
-            && byte != b'-'
-            && !(b'A'..=b'Z').contains(&byte)
-        {
+        if !is_http_tchar(byte) {
             return None;
         }
         lower.push(byte.to_ascii_lowercase());
@@ -429,6 +425,40 @@ fn normalize_http3_response_header_name(name: &[u8]) -> Option<Vec<u8>> {
         | b"te" => None,
         _ => Some(lower),
     }
+}
+
+fn is_http_tchar(byte: u8) -> bool {
+    matches!(
+        byte,
+        b'!'
+            | b'#'
+            | b'$'
+            | b'%'
+            | b'&'
+            | b'\''
+            | b'*'
+            | b'+'
+            | b'-'
+            | b'.'
+            | b'^'
+            | b'_'
+            | b'`'
+            | b'|'
+            | b'~'
+            | b'0'..=b'9'
+            | b'a'..=b'z'
+            | b'A'..=b'Z'
+    )
+}
+
+fn is_valid_http_field_name(name: &[u8]) -> bool {
+    !name.is_empty() && !name.starts_with(b":") && name.iter().copied().all(is_http_tchar)
+}
+
+fn is_valid_http_field_value(value: &[u8]) -> bool {
+    value.iter().copied().all(|byte| {
+        byte == b'\t' || (byte >= 0x20 && byte != 0x7f)
+    })
 }
 
 pub struct QuicServer {
@@ -842,9 +872,12 @@ impl QuicServer {
                             request.header_count += 1;
                             request.header_bytes += header.name().len() + header.value().len();
                             let name = header.name();
+                            let value = header.value();
                             if request.header_count > 100
                                 || request.header_bytes > 32_768
                                 || name.starts_with(b":")
+                                || !is_valid_http_field_name(name)
+                                || !is_valid_http_field_value(value)
                                 || matches!(
                                     name,
                                     b"connection"
@@ -861,7 +894,7 @@ impl QuicServer {
                             }
                             request
                                 .trailers
-                                .push((name.to_vec(), header.value().to_vec()));
+                                .push((name.to_vec(), value.to_vec()));
                         }
                         if invalid {
                             let code = if request.header_bytes > 32_768 {
@@ -925,14 +958,17 @@ impl QuicServer {
                             name if name.starts_with(b":") => invalid = true,
                             name => {
                                 regular_header_seen = true;
-                                if matches!(
-                                    name,
-                                    b"connection"
-                                        | b"keep-alive"
-                                        | b"proxy-connection"
-                                        | b"transfer-encoding"
-                                        | b"upgrade"
-                                ) || (name == b"te" && header.value() != b"trailers")
+                                if !is_valid_http_field_name(name)
+                                    || !is_valid_http_field_value(header.value())
+                                    || matches!(
+                                        name,
+                                        b"connection"
+                                            | b"keep-alive"
+                                            | b"proxy-connection"
+                                            | b"transfer-encoding"
+                                            | b"upgrade"
+                                    )
+                                    || (name == b"te" && header.value() != b"trailers")
                                 {
                                     invalid = true;
                                 }

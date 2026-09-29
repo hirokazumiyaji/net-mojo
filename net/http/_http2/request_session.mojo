@@ -110,6 +110,10 @@ struct Http2RequestSession(Movable):
     var _send_window: Http2FlowWindow
     var _max_active_streams: Int
     var _max_body_size: Int
+    var _max_headers_bytes: Int
+    var _max_headers_count: Int
+    var _max_trailer_bytes: Int
+    var _max_trailer_count: Int
     var _last_stream_id: UInt32
     var _draining: Bool
     var _failed: Bool
@@ -119,22 +123,43 @@ struct Http2RequestSession(Movable):
         var library_path: String,
         max_active_streams: Int,
         max_body_size: Int,
+        max_headers_bytes: Int = 32768,
+        max_headers_count: Int = 100,
+        max_trailer_bytes: Int = 8192,
+        max_trailer_count: Int = 32,
     ):
         self._input = Http2ServerConnectionInput(
             max_concurrent_streams=max_active_streams
         )
         self._decoder = None
         self._library_path = library_path^
-        self._header_output = List[Byte](length=65536, fill=0)
+        var output_capacity = max_headers_bytes
+        if max_trailer_bytes > output_capacity:
+            output_capacity = max_trailer_bytes
+        output_capacity += max_headers_count * 8
+        if output_capacity < 1024:
+            output_capacity = 1024
+        self._header_output = List[Byte](length=output_capacity, fill=0)
         self._streams = List[_Http2RequestEntry]()
         self._send_streams = List[_Http2SendWindowEntry]()
         self._receive_window = Http2FlowWindow(65535, 65535)
         self._send_window = Http2FlowWindow(65535, 65535)
         self._max_active_streams = max_active_streams
         self._max_body_size = max_body_size
+        self._max_headers_bytes = max_headers_bytes
+        self._max_headers_count = max_headers_count
+        self._max_trailer_bytes = max_trailer_bytes
+        self._max_trailer_count = max_trailer_count
         self._last_stream_id = UInt32(0)
         self._draining = False
-        self._failed = max_active_streams < 0 or max_body_size < 0
+        self._failed = (
+            max_active_streams < 0
+            or max_body_size < 0
+            or max_headers_bytes < 0
+            or max_headers_count < 0
+            or max_trailer_bytes < 0
+            or max_trailer_count < 0
+        )
 
     def begin_shutdown(mut self) -> List[Byte]:
         if self._draining:
@@ -182,7 +207,8 @@ struct Http2RequestSession(Movable):
                         frame, Span(input.payload)
                     )
                     if decoded.is_complete():
-                        if self._draining:
+                        var is_new_stream = self._find_stream(decoded.stream_id) < 0
+                        if self._draining and is_new_stream:
                             var reset = encode_rst_stream_frame(
                                 decoded.stream_id, UInt32(7)
                             )
@@ -288,12 +314,20 @@ struct Http2RequestSession(Movable):
         frame: FrameParseResult,
         payload: Span[Byte, origin],
     ) raises -> Http2HeaderDecodeResult:
+        var for_trailers = self._find_stream(frame.stream_id) >= 0
+        var max_bytes = self._max_headers_bytes
+        var max_count = self._max_headers_count
+        if for_trailers:
+            max_bytes = self._max_trailer_bytes
+            max_count = self._max_trailer_count
         if not self._decoder:
             self._decoder = Optional(
-                Http2HeaderDecoder(String(self._library_path), 4096, 65536)
+                Http2HeaderDecoder(
+                    String(self._library_path), 4096, max_bytes
+                )
             )
         return self._decoder.value().consume(
-            frame, payload, 65536, 256, Span(self._header_output)
+            frame, payload, max_bytes, max_count, Span(self._header_output)
         )
 
     def _receive_headers(

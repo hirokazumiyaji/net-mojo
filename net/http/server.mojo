@@ -741,22 +741,27 @@ struct Server(Movable):
             elif not self._budget.try_reserve(body_size):
                 response.status = 503
             else:
-                for i in range(len(quic_request.headers)):
-                    var name = quic_request.headers[i].name.copy()
-                    request.headers.add_bytes(
-                        name^, Span(quic_request.headers[i].value)
-                    )
-                for i in range(len(quic_request.trailers)):
-                    var name = quic_request.trailers[i].name.copy()
-                    request.trailers.add_bytes(
-                        name^, Span(quic_request.trailers[i].value)
-                    )
-                request.body = quic_request.take_body()
                 try:
-                    handler.handle(request^, response)
+                    for i in range(len(quic_request.headers)):
+                        var name = quic_request.headers[i].name.copy()
+                        request.headers.add_bytes(
+                            name^, Span(quic_request.headers[i].value)
+                        )
+                    for i in range(len(quic_request.trailers)):
+                        var name = quic_request.trailers[i].name.copy()
+                        request.trailers.add_bytes(
+                            name^, Span(quic_request.trailers[i].value)
+                        )
+                    request.body = quic_request.take_body()
+                    try:
+                        handler.handle(request^, response)
+                    except e:
+                        _ = e
+                        response.status = 500
+                        response.body.clear()
                 except e:
                     _ = e
-                    response.status = 500
+                    response.status = 400
                     response.body.clear()
                 self._budget.release(body_size)
             if response.is_detached():
@@ -981,6 +986,10 @@ struct Server(Movable):
                             "build/http2/libnet_hpack",
                             self.config.max_http2_streams_per_connection,
                             self.config.max_body_bytes,
+                            self.config.max_headers_bytes,
+                            self.config.max_headers_count,
+                            self.config.max_trailer_bytes,
+                            self.config.max_trailer_count,
                         )
                     )
                 elif protocol != "http/1.1":
