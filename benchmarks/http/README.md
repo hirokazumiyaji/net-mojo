@@ -8,7 +8,8 @@ stay comparable.
 
 - Go toolchain: `go1.26.4 darwin/arm64` (local). CI re-records its own
   `go version` output with each measurement.
-- Go baseline: `benchmarks/http_go/main.go` (`go.mod` pins `go 1.24`).
+- Go baseline: `benchmarks/http_go/main.go` (`go.mod` pins `go 1.26` and
+  `golang.org/x/net` for HTTPS+HTTP/2).
 - Mojo toolchain: `pixi.toml` pinned `mojo >=1.0.0,<2` (local `1.0.0`).
 - Build: Go `go -C benchmarks/http_go build -o /tmp/http_go_baseline .` (run from the repository root; `benchmarks/http_go` is its own module);
   Mojo optimized executable (`mojo build`), compile and startup time
@@ -74,12 +75,24 @@ curl -X POST --data-binary @/tmp/fixed.body \
   http://127.0.0.1:18080/echo -o /tmp/echo.body
 ```
 
+HTTPS + HTTP/2 (after `pixi run -e tls-http2 tls-build`):
+
+```bash
+go -C benchmarks/http_go build -o /tmp/http_go_h2 .
+GOMAXPROCS=1 /tmp/http_go_h2 -tls -addr 127.0.0.1:18442 \
+  -cert build/tls/test-cert.pem -key build/tls/test-key.pem &
+curl -k --http2 https://127.0.0.1:18442/fixed -o /tmp/fixed.h2.body
+```
+
 ## Mojo benchmarks
 
 - `benchmarks/http_parse.mojo` (Phase 1): parser time by input size.
 - `benchmarks/http_server.mojo` (Phase 4): `pixi run benchmark-http-server`.
   Sequential keep-alive round-trips plus nonblocking tick time with many
   idle connections (ready-batch-only proof).
+- `benchmarks/http2_tls_server.mojo` + `benchmarks/http/run_http2_bench.sh`
+  (PR 9): HTTPS+HTTP/2 `/fixed`/`/json`/`/echo` vs the Go `-tls` baseline
+  using `h2load`.
 
 ## Phase 3 poll baseline (preliminary, same host)
 
@@ -144,3 +157,66 @@ costs carried forward (unchanged from Phase 3): one `Date` syscall per
 tick, string copies on the request path, `List` prefix drains. No
 bottleneck optimization beyond the readiness + scan removal was added, per
 the Phase 4 rule (optimizations only with before/after measurements).
+
+## HTTP/2 TLS (PR 9, measured)
+
+HTTPS + ALPN `h2` comparison for the shared `/fixed` / `/json` / `/echo`
+handlers. Numbers below are from a full Phase 0 procedure on one host
+(warmup 10 s, measure 30 s, 5 runs). Raw h2load logs and mid-run
+`ps`/`lsof` samples live under `build/bench/http2/` when the harness is
+re-run locally (that directory is gitignored).
+
+### Host and toolchain
+
+| Item | Value |
+| --- | --- |
+| Host | Mac mini (Mac14,12), Apple M2 Pro, 32 GB |
+| OS | macOS 27.0.1 (Darwin 27.0.0), `arm64` |
+| Go | `go1.26.4 darwin/arm64` (`GOMAXPROCS=1`) |
+| Mojo | `1.0.0` (`pixi.toml` pin `>=1.0.0,<2`) |
+| OpenSSL (TLS shim / pixi `tls-http2`) | `3.6.4` via `pkg-config` |
+| Load tool | `h2load` from Homebrew `nghttp2` 1.70.0 (`--alpn-list=h2`) |
+| Certs | `build/tls/test-cert.pem` / `test-key.pem` from `pixi run -e tls-http2 tls-build` |
+
+### Harness
+
+- Go: `benchmarks/http_go/main.go` with `-tls` (stdlib + `golang.org/x/net/http2`, NextProtos `h2,http/1.1`). Default listen for this run: `127.0.0.1:18442`.
+- Mojo: optimized `mojo build` of `benchmarks/http2_tls_server.mojo` (ALPN `h2` only) on `127.0.0.1:18443`. Requires `tls-build` + `hpack-test`.
+- Driver: `benchmarks/http/run_http2_bench.sh` (documents `WARMUP_S` / `MEASURE_S` / `RUNS` / `CLIENTS` / `STREAMS`).
+- Scenario measured here: `GET /fixed` (64 B), `clients=64`, max concurrent streams `1` and `10`, h2load `-t 1`. Loader and server share the host (same caveat as earlier Phase 3/4 notes); Go pinned with `GOMAXPROCS=1`, Mojo unpinned.
+
+### Reproduce
+
+```bash
+pixi run -e tls-http2 tls-build
+pixi run -e tls-http2 hpack-test
+# Full Phase 0 (as recorded below):
+WARMUP_S=10 MEASURE_S=30 RUNS=5 CLIENTS=64 STREAMS="1 10" \
+  bash benchmarks/http/run_http2_bench.sh
+```
+
+### Results (mean of 5 runs; req/s from h2load; latency = h2load request median/p95/p99)
+
+| Server | Conns | Streams | req/s (mean) | p50 (µs) | p95 (µs) | p99 (µs) | CPU % | RSS (MB) | fd |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| Go HTTPS+H2 | 64 | 1 | 42,551 | 1,300 | 2,368 | 2,882 | ~99 | ~20 | 75 |
+| Mojo HTTPS+H2 | 64 | 1 | 32,504 | 1,966 | 2,070 | 2,180 | ~99 | ~38 | 85 |
+| Go HTTPS+H2 | 64 | 10 | 52,101 | 11,554 | 21,252 | 25,592 | ~99 | ~32 | 75 |
+| Mojo HTTPS+H2 | 64 | 10 | 51,223 | 11,964 | 15,662 | 17,802 | ~99 | ~39 | 85 |
+
+Per-run req/s ranges: Go m=1 42,164–43,082; Mojo m=1 32,485–32,531; Go m=10 51,928–52,205; Mojo m=10 50,551–51,526. All runs: 0 failed / 0 errored.
+
+### Target check
+
+Development target for small fixed responses is ≥90% of the Go baseline
+throughput (same unsaturated latency budget where applicable).
+
+| Scenario | Mojo / Go req/s | Verdict |
+| --- | ---: | --- |
+| 64 conns × 1 stream | 76.4% | Miss — shortfall recorded; no features cut |
+| 64 conns × 10 streams | 98.3% | Meet |
+
+At single-stream concurrency Mojo trails Go on median latency (~1.5×) while
+p95/p99 stay comparable or slightly better. Multiplexed streams close the
+throughput gap. Follow-up profiling (not in this PR): TLS/HPACK path cost
+and per-request handler overhead under low stream concurrency.

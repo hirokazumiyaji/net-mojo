@@ -1,4 +1,4 @@
-// Go baseline for net-mojo HTTP benchmarks (Issue #42 Phase 0).
+// Go baseline for net-mojo HTTP benchmarks (Issue #42 Phase 0 / PR 9).
 //
 // Same handler shapes the Mojo server will implement, so throughput and
 // p99 comparisons use identical request/response bytes and handler work:
@@ -6,6 +6,9 @@
 //   - GET /json  : 1 KiB JSON built with the same field layout.
 //   - POST /echo : bounded echo of the request body (Content-Length and
 //     chunked both accepted by net/http), capped at 1 MiB.
+//
+// Plain HTTP/1.1: default listen. HTTPS + HTTP/2 (ALPN h2): pass -tls
+// with -cert/-key (defaults to build/tls/test-cert.pem after tls-build).
 //
 // Logging is disabled and keep-alives are left on, matching the Mojo
 // server defaults. Pin the server to one core with GOMAXPROCS=1 for the
@@ -15,6 +18,7 @@ package main
 
 import (
 	"context"
+	"crypto/tls"
 	"flag"
 	"fmt"
 	"io"
@@ -23,6 +27,8 @@ import (
 	"net/http"
 	"strings"
 	"time"
+
+	"golang.org/x/net/http2"
 )
 
 var fixedBody = []byte(strings.Repeat("a", 64))
@@ -87,7 +93,7 @@ type connKey struct{}
 
 // withBodyDeadline resets the connection read deadline when the handler
 // starts, i.e. right after net/http parsed the headers. Go's ReadTimeout
-// otherwise runs from the first request byte, so a client spending most
+// otherwise runs from the first byte, so a client spending most
 // of the header budget would steal time from the body phase that the
 // Mojo server grants separately (5s headers, then a fresh 30s body).
 func withBodyDeadline(next http.Handler) http.Handler {
@@ -102,6 +108,9 @@ func withBodyDeadline(next http.Handler) http.Handler {
 
 func main() {
 	addr := flag.String("addr", "127.0.0.1:18080", "listen address")
+	useTLS := flag.Bool("tls", false, "serve HTTPS (enables HTTP/2 via ALPN h2)")
+	certFile := flag.String("cert", "build/tls/test-cert.pem", "TLS certificate (PEM)")
+	keyFile := flag.String("key", "build/tls/test-key.pem", "TLS private key (PEM)")
 	flag.Parse()
 
 	mux := http.NewServeMux()
@@ -131,7 +140,32 @@ func main() {
 	if err != nil {
 		log.Fatalf("listen: %v", err)
 	}
-	fmt.Printf("http_go baseline listening on %s (fixed=%dB json=%dB)\n", ln.Addr(), len(fixedBody), len(jsonBody))
+
+	proto := "http"
+	if *useTLS {
+		proto = "https+h2"
+		server.TLSConfig = &tls.Config{
+			MinVersion: tls.VersionTLS12,
+			NextProtos: []string{"h2", "http/1.1"},
+		}
+		if err := http2.ConfigureServer(server, &http2.Server{}); err != nil {
+			log.Fatalf("http2 configure: %v", err)
+		}
+	}
+
+	fmt.Printf(
+		"http_go baseline listening on %s proto=%s (fixed=%dB json=%dB)\n",
+		ln.Addr(),
+		proto,
+		len(fixedBody),
+		len(jsonBody),
+	)
+	if *useTLS {
+		if err := server.ServeTLS(ln, *certFile, *keyFile); err != nil && err != http.ErrServerClosed {
+			log.Fatalf("serve tls: %v", err)
+		}
+		return
+	}
 	if err := server.Serve(ln); err != nil && err != http.ErrServerClosed {
 		log.Fatalf("serve: %v", err)
 	}
