@@ -10,6 +10,38 @@ use std::time::{Duration, Instant};
 use quiche::h3::NameValue;
 use quiche::{Connection, ConnectionId, RecvInfo, SendInfo};
 
+/// Whether provider quiche configs enable TLS early data (0-RTT).
+///
+/// Quiche only exposes [`quiche::Config::enable_early_data`] as an opt-in.
+/// First-ship HTTP/3 keeps 0-RTT off: never call that API on provider configs.
+const PROVIDER_ENABLE_EARLY_DATA: bool = false;
+
+/// Keep early data / 0-RTT disabled on a quiche config.
+///
+/// Quiche 0.29 has no `disable_early_data` or `set_enable_early_data(false)`.
+/// Early data stays off unless [`quiche::Config::enable_early_data`] is called;
+/// this helper is the explicit policy call site. Do not call `enable_early_data`
+/// while [`PROVIDER_ENABLE_EARLY_DATA`] is false.
+fn disable_quic_early_data(_config: &mut quiche::Config) {
+    assert!(
+        !PROVIDER_ENABLE_EARLY_DATA,
+        "provider must not enable quiche early data / 0-RTT"
+    );
+    // Intentionally do not call Config::enable_early_data().
+}
+
+/// Apply shared provider transport settings (including explicit 0-RTT disable).
+fn apply_provider_quic_transport_settings(config: &mut quiche::Config) {
+    disable_quic_early_data(config);
+    config.set_initial_max_data(10_000_000);
+    config.set_initial_max_stream_data_bidi_local(1_000_000);
+    config.set_initial_max_stream_data_bidi_remote(1_000_000);
+    config.set_initial_max_stream_data_uni(1_000_000);
+    config.set_initial_max_streams_bidi(100);
+    config.set_initial_max_streams_uni(3);
+    config.set_max_idle_timeout(60_000);
+}
+
 pub struct NetQuicServerConfig {
     _inner: Option<quiche::Config>,
 }
@@ -56,13 +88,7 @@ pub unsafe extern "C" fn net_quic_server_config_new(
     {
         return ptr::null_mut();
     }
-    config.set_initial_max_data(10_000_000);
-    config.set_initial_max_stream_data_bidi_local(1_000_000);
-    config.set_initial_max_stream_data_bidi_remote(1_000_000);
-    config.set_initial_max_stream_data_uni(1_000_000);
-    config.set_initial_max_streams_bidi(100);
-    config.set_initial_max_streams_uni(3);
-    config.set_max_idle_timeout(60_000);
+    apply_provider_quic_transport_settings(&mut config);
 
     Box::into_raw(Box::new(NetQuicServerConfig {
         _inner: Some(config),
@@ -1928,6 +1954,176 @@ mod tests {
         assert_eq!(used, MAX_HTTP3_BUFFERED_RESPONSE_BYTES);
         assert!(!reserve_response_bytes(&mut used, 1));
         assert_eq!(used, MAX_HTTP3_BUFFERED_RESPONSE_BYTES);
+    }
+
+    #[test]
+    fn provider_quic_config_keeps_early_data_disabled_on_session_resume() {
+        assert!(
+            !super::PROVIDER_ENABLE_EARLY_DATA,
+            "provider must ship with 0-RTT / early data disabled"
+        );
+
+        let certificate_path = std::env::var("NET_HTTP_TEST_CERT").unwrap();
+        let private_key_path = std::env::var("NET_HTTP_TEST_KEY").unwrap();
+
+        let mut server_config = quiche::Config::new(quiche::PROTOCOL_VERSION).unwrap();
+        server_config
+            .set_application_protos(quiche::h3::APPLICATION_PROTOCOL)
+            .unwrap();
+        server_config
+            .load_cert_chain_from_pem_file(&certificate_path)
+            .unwrap();
+        server_config
+            .load_priv_key_from_pem_file(&private_key_path)
+            .unwrap();
+        super::apply_provider_quic_transport_settings(&mut server_config);
+
+        let mut client_config = quiche::Config::new(quiche::PROTOCOL_VERSION).unwrap();
+        client_config
+            .set_application_protos(quiche::h3::APPLICATION_PROTOCOL)
+            .unwrap();
+        client_config.verify_peer(false);
+        super::apply_provider_quic_transport_settings(&mut client_config);
+
+        let client_address = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 54321);
+        let server_address = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 4433);
+        let mut packet = [0; 65535];
+
+        // Initial handshake to obtain a session ticket.
+        let client_scid = [0x31; 16];
+        let server_scid = [0x52; 16];
+        let mut client = quiche::connect(
+            Some("localhost"),
+            &ConnectionId::from_ref(&client_scid),
+            client_address,
+            server_address,
+            &mut client_config,
+        )
+        .unwrap();
+        let (initial_length, _) = client.send(&mut packet).unwrap();
+        let original_dcid = Header::from_slice(&mut packet[..initial_length], 16)
+            .unwrap()
+            .dcid
+            .as_ref()
+            .to_vec();
+        let mut server = quiche::accept(
+            &ConnectionId::from_ref(&server_scid),
+            Some(&ConnectionId::from_ref(&original_dcid)),
+            server_address,
+            client_address,
+            &mut server_config,
+        )
+        .unwrap();
+        server
+            .recv(
+                &mut packet[..initial_length],
+                RecvInfo {
+                    from: client_address,
+                    to: server_address,
+                },
+            )
+            .unwrap();
+
+        for _ in 0..16 {
+            while let Ok((length, _)) = server.send(&mut packet) {
+                client
+                    .recv(
+                        &mut packet[..length],
+                        RecvInfo {
+                            from: server_address,
+                            to: client_address,
+                        },
+                    )
+                    .unwrap();
+            }
+            while let Ok((length, _)) = client.send(&mut packet) {
+                server
+                    .recv(
+                        &mut packet[..length],
+                        RecvInfo {
+                            from: client_address,
+                            to: server_address,
+                        },
+                    )
+                    .unwrap();
+            }
+            if client.is_established() && server.is_established() && client.session().is_some() {
+                break;
+            }
+        }
+        assert!(client.is_established());
+        assert!(server.is_established());
+        assert!(!client.is_in_early_data());
+        assert!(!server.is_in_early_data());
+
+        let session = client
+            .session()
+            .expect("session ticket after handshake")
+            .to_vec();
+
+        // Resumed connection with the same provider settings must not enter early data.
+        let mut resume_server_config = quiche::Config::new(quiche::PROTOCOL_VERSION).unwrap();
+        resume_server_config
+            .set_application_protos(quiche::h3::APPLICATION_PROTOCOL)
+            .unwrap();
+        resume_server_config
+            .load_cert_chain_from_pem_file(&certificate_path)
+            .unwrap();
+        resume_server_config
+            .load_priv_key_from_pem_file(&private_key_path)
+            .unwrap();
+        super::apply_provider_quic_transport_settings(&mut resume_server_config);
+
+        let mut resume_client_config = quiche::Config::new(quiche::PROTOCOL_VERSION).unwrap();
+        resume_client_config
+            .set_application_protos(quiche::h3::APPLICATION_PROTOCOL)
+            .unwrap();
+        resume_client_config.verify_peer(false);
+        super::apply_provider_quic_transport_settings(&mut resume_client_config);
+
+        let resume_client_scid = [0x33; 16];
+        let resume_server_scid = [0x54; 16];
+        let mut resume_client = quiche::connect(
+            Some("localhost"),
+            &ConnectionId::from_ref(&resume_client_scid),
+            client_address,
+            server_address,
+            &mut resume_client_config,
+        )
+        .unwrap();
+        resume_client.set_session(&session).unwrap();
+        let (resume_initial_length, _) = resume_client.send(&mut packet).unwrap();
+        assert!(
+            !resume_client.is_in_early_data(),
+            "provider configs must not offer 0-RTT after set_session"
+        );
+
+        let resume_dcid = Header::from_slice(&mut packet[..resume_initial_length], 16)
+            .unwrap()
+            .dcid
+            .as_ref()
+            .to_vec();
+        let mut resume_server = quiche::accept(
+            &ConnectionId::from_ref(&resume_server_scid),
+            Some(&ConnectionId::from_ref(&resume_dcid)),
+            server_address,
+            client_address,
+            &mut resume_server_config,
+        )
+        .unwrap();
+        resume_server
+            .recv(
+                &mut packet[..resume_initial_length],
+                RecvInfo {
+                    from: client_address,
+                    to: server_address,
+                },
+            )
+            .unwrap();
+        assert!(
+            !resume_server.is_in_early_data(),
+            "provider server configs must not accept 0-RTT early data"
+        );
     }
 
     #[test]
