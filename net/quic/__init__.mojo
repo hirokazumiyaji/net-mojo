@@ -499,6 +499,28 @@ struct QuicUDPEndpoint(Movable):
     def wants_write(self) -> Bool:
         return self._pending_length > 0
 
+    def stage_outgoing_datagram[
+        origin: Origin
+    ](
+        mut self, packet: Span[Byte, origin], destination: SocketAddress
+    ) raises NetError:
+        """Retain `packet` as the current pending UDP send.
+
+        Test hook for send-path backpressure: stages bytes the same way
+        `try_send` does after `try_send_datagram` returns a packet.
+        """
+        if len(packet) == 0 or len(packet) > len(self._send_buffer):
+            raise NetError(
+                NetErrorKind.invalid_argument(),
+                "stage QUIC datagram",
+                None,
+                "pending datagram length is out of range",
+            )
+        for i in range(len(packet)):
+            self._send_buffer[i] = packet[i]
+        self._pending_length = len(packet)
+        self._pending_destination = Optional(destination.copy())
+
     def timeout_micros(self) -> UInt64:
         return self._server.timeout_micros()
 
