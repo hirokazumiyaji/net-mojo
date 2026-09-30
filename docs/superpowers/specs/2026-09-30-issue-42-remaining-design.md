@@ -11,16 +11,16 @@ Close the remaining non-CI gaps so HTTP/1.1, HTTP/2, and HTTP/3 share the handle
 
 ## Current baseline
 
-Phases 0–6 and the core of Phases 7–9 are already in tree on `main` (through PR #69 and follow-ups). Functional gaps left:
+Phases 0–6 and the core of Phases 7–9 are already in tree on `main` (through PR #69 and follow-ups). The Issue #42 remaining stack closes the gaps below on **open sibling PRs** ([#71](https://github.com/hirokazumiyaji/net-mojo/pull/71)–[#81](https://github.com/hirokazumiyaji/net-mojo/pull/81)). This ops-docs branch is stacked on the benchmark PRs (#79–#81) only; PRs #71–#78 live on other branches and are **not** present as code in this worktree tip.
 
-| Area | Gap |
-| --- | --- |
-| HTTP/2 | No control-frame / RST rate limits or storm tests |
-| QUIC | 0-RTT not explicitly disabled; reorder/duplicate/NAT stress missing; quiche transport memory outside budgets; UDP send saturation untested |
-| HTTP/3 | No Alt-Svc; broader reorder/reset stress incomplete |
-| Phase 10 | No HTTP/2 or HTTP/3 harnesses or recorded results |
+| Area | Gap (pre-stack) | Stack status |
+| --- | --- | --- |
+| HTTP/2 | No control-frame / RST rate limits or storm tests | [#71](https://github.com/hirokazumiyaji/net-mojo/pull/71)–[#72](https://github.com/hirokazumiyaji/net-mojo/pull/72) (sibling branches) |
+| QUIC | 0-RTT not explicitly disabled; reorder/duplicate/NAT stress missing; quiche transport memory outside budgets; UDP send saturation untested | [#73](https://github.com/hirokazumiyaji/net-mojo/pull/73)–[#76](https://github.com/hirokazumiyaji/net-mojo/pull/76) (sibling branches) |
+| HTTP/3 | No Alt-Svc; broader reorder/reset stress incomplete | [#77](https://github.com/hirokazumiyaji/net-mojo/pull/77)–[#78](https://github.com/hirokazumiyaji/net-mojo/pull/78) (sibling branches) |
+| Phase 10 | No HTTP/2 or HTTP/3 harnesses or recorded results | [#79](https://github.com/hirokazumiyaji/net-mojo/pull/79)–[#81](https://github.com/hirokazumiyaji/net-mojo/pull/81) (this stack) |
 
-Deferred (not required to close #42): HTTP/2 response trailers; full H1↔H2 application-contract mirror suite.
+Deferred (not required to close #42): HTTP/2 response trailers; full H1↔H2 application-contract mirror suite; macOS end-to-end Mojo HTTP/3 validation; enabling 0-RTT; CI workflow edits.
 
 ## Design principles
 
@@ -149,11 +149,13 @@ Depends on PR 4. aioquic/quiche client scripts: reorder application datagrams; r
 
 ## Success criteria for #42 (non-CI)
 
-- [ ] PRs 1–8 merged with green local suites.
-- [ ] PRs 9–11 merge with real numbers in `benchmarks/http/README.md`.
-- [ ] PR 12 docs match code.
-- [ ] Shared handler serves H1/H2/H3; TLS ALPN `h2` and QUIC ALPN `h3` verified by independent clients.
-- [ ] Flood bounds, explicit 0-RTT off, Alt-Svc, transport memory story documented and tested.
+- [x] PRs 1–8 implemented on the open stack ([#71](https://github.com/hirokazumiyaji/net-mojo/pull/71)–[#78](https://github.com/hirokazumiyaji/net-mojo/pull/78); sibling branches — code not in this worktree tip).
+- [x] PRs 9–11 with real numbers in `benchmarks/http/README.md` ([#79](https://github.com/hirokazumiyaji/net-mojo/pull/79)–[#81](https://github.com/hirokazumiyaji/net-mojo/pull/81); this branch stack).
+- [x] PR 12 docs match the intended ops model and record stack status honestly (this PR; no claim that #71–#78 code lives here).
+- [x] Shared handler serves H1/H2/H3; TLS ALPN `h2` and QUIC ALPN `h3` verified by independent clients (already on `main`; extended by #78).
+- [x] Flood bounds, explicit 0-RTT off, Alt-Svc, transport memory story documented and tested (#71–#77 on sibling branches; ops docs here).
+
+Merge of #71–#81 into `main` remains the integration gate; this checklist tracks implementation on the open PR stack, not merge status.
 
 ## Non-goals
 

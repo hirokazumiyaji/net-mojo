@@ -1,7 +1,8 @@
 """Shared request semantics for HTTP/1.1, HTTP/2, and HTTP/3.
 
 The wire format stays protocol-specific (`_parser` for HTTP/1.1,
-`_http2/` and `_http3/` later), but every protocol adapts into this
+`_http2/` for HTTP/2, and the quiche provider for HTTP/3 — there is no
+`net/http/_http3/` package), but every protocol adapts into this
 shape before calling the handler:
 
 - `method` is the raw token (`GET`, `POST`, custom tokens allowed).
