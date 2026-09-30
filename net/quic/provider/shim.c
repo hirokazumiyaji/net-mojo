@@ -26,6 +26,16 @@ int32_t net_quic_set_connection_limit(
     return net_quic_server_set_connection_limit(server, limit);
 }
 
+int32_t net_quic_set_transport_memory_limit(
+    struct NetQuicServer *server, size_t limit) {
+    return net_quic_server_set_transport_memory_limit(server, limit);
+}
+
+size_t net_quic_transport_memory_bytes(
+    const struct NetQuicServer *server) {
+    return net_quic_server_transport_memory_bytes(server);
+}
+
 int32_t net_quic_set_request_limits(
     struct NetQuicServer *server, size_t max_body_bytes,
     size_t max_headers_bytes, size_t max_headers_count,

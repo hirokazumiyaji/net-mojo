@@ -138,6 +138,28 @@ pub unsafe extern "C" fn net_quic_server_set_connection_limit(
 }
 
 #[unsafe(no_mangle)]
+pub unsafe extern "C" fn net_quic_server_set_transport_memory_limit(
+    server: *mut NetQuicServer,
+    limit: usize,
+) -> i32 {
+    if server.is_null() {
+        return -1;
+    }
+    unsafe { &mut *server }._inner.max_transport_memory_bytes = limit;
+    1
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn net_quic_server_transport_memory_bytes(
+    server: *const NetQuicServer,
+) -> usize {
+    if server.is_null() {
+        return 0;
+    }
+    unsafe { &*server }._inner.estimated_transport_memory_bytes()
+}
+
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn net_quic_server_set_request_limits(
     server: *mut NetQuicServer,
     max_body_bytes: usize,
@@ -759,6 +781,7 @@ pub struct QuicServer {
     next_request_id: u64,
     random: File,
     max_connections: usize,
+    max_transport_memory_bytes: usize,
     max_request_body_bytes: usize,
     max_request_headers_bytes: usize,
     max_request_headers_count: usize,
@@ -803,6 +826,14 @@ const MAX_HTTP3_REQUEST_STREAM_ID: u64 = (1 << 62) - 4;
 const MAX_HTTP3_BUFFERED_REQUEST_BYTES: usize = 64 * 1024 * 1024;
 const MAX_HTTP3_REQUEST_BODY_BYTES: usize = 1024 * 1024;
 const MAX_HTTP3_BUFFERED_RESPONSE_BYTES: usize = 64 * 1024 * 1024;
+/// Soft per-connection estimate for quiche transport heap/state.
+/// Quiche's `stats()` does not report allocator-backed memory, so admission
+/// uses `connections.len() *` this constant instead of an exact RSS probe.
+const ESTIMATED_QUIC_TRANSPORT_BYTES_PER_CONNECTION: usize = 256 * 1024;
+/// Default soft cap (~2.5 GiB) so `max_connections` remains the primary gate
+/// unless operators lower `quic_max_transport_memory_bytes`.
+const DEFAULT_MAX_QUIC_TRANSPORT_MEMORY_BYTES: usize =
+    10_000 * ESTIMATED_QUIC_TRANSPORT_BYTES_PER_CONNECTION;
 const H3_EXCESSIVE_LOAD: u64 = 0x107;
 // RFC 9114 assigns 0x105 to H3_FRAME_UNEXPECTED and 0x10b to H3_REQUEST_REJECTED.
 const H3_FRAME_UNEXPECTED: u64 = 0x105;
@@ -890,6 +921,7 @@ impl QuicServer {
             next_request_id: 1,
             random: File::open("/dev/urandom")?,
             max_connections: 10_000,
+            max_transport_memory_bytes: DEFAULT_MAX_QUIC_TRANSPORT_MEMORY_BYTES,
             max_request_body_bytes: MAX_HTTP3_REQUEST_BODY_BYTES,
             max_request_headers_bytes: 32_768,
             max_request_headers_count: 100,
@@ -973,6 +1005,18 @@ impl QuicServer {
         self.connections.is_empty()
     }
 
+    pub fn estimated_transport_memory_bytes(&self) -> usize {
+        self.connections
+            .len()
+            .saturating_mul(ESTIMATED_QUIC_TRANSPORT_BYTES_PER_CONNECTION)
+    }
+
+    fn would_exceed_transport_memory_budget(&self) -> bool {
+        self.estimated_transport_memory_bytes()
+            .saturating_add(ESTIMATED_QUIC_TRANSPORT_BYTES_PER_CONNECTION)
+            > self.max_transport_memory_bytes
+    }
+
     pub fn recv_datagram(
         &mut self,
         packet: &mut [u8],
@@ -988,6 +1032,9 @@ impl QuicServer {
                     return Err(quiche::Error::Done.into());
                 }
                 if self.connections.len() >= self.max_connections {
+                    return Err(quiche::Error::Done.into());
+                }
+                if self.would_exceed_transport_memory_budget() {
                     return Err(quiche::Error::Done.into());
                 }
                 let mut source_id = [0; 16];
@@ -2853,6 +2900,119 @@ mod tests {
         ));
         assert_eq!(server.connections.len(), 1);
         assert!(!server.routes.contains_key(&second_dcid));
+    }
+
+    #[test]
+    fn refuses_new_quic_connections_when_transport_memory_budget_is_exhausted() {
+        let certificate_path = std::env::var("NET_HTTP_TEST_CERT").unwrap();
+        let private_key_path = std::env::var("NET_HTTP_TEST_KEY").unwrap();
+        let mut server_config = quiche::Config::new(quiche::PROTOCOL_VERSION).unwrap();
+        server_config
+            .set_application_protos(quiche::h3::APPLICATION_PROTOCOL)
+            .unwrap();
+        server_config
+            .load_cert_chain_from_pem_file(&certificate_path)
+            .unwrap();
+        server_config
+            .load_priv_key_from_pem_file(&private_key_path)
+            .unwrap();
+        let mut server = super::QuicServer::new(server_config).unwrap();
+        // Soft estimate: one connection fills the budget; a second Initial is refused.
+        server.max_transport_memory_bytes = super::ESTIMATED_QUIC_TRANSPORT_BYTES_PER_CONNECTION;
+
+        let local = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 4433);
+        let mut packet = [0; 65535];
+        let mut first_config = quiche::Config::new(quiche::PROTOCOL_VERSION).unwrap();
+        first_config
+            .set_application_protos(quiche::h3::APPLICATION_PROTOCOL)
+            .unwrap();
+        first_config.verify_peer(false);
+        let first_address = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 54421);
+        let first_scid = [0x71; 16];
+        let mut first_client = quiche::connect(
+            Some("localhost"),
+            &ConnectionId::from_ref(&first_scid),
+            first_address,
+            local,
+            &mut first_config,
+        )
+        .unwrap();
+        let (first_length, _) = first_client.send(&mut packet).unwrap();
+        server
+            .recv_datagram(&mut packet[..first_length], local, first_address)
+            .unwrap();
+        assert_eq!(server.connections.len(), 1);
+        assert_eq!(
+            server.estimated_transport_memory_bytes(),
+            super::ESTIMATED_QUIC_TRANSPORT_BYTES_PER_CONNECTION
+        );
+
+        let mut second_config = quiche::Config::new(quiche::PROTOCOL_VERSION).unwrap();
+        second_config
+            .set_application_protos(quiche::h3::APPLICATION_PROTOCOL)
+            .unwrap();
+        second_config.verify_peer(false);
+        let second_address = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 54422);
+        let second_scid = [0x72; 16];
+        let mut second_client = quiche::connect(
+            Some("localhost"),
+            &ConnectionId::from_ref(&second_scid),
+            second_address,
+            local,
+            &mut second_config,
+        )
+        .unwrap();
+        let (second_length, _) = second_client.send(&mut packet).unwrap();
+        let second_dcid = Header::from_slice(&mut packet[..second_length], 16)
+            .unwrap()
+            .dcid
+            .as_ref()
+            .to_vec();
+        assert!(matches!(
+            server.recv_datagram(&mut packet[..second_length], local, second_address),
+            Err(super::QuicServerError::Quiche(quiche::Error::Done))
+        ));
+        assert_eq!(server.connections.len(), 1);
+        assert!(!server.routes.contains_key(&second_dcid));
+        assert_eq!(
+            server.estimated_transport_memory_bytes(),
+            super::ESTIMATED_QUIC_TRANSPORT_BYTES_PER_CONNECTION
+        );
+
+        let keys: Vec<Vec<u8>> = server.connections.keys().cloned().collect();
+        for key in keys {
+            server.force_drop_connection(&key);
+        }
+        assert!(server.connections.is_empty());
+        assert!(server.routes.is_empty());
+        assert!(server.request_routes.is_empty());
+        assert_eq!(server.estimated_transport_memory_bytes(), 0);
+
+        // After close, the budget frees and a new Initial is admitted.
+        let mut retry_config = quiche::Config::new(quiche::PROTOCOL_VERSION).unwrap();
+        retry_config
+            .set_application_protos(quiche::h3::APPLICATION_PROTOCOL)
+            .unwrap();
+        retry_config.verify_peer(false);
+        let retry_address = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 54423);
+        let retry_scid = [0x73; 16];
+        let mut retry_client = quiche::connect(
+            Some("localhost"),
+            &ConnectionId::from_ref(&retry_scid),
+            retry_address,
+            local,
+            &mut retry_config,
+        )
+        .unwrap();
+        let (retry_length, _) = retry_client.send(&mut packet).unwrap();
+        server
+            .recv_datagram(&mut packet[..retry_length], local, retry_address)
+            .unwrap();
+        assert_eq!(server.connections.len(), 1);
+        assert_eq!(
+            server.estimated_transport_memory_bytes(),
+            super::ESTIMATED_QUIC_TRANSPORT_BYTES_PER_CONNECTION
+        );
     }
 
     fn stress_server_config() -> quiche::Config {

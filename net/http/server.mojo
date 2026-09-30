@@ -252,6 +252,9 @@ struct Server(Movable):
                 "server already has a QUIC endpoint",
             )
         endpoint.set_connection_limit(self.config.max_connections)
+        endpoint.set_transport_memory_limit(
+            self.config.quic_max_transport_memory_bytes
+        )
         endpoint.set_request_limits(
             self.config.max_body_bytes,
             self.config.max_headers_bytes,
