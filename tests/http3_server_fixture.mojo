@@ -41,7 +41,10 @@ def main() raises:
     )
     var handler = _Http3Handler()
     print("READY " + address)
-    while handler.requests < 2:
+    # Completions expected from scripts/test_http3_server.py:
+    # reordered POST, two reset-storm siblings, trailers POST, final POST.
+    # Cancelled / reset streams do not increment this counter.
+    while handler.requests < 5:
         _ = server.tick(handler, Timeout.seconds(2))
     server.request_shutdown()
     var running = True
