@@ -20,6 +20,7 @@ from net.http._http2.frame_dispatcher import (
     Http2FrameDispatcher,
 )
 from net.http._http2.frame_reader import Http2FrameReader
+from net.http._http2.request_session import Http2RequestSession
 from net.http._http2.settings_state import (
     Http2PeerSettings,
     Http2PeerSettingsSnapshot,
@@ -511,13 +512,8 @@ def test_http2_dispatcher_returns_window_reset_and_goaway_events() raises:
 
 
 def _assert_enhance_your_calm_goaway(result: Http2DispatchResult) raises:
-    assert_true(result.is_output())
-    assert_equal(len(result.output), 17)
-    assert_equal(result.output[3], Byte(7))
-    assert_equal(result.output[13], Byte(0))
-    assert_equal(result.output[14], Byte(0))
-    assert_equal(result.output[15], Byte(0))
-    assert_equal(result.output[16], Byte(11))
+    assert_true(result.is_flood())
+    assert_equal(result.value, UInt32(11))
 
 
 def test_http2_dispatcher_control_flood_emits_goaway() raises:
@@ -606,6 +602,77 @@ def test_http2_dispatcher_control_under_limit_succeeds() raises:
     result = dispatcher.accept(reset, Span(reset_payload))
     assert_true(result.is_reset())
     assert_false(dispatcher.is_failed())
+
+
+def _find_goaway_offset(wire: List[Byte]) raises -> Int:
+    var offset = 0
+    while offset + 9 <= len(wire):
+        var frame = parse_frame(Span(wire)[offset:])
+        assert_true(frame.is_complete())
+        if frame.frame_type == Byte(7):
+            return offset
+        offset += frame.consumed
+    return -1
+
+
+def test_http2_request_session_control_flood_emits_goaway_and_drains() raises:
+    var session = Http2RequestSession(
+        "build/http2/libnet_hpack",
+        4,
+        1024,
+        max_control_frames_per_second=3,
+        max_resets_per_second=100,
+    )
+    var bootstrap = List[Byte]()
+    var preface = "PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n".as_bytes()
+    for i in range(len(preface)):
+        bootstrap.append(preface[i])
+    var empty = List[Byte]()
+    var settings = encode_frame(Byte(4), Byte(0), UInt32(0), Span(empty))
+    for i in range(len(settings.wire)):
+        bootstrap.append(settings.wire[i])
+    var boot = session.consume(Span(bootstrap))
+    assert_true(boot.is_pending())
+    assert_false(session.is_failed())
+
+    var ping_payload: List[Byte] = [
+        Byte(1), Byte(2), Byte(3), Byte(4), Byte(5), Byte(6), Byte(7), Byte(8)
+    ]
+    for _ in range(3):
+        var ping_wire = _frame(6, 0, 0, ping_payload)
+        var ack = session.consume(Span(ping_wire))
+        assert_true(ack.is_pending())
+        assert_false(session.is_failed())
+        assert_false(session.is_draining())
+
+    var flood_ping = _frame(6, 0, 0, ping_payload)
+    var flooded = session.consume(Span(flood_ping))
+    assert_true(flooded.is_pending())
+    assert_true(session.is_draining())
+    assert_false(session.is_failed())
+    var goaway_at = _find_goaway_offset(flooded.output)
+    assert_true(goaway_at >= 0)
+    var goaway_frame = parse_frame(Span(flooded.output)[goaway_at:])
+    assert_true(goaway_frame.is_complete())
+    assert_equal(goaway_frame.frame_type, Byte(7))
+    var goaway = parse_goaway_frame(
+        goaway_frame, Span(flooded.output)[goaway_at + 9 :]
+    )
+    assert_true(goaway.is_valid())
+    assert_equal(goaway.error_code, UInt32(11))
+    assert_equal(goaway.last_stream_id, UInt32(0))
+
+    var compressed: List[Byte] = [
+        Byte(0x82), Byte(0x86), Byte(0x84), Byte(0x41), Byte(0x0F),
+        Byte(ord("w")), Byte(ord("w")), Byte(ord("w")), Byte(ord(".")),
+        Byte(ord("e")), Byte(ord("x")), Byte(ord("a")), Byte(ord("m")),
+        Byte(ord("p")), Byte(ord("l")), Byte(ord("e")), Byte(ord(".")),
+        Byte(ord("c")), Byte(ord("o")), Byte(ord("m")),
+    ]
+    var headers = _frame(1, 5, 1, compressed)
+    var after = session.consume(Span(headers))
+    assert_false(after.is_request())
+    assert_true(session.is_draining())
 
 
 def test_http2_frame_reader_retains_fragmented_frame_and_leaves_next() raises:

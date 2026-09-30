@@ -246,9 +246,17 @@ struct Http2RequestSession(Movable):
                     self._failed = True
                     return Http2RequestSessionResult.error(consumed, output^)
             _append_session_output(output, Span(input.output))
-            if self._input.is_failed():
-                self._failed = True
+            if input.is_flood():
+                # Drain only: leave `_failed` false so the server can flush
+                # ENHANCE_YOUR_CALM GOAWAY before closing the connection.
                 self._draining = True
+                var goaway = encode_goaway_frame(
+                    self._last_stream_id, UInt32(11)
+                )
+                if not goaway.is_complete():
+                    self._failed = True
+                    return Http2RequestSessionResult.error(consumed, output^)
+                _append_session_output(output, Span(goaway.wire))
                 return Http2RequestSessionResult.pending(consumed, output^)
 
             if (
@@ -580,6 +588,9 @@ struct Http2RequestSession(Movable):
 
     def is_failed(self) -> Bool:
         return self._failed
+
+    def is_draining(self) -> Bool:
+        return self._draining
 
     def peer_settings(self) -> Http2PeerSettingsSnapshot:
         return self._input.peer_settings()

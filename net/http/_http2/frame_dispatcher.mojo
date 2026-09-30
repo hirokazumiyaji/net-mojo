@@ -2,7 +2,6 @@
 
 from .._deadline import now_ns
 from .control_frames import (
-    encode_goaway_frame,
     parse_goaway_frame,
     parse_ping_frame,
     parse_rst_stream_frame,
@@ -13,7 +12,8 @@ from .settings_frame import parse_settings_frame
 from .settings_state import Http2PeerSettings, Http2PeerSettingsSnapshot
 from .window_update import parse_window_update_frame
 
-comptime _HTTP2_ENHANCE_YOUR_CALM: UInt32 = UInt32(11)
+# Tumbling 1-second windows (reset at first event after prior window ends);
+# not a sliding deque of timestamps.
 comptime _RATE_WINDOW_NS: Int = 1_000_000_000
 
 
@@ -48,6 +48,13 @@ struct Http2DispatchResult(Movable):
             kind=6, stream_id=UInt32(0), value=UInt32(0), output=List[Byte]()
         )
 
+    @staticmethod
+    def flood() -> Self:
+        # Session encodes GOAWAY ENHANCE_YOUR_CALM with its last_stream_id.
+        return Self(
+            kind=7, stream_id=UInt32(0), value=UInt32(11), output=List[Byte]()
+        )
+
     def is_ignored(self) -> Bool:
         return self.kind == 1
 
@@ -65,6 +72,9 @@ struct Http2DispatchResult(Movable):
 
     def is_error(self) -> Bool:
         return self.kind == 6
+
+    def is_flood(self) -> Bool:
+        return self.kind == 7
 
 
 struct Http2FrameDispatcher(Movable):
@@ -107,13 +117,9 @@ struct Http2FrameDispatcher(Movable):
         self._reset_window_start_ns = 0
         self._reset_count = 0
 
-    def _flood_goaway(mut self) -> Http2DispatchResult:
+    def _flood(mut self) -> Http2DispatchResult:
         self._failed = True
-        var encoded = encode_goaway_frame(UInt32(0), _HTTP2_ENHANCE_YOUR_CALM)
-        if not encoded.is_complete():
-            return Http2DispatchResult.error()
-        var wire = encoded.wire.copy()
-        return Http2DispatchResult.output_frame(wire^)
+        return Http2DispatchResult.flood()
 
     def _control_exceeded(mut self) -> Bool:
         var now = now_ns()
@@ -156,7 +162,7 @@ struct Http2FrameDispatcher(Movable):
             if settings.is_ack():
                 return Http2DispatchResult.ignored()
             if self._control_exceeded():
-                return self._flood_goaway()
+                return self._flood()
             var applied = self._peer_settings.apply(
                 Span(settings.parsed.settings)
             )
@@ -184,7 +190,7 @@ struct Http2FrameDispatcher(Movable):
             if ping.is_ack():
                 return Http2DispatchResult.ignored()
             if self._control_exceeded():
-                return self._flood_goaway()
+                return self._flood()
             var ack = ping.encode_ack()
             if not ack.is_complete():
                 self._failed = True
@@ -198,7 +204,7 @@ struct Http2FrameDispatcher(Movable):
                 self._failed = True
                 return Http2DispatchResult.error()
             if self._control_exceeded():
-                return self._flood_goaway()
+                return self._flood()
             return Http2DispatchResult.event(
                 3, update.stream_id, update.increment
             )
@@ -209,7 +215,7 @@ struct Http2FrameDispatcher(Movable):
                 self._failed = True
                 return Http2DispatchResult.error()
             if self._reset_exceeded():
-                return self._flood_goaway()
+                return self._flood()
             return Http2DispatchResult.event(
                 4, reset.stream_id, reset.error_code
             )
@@ -225,7 +231,7 @@ struct Http2FrameDispatcher(Movable):
 
         if frame.frame_type == Byte(2):
             if self._control_exceeded():
-                return self._flood_goaway()
+                return self._flood()
             return Http2DispatchResult.ignored()
 
         return Http2DispatchResult.ignored()

@@ -1,4 +1,4 @@
-from std.testing import assert_equal, assert_true, TestSuite
+from std.testing import assert_equal, assert_false, assert_true, TestSuite
 
 from net.http._http2.hpack import Http2HpackDeflater, Http2HpackInflater
 from net.http._http2.frame import FrameParseResult, parse_frame
@@ -430,6 +430,73 @@ def test_http2_request_session_refuses_new_streams_after_goaway() raises:
     var reset = parse_rst_stream_frame(reset_frame, Span(result.output[9:]))
     assert_true(reset.is_valid())
     assert_equal(reset.error_code, UInt32(7))
+
+
+def _find_goaway_offset(wire: List[Byte]) raises -> Int:
+    var offset = 0
+    while offset + 9 <= len(wire):
+        var frame = parse_frame(Span(wire)[offset:])
+        assert_true(frame.is_complete())
+        if frame.frame_type == Byte(7):
+            return offset
+        offset += frame.consumed
+    return -1
+
+
+def test_http2_request_session_reset_flood_uses_last_stream_id() raises:
+    var session = Http2RequestSession(
+        "build/http2/libnet_hpack",
+        4,
+        1024,
+        max_control_frames_per_second=1000,
+        max_resets_per_second=2,
+    )
+    var wire = List[Byte]()
+    var preface = "PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n".as_bytes()
+    for i in range(len(preface)):
+        wire.append(preface[i])
+    var empty = List[Byte]()
+    _append_frame(wire, Byte(4), Byte(0), UInt32(0), Span(empty))
+    var compressed: List[Byte] = [
+        Byte(0x82), Byte(0x86), Byte(0x84), Byte(0x41), Byte(0x0F),
+        Byte(ord("w")), Byte(ord("w")), Byte(ord("w")), Byte(ord(".")),
+        Byte(ord("e")), Byte(ord("x")), Byte(ord("a")), Byte(ord("m")),
+        Byte(ord("p")), Byte(ord("l")), Byte(ord("e")), Byte(ord(".")),
+        Byte(ord("c")), Byte(ord("o")), Byte(ord("m")),
+    ]
+    _append_frame(wire, Byte(1), Byte(5), UInt32(3), Span(compressed))
+    var request = session.consume(Span(wire))
+    assert_true(request.is_request())
+    assert_equal(request.stream_id, UInt32(3))
+
+    var reset_payload: List[Byte] = [Byte(0), Byte(0), Byte(0), Byte(8)]
+    var reset1 = List[Byte]()
+    _append_frame(reset1, Byte(3), Byte(0), UInt32(3), Span(reset_payload))
+    assert_true(session.consume(Span(reset1)).is_pending())
+    var reset2 = List[Byte]()
+    _append_frame(reset2, Byte(3), Byte(0), UInt32(3), Span(reset_payload))
+    assert_true(session.consume(Span(reset2)).is_pending())
+    assert_false(session.is_draining())
+
+    var reset3 = List[Byte]()
+    _append_frame(reset3, Byte(3), Byte(0), UInt32(3), Span(reset_payload))
+    var flooded = session.consume(Span(reset3))
+    assert_true(flooded.is_pending())
+    assert_true(session.is_draining())
+    assert_false(session.is_failed())
+    var goaway_at = _find_goaway_offset(flooded.output)
+    assert_true(goaway_at >= 0)
+    var goaway_frame = parse_frame(Span(flooded.output)[goaway_at:])
+    var goaway = parse_goaway_frame(
+        goaway_frame, Span(flooded.output)[goaway_at + 9 :]
+    )
+    assert_true(goaway.is_valid())
+    assert_equal(goaway.error_code, UInt32(11))
+    assert_equal(goaway.last_stream_id, UInt32(3))
+
+    var more = List[Byte]()
+    _append_frame(more, Byte(1), Byte(5), UInt32(5), Span(compressed))
+    assert_false(session.consume(Span(more)).is_request())
 
 
 def test_http2_request_session_completes_data_body() raises:

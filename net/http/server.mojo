@@ -668,9 +668,6 @@ struct Server(Movable):
                     self._close_conn(idx)
                     continue
                 var expired = self._conns[idx].http2_session.value().expire(now)
-                if self._conns[idx].http2_session.value().is_failed():
-                    self._close_conn(idx)
-                    continue
                 if len(expired) > 0:
                     if not self._budget.try_reserve(len(expired)):
                         self._close_conn(idx)
@@ -682,6 +679,12 @@ struct Server(Movable):
                     )
                     self._arm_deadline(idx)
                     self._sync_interests(idx)
+                    continue
+                if (
+                    self._conns[idx].http2_session.value().is_failed()
+                    and self._conns[idx].pending_remaining() == 0
+                ):
+                    self._close_conn(idx)
                     continue
                 self._arm_deadline(idx)
                 continue
@@ -1211,9 +1214,6 @@ struct Server(Movable):
         if self._conns[idx].protocol == PROTOCOL_HTTP2:
             if self._conns[idx].http2_session:
                 var expired = self._conns[idx].http2_session.value().expire(now)
-                if self._conns[idx].http2_session.value().is_failed():
-                    self._close_conn(idx)
-                    return
                 if len(expired) > 0:
                     if not self._budget.try_reserve(len(expired)):
                         self._close_conn(idx)
@@ -1223,12 +1223,22 @@ struct Server(Movable):
                     self._conns[idx].write_at = deadline_from_now(
                         self.config.write_deadline
                     )
-            if self._conns[idx].state == STATE_SENDING_HTTP2_CONTROL:
+            if (
+                self._conns[idx].state == STATE_SENDING_HTTP2_CONTROL
+                or self._conns[idx].pending_remaining() > 0
+            ):
                 self._pump_send(
                     idx, self._conns[idx].write_ready(readable, writable)
                 )
                 if not self._conns[idx].active:
                     return
+            if (
+                self._conns[idx].http2_session
+                and self._conns[idx].http2_session.value().is_failed()
+                and self._conns[idx].pending_remaining() == 0
+            ):
+                self._close_conn(idx)
+                return
             var read_event = (
                 self._conns[idx].read_ready(readable, writable)
                 or self._conns[idx].tls_pending() > 0
@@ -1251,6 +1261,17 @@ struct Server(Movable):
                 self._pump_http2_input(idx, handler)
                 http2_activity = True
                 if not self._conns[idx].active:
+                    return
+                if self._conns[idx].state == STATE_SENDING_HTTP2_CONTROL:
+                    self._pump_send(idx, True)
+                    if not self._conns[idx].active:
+                        return
+                if (
+                    self._conns[idx].http2_session
+                    and self._conns[idx].http2_session.value().is_failed()
+                    and self._conns[idx].pending_remaining() == 0
+                ):
+                    self._close_conn(idx)
                     return
                 if self._conns[idx].buffered_len() >= buffered_before:
                     break
@@ -1366,6 +1387,13 @@ struct Server(Movable):
                 self._close_conn(idx)
                 return
             if result.is_error():
+                if self._conns[idx].pending_remaining() > 0:
+                    self._conns[idx].state = STATE_SENDING_HTTP2_CONTROL
+                    self._conns[idx].write_at = deadline_from_now(
+                        self.config.write_deadline
+                    )
+                    self._pump_send(idx, True)
+                    return
                 self._close_conn(idx)
                 return
             if result.consumed > 0:
@@ -1419,6 +1447,7 @@ struct Server(Movable):
                 self._conns[idx].write_at = deadline_from_now(
                     self.config.write_deadline
                 )
+                self._pump_send(idx, True)
                 return
             if result.is_pending():
                 self._drain_http2_responses(idx)
