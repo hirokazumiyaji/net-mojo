@@ -150,3 +150,19 @@ def has_body_for_status(status: Int, is_head: Bool) -> Bool:
     if status == 204 or status == 205 or status == 304:
         return False
     return True
+
+
+def maybe_inject_alt_svc(
+    mut writer: ResponseWriter, alt_svc: StringSlice
+) raises:
+    """Adds `Alt-Svc` when configured and the handler did not set it.
+
+    Callers restrict this to HTTPS (TLS) responses. An empty `alt_svc`
+    leaves the response unchanged so UDP-unavailable deployments can
+    serve HTTPS without advertising HTTP/3.
+    """
+    if alt_svc.byte_length() == 0:
+        return
+    if writer.headers.get_first("Alt-Svc"):
+        return
+    writer.headers.add(String("Alt-Svc"), String(alt_svc))

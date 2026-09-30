@@ -74,7 +74,11 @@ from ._parser import ParseResult, parse_head, parse_one
 from .config import ServerConfig
 from .handler import Handler
 from .headers import Headers
-from .response import ResponseWriter, has_body_for_status
+from .response import (
+    ResponseWriter,
+    has_body_for_status,
+    maybe_inject_alt_svc,
+)
 from .request import HttpVersion, Request, split_path_query
 from net.tls import TLSConnection, TLSContext
 from net.http._http2.hpack import Http2HpackDeflater
@@ -221,6 +225,14 @@ struct Server(Movable):
 
     def active_connections(self) -> Int:
         return self._active_conns
+
+    def _inject_alt_svc_for_tls(
+        mut self, idx: Int, mut writer: ResponseWriter
+    ) raises:
+        # Opt-in HTTPS advertisement only: plaintext and empty alt_svc skip.
+        if not self._conns[idx].is_tls():
+            return
+        maybe_inject_alt_svc(writer, self.config.alt_svc)
 
     def add_listener(mut self, var listener: TCPListener) raises:
         if self._listener:
@@ -1456,6 +1468,13 @@ struct Server(Movable):
             writer.headers.clear()
             writer.body.clear()
 
+        try:
+            self._inject_alt_svc_for_tls(idx, writer)
+        except e:
+            _ = e
+            self._close_conn(idx)
+            return
+
         if not self._conns[idx].http2_deflater:
             try:
                 var table_size = Int(
@@ -1889,6 +1908,12 @@ struct Server(Movable):
             return
         # Header count/bytes are enforced inside the encoder, the single
         # authoritative site; its failure below becomes a 500 the same way.
+        try:
+            self._inject_alt_svc_for_tls(idx, writer)
+        except e:
+            _ = e
+            self._send_error(idx, 500)
+            return
         var wire: List[Byte]
         try:
             wire = encode_response(
@@ -2227,6 +2252,16 @@ struct Server(Movable):
             self._arm_deadline(idx)
             return
 
+        try:
+            self._inject_alt_svc_for_tls(idx, rw)
+        except e:
+            _ = e
+            self._mark_detached_cancelled(idx)
+            self._cleanup_detached_state(idx)
+            self._send_error(idx, 500, is_head=is_head)
+            self._arm_deadline(idx)
+            return
+
         var wire: List[Byte]
         try:
             wire = encode_response(
@@ -2286,6 +2321,16 @@ struct Server(Movable):
         msg.headers = Headers()
         rw.headers = h^
         rw.set_should_close(req_close or (self._shutdown_at != NO_DEADLINE))
+
+        try:
+            self._inject_alt_svc_for_tls(idx, rw)
+        except e:
+            _ = e
+            self._mark_detached_cancelled(idx)
+            self._cleanup_detached_state(idx)
+            self._send_error(idx, 500, is_head=is_head)
+            self._arm_deadline(idx)
+            return
 
         var wire: List[Byte]
         try:

@@ -26,6 +26,22 @@ def read_h2_frame(client):
     )
 
 
+def hpack_starts_with_status_200(payload):
+    """True when the block encodes :status 200, optionally after a table-size update."""
+    i = 0
+    # RFC 7541 §6.3: Dynamic Table Size Update has pattern 001xxxxx.
+    while i < len(payload) and (payload[i] & 0xE0) == 0x20:
+        prefix = payload[i] & 0x1F
+        i += 1
+        if prefix == 0x1F:
+            while i < len(payload) and (payload[i] & 0x80) != 0:
+                i += 1
+            if i < len(payload):
+                i += 1
+    return i < len(payload) and payload[i] == 0x88
+
+
+
 def test_http2_shutdown_goaway():
     shutdown_process = subprocess.Popen(
         [
@@ -96,6 +112,72 @@ def test_http2_shutdown_goaway():
         raise
 
 
+def test_https_alt_svc_advertisement():
+    alt_process = subprocess.Popen(
+        [
+            "mojo",
+            "run",
+            "--Werror",
+            "-I",
+            ".",
+            "tests/https_alt_svc_fixture.mojo",
+        ],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    try:
+        ready = alt_process.stdout.readline().strip()
+        if not ready.startswith("READY "):
+            raise RuntimeError(f"alt-svc fixture did not start: {ready}")
+        port = int(ready.split()[1])
+        context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+        context.check_hostname = False
+        context.verify_mode = ssl.CERT_NONE
+        context.set_alpn_protocols(["http/1.1"])
+
+        with socket.create_connection(("127.0.0.1", port), timeout=5) as raw:
+            with context.wrap_socket(raw, server_hostname="localhost") as client:
+                client.sendall(
+                    b"GET / HTTP/1.1\r\nHost: localhost\r\n"
+                    b"Connection: close\r\n\r\n"
+                )
+                response = bytearray()
+                while chunk := client.recv(4096):
+                    response.extend(chunk)
+        injected = bytes(response)
+        if b'Alt-Svc: h3=":8443"; ma=86400\r\n' not in injected:
+            raise RuntimeError(
+                f"expected injected Alt-Svc on HTTPS response: {injected!r}"
+            )
+
+        with socket.create_connection(("127.0.0.1", port), timeout=5) as raw:
+            with context.wrap_socket(raw, server_hostname="localhost") as client:
+                client.sendall(
+                    b"GET /custom HTTP/1.1\r\nHost: localhost\r\n"
+                    b"Connection: close\r\n\r\n"
+                )
+                response = bytearray()
+                while chunk := client.recv(4096):
+                    response.extend(chunk)
+        custom = bytes(response)
+        if b'Alt-Svc: h3=":9443"; ma=60\r\n' not in custom:
+            raise RuntimeError(
+                f"handler Alt-Svc must win over config: {custom!r}"
+            )
+        if b'h3=":8443"; ma=86400' in custom:
+            raise RuntimeError(
+                f"config Alt-Svc must not replace handler value: {custom!r}"
+            )
+        if alt_process.wait(timeout=5) != 0:
+            raise RuntimeError(alt_process.stderr.read())
+    except Exception:
+        alt_process.kill()
+        alt_process.wait()
+        sys.stderr.write(alt_process.stderr.read())
+        raise
+
+
 process = subprocess.Popen(
     ["mojo", "run", "--Werror", "-I", ".", "tests/https_server_fixture.mojo"],
     stdout=subprocess.PIPE,
@@ -104,6 +186,9 @@ process = subprocess.Popen(
 )
 
 try:
+    # Independent of the shared fixture: opt-in Alt-Svc advertisement.
+    test_https_alt_svc_advertisement()
+
     ready = process.stdout.readline().strip()
     if not ready.startswith("READY "):
         raise RuntimeError(f"HTTPS fixture did not start: {ready}")
@@ -185,7 +270,7 @@ try:
             for _ in range(4):
                 frame = read_h2_frame(client)
                 if frame[0] == 1:
-                    if frame[3][0] != 0x88:
+                    if not hpack_starts_with_status_200(frame[3]):
                         raise RuntimeError(
                             f"unexpected HTTP/2 headers: {frame!r}"
                         )
@@ -226,7 +311,7 @@ try:
                 limited_headers[0] != 1
                 or limited_headers[2] != 1
                 or (limited_headers[1] & 1) != 0
-                or limited_headers[3][0] != 0x88
+                or not hpack_starts_with_status_200(limited_headers[3])
             ):
                 raise RuntimeError(
                     f"server exceeded a zero HTTP/2 send window: {limited_headers!r}"
@@ -264,6 +349,10 @@ try:
         raise RuntimeError(f"unexpected HTTPS response: {wire!r}")
     if not wire.endswith(b"hello over https"):
         raise RuntimeError(f"unexpected HTTPS response body: {wire!r}")
+    if b"Alt-Svc:" in wire:
+        raise RuntimeError(
+            f"Alt-Svc must be absent when ServerConfig.alt_svc is empty: {wire!r}"
+        )
     if process.wait(timeout=5) != 0:
         raise RuntimeError(process.stderr.read())
     test_http2_shutdown_goaway()

@@ -256,7 +256,9 @@ section records only the package-level boundaries.
   bounds incomplete peers. Core `net` and plaintext server builds remain
   OpenSSL-free. HTTP/3 uses a separately configured QUIC UDP endpoint and the
   same shared `Request`/`Headers`/`Handler`/`ResponseWriter` semantics; wire
-  formats and state machines stay per protocol.
+  formats and state machines stay per protocol. Advertise HTTP/3 to HTTPS
+  clients by setting `ServerConfig.alt_svc` (for example `h3=":443"; ma=86400`)
+  when that UDP endpoint is attached; leave it empty when QUIC is unavailable.
 
 ## Testing
 
