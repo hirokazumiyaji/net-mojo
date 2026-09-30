@@ -718,6 +718,10 @@ struct Server(Movable):
                     self._conns[i].write_at = deadline_from_now(
                         self.config.write_deadline
                     )
+                    # Wake the write path: without this, GOAWAY sits in pending
+                    # until an unrelated read event arrives.
+                    self._sync_interests(i)
+                    self._push_urgent(i)
                 # Idle connections (nothing buffered, nothing queued)
                 # stop waiting out their long keep-alive clock: give
                 # them a short cushion instead. Anything with bytes in

@@ -675,6 +675,135 @@ def test_http2_request_session_control_flood_emits_goaway_and_drains() raises:
     assert_true(session.is_draining())
 
 
+def test_http2_request_session_rst_storm_while_healthy_stream_emits_goaway() raises:
+    # Mixed pattern: stream 3 stays open (HEADERS without END_STREAM) while
+    # RST_STREAM on stream 1 exceeds the tumbling reset budget.
+    var session = Http2RequestSession(
+        "build/http2/libnet_hpack",
+        4,
+        1024,
+        max_control_frames_per_second=1000,
+        max_resets_per_second=2,
+    )
+    var bootstrap = List[Byte]()
+    var preface = "PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n".as_bytes()
+    for i in range(len(preface)):
+        bootstrap.append(preface[i])
+    var empty = List[Byte]()
+    var settings = encode_frame(Byte(4), Byte(0), UInt32(0), Span(empty))
+    for i in range(len(settings.wire)):
+        bootstrap.append(settings.wire[i])
+    assert_true(session.consume(Span(bootstrap)).is_pending())
+
+    var compressed: List[Byte] = [
+        Byte(0x82), Byte(0x86), Byte(0x84), Byte(0x41), Byte(0x0F),
+        Byte(ord("w")), Byte(ord("w")), Byte(ord("w")), Byte(ord(".")),
+        Byte(ord("e")), Byte(ord("x")), Byte(ord("a")), Byte(ord("m")),
+        Byte(ord("p")), Byte(ord("l")), Byte(ord("e")), Byte(ord(".")),
+        Byte(ord("c")), Byte(ord("o")), Byte(ord("m")),
+    ]
+    var stream1 = _frame(1, 5, 1, compressed)
+    var completed = session.consume(Span(stream1))
+    assert_true(completed.is_request())
+    assert_equal(completed.stream_id, UInt32(1))
+
+    # Healthy stream still assembling a body.
+    var stream3 = _frame(1, 4, 3, compressed)
+    assert_true(session.consume(Span(stream3)).is_pending())
+    assert_false(session.is_draining())
+
+    var reset_payload: List[Byte] = [Byte(0), Byte(0), Byte(0), Byte(8)]
+    for _ in range(2):
+        var reset = _frame(3, 0, 1, reset_payload)
+        assert_true(session.consume(Span(reset)).is_pending())
+        assert_false(session.is_draining())
+
+    var flood_reset = _frame(3, 0, 1, reset_payload)
+    var flooded = session.consume(Span(flood_reset))
+    assert_true(flooded.is_pending())
+    assert_true(session.is_draining())
+    assert_false(session.is_failed())
+    var goaway_at = _find_goaway_offset(flooded.output)
+    assert_true(goaway_at >= 0)
+    var goaway_frame = parse_frame(Span(flooded.output)[goaway_at:])
+    assert_true(goaway_frame.is_complete())
+    assert_equal(goaway_frame.frame_type, Byte(7))
+    var goaway = parse_goaway_frame(
+        goaway_frame, Span(flooded.output)[goaway_at + 9 :]
+    )
+    assert_true(goaway.is_valid())
+    assert_equal(goaway.error_code, UInt32(11))
+    assert_equal(goaway.last_stream_id, UInt32(3))
+
+    # No further request completes on the flooded connection.
+    var stream5 = _frame(1, 5, 5, compressed)
+    assert_false(session.consume(Span(stream5)).is_request())
+    var end_body: List[Byte] = List[Byte]()
+    var finish_healthy = _frame(0, 1, 3, end_body)
+    assert_false(session.consume(Span(finish_healthy)).is_request())
+    assert_true(session.is_draining())
+
+
+def test_http2_request_session_flood_isolates_sibling_session() raises:
+    var flooded = Http2RequestSession(
+        "build/http2/libnet_hpack",
+        4,
+        1024,
+        max_control_frames_per_second=1000,
+        max_resets_per_second=2,
+    )
+    var healthy = Http2RequestSession(
+        "build/http2/libnet_hpack",
+        4,
+        1024,
+        max_control_frames_per_second=1000,
+        max_resets_per_second=2,
+    )
+    var preface = "PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n".as_bytes()
+    var empty = List[Byte]()
+    var settings = encode_frame(Byte(4), Byte(0), UInt32(0), Span(empty))
+    var bootstrap = List[Byte]()
+    for i in range(len(preface)):
+        bootstrap.append(preface[i])
+    for i in range(len(settings.wire)):
+        bootstrap.append(settings.wire[i])
+    assert_true(flooded.consume(Span(bootstrap)).is_pending())
+    assert_true(healthy.consume(Span(bootstrap)).is_pending())
+
+    var compressed: List[Byte] = [
+        Byte(0x82), Byte(0x86), Byte(0x84), Byte(0x41), Byte(0x0F),
+        Byte(ord("w")), Byte(ord("w")), Byte(ord("w")), Byte(ord(".")),
+        Byte(ord("e")), Byte(ord("x")), Byte(ord("a")), Byte(ord("m")),
+        Byte(ord("p")), Byte(ord("l")), Byte(ord("e")), Byte(ord(".")),
+        Byte(ord("c")), Byte(ord("o")), Byte(ord("m")),
+    ]
+    var open_stream = _frame(1, 5, 1, compressed)
+    assert_true(flooded.consume(Span(open_stream)).is_request())
+
+    var reset_payload: List[Byte] = [Byte(0), Byte(0), Byte(0), Byte(8)]
+    for _ in range(2):
+        assert_true(
+            flooded.consume(Span(_frame(3, 0, 1, reset_payload))).is_pending()
+        )
+    var storm = flooded.consume(Span(_frame(3, 0, 1, reset_payload)))
+    assert_true(storm.is_pending())
+    assert_true(flooded.is_draining())
+    var goaway_at = _find_goaway_offset(storm.output)
+    assert_true(goaway_at >= 0)
+    var goaway_frame = parse_frame(Span(storm.output)[goaway_at:])
+    var goaway = parse_goaway_frame(
+        goaway_frame, Span(storm.output)[goaway_at + 9 :]
+    )
+    assert_equal(goaway.error_code, UInt32(11))
+
+    # Sibling connection/session is unaffected.
+    var sibling = healthy.consume(Span(open_stream))
+    assert_true(sibling.is_request())
+    assert_equal(sibling.stream_id, UInt32(1))
+    assert_false(healthy.is_draining())
+    assert_false(healthy.is_failed())
+
+
 def test_http2_frame_reader_retains_fragmented_frame_and_leaves_next() raises:
     var reader = Http2FrameReader(16384)
     var payload: List[Byte] = [Byte(4), Byte(3), Byte(2), Byte(1)]
