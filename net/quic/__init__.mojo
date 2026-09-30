@@ -150,6 +150,25 @@ struct QuicServer(Movable):
                 "QUIC provider could not set the connection limit",
             )
 
+    def set_transport_memory_limit(mut self, limit: Int) raises NetError:
+        var result = self._library.call[
+            "net_quic_set_transport_memory_limit", c_int
+        ](self._server, c_size_t(limit))
+        if result != 1:
+            raise NetError(
+                NetErrorKind.invalid_state(),
+                "set QUIC transport memory limit",
+                None,
+                "QUIC provider could not set the transport memory limit",
+            )
+
+    def transport_memory_bytes(self) -> Int:
+        return Int(
+            self._library.call["net_quic_transport_memory_bytes", c_size_t](
+                self._server
+            )
+        )
+
     def set_request_limits(
         mut self,
         max_body_bytes: Int,
@@ -355,6 +374,12 @@ struct QuicUDPEndpoint(Movable):
 
     def set_connection_limit(mut self, limit: Int) raises NetError:
         self._server.set_connection_limit(limit)
+
+    def set_transport_memory_limit(mut self, limit: Int) raises NetError:
+        self._server.set_transport_memory_limit(limit)
+
+    def transport_memory_bytes(self) -> Int:
+        return self._server.transport_memory_bytes()
 
     def set_request_limits(
         mut self,

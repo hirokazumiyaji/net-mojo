@@ -30,10 +30,10 @@ consumption. The aggregate request-body budget is enforced in the provider
 before appending each DATA chunk; an over-budget stream is reset with
 `H3_EXCESSIVE_LOAD`. Response headers are limited to 32 KiB and 100 fields, and
 response bodies to 1 MiB per response. The provider configures a 32 KiB HTTP/3
-field-section limit. Provider response queues and quiche's internal transport
-memory do not yet have aggregate accounting. Pending response field and body
-bytes are capped at 64 MiB across the provider; a stream that exceeds this
-queue budget is reset with `H3_EXCESSIVE_LOAD`.
+field-section limit. Pending response field and body bytes are capped at 64 MiB
+across the provider; a stream that exceeds this queue budget is reset with
+`H3_EXCESSIVE_LOAD`. Quiche transport memory is estimated separately (see
+limits below) and does not share those 64 MiB application queue caps.
 
 The QUIC provider uses a 10,000,000 byte connection receive limit, 1,000,000
 bytes of bidirectional and unidirectional stream receive credit, an initial
@@ -66,14 +66,19 @@ expires.
 The QUIC engine supplies HTTP/3 control and QPACK behavior; the application does
 not implement duplicate control streams or a second QPACK implementation.
 Interoperability coverage currently uses aioquic 1.3.0 and quiche. Broader
-independent-client coverage, loss and reordering stress, cancellation and reset
-stress, and aggregate memory bounds remain outstanding. HTTPS Alt-Svc
-advertisement and shared TCP/UDP origin setup also remain outstanding. Server
-push and CONNECT are not supported.
+independent-client coverage and cancellation/reset stress remain outstanding.
+HTTPS Alt-Svc advertisement and shared TCP/UDP origin setup also remain
+outstanding. Server push and CONNECT are not supported.
 
 Closed or timed-out QUIC connections are removed with their connection-ID
 routes, pending request routes, and queued completed requests. New connections
-are capped by `ServerConfig.max_connections`; request-body buffering and
-pending response fields and bodies each have a 64 MiB aggregate provider cap.
-quiche transport memory remains outside these budgets and requires separate
-accounting.
+are capped by `ServerConfig.max_connections`. Request-body buffering and
+pending response fields and bodies each have a 64 MiB aggregate provider cap
+(unchanged). Quiche does not expose allocator-backed transport memory in
+`stats()`, so the provider reports a soft estimate of
+`connections.len() × 256 KiB` and refuses new Initial packets when accepting
+another connection would exceed
+`ServerConfig.quic_max_transport_memory_bytes` (default ~2.5 GiB, aligned with
+10,000 connections). Existing connections continue to drain normally when the
+budget is exhausted. UDP send-path saturation under sustained would-block
+remains a separate verification item.
