@@ -1,3 +1,7 @@
 module github.com/hirokazumiyaji/net-mojo/benchmarks/http_go
 
-go 1.24
+go 1.26.0
+
+require golang.org/x/net v0.59.0
+
+require golang.org/x/text v0.42.0 // indirect
