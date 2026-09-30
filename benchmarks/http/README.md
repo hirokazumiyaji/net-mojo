@@ -93,6 +93,11 @@ curl -k --http2 https://127.0.0.1:18442/fixed -o /tmp/fixed.h2.body
 - `benchmarks/http2_tls_server.mojo` + `benchmarks/http/run_http2_bench.sh`
   (PR 9): HTTPS+HTTP/2 `/fixed`/`/json`/`/echo` vs the Go `-tls` baseline
   using `h2load`.
+- `benchmarks/http3_server.mojo` + `benchmarks/http3_aioquic_baseline.py` +
+  `benchmarks/http/run_http3_bench.sh` (PR 10): QUIC ALPN `h3` `/fixed`/
+  `/json`/`/echo` vs a pinned aioquic 1.3.0 server using
+  `benchmarks/http3_load.py` (aioquic client; Homebrew `h2load` lacks
+  ngtcp2/nghttp3).
 
 ## Phase 3 poll baseline (preliminary, same host)
 
@@ -225,3 +230,83 @@ At single-stream concurrency Mojo trails Go on median latency (~1.5×) while
 p95/p99 stay comparable or slightly better. Multiplexed streams close the
 throughput gap. Follow-up profiling (not in this PR): TLS/HPACK path cost
 and per-request handler overhead under low stream concurrency.
+
+## HTTP/3 QUIC (PR 10, measured)
+
+QUIC ALPN `h3` comparison for the shared `/fixed` / `/json` / `/echo`
+handlers on loopback (RTT ≈ 0, induced loss 0%). Numbers below are from a
+full Phase 0 procedure on one host (warmup 10 s, measure 30 s, 5 runs).
+Raw load logs and mid-run `ps`/`lsof` samples live under
+`build/bench/http3/` when the harness is re-run locally (that directory is
+gitignored).
+
+### Host and toolchain
+
+| Item | Value |
+| --- | --- |
+| Host | Mac mini (Mac14,12), Apple M2 Pro, 32 GB |
+| OS | macOS 27.0.1 (Darwin 27.0.0), `arm64` |
+| Mojo | `1.0.0` (`pixi.toml` pin `>=1.0.0,<2`) |
+| QUIC provider | quiche `0.29.3` (`net/quic/provider/Cargo.toml`, BoringSSL via quiche) |
+| H3 baseline | aioquic `==1.3.0` (`pixi` feature `http3` / `tls-http3`) |
+| Load tool | `benchmarks/http3_load.py` (aioquic 1.3.0 client). Homebrew `h2load` 1.70.0 advertises `--h3` but is not linked against ngtcp2/nghttp3, so it cannot drive H3 here. |
+| Certs | `build/tls/test-cert.pem` / `test-key.pem` from `pixi run -e tls-http3 tls-build` |
+| Loss | `0%` loopback (harness `LOSS_PCT` is a label only; no netem/pf injection in this recording) |
+
+### Harness
+
+- Baseline: `benchmarks/http3_aioquic_baseline.py` on UDP `127.0.0.1:18452`.
+- Mojo: optimized `mojo build` of `benchmarks/http3_server.mojo` (quiche
+  provider + UDP-only tick loop) on `127.0.0.1:18453`. Requires
+  `tls-build` + `quic-build`.
+- Driver: `benchmarks/http/run_http3_bench.sh` (documents `WARMUP_S` /
+  `MEASURE_S` / `RUNS` / `CLIENTS` / `STREAMS` / `LOSS_PCT`).
+- Scenario measured here: `GET /fixed` (64 B), `clients=64`, max concurrent
+  streams `1` and `10`. Loader and server share the host (same caveat as
+  PR 9). Mojo unpinned; aioquic is a single asyncio process.
+
+### Reproduce
+
+```bash
+pixi run -e tls-http3 tls-build
+pixi run -e tls-http3 quic-build
+# Full Phase 0 (as recorded below):
+WARMUP_S=10 MEASURE_S=30 RUNS=5 CLIENTS=64 STREAMS="1 10" \
+  bash benchmarks/http/run_http3_bench.sh
+```
+
+### Results (mean of 5 runs; req/s and latency from aioquic load client; CPU/RSS/fd mid-measure)
+
+| Server | Conns | Streams | Loss % | req/s (mean) | p50 (µs) | p95 (µs) | p99 (µs) | CPU % | RSS (MB) | fd |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| aioquic H3 | 64 | 1 | 0 | 4,984 | 12,575 | 13,838 | 14,763 | ~100 | ~106 | 47 |
+| Mojo H3 | 64 | 1 | 0 | 8,426 | 5,875 | 6,817 | 7,329 | ~50 | ~32 | 18 |
+| aioquic H3 | 64 | 10 | 0 | 4,465 | 136,645 | 186,740 | 221,746 | ~98 | ~153 | 47 |
+| Mojo H3 | 64 | 10 | 0 | 7,237 | 86,051 | 91,238 | 102,805 | ~43 | ~38 | 18 |
+
+Per-run req/s ranges: aioquic m=1 4,904–5,045; Mojo m=1 8,315–8,567;
+aioquic m=10 4,183–4,744; Mojo m=10 7,208–7,262. All runs: 0 failed.
+
+Notes on sources within this recording:
+
+- Mojo rows: single Phase 0 session (`build/bench/http3/`).
+- aioquic throughput/latency/CPU/RSS: Phase 0 re-run after the harness was
+  fixed to sample the real Python PID (not the `pixi run` wrapper). Same
+  host, procedure, and load shape as the Mojo session.
+
+### Target check
+
+There is no Go H3 peer in this PR; the pinned independent baseline is
+aioquic 1.3.0. Relative to that baseline:
+
+| Scenario | Mojo / aioquic req/s | Verdict |
+| --- | ---: | --- |
+| 64 conns × 1 stream | 169% | Exceed baseline |
+| 64 conns × 10 streams | 162% | Exceed baseline |
+
+Mojo’s quiche-backed path outperforms the Python aioquic server on
+loopback for this small-response workload, with lower median latency and
+RSS. Multiplexing (m=10) raises per-request latency on both sides as
+expected when 640 in-flight streams share the client and server. Follow-up
+(not in this PR): induced-loss runs (`LOSS_PCT` with an out-of-band
+netem/pf path) and a non-Python H3 baseline if a stronger peer is needed.
