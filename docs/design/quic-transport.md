@@ -24,6 +24,14 @@ The recommendation is conditional on those build and packaging probes. The appli
 
 Provider config construction (`apply_provider_quic_transport_settings` in `net/quic/provider/src/lib.rs`) explicitly keeps TLS early data disabled. Quiche only exposes `Config::enable_early_data()` as an opt-in and has no `disable_*` setter; the provider never calls that API (`PROVIDER_ENABLE_EARLY_DATA` is false). Session tickets may still be issued for resumption, but connections must not enter early data / 0-RTT.
 
+### Packet stress (duplicate / reorder / NAT rebinding)
+
+Provider Rust tests drive an in-memory quiche client against `QuicServer::recv_datagram` / `send` / `on_timeout` without a UDP socket:
+
+- Duplicate client datagrams must still complete an HTTP/3 request.
+- Swapped consecutive handshake or 1-RTT datagrams must recover via loss-detection timers.
+- Mid-connection change of the observed client UDP address must either continue serving or idle/timeout-clean without leaking CID `routes` or connection maps. Full path migration beyond quiche’s built-in behavior is out of scope.
+
 ## Source material
 
 - [quiche README](https://github.com/cloudflare/quiche): QUIC and HTTP/3 implementation, low-level I/O model, Rust requirement, BoringSSL build, and C API.

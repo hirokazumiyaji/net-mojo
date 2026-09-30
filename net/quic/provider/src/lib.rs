@@ -2864,6 +2864,408 @@ mod tests {
         assert!(!server.routes.contains_key(&second_dcid));
     }
 
+    fn stress_server_config() -> quiche::Config {
+        let certificate_path = std::env::var("NET_HTTP_TEST_CERT").unwrap();
+        let private_key_path = std::env::var("NET_HTTP_TEST_KEY").unwrap();
+        let mut server_config = quiche::Config::new(quiche::PROTOCOL_VERSION).unwrap();
+        server_config
+            .set_application_protos(quiche::h3::APPLICATION_PROTOCOL)
+            .unwrap();
+        server_config
+            .load_cert_chain_from_pem_file(&certificate_path)
+            .unwrap();
+        server_config
+            .load_priv_key_from_pem_file(&private_key_path)
+            .unwrap();
+        super::apply_provider_quic_transport_settings(&mut server_config);
+        server_config
+    }
+
+    fn stress_client_config() -> quiche::Config {
+        let mut client_config = quiche::Config::new(quiche::PROTOCOL_VERSION).unwrap();
+        client_config
+            .set_application_protos(quiche::h3::APPLICATION_PROTOCOL)
+            .unwrap();
+        client_config.verify_peer(false);
+        super::apply_provider_quic_transport_settings(&mut client_config);
+        client_config
+    }
+
+    fn collect_client_datagrams(
+        client: &mut quiche::Connection,
+        packet: &mut [u8],
+    ) -> Vec<Vec<u8>> {
+        let mut datagrams = Vec::new();
+        while let Ok((length, _)) = client.send(packet) {
+            datagrams.push(packet[..length].to_vec());
+        }
+        datagrams
+    }
+
+    fn deliver_client_datagram(
+        server: &mut super::QuicServer,
+        datagram: &[u8],
+        local: SocketAddr,
+        remote: SocketAddr,
+    ) {
+        let mut packet = datagram.to_vec();
+        match server.recv_datagram(&mut packet, local, remote) {
+            Ok(()) => {}
+            // Duplicate / out-of-order packets may be ignored by quiche.
+            Err(super::QuicServerError::Quiche(quiche::Error::Done)) => {}
+            Err(error) => panic!("unexpected recv_datagram error: {error:?}"),
+        }
+    }
+
+    fn flush_server_to_client(
+        client: &mut quiche::Connection,
+        server: &mut super::QuicServer,
+        packet: &mut [u8],
+        client_address: SocketAddr,
+    ) {
+        while let Ok(Some((length, info))) = server.send(packet) {
+            let _ = client.recv(
+                &mut packet[..length],
+                RecvInfo {
+                    from: info.from,
+                    to: client_address,
+                },
+            );
+        }
+    }
+
+    fn drive_timeouts(client: &mut quiche::Connection, server: &mut super::QuicServer) {
+        if client.timeout().is_some_and(|timeout| timeout.is_zero()) {
+            client.on_timeout();
+        }
+        if server.timeout().is_some_and(|timeout| timeout.is_zero()) {
+            server.on_timeout();
+        }
+    }
+
+    fn pump_in_memory(
+        client: &mut quiche::Connection,
+        server: &mut super::QuicServer,
+        packet: &mut [u8],
+        local: SocketAddr,
+        remote: SocketAddr,
+        reorder_first_pair: bool,
+        duplicate: bool,
+    ) {
+        drive_timeouts(client, server);
+        let mut datagrams = collect_client_datagrams(client, packet);
+        if reorder_first_pair && datagrams.len() >= 2 {
+            datagrams.swap(0, 1);
+        }
+        for datagram in &datagrams {
+            deliver_client_datagram(server, datagram, local, remote);
+            if duplicate {
+                deliver_client_datagram(server, datagram, local, remote);
+            }
+        }
+        flush_server_to_client(client, server, packet, remote);
+    }
+
+    fn establish_http3_in_memory(
+        client: &mut quiche::Connection,
+        server: &mut super::QuicServer,
+        packet: &mut [u8],
+        local: SocketAddr,
+        remote: SocketAddr,
+        reorder_handshake: bool,
+    ) {
+        for round in 0..64 {
+            pump_in_memory(
+                client,
+                server,
+                packet,
+                local,
+                remote,
+                reorder_handshake && round > 0,
+                false,
+            );
+            if client.is_established()
+                && server
+                    .connections
+                    .values()
+                    .any(|connection| connection.transport.is_established())
+            {
+                return;
+            }
+            // Loss/reorder recovery is timer-driven; advance when quiche asks.
+            if let Some(timeout) = client.timeout().filter(|timeout| !timeout.is_zero()) {
+                std::thread::sleep(timeout.min(Duration::from_millis(25)));
+            } else if let Some(timeout) = server.timeout().filter(|timeout| !timeout.is_zero()) {
+                std::thread::sleep(timeout.min(Duration::from_millis(25)));
+            }
+        }
+        assert!(
+            client.is_established(),
+            "client failed to establish under stress"
+        );
+    }
+
+    fn complete_post_request_in_memory(
+        client: &mut quiche::Connection,
+        server: &mut super::QuicServer,
+        packet: &mut [u8],
+        local: SocketAddr,
+        remote: SocketAddr,
+        duplicate_request_datagrams: bool,
+        reorder_request_datagrams: bool,
+    ) -> super::CompletedRequest {
+        let mut client_h3 = quiche::h3::Connection::with_transport(
+            client,
+            &quiche::h3::Config::new().unwrap(),
+        )
+        .unwrap();
+        let request_headers = [
+            quiche::h3::Header::new(b":method", b"POST"),
+            quiche::h3::Header::new(b":scheme", b"https"),
+            quiche::h3::Header::new(b":authority", b"localhost"),
+            quiche::h3::Header::new(b":path", b"/stress"),
+            quiche::h3::Header::new(b"content-length", b"4"),
+        ];
+        let stream_id = client_h3
+            .send_request(client, &request_headers, false)
+            .unwrap();
+        assert_eq!(
+            client_h3
+                .send_body(client, stream_id, b"ping", true)
+                .unwrap(),
+            4
+        );
+
+        for round in 0..64 {
+            drive_timeouts(client, server);
+            let mut datagrams = collect_client_datagrams(client, packet);
+            if reorder_request_datagrams && datagrams.len() >= 2 {
+                datagrams.swap(0, 1);
+            }
+            for datagram in &datagrams {
+                deliver_client_datagram(server, datagram, local, remote);
+                if duplicate_request_datagrams {
+                    deliver_client_datagram(server, datagram, local, remote);
+                }
+            }
+            flush_server_to_client(client, server, packet, remote);
+            while client_h3.poll(client).is_ok() {}
+            if !server.requests.is_empty() {
+                break;
+            }
+            if let Some(timeout) = client.timeout().filter(|timeout| !timeout.is_zero()) {
+                std::thread::sleep(timeout.min(Duration::from_millis(25)));
+            } else if let Some(timeout) = server.timeout().filter(|timeout| !timeout.is_zero()) {
+                std::thread::sleep(timeout.min(Duration::from_millis(25)));
+            }
+            let _ = round;
+        }
+
+        server
+            .next_request()
+            .expect("HTTP/3 request should complete under packet stress")
+    }
+
+    #[test]
+    fn tolerates_duplicate_client_datagrams_and_completes_request() {
+        let mut server = super::QuicServer::new(stress_server_config()).unwrap();
+        let local = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 4433);
+        let remote = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 54321);
+        let mut client_config = stress_client_config();
+        let client_scid = [0x71; 16];
+        let mut client = quiche::connect(
+            Some("localhost"),
+            &ConnectionId::from_ref(&client_scid),
+            remote,
+            local,
+            &mut client_config,
+        )
+        .unwrap();
+        let mut packet = [0; 65535];
+
+        establish_http3_in_memory(&mut client, &mut server, &mut packet, local, remote, false);
+        assert!(client.is_established());
+
+        let request = complete_post_request_in_memory(
+            &mut client,
+            &mut server,
+            &mut packet,
+            local,
+            remote,
+            true,
+            false,
+        );
+        assert_eq!(request.method, b"POST");
+        assert_eq!(request.target, b"/stress");
+        assert_eq!(request.body, b"ping");
+        assert!(!server.routes.is_empty());
+        assert_eq!(server.connections.len(), 1);
+    }
+
+    #[test]
+    fn recovers_from_reordered_handshake_datagrams_via_timeouts() {
+        let mut server = super::QuicServer::new(stress_server_config()).unwrap();
+        let local = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 4433);
+        let remote = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 54322);
+        let mut client_config = stress_client_config();
+        let client_scid = [0x72; 16];
+        let mut client = quiche::connect(
+            Some("localhost"),
+            &ConnectionId::from_ref(&client_scid),
+            remote,
+            local,
+            &mut client_config,
+        )
+        .unwrap();
+        let mut packet = [0; 65535];
+
+        // Deliver the first flight normally so the server accepts the connection,
+        // then swap subsequent consecutive client datagrams and let timers recover.
+        pump_in_memory(
+            &mut client,
+            &mut server,
+            &mut packet,
+            local,
+            remote,
+            false,
+            false,
+        );
+        establish_http3_in_memory(&mut client, &mut server, &mut packet, local, remote, true);
+        assert!(client.is_established());
+        assert!(
+            server
+                .connections
+                .values()
+                .any(|connection| connection.transport.is_established())
+        );
+
+        let request = complete_post_request_in_memory(
+            &mut client,
+            &mut server,
+            &mut packet,
+            local,
+            remote,
+            false,
+            true,
+        );
+        assert_eq!(request.body, b"ping");
+    }
+
+    #[test]
+    fn nat_rebinding_continues_or_cleans_cid_routes() {
+        let mut server = super::QuicServer::new(stress_server_config()).unwrap();
+        // Keep idle short so the timeout path finishes quickly when migration fails.
+        server.idle_timeout = Duration::from_millis(150);
+        server.config.set_max_idle_timeout(150);
+        let local = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 4433);
+        let original_remote = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 54323);
+        let rebound_remote = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 54324);
+        let mut client_config = stress_client_config();
+        client_config.set_max_idle_timeout(150);
+        let client_scid = [0x73; 16];
+        let mut client = quiche::connect(
+            Some("localhost"),
+            &ConnectionId::from_ref(&client_scid),
+            original_remote,
+            local,
+            &mut client_config,
+        )
+        .unwrap();
+        let mut packet = [0; 65535];
+
+        establish_http3_in_memory(
+            &mut client,
+            &mut server,
+            &mut packet,
+            local,
+            original_remote,
+            false,
+        );
+        assert_eq!(server.connections.len(), 1);
+        let route_count_before = server.routes.len();
+        assert!(route_count_before > 0);
+
+        // Mid-connection NAT rebinding: same CIDs, new observed UDP source address.
+        let mut continued = false;
+        let mut client_h3 = quiche::h3::Connection::with_transport(
+            &mut client,
+            &quiche::h3::Config::new().unwrap(),
+        )
+        .unwrap();
+        let request_headers = [
+            quiche::h3::Header::new(b":method", b"GET"),
+            quiche::h3::Header::new(b":scheme", b"https"),
+            quiche::h3::Header::new(b":authority", b"localhost"),
+            quiche::h3::Header::new(b":path", b"/rebind"),
+        ];
+        let _ = client_h3
+            .send_request(&mut client, &request_headers, true)
+            .unwrap();
+
+        for _ in 0..48 {
+            drive_timeouts(&mut client, &mut server);
+            let datagrams = collect_client_datagrams(&mut client, &mut packet);
+            for datagram in &datagrams {
+                deliver_client_datagram(&mut server, datagram, local, rebound_remote);
+            }
+            flush_server_to_client(&mut client, &mut server, &mut packet, original_remote);
+            while client_h3.poll(&mut client).is_ok() {}
+            if server.next_request().is_some() {
+                continued = true;
+                break;
+            }
+            if server.connections.is_empty() {
+                break;
+            }
+            if let Some(timeout) = client.timeout().filter(|timeout| !timeout.is_zero()) {
+                std::thread::sleep(timeout.min(Duration::from_millis(40)));
+            } else if let Some(timeout) = server.timeout().filter(|timeout| !timeout.is_zero()) {
+                std::thread::sleep(timeout.min(Duration::from_millis(40)));
+            } else {
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        }
+
+        if continued {
+            // Path accepted: connection remains routed and usable.
+            assert_eq!(server.connections.len(), 1);
+            assert!(!server.routes.is_empty());
+            client.close(true, 0, b"done").ok();
+            for _ in 0..32 {
+                drive_timeouts(&mut client, &mut server);
+                for datagram in collect_client_datagrams(&mut client, &mut packet) {
+                    deliver_client_datagram(&mut server, &datagram, local, rebound_remote);
+                }
+                flush_server_to_client(&mut client, &mut server, &mut packet, original_remote);
+                if server.connections.is_empty() {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        } else {
+            // No full path migration: idle / loss timers must drop CID routes.
+            for _ in 0..40 {
+                drive_timeouts(&mut client, &mut server);
+                let _ = flush_server_to_client(&mut client, &mut server, &mut packet, original_remote);
+                if server.connections.is_empty() && server.routes.is_empty() {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(25));
+            }
+        }
+
+        assert!(
+            server.connections.is_empty(),
+            "NAT rebinding must not leak connections"
+        );
+        assert!(
+            server.routes.is_empty(),
+            "NAT rebinding must not leak CID routes"
+        );
+        assert!(server.request_routes.is_empty());
+        assert!(server.requests.is_empty());
+    }
+
     #[test]
     fn routes_http3_request_through_mojo_server_handler() {
         use std::collections::HashMap;
