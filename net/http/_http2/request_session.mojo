@@ -135,9 +135,13 @@ struct Http2RequestSession(Movable):
         max_trailer_count: Int = 32,
         header_deadline: Timeout = Timeout.nanoseconds(5_000_000_000),
         body_deadline: Timeout = Timeout.nanoseconds(30_000_000_000),
+        max_control_frames_per_second: Int = 1000,
+        max_resets_per_second: Int = 100,
     ):
         self._input = Http2ServerConnectionInput(
-            max_concurrent_streams=max_active_streams
+            max_concurrent_streams=max_active_streams,
+            max_control_frames_per_second=max_control_frames_per_second,
+            max_resets_per_second=max_resets_per_second,
         )
         self._decoder = None
         self._library_path = library_path^
@@ -242,6 +246,10 @@ struct Http2RequestSession(Movable):
                     self._failed = True
                     return Http2RequestSessionResult.error(consumed, output^)
             _append_session_output(output, Span(input.output))
+            if self._input.is_failed():
+                self._failed = True
+                self._draining = True
+                return Http2RequestSessionResult.pending(consumed, output^)
 
             if (
                 self._pending_headers_at == NO_DEADLINE

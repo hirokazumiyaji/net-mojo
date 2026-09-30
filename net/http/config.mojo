@@ -12,6 +12,10 @@ from net import Timeout
 struct ServerConfig(Copyable, Movable):
     var max_connections: Int
     var max_http2_streams_per_connection: Int
+    # Sliding 1s window; non-ACK PING/SETTINGS, WINDOW_UPDATE, PRIORITY.
+    var http2_max_control_frames_per_second: Int
+    # Sliding 1s window for RST_STREAM; separate from control-frame budget.
+    var http2_max_resets_per_second: Int
     var max_request_line: Int
     var max_headers_bytes: Int
     var max_headers_count: Int
@@ -47,6 +51,8 @@ struct ServerConfig(Copyable, Movable):
         return Self(
             max_connections=10000,
             max_http2_streams_per_connection=100,
+            http2_max_control_frames_per_second=1000,
+            http2_max_resets_per_second=100,
             max_request_line=8192,
             max_headers_bytes=32768,
             max_headers_count=100,

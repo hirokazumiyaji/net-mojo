@@ -15,7 +15,10 @@ from net.http.response import ResponseWriter
 from net.http._http2.bootstrap import Http2ServerBootstrap
 from net.http._http2.connection_bootstrap import Http2ConnectionBootstrap
 from net.http._http2.connection_input import Http2ServerConnectionInput
-from net.http._http2.frame_dispatcher import Http2FrameDispatcher
+from net.http._http2.frame_dispatcher import (
+    Http2DispatchResult,
+    Http2FrameDispatcher,
+)
 from net.http._http2.frame_reader import Http2FrameReader
 from net.http._http2.settings_state import (
     Http2PeerSettings,
@@ -505,6 +508,104 @@ def test_http2_dispatcher_returns_window_reset_and_goaway_events() raises:
     assert_true(result.is_goaway())
     assert_equal(result.stream_id, UInt32(3))
     assert_equal(result.value, UInt32(2))
+
+
+def _assert_enhance_your_calm_goaway(result: Http2DispatchResult) raises:
+    assert_true(result.is_output())
+    assert_equal(len(result.output), 17)
+    assert_equal(result.output[3], Byte(7))
+    assert_equal(result.output[13], Byte(0))
+    assert_equal(result.output[14], Byte(0))
+    assert_equal(result.output[15], Byte(0))
+    assert_equal(result.output[16], Byte(11))
+
+
+def test_http2_dispatcher_control_flood_emits_goaway() raises:
+    var dispatcher = Http2FrameDispatcher(
+        Http2PeerSettings().snapshot(),
+        max_control_frames_per_second=3,
+        max_resets_per_second=100,
+    )
+    var payload: List[Byte] = [
+        Byte(1), Byte(2), Byte(3), Byte(4), Byte(5), Byte(6), Byte(7), Byte(8)
+    ]
+    var ping = FrameParseResult.complete(Byte(6), Byte(0), UInt32(0), 8)
+    var window_payload: List[Byte] = [Byte(0), Byte(0), Byte(0), Byte(1)]
+    var window = FrameParseResult.complete(Byte(8), Byte(0), UInt32(0), 4)
+
+    var result = dispatcher.accept(ping, Span(payload))
+    assert_true(result.is_output())
+    assert_false(dispatcher.is_failed())
+    result = dispatcher.accept(window, Span(window_payload))
+    assert_true(result.is_window_update())
+    result = dispatcher.accept(ping, Span(payload))
+    assert_true(result.is_output())
+    assert_false(dispatcher.is_failed())
+
+    result = dispatcher.accept(ping, Span(payload))
+    _assert_enhance_your_calm_goaway(result)
+    assert_true(dispatcher.is_failed())
+
+    result = dispatcher.accept(ping, Span(payload))
+    assert_true(result.is_error())
+
+
+def test_http2_dispatcher_reset_flood_emits_goaway() raises:
+    var dispatcher = Http2FrameDispatcher(
+        Http2PeerSettings().snapshot(),
+        max_control_frames_per_second=1000,
+        max_resets_per_second=2,
+    )
+    var reset_payload: List[Byte] = [Byte(0), Byte(0), Byte(0), Byte(8)]
+    var reset = FrameParseResult.complete(Byte(3), Byte(0), UInt32(3), 4)
+
+    var result = dispatcher.accept(reset, Span(reset_payload))
+    assert_true(result.is_reset())
+    result = dispatcher.accept(reset, Span(reset_payload))
+    assert_true(result.is_reset())
+    assert_false(dispatcher.is_failed())
+
+    result = dispatcher.accept(reset, Span(reset_payload))
+    _assert_enhance_your_calm_goaway(result)
+    assert_true(dispatcher.is_failed())
+
+    result = dispatcher.accept(reset, Span(reset_payload))
+    assert_true(result.is_error())
+
+
+def test_http2_dispatcher_control_under_limit_succeeds() raises:
+    var dispatcher = Http2FrameDispatcher(
+        Http2PeerSettings().snapshot(),
+        max_control_frames_per_second=3,
+        max_resets_per_second=2,
+    )
+    var payload: List[Byte] = [
+        Byte(1), Byte(2), Byte(3), Byte(4), Byte(5), Byte(6), Byte(7), Byte(8)
+    ]
+    var ping = FrameParseResult.complete(Byte(6), Byte(0), UInt32(0), 8)
+    var ack_ping = FrameParseResult.complete(Byte(6), Byte(1), UInt32(0), 8)
+
+    var result = dispatcher.accept(ping, Span(payload))
+    assert_true(result.is_output())
+    assert_equal(result.output[4], Byte(1))
+    result = dispatcher.accept(ping, Span(payload))
+    assert_true(result.is_output())
+    result = dispatcher.accept(ping, Span(payload))
+    assert_true(result.is_output())
+    assert_false(dispatcher.is_failed())
+
+    # ACK frames do not count toward the control limit.
+    result = dispatcher.accept(ack_ping, Span(payload))
+    assert_true(result.is_ignored())
+    assert_false(dispatcher.is_failed())
+
+    var reset_payload: List[Byte] = [Byte(0), Byte(0), Byte(0), Byte(8)]
+    var reset = FrameParseResult.complete(Byte(3), Byte(0), UInt32(1), 4)
+    result = dispatcher.accept(reset, Span(reset_payload))
+    assert_true(result.is_reset())
+    result = dispatcher.accept(reset, Span(reset_payload))
+    assert_true(result.is_reset())
+    assert_false(dispatcher.is_failed())
 
 
 def test_http2_frame_reader_retains_fragmented_frame_and_leaves_next() raises:

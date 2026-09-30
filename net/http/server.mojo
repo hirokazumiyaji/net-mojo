@@ -1134,6 +1134,8 @@ struct Server(Movable):
                             self.config.max_trailer_count,
                             self.config.header_deadline,
                             self.config.body_deadline,
+                            self.config.http2_max_control_frames_per_second,
+                            self.config.http2_max_resets_per_second,
                         )
                     )
                 elif protocol != "http/1.1":
