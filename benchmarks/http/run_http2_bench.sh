@@ -165,10 +165,12 @@ run_h2load() {
         sample_server "$server_pid" "$sample"
     fi
 
-    local req_s success failed
+    local req_s success failed errored timedout
     req_s="$(rg -o 'finished in [^,]+, ([0-9.]+) req/s' -r '$1' "$out" | head -1 || true)"
     success="$(rg -o 'requests: .* ([0-9]+) succeeded' -r '$1' "$out" | head -1 || true)"
     failed="$(rg -o 'requests: .* ([0-9]+) failed' -r '$1' "$out" | head -1 || true)"
+    errored="$(rg -o 'requests: .* ([0-9]+) errored' -r '$1' "$out" | head -1 || true)"
+    timedout="$(rg -o 'requests: .* ([0-9]+) timeout' -r '$1' "$out" | head -1 || true)"
 
     # h2load request row: min max median p95 p99 mean sd +/-sd
     # Fields after splitting on whitespace: $1=request $2=: $3=min $4=max
@@ -195,6 +197,15 @@ run_h2load() {
     if [ "$rc" -ne 0 ]; then
         BENCH_FAILURES=$((BENCH_FAILURES + 1))
         echo "benchmark failed: $label c=$clients m=$streams run=$run_idx rc=$rc (see $out)" >&2
+    elif [ "${failed:-0}" != "0" ] && [ -n "${failed:-}" ]; then
+        BENCH_FAILURES=$((BENCH_FAILURES + 1))
+        echo "benchmark failed: $label c=$clients m=$streams run=$run_idx failed=${failed} (see $out)" >&2
+    elif [ -n "${errored:-}" ] && [ "${errored}" != "0" ]; then
+        BENCH_FAILURES=$((BENCH_FAILURES + 1))
+        echo "benchmark failed: $label c=$clients m=$streams run=$run_idx errored=${errored} (see $out)" >&2
+    elif [ -n "${timedout:-}" ] && [ "${timedout}" != "0" ]; then
+        BENCH_FAILURES=$((BENCH_FAILURES + 1))
+        echo "benchmark failed: $label c=$clients m=$streams run=$run_idx timeout=${timedout} (see $out)" >&2
     fi
     return 0
 }
