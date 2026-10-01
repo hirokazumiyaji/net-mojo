@@ -483,7 +483,7 @@ def test_http2_request_session_reset_flood_uses_last_stream_id() raises:
     var flooded = session.consume(Span(reset3))
     assert_true(flooded.is_pending())
     assert_true(session.is_draining())
-    assert_false(session.is_failed())
+    assert_true(session.is_failed())
     var goaway_at = _find_goaway_offset(flooded.output)
     assert_true(goaway_at >= 0)
     var goaway_frame = parse_frame(Span(flooded.output)[goaway_at:])

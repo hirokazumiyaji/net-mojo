@@ -247,9 +247,13 @@ struct Http2RequestSession(Movable):
                     return Http2RequestSessionResult.error(consumed, output^)
             _append_session_output(output, Span(input.output))
             if input.is_flood():
-                # Drain only: leave `_failed` false so the server can flush
-                # ENHANCE_YOUR_CALM GOAWAY before closing the connection.
+                # Flooded: queue ENHANCE_YOUR_CALM GOAWAY and mark the
+                # session failed so the server flushes pending output and
+                # then closes the connection. `is_failed` gates
+                # close-after-flush; leaving it false keeps the connection
+                # open until idle timeout with no further readable progress.
                 self._draining = True
+                self._failed = True
                 var goaway = encode_goaway_frame(
                     self._last_stream_id, UInt32(11)
                 )
