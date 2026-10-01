@@ -9,6 +9,7 @@ from net.http import (
 )
 from net.quic import QuicProvider, QuicUDPEndpoint
 from net.udp import listen_udp
+from std.os import getenv
 
 
 struct _Http3Handler(Handler):
@@ -33,6 +34,26 @@ struct _Http3Handler(Handler):
         self.requests += 1
 
 
+def _expected_requests() -> Int:
+    # Shared by the aioquic client script (5 completions: reordered POST,
+    # two reset-storm siblings, trailers POST, final POST) and the Rust
+    # provider test (2 POSTs). Cancelled / reset streams never increment
+    # the handler counter, so each driver sets its own total; default 5.
+    var raw = getenv("HTTP3_FIXTURE_EXPECT")
+    var count = 0
+    var digits = 0
+    var buf = raw.as_bytes()
+    for i in range(len(buf)):
+        var b = Int(buf[i])
+        if b < ord("0") or b > ord("9"):
+            break
+        count = count * 10 + (b - ord("0"))
+        digits += 1
+    if digits == 0:
+        return 5
+    return count
+
+
 def main() raises:
     var provider = QuicProvider("build/quic/libnet_quic_provider")
     var listener = listen_udp("127.0.0.1:0")
@@ -48,7 +69,11 @@ def main() raises:
     )
     var handler = _Http3Handler()
     print("READY " + address)
-    while handler.requests < 2:
+    # Completions expected from the driver (see _expected_requests):
+    # reordered POST, two reset-storm siblings, trailers POST, final POST.
+    # Cancelled / reset streams do not increment this counter.
+    var expected = _expected_requests()
+    while handler.requests < expected:
         _ = server.tick(handler, Timeout.seconds(2))
     server.request_shutdown()
     var running = True
