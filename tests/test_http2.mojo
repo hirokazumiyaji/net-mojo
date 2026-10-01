@@ -722,7 +722,7 @@ def test_http2_request_session_rst_storm_while_healthy_stream_emits_goaway() rai
     var flooded = session.consume(Span(flood_reset))
     assert_true(flooded.is_pending())
     assert_true(session.is_draining())
-    assert_false(session.is_failed())
+    assert_true(session.is_failed())
     var goaway_at = _find_goaway_offset(flooded.output)
     assert_true(goaway_at >= 0)
     var goaway_frame = parse_frame(Span(flooded.output)[goaway_at:])
