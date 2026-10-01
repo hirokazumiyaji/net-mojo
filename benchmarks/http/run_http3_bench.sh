@@ -43,12 +43,16 @@ PIXI_PYTHON="${PIXI_PYTHON:-$(cd "$ROOT" && pixi run -e "$PIXI_ENV" python -c 'i
 
 mkdir -p "$OUT_DIR"
 
-for artifact in build/tls/test-cert.pem build/tls/test-key.pem build/quic/libnet_quic_provider; do
+for artifact in build/tls/test-cert.pem build/tls/test-key.pem; do
     [ -f "$artifact" ] || {
         echo "missing $artifact; run: pixi run -e $PIXI_ENV tls-build && pixi run -e $PIXI_ENV quic-build" >&2
         exit 1
     }
 done
+if [ "${SKIP_MOJO:-0}" != "1" ] && [ ! -f build/quic/libnet_quic_provider ]; then
+    echo "missing build/quic/libnet_quic_provider; run: pixi run -e $PIXI_ENV quic-build (or SKIP_MOJO=1 for baseline-only)" >&2
+    exit 1
+fi
 
 echo "== host =="
 uname -a
