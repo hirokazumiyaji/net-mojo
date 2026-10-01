@@ -19,6 +19,10 @@ struct NetQuicServer *net_quic_server_new(struct NetQuicServerConfig *config);
 void net_quic_server_free(struct NetQuicServer *server);
 int32_t net_quic_server_set_connection_limit(
     struct NetQuicServer *server, size_t limit);
+int32_t net_quic_server_set_transport_memory_limit(
+    struct NetQuicServer *server, size_t limit);
+size_t net_quic_server_transport_memory_bytes(
+    const struct NetQuicServer *server);
 int32_t net_quic_server_set_request_limits(
     struct NetQuicServer *server, size_t max_body_bytes,
     size_t max_headers_bytes, size_t max_headers_count,
@@ -53,6 +57,10 @@ struct NetQuicServer *net_quic_create(struct NetQuicServerConfig *config);
 void net_quic_free(struct NetQuicServer *server);
 int32_t net_quic_set_connection_limit(
     struct NetQuicServer *server, size_t limit);
+int32_t net_quic_set_transport_memory_limit(
+    struct NetQuicServer *server, size_t limit);
+size_t net_quic_transport_memory_bytes(
+    const struct NetQuicServer *server);
 int32_t net_quic_set_request_limits(
     struct NetQuicServer *server, size_t max_body_bytes,
     size_t max_headers_bytes, size_t max_headers_count,

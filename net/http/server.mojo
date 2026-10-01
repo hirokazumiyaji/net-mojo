@@ -253,9 +253,7 @@ struct Server(Movable):
         self.add_listener(listener^)
         self._tls_context = Optional[TLSContext](tls_context^)
 
-    def add_quic_endpoint(
-        mut self, var endpoint: QuicUDPEndpoint
-    ) raises:
+    def add_quic_endpoint(mut self, var endpoint: QuicUDPEndpoint) raises:
         if self._quic_endpoint:
             raise NetError(
                 NetErrorKind.invalid_state(),
@@ -264,6 +262,9 @@ struct Server(Movable):
                 "server already has a QUIC endpoint",
             )
         endpoint.set_connection_limit(self.config.max_connections)
+        endpoint.set_transport_memory_limit(
+            self.config.quic_max_transport_memory_bytes
+        )
         endpoint.set_request_limits(
             self.config.max_body_bytes,
             self.config.max_headers_bytes,
@@ -297,7 +298,11 @@ struct Server(Movable):
         var now = now_ns()
         self._tick_date = current_http_date()
         self._note_shutdown(now)
-        if not self._listener and not self._quic_endpoint and self._active_conns == 0:
+        if (
+            not self._listener
+            and not self._quic_endpoint
+            and self._active_conns == 0
+        ):
             self.control.mark_exited()
             return False
         self._tick_id += 1
@@ -404,7 +409,11 @@ struct Server(Movable):
                 self._arm_deadline(idx)
         self._expire_deadlines(now_ns())
         self._process_detached_messages(now_ns())
-        if not self._listener and not self._quic_endpoint and self._active_conns == 0:
+        if (
+            not self._listener
+            and not self._quic_endpoint
+            and self._active_conns == 0
+        ):
             self.control.mark_exited()
             return False
         return True
@@ -709,7 +718,9 @@ struct Server(Movable):
                         or not self._conns[i].http2_session
                     ):
                         continue
-                    var goaway = self._conns[i].http2_session.value().begin_shutdown()
+                    var goaway = (
+                        self._conns[i].http2_session.value().begin_shutdown()
+                    )
                     if not self._budget.try_reserve(len(goaway)):
                         self._close_conn(i)
                         continue
@@ -1282,8 +1293,7 @@ struct Server(Movable):
                 return
             var http2_activity = read_event
             while (
-                self._conns[idx].active
-                and self._conns[idx].buffered_len() > 0
+                self._conns[idx].active and self._conns[idx].buffered_len() > 0
             ):
                 if (
                     self._conns[idx].requests_this_tick
@@ -1413,8 +1423,10 @@ struct Server(Movable):
         while self._conns[idx].active and self._conns[idx].buffered_len() > 0:
             var result: Http2RequestSessionResult
             try:
-                result = self._conns[idx].http2_session.value().consume(
-                    Span(self._conns[idx].buf)
+                result = (
+                    self._conns[idx]
+                    .http2_session.value()
+                    .consume(Span(self._conns[idx].buf))
                 )
             except e:
                 _ = e
@@ -1576,8 +1588,10 @@ struct Server(Movable):
                 .peer_settings()
                 .header_table_size
             )
-            if not self._conns[idx].http2_deflater.value().set_max_table_size(
-                table_size
+            if (
+                not self._conns[idx]
+                .http2_deflater.value()
+                .set_max_table_size(table_size)
             ):
                 self._close_conn(idx)
                 return
@@ -1649,9 +1663,9 @@ struct Server(Movable):
         )
         if batch.released_bytes > 0:
             self._budget.release(batch.released_bytes)
-            self._conns[idx].http2_response_bytes_reserved -= (
-                batch.released_bytes
-            )
+            self._conns[
+                idx
+            ].http2_response_bytes_reserved -= batch.released_bytes
         if len(batch.wire) == 0:
             if self._conns[idx].http2_responses.queued_count() > 0:
                 # Still waiting for WINDOW_UPDATE credit; keep the write

@@ -90,9 +90,7 @@ def encode_http2_response[
         deflater.fail()
         return FrameEncodeResult.failure()
 
-    header_frames.wire.reserve(
-        len(header_frames.wire) + len(data_frames.wire)
-    )
+    header_frames.wire.reserve(len(header_frames.wire) + len(data_frames.wire))
     for i in range(len(data_frames.wire)):
         header_frames.wire.append(data_frames.wire[i])
     return header_frames^

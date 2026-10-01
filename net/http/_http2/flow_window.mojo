@@ -7,7 +7,9 @@ struct Http2FlowWindow(Movable):
     var _receive_window: Int
     var _pending_receive_credit: Int
 
-    def __init__(out self, initial_send_window: Int, initial_receive_window: Int):
+    def __init__(
+        out self, initial_send_window: Int, initial_receive_window: Int
+    ):
         self._initial_send_window = initial_send_window
         self._send_window = initial_send_window
         self._receive_window = initial_receive_window
