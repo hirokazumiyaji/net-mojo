@@ -7,7 +7,8 @@ decision. Usage instructions are out of scope here.
 ## Goals
 
 - Provide synchronous IPv4/IPv6 addressing, OS name resolution, TCP, UDP, and
-  Unix stream sockets for Mojo 1.0.0.
+  Unix stream sockets for Mojo 1.1, while retaining core compatibility with
+  Mojo 1.0.
 - Keep core `net` dependent on Mojo `std` and the documented libc/POSIX ABI,
   with no C shim or third-party runtime. Optional protocol features may add
   isolated native dependencies.
