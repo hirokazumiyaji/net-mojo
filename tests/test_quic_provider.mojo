@@ -32,10 +32,14 @@ def _shrink_send_buffer(mut socket: UDPConn) raises:
     )
 
 
-def _fill_udp_send_queue(mut socket: UDPConn) raises -> Bool:
-    """Push datagrams toward TEST-NET until `try_send_to` would-block."""
+def _fill_udp_send_queue(mut socket: UDPConn, blackhole: SocketAddress) raises -> Bool:
+    """Push datagrams until `try_send_to` would-block.
+
+    Sends toward a local receiver that is never drained, so saturation
+    relies on the shrunken SO_SNDBUF rather than TEST-NET routing (which
+    raises system errors on unroutable hosts and drains unpredictably).
+    """
     var filler = Array[Byte, 1400](fill=0xAB)
-    var blackhole = SocketAddress.parse("192.0.2.1:9")
     for _ in range(10_000):
         try:
             _ = socket.try_send_to(Span(filler), blackhole)
@@ -66,18 +70,35 @@ def test_udp_send_backpressure_preserves_pending_datagram() raises:
     var endpoint = QuicUDPEndpoint(server^, listener^)
     var receiver = listen_udp("127.0.0.1:0")
     var destination = receiver.local_address()
+    # Separate blackhole for saturation fills so filler datagrams never
+    # pollute `destination` (which must only see the staged 16-byte payload).
+    var blackhole_sock = listen_udp("127.0.0.1:0")
+    var blackhole = blackhole_sock.local_address()
 
     var blocked = False
     for _ in range(64):
         _stage_pending_payload(endpoint, destination)
         assert endpoint.wants_write()
-        if not _fill_udp_send_queue(endpoint._socket):
-            raise Error("UDP send queue did not saturate toward TEST-NET")
+        if not _fill_udp_send_queue(endpoint._socket, blackhole):
+            raise Error("UDP send queue did not saturate")
         # Would-block must keep the staged datagram; a drop-without-retry
         # would clear write interest before the bytes leave.
         if not endpoint.try_send():
             assert endpoint.wants_write()
-            assert not endpoint.try_send()
+            # Immediate retry may succeed if the kernel drained between
+            # calls; both outcomes preserve correctness (still-pending or
+            # delivered). Tolerate success instead of asserting False.
+            if endpoint.try_send():
+                assert not endpoint.wants_write()
+                # Delivery won the race; consume it and re-saturate to
+                # return to the blocked state for the reactor check below.
+                var scratch = Array[Byte, 64](fill=0)
+                try:
+                    _ = receiver.try_recv_from(Span[mut=True](scratch))
+                except error:
+                    if error.kind != NetErrorKind.timeout():
+                        raise error^
+                continue
             assert endpoint.wants_write()
             blocked = True
             break
