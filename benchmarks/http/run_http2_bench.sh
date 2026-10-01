@@ -30,6 +30,7 @@ MOJO_ADDR="127.0.0.1:18443"
 OUT_DIR="${OUT_DIR:-build/bench/http2}"
 GO_BIN="${GO_BIN:-$OUT_DIR/http_go_h2}"
 MOJO_BIN="${MOJO_BIN:-$OUT_DIR/http2_tls_server}"
+BENCH_FAILURES=0
 
 if ! command -v h2load >/dev/null; then
     echo "h2load not found; install with: brew install nghttp2" >&2
@@ -83,7 +84,10 @@ sample_server() {
     cpu="$(ps -o %cpu= -p "$pid" 2>/dev/null | tr -d ' ' || echo "?")"
     rss="$(ps -o rss= -p "$pid" 2>/dev/null | tr -d ' ' || echo "?")"
     if command -v lsof >/dev/null; then
-        fds="$(lsof -nP -p "$pid" 2>/dev/null | wc -l | tr -d ' ')"
+        # Count only numeric file descriptors; lsof output includes a
+        # header plus cwd/txt entries that inflate `wc -l`.
+        fds="$(lsof -nP -p "$pid" 2>/dev/null | awk 'NR>1 && $4 ~ /^[0-9]+[rwu-]*$/ {n++} END{print n+0}')"
+        [ -n "$fds" ] || fds="?"
     else
         fds="?"
     fi
@@ -188,6 +192,10 @@ run_h2load() {
         | tee -a "$OUT_DIR/summary.tsv"
 
     cp "$out" "$log"
+    if [ "$rc" -ne 0 ]; then
+        BENCH_FAILURES=$((BENCH_FAILURES + 1))
+        echo "benchmark failed: $label c=$clients m=$streams run=$run_idx rc=$rc (see $out)" >&2
+    fi
     return 0
 }
 
@@ -298,3 +306,7 @@ fi
 echo
 echo "== summary ($OUT_DIR/summary.tsv) =="
 column -t -s $'\t' "$OUT_DIR/summary.tsv" 2>/dev/null || cat "$OUT_DIR/summary.tsv"
+if [ "$BENCH_FAILURES" -gt 0 ]; then
+    echo "$BENCH_FAILURES benchmark run(s) failed" >&2
+    exit 1
+fi
