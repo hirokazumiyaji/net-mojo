@@ -26,7 +26,9 @@ struct Http2HpackInflater(Movable):
     var _library: OwnedDLHandle
     var _inflater: Pointer[Byte, MutUntrackedOrigin]
 
-    def __init__(out self, var library_path: String, max_table_size: Int) raises:
+    def __init__(
+        out self, var library_path: String, max_table_size: Int
+    ) raises:
         var library = OwnedDLHandle(library_path)
         var inflater = library.call[
             "net_hpack_inflater_new",
@@ -46,9 +48,12 @@ struct Http2HpackInflater(Movable):
         self._library.call["net_hpack_inflater_free"](self._inflater)
 
     def set_max_table_size(mut self, size: Int) -> Bool:
-        return self._library.call["net_hpack_inflater_set_max_table_size", c_int](
-            self._inflater, c_size_t(size)
-        ) == 0
+        return (
+            self._library.call["net_hpack_inflater_set_max_table_size", c_int](
+                self._inflater, c_size_t(size)
+            )
+            == 0
+        )
 
     def decode[
         block_origin: ImmOrigin,
@@ -63,9 +68,9 @@ struct Http2HpackInflater(Movable):
         var output_length = c_size_t(0)
         var field_count = c_size_t(0)
         var decoded_size = c_size_t(0)
-        var output_length_ptr = Pointer[
-            c_size_t, origin_of(output_length)
-        ](to=output_length)
+        var output_length_ptr = Pointer[c_size_t, origin_of(output_length)](
+            to=output_length
+        )
         var field_count_ptr = Pointer[c_size_t, origin_of(field_count)](
             to=field_count
         )
@@ -112,7 +117,9 @@ struct Http2HpackDeflater(Movable):
     var _deflater: Pointer[Byte, MutUntrackedOrigin]
     var _failed: Bool
 
-    def __init__(out self, var library_path: String, max_table_size: Int) raises:
+    def __init__(
+        out self, var library_path: String, max_table_size: Int
+    ) raises:
         var library = OwnedDLHandle(library_path)
         var deflater = library.call[
             "net_hpack_deflater_new",
@@ -135,9 +142,12 @@ struct Http2HpackDeflater(Movable):
     def set_max_table_size(mut self, size: Int) -> Bool:
         if self._failed:
             return False
-        var changed = self._library.call[
-            "net_hpack_deflater_set_max_table_size", c_int
-        ](self._deflater, c_size_t(size)) == 0
+        var changed = (
+            self._library.call["net_hpack_deflater_set_max_table_size", c_int](
+                self._deflater, c_size_t(size)
+            )
+            == 0
+        )
         if not changed:
             self._failed = True
         return changed
@@ -160,9 +170,9 @@ struct Http2HpackDeflater(Movable):
         if max_header_list_size < 0 or max_fields < 0:
             return HpackEncodeResult(status=2, output_length=0)
         var output_length = c_size_t(0)
-        var output_length_ptr = Pointer[
-            c_size_t, origin_of(output_length)
-        ](to=output_length)
+        var output_length_ptr = Pointer[c_size_t, origin_of(output_length)](
+            to=output_length
+        )
         var status = self._library.call["net_hpack_encode", c_int](
             self._deflater,
             fields.unsafe_ptr(),

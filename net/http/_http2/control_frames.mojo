@@ -62,7 +62,9 @@ struct GoAwayFrameResult(Copyable):
 
     @staticmethod
     def valid(last_stream_id: UInt32, error_code: UInt32) -> Self:
-        return Self(kind=1, last_stream_id=last_stream_id, error_code=error_code)
+        return Self(
+            kind=1, last_stream_id=last_stream_id, error_code=error_code
+        )
 
     @staticmethod
     def error() -> Self:

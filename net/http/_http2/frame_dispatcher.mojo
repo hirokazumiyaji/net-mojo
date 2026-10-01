@@ -1,5 +1,6 @@
 """Connection-level dispatch for complete HTTP/2 frames."""
 
+from .._deadline import now_ns
 from .control_frames import (
     parse_goaway_frame,
     parse_ping_frame,
@@ -10,6 +11,10 @@ from .frame_sequence import Http2ContinuationSequence
 from .settings_frame import parse_settings_frame
 from .settings_state import Http2PeerSettings, Http2PeerSettingsSnapshot
 from .window_update import parse_window_update_frame
+
+# Tumbling 1-second windows (reset at first event after prior window ends);
+# not a sliding deque of timestamps.
+comptime _RATE_WINDOW_NS: Int = 1_000_000_000
 
 
 @fieldwise_init
@@ -43,6 +48,13 @@ struct Http2DispatchResult(Movable):
             kind=6, stream_id=UInt32(0), value=UInt32(0), output=List[Byte]()
         )
 
+    @staticmethod
+    def flood() -> Self:
+        # Session encodes GOAWAY ENHANCE_YOUR_CALM with its last_stream_id.
+        return Self(
+            kind=7, stream_id=UInt32(0), value=UInt32(11), output=List[Byte]()
+        )
+
     def is_ignored(self) -> Bool:
         return self.kind == 1
 
@@ -61,13 +73,27 @@ struct Http2DispatchResult(Movable):
     def is_error(self) -> Bool:
         return self.kind == 6
 
+    def is_flood(self) -> Bool:
+        return self.kind == 7
+
 
 struct Http2FrameDispatcher(Movable):
     var _sequence: Http2ContinuationSequence
     var _peer_settings: Http2PeerSettings
     var _failed: Bool
+    var _max_control_frames_per_second: Int
+    var _max_resets_per_second: Int
+    var _control_window_start_ns: Int
+    var _control_count: Int
+    var _reset_window_start_ns: Int
+    var _reset_count: Int
 
-    def __init__(out self, initial_settings: Http2PeerSettingsSnapshot):
+    def __init__(
+        out self,
+        initial_settings: Http2PeerSettingsSnapshot,
+        max_control_frames_per_second: Int = 1000,
+        max_resets_per_second: Int = 100,
+    ):
         self._sequence = Http2ContinuationSequence()
         self._peer_settings = Http2PeerSettings()
         self._peer_settings.header_table_size = (
@@ -84,6 +110,38 @@ struct Http2FrameDispatcher(Movable):
             initial_settings.max_header_list_size
         )
         self._failed = False
+        self._max_control_frames_per_second = max_control_frames_per_second
+        self._max_resets_per_second = max_resets_per_second
+        self._control_window_start_ns = 0
+        self._control_count = 0
+        self._reset_window_start_ns = 0
+        self._reset_count = 0
+
+    def _flood(mut self) -> Http2DispatchResult:
+        self._failed = True
+        return Http2DispatchResult.flood()
+
+    def _control_exceeded(mut self) -> Bool:
+        var now = now_ns()
+        if (
+            self._control_window_start_ns == 0
+            or now - self._control_window_start_ns >= _RATE_WINDOW_NS
+        ):
+            self._control_window_start_ns = now
+            self._control_count = 0
+        self._control_count += 1
+        return self._control_count > self._max_control_frames_per_second
+
+    def _reset_exceeded(mut self) -> Bool:
+        var now = now_ns()
+        if (
+            self._reset_window_start_ns == 0
+            or now - self._reset_window_start_ns >= _RATE_WINDOW_NS
+        ):
+            self._reset_window_start_ns = now
+            self._reset_count = 0
+        self._reset_count += 1
+        return self._reset_count > self._max_resets_per_second
 
     def accept[
         origin: Origin
@@ -103,6 +161,8 @@ struct Http2FrameDispatcher(Movable):
                 return Http2DispatchResult.error()
             if settings.is_ack():
                 return Http2DispatchResult.ignored()
+            if self._control_exceeded():
+                return self._flood()
             var applied = self._peer_settings.apply(
                 Span(settings.parsed.settings)
             )
@@ -129,6 +189,8 @@ struct Http2FrameDispatcher(Movable):
                 return Http2DispatchResult.error()
             if ping.is_ack():
                 return Http2DispatchResult.ignored()
+            if self._control_exceeded():
+                return self._flood()
             var ack = ping.encode_ack()
             if not ack.is_complete():
                 self._failed = True
@@ -141,6 +203,8 @@ struct Http2FrameDispatcher(Movable):
             if update.is_error():
                 self._failed = True
                 return Http2DispatchResult.error()
+            if self._control_exceeded():
+                return self._flood()
             return Http2DispatchResult.event(
                 3, update.stream_id, update.increment
             )
@@ -150,6 +214,8 @@ struct Http2FrameDispatcher(Movable):
             if reset.is_error():
                 self._failed = True
                 return Http2DispatchResult.error()
+            if self._reset_exceeded():
+                return self._flood()
             return Http2DispatchResult.event(
                 4, reset.stream_id, reset.error_code
             )
@@ -162,6 +228,11 @@ struct Http2FrameDispatcher(Movable):
             return Http2DispatchResult.event(
                 5, goaway.last_stream_id, goaway.error_code
             )
+
+        if frame.frame_type == Byte(2):
+            if self._control_exceeded():
+                return self._flood()
+            return Http2DispatchResult.ignored()
 
         return Http2DispatchResult.ignored()
 

@@ -32,7 +32,9 @@ struct WindowUpdateFrameResult(Movable):
 
 def parse_window_update_frame[
     origin: Origin
-](frame: FrameParseResult, payload: Span[Byte, origin]) -> WindowUpdateFrameResult:
+](
+    frame: FrameParseResult, payload: Span[Byte, origin]
+) -> WindowUpdateFrameResult:
     if (
         not frame.is_complete()
         or frame.frame_type != Byte(8)

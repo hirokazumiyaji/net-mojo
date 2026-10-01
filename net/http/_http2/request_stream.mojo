@@ -147,9 +147,7 @@ struct Http2RequestStream(Movable):
             return Http2RequestStreamResult.malformed()
         self._request.trailers = trailers^.take_trailers()
         self._request.body = self._body.bytes()
-        if not _content_length_matches_body(
-            self._request, self._body.size()
-        ):
+        if not _content_length_matches_body(self._request, self._body.size()):
             self._failed = True
             return Http2RequestStreamResult.malformed()
         self._ready = True

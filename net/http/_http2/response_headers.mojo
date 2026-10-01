@@ -12,7 +12,9 @@ struct Http2ResponseHeadersResult(Movable):
     var send_body: Bool
 
     @staticmethod
-    def valid(var fields: List[Byte], field_count: Int, send_body: Bool) -> Self:
+    def valid(
+        var fields: List[Byte], field_count: Int, send_body: Bool
+    ) -> Self:
         return Self(
             kind=1,
             fields=fields^,
@@ -33,9 +35,7 @@ struct Http2ResponseHeadersResult(Movable):
 
 def _append_field[
     origin: Origin
-](
-    mut output: List[Byte], name: StringSlice, value: Span[Byte, origin]
-) -> Bool:
+](mut output: List[Byte], name: StringSlice, value: Span[Byte, origin]) -> Bool:
     var name_bytes = name.as_bytes()
     if len(name_bytes) > 0xFFFFFFFF or len(value) > 0xFFFFFFFF:
         return False
@@ -160,9 +160,7 @@ def encode_http2_response_headers(
         if (
             field_count > max_fields
             or header_list_size > max_header_list_size
-            or not _append_field(
-                fields, String("content-length"), length_bytes
-            )
+            or not _append_field(fields, String("content-length"), length_bytes)
         ):
             return Http2ResponseHeadersResult.error()
 

@@ -67,8 +67,9 @@ The QUIC engine supplies HTTP/3 control and QPACK behavior; the application does
 not implement duplicate control streams or a second QPACK implementation.
 Interoperability coverage currently uses aioquic 1.3.0 and quiche. Broader
 independent-client coverage and cancellation/reset stress remain outstanding.
-HTTPS Alt-Svc advertisement and shared TCP/UDP origin setup also remain
-outstanding. Server push and CONNECT are not supported.
+HTTPS can opt in to `Alt-Svc` advertisement via `ServerConfig.alt_svc` when a
+QUIC endpoint is attached; empty `alt_svc` keeps HTTPS-only deployments from
+advertising H3. Server push and CONNECT are not supported.
 
 Closed or timed-out QUIC connections are removed with their connection-ID
 routes, pending request routes, and queued completed requests. New connections

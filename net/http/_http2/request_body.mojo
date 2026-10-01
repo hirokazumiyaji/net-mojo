@@ -63,7 +63,9 @@ struct Http2RequestBody(Movable):
             return RequestBodyResult.too_large()
 
         self._bytes.reserve(len(self._bytes) + frame.data_length)
-        for i in range(frame.data_offset, frame.data_offset + frame.data_length):
+        for i in range(
+            frame.data_offset, frame.data_offset + frame.data_length
+        ):
             self._bytes.append(payload[i])
         self._complete = frame.end_stream
         return RequestBodyResult.accepted()

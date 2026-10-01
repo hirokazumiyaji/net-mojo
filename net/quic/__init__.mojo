@@ -42,9 +42,7 @@ struct QuicProvider(Movable):
         var library = OwnedDLHandle(self._library_path)
         return QuicServerConfig(library^, config.value())
 
-    def server(
-        mut self, var config: QuicServerConfig
-    ) raises -> QuicServer:
+    def server(mut self, var config: QuicServerConfig) raises -> QuicServer:
         var server = config._library.call[
             "net_quic_create",
             Optional[Pointer[Byte, MutUntrackedOrigin]],
@@ -134,9 +132,12 @@ struct QuicServer(Movable):
             )
 
     def shutdown_complete(self) -> Bool:
-        return self._library.call["net_quic_shutdown_complete", c_int](
-            self._server
-        ) == 1
+        return (
+            self._library.call["net_quic_shutdown_complete", c_int](
+                self._server
+            )
+            == 1
+        )
 
     def set_connection_limit(mut self, limit: Int) raises NetError:
         var result = self._library.call["net_quic_set_connection_limit", c_int](
@@ -434,9 +435,7 @@ struct QuicUDPEndpoint(Movable):
     def shutdown_complete(self) -> Bool:
         return self._server.shutdown_complete()
 
-    def __init__(
-        out self, var server: QuicServer, var socket: UDPConn
-    ):
+    def __init__(out self, var server: QuicServer, var socket: UDPConn):
         self._server = server^
         self._socket = socket^
         self._receive_buffer = List[Byte](length=65535, fill=0)
@@ -579,9 +578,7 @@ struct QuicUDPEndpoint(Movable):
                 None,
                 "HTTP/3 request record exceeds the configured buffer",
             )
-        return _decode_request_record(
-            Span(self._request_buffer)[0:length]
-        )
+        return _decode_request_record(Span(self._request_buffer)[0:length])
 
     def _ensure_request_buffer(
         mut self,
@@ -663,13 +660,17 @@ def _decode_request_record[
     var header_count = Int(_read_request_u32(data, offset))
     var headers = List[QuicRequestHeader]()
     for _ in range(header_count):
-        var name = String(from_utf8_lossy=Span(_read_request_bytes(data, offset)))
+        var name = String(
+            from_utf8_lossy=Span(_read_request_bytes(data, offset))
+        )
         var value = _read_request_bytes(data, offset)
         headers.append(QuicRequestHeader(name=name^, value=value^))
     var trailer_count = Int(_read_request_u32(data, offset))
     var trailers = List[QuicRequestHeader]()
     for _ in range(trailer_count):
-        var name = String(from_utf8_lossy=Span(_read_request_bytes(data, offset)))
+        var name = String(
+            from_utf8_lossy=Span(_read_request_bytes(data, offset))
+        )
         var value = _read_request_bytes(data, offset)
         trailers.append(QuicRequestHeader(name=name^, value=value^))
     var body = _read_request_bytes(data, offset)

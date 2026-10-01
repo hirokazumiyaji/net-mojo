@@ -15,8 +15,12 @@ from net.http.response import ResponseWriter
 from net.http._http2.bootstrap import Http2ServerBootstrap
 from net.http._http2.connection_bootstrap import Http2ConnectionBootstrap
 from net.http._http2.connection_input import Http2ServerConnectionInput
-from net.http._http2.frame_dispatcher import Http2FrameDispatcher
+from net.http._http2.frame_dispatcher import (
+    Http2DispatchResult,
+    Http2FrameDispatcher,
+)
 from net.http._http2.frame_reader import Http2FrameReader
+from net.http._http2.request_session import Http2RequestSession
 from net.http._http2.settings_state import (
     Http2PeerSettings,
     Http2PeerSettingsSnapshot,
@@ -54,9 +58,7 @@ def test_header_block_collects_headers_payload_until_end_headers() raises:
     assert_true(result.is_pending())
 
     var second: List[Byte] = [Byte(3)]
-    var continuation = FrameParseResult.complete(
-        Byte(9), Byte(4), UInt32(1), 1
-    )
+    var continuation = FrameParseResult.complete(Byte(9), Byte(4), UInt32(1), 1)
     result = block.continue_with(continuation, Span(second))
     assert_true(result.is_complete())
     var decoded = block.compressed_block()
@@ -68,7 +70,14 @@ def test_header_block_collects_headers_payload_until_end_headers() raises:
 def test_header_block_skips_padding_and_priority_fields() raises:
     var block = Http2HeaderBlock(16)
     var payload: List[Byte] = [
-        Byte(1), Byte(0), Byte(0), Byte(0), Byte(1), Byte(0), Byte(7), Byte(8)
+        Byte(1),
+        Byte(0),
+        Byte(0),
+        Byte(0),
+        Byte(1),
+        Byte(0),
+        Byte(7),
+        Byte(8),
     ]
     var frame = FrameParseResult.complete(Byte(1), Byte(0x2C), UInt32(3), 8)
     var result = block.begin(frame, Span(payload))
@@ -93,7 +102,9 @@ def test_header_block_rejects_compressed_block_over_limit() raises:
     var headers = FrameParseResult.complete(Byte(1), Byte(0), UInt32(1), 2)
     assert_true(block.begin(headers, Span(payload)).is_pending())
     var continuation = FrameParseResult.complete(Byte(9), Byte(4), UInt32(1), 1)
-    assert_true(block.continue_with(continuation, Span(payload[0:1])).is_error())
+    assert_true(
+        block.continue_with(continuation, Span(payload[0:1])).is_error()
+    )
 
 
 def test_http2_flow_window_tracks_data_and_credit_separately() raises:
@@ -191,9 +202,7 @@ def test_http2_continuation_sequence_rejects_orphan_and_wrong_stream() raises:
     var wrong_stream_sequence = Http2ContinuationSequence()
     var headers = FrameParseResult.complete(Byte(1), Byte(0), UInt32(1), 1)
     assert_true(wrong_stream_sequence.accept(headers))
-    var wrong_stream = FrameParseResult.complete(
-        Byte(9), Byte(4), UInt32(3), 1
-    )
+    var wrong_stream = FrameParseResult.complete(Byte(9), Byte(4), UInt32(3), 1)
     assert_false(wrong_stream_sequence.accept(wrong_stream))
 
 
@@ -212,7 +221,13 @@ def test_http2_data_frame_extracts_payload_and_end_stream() raises:
     assert_equal(parsed.data_length, 3)
     assert_true(parsed.end_stream)
 
-    var padded_payload: List[Byte] = [Byte(2), Byte(10), Byte(11), Byte(0), Byte(0)]
+    var padded_payload: List[Byte] = [
+        Byte(2),
+        Byte(10),
+        Byte(11),
+        Byte(0),
+        Byte(0),
+    ]
     var padded = FrameParseResult.complete(Byte(0), Byte(9), UInt32(1), 5)
     parsed = parse_data_frame(padded, Span(padded_payload))
     assert_true(parsed.is_valid())
@@ -231,7 +246,9 @@ def test_http2_data_frame_rejects_invalid_padding_and_shape() raises:
         Byte(0), Byte(8), UInt32(1), 2
     )
     assert_true(
-        parse_data_frame(invalid_padding, Span(invalid_padding_payload)).is_error()
+        parse_data_frame(
+            invalid_padding, Span(invalid_padding_payload)
+        ).is_error()
     )
 
     var payload: List[Byte] = [Byte(1)]
@@ -269,7 +286,9 @@ def test_http2_request_body_enforces_limit_and_completion() raises:
         Byte(0), Byte(1), UInt32(1), 2
     )
     var oversized = parse_data_frame(oversized_frame, Span(oversized_payload))
-    assert_true(body.append_data(oversized, Span(oversized_payload)).is_too_large())
+    assert_true(
+        body.append_data(oversized, Span(oversized_payload)).is_too_large()
+    )
 
     var complete = Http2RequestBody(1)
     var payload: List[Byte] = [Byte(9)]
@@ -300,32 +319,33 @@ def test_http2_response_headers_reject_forbidden_and_mismatched_fields() raises:
     var connection = ResponseWriter(16)
     connection.headers.add("Connection", "close")
     assert_true(
-        encode_http2_response_headers(connection, False, "date", 1024, 8)
-        .is_error()
+        encode_http2_response_headers(
+            connection, False, "date", 1024, 8
+        ).is_error()
     )
 
     var mismatch = ResponseWriter(16)
     mismatch.headers.add("Content-Length", "3")
     mismatch.write_string("hello")
     assert_true(
-        encode_http2_response_headers(mismatch, False, "date", 1024, 8)
-        .is_error()
+        encode_http2_response_headers(
+            mismatch, False, "date", 1024, 8
+        ).is_error()
     )
 
     var invalid_status = ResponseWriter(16)
     invalid_status.set_status(101)
     assert_true(
-        encode_http2_response_headers(invalid_status, False, "date", 1024, 8)
-        .is_error()
+        encode_http2_response_headers(
+            invalid_status, False, "date", 1024, 8
+        ).is_error()
     )
 
 
 def test_http2_response_headers_keep_head_length_and_drop_no_body_length() raises:
     var head = ResponseWriter(16)
     head.write_string("hello")
-    var head_fields = encode_http2_response_headers(
-        head, True, "date", 1024, 8
-    )
+    var head_fields = encode_http2_response_headers(head, True, "date", 1024, 8)
     assert_true(head_fields.is_valid())
     assert_false(head_fields.send_body)
     assert_equal(head_fields.field_count, 3)
@@ -372,7 +392,9 @@ def test_http2_window_update_rejects_invalid_frame_shape() raises:
     var wrong_type = FrameParseResult.complete(Byte(6), Byte(0), UInt32(0), 3)
     assert_true(parse_window_update_frame(wrong_type, Span(payload)).is_error())
     assert_true(
-        parse_window_update_frame(FrameParseResult.failure(), Span(payload)).is_error()
+        parse_window_update_frame(
+            FrameParseResult.failure(), Span(payload)
+        ).is_error()
     )
 
 
@@ -390,12 +412,21 @@ def test_http2_rst_stream_rejects_invalid_shape_or_connection_stream() raises:
     var connection = FrameParseResult.complete(Byte(3), Byte(0), UInt32(0), 4)
     assert_true(parse_rst_stream_frame(connection, Span(payload)).is_error())
     var wrong_length = FrameParseResult.complete(Byte(3), Byte(0), UInt32(1), 3)
-    assert_true(parse_rst_stream_frame(wrong_length, Span(payload[0:3])).is_error())
+    assert_true(
+        parse_rst_stream_frame(wrong_length, Span(payload[0:3])).is_error()
+    )
 
 
 def test_http2_ping_echoes_opaque_data_only_for_non_ack() raises:
     var payload: List[Byte] = [
-        Byte(1), Byte(2), Byte(3), Byte(4), Byte(5), Byte(6), Byte(7), Byte(8)
+        Byte(1),
+        Byte(2),
+        Byte(3),
+        Byte(4),
+        Byte(5),
+        Byte(6),
+        Byte(7),
+        Byte(8),
     ]
     var frame = FrameParseResult.complete(Byte(6), Byte(0), UInt32(0), 8)
     var ping = parse_ping_frame(frame, Span(payload))
@@ -410,7 +441,14 @@ def test_http2_ping_echoes_opaque_data_only_for_non_ack() raises:
 
 def test_http2_ping_rejects_ack_response_and_invalid_shape() raises:
     var payload: List[Byte] = [
-        Byte(0), Byte(0), Byte(0), Byte(0), Byte(0), Byte(0), Byte(0), Byte(0)
+        Byte(0),
+        Byte(0),
+        Byte(0),
+        Byte(0),
+        Byte(0),
+        Byte(0),
+        Byte(0),
+        Byte(0),
     ]
     var ack_frame = FrameParseResult.complete(Byte(6), Byte(1), UInt32(0), 8)
     var ack = parse_ping_frame(ack_frame, Span(payload))
@@ -423,8 +461,15 @@ def test_http2_ping_rejects_ack_response_and_invalid_shape() raises:
 
 def test_http2_goaway_parses_last_stream_and_encodes_frame() raises:
     var payload: List[Byte] = [
-        Byte(0xFF), Byte(0xFF), Byte(0xFF), Byte(0xFF),
-        Byte(0), Byte(0), Byte(0), Byte(2), Byte(99),
+        Byte(0xFF),
+        Byte(0xFF),
+        Byte(0xFF),
+        Byte(0xFF),
+        Byte(0),
+        Byte(0),
+        Byte(0),
+        Byte(2),
+        Byte(99),
     ]
     var frame = FrameParseResult.complete(Byte(7), Byte(0), UInt32(0), 9)
     var goaway = parse_goaway_frame(frame, Span(payload))
@@ -439,17 +484,33 @@ def test_http2_goaway_parses_last_stream_and_encodes_frame() raises:
 
 
 def test_http2_goaway_rejects_invalid_shape_or_stream() raises:
-    var payload: List[Byte] = [Byte(0), Byte(0), Byte(0), Byte(0), Byte(0), Byte(0), Byte(0)]
+    var payload: List[Byte] = [
+        Byte(0),
+        Byte(0),
+        Byte(0),
+        Byte(0),
+        Byte(0),
+        Byte(0),
+        Byte(0),
+    ]
     var frame = FrameParseResult.complete(Byte(7), Byte(0), UInt32(0), 7)
     assert_true(parse_goaway_frame(frame, Span(payload)).is_error())
     var wrong_stream = FrameParseResult.complete(Byte(7), Byte(0), UInt32(1), 8)
     assert_true(parse_goaway_frame(wrong_stream, Span(payload[0:7])).is_error())
 
 
-
 def test_http2_dispatcher_acknowledges_ping_and_rejects_interleaving() raises:
     var dispatcher = Http2FrameDispatcher(Http2PeerSettings().snapshot())
-    var payload: List[Byte] = [Byte(1), Byte(2), Byte(3), Byte(4), Byte(5), Byte(6), Byte(7), Byte(8)]
+    var payload: List[Byte] = [
+        Byte(1),
+        Byte(2),
+        Byte(3),
+        Byte(4),
+        Byte(5),
+        Byte(6),
+        Byte(7),
+        Byte(8),
+    ]
     var ping = FrameParseResult.complete(Byte(6), Byte(0), UInt32(0), 8)
     var result = dispatcher.accept(ping, Span(payload))
     assert_true(result.is_output())
@@ -473,7 +534,14 @@ def test_http2_dispatcher_applies_peer_settings_and_emits_ack() raises:
         max_header_list_size=UInt32(4096),
     )
     var dispatcher = Http2FrameDispatcher(initial)
-    var payload: List[Byte] = [Byte(0), Byte(5), Byte(0), Byte(0), Byte(128), Byte(0)]
+    var payload: List[Byte] = [
+        Byte(0),
+        Byte(5),
+        Byte(0),
+        Byte(0),
+        Byte(128),
+        Byte(0),
+    ]
     var frame = FrameParseResult.complete(Byte(4), Byte(0), UInt32(0), 6)
     var result = dispatcher.accept(frame, Span(payload))
     assert_true(result.is_output())
@@ -499,12 +567,380 @@ def test_http2_dispatcher_returns_window_reset_and_goaway_events() raises:
     assert_equal(result.stream_id, UInt32(3))
     assert_equal(result.value, UInt32(8))
 
-    var goaway_payload: List[Byte] = [Byte(0), Byte(0), Byte(0), Byte(3), Byte(0), Byte(0), Byte(0), Byte(2)]
+    var goaway_payload: List[Byte] = [
+        Byte(0),
+        Byte(0),
+        Byte(0),
+        Byte(3),
+        Byte(0),
+        Byte(0),
+        Byte(0),
+        Byte(2),
+    ]
     var goaway = FrameParseResult.complete(Byte(7), Byte(0), UInt32(0), 8)
     result = dispatcher.accept(goaway, Span(goaway_payload))
     assert_true(result.is_goaway())
     assert_equal(result.stream_id, UInt32(3))
     assert_equal(result.value, UInt32(2))
+
+
+def _assert_enhance_your_calm_goaway(result: Http2DispatchResult) raises:
+    assert_true(result.is_flood())
+    assert_equal(result.value, UInt32(11))
+
+
+def test_http2_dispatcher_control_flood_emits_goaway() raises:
+    var dispatcher = Http2FrameDispatcher(
+        Http2PeerSettings().snapshot(),
+        max_control_frames_per_second=3,
+        max_resets_per_second=100,
+    )
+    var payload: List[Byte] = [
+        Byte(1),
+        Byte(2),
+        Byte(3),
+        Byte(4),
+        Byte(5),
+        Byte(6),
+        Byte(7),
+        Byte(8),
+    ]
+    var ping = FrameParseResult.complete(Byte(6), Byte(0), UInt32(0), 8)
+    var window_payload: List[Byte] = [Byte(0), Byte(0), Byte(0), Byte(1)]
+    var window = FrameParseResult.complete(Byte(8), Byte(0), UInt32(0), 4)
+
+    var result = dispatcher.accept(ping, Span(payload))
+    assert_true(result.is_output())
+    assert_false(dispatcher.is_failed())
+    result = dispatcher.accept(window, Span(window_payload))
+    assert_true(result.is_window_update())
+    result = dispatcher.accept(ping, Span(payload))
+    assert_true(result.is_output())
+    assert_false(dispatcher.is_failed())
+
+    result = dispatcher.accept(ping, Span(payload))
+    _assert_enhance_your_calm_goaway(result)
+    assert_true(dispatcher.is_failed())
+
+    result = dispatcher.accept(ping, Span(payload))
+    assert_true(result.is_error())
+
+
+def test_http2_dispatcher_reset_flood_emits_goaway() raises:
+    var dispatcher = Http2FrameDispatcher(
+        Http2PeerSettings().snapshot(),
+        max_control_frames_per_second=1000,
+        max_resets_per_second=2,
+    )
+    var reset_payload: List[Byte] = [Byte(0), Byte(0), Byte(0), Byte(8)]
+    var reset = FrameParseResult.complete(Byte(3), Byte(0), UInt32(3), 4)
+
+    var result = dispatcher.accept(reset, Span(reset_payload))
+    assert_true(result.is_reset())
+    result = dispatcher.accept(reset, Span(reset_payload))
+    assert_true(result.is_reset())
+    assert_false(dispatcher.is_failed())
+
+    result = dispatcher.accept(reset, Span(reset_payload))
+    _assert_enhance_your_calm_goaway(result)
+    assert_true(dispatcher.is_failed())
+
+    result = dispatcher.accept(reset, Span(reset_payload))
+    assert_true(result.is_error())
+
+
+def test_http2_dispatcher_control_under_limit_succeeds() raises:
+    var dispatcher = Http2FrameDispatcher(
+        Http2PeerSettings().snapshot(),
+        max_control_frames_per_second=3,
+        max_resets_per_second=2,
+    )
+    var payload: List[Byte] = [
+        Byte(1),
+        Byte(2),
+        Byte(3),
+        Byte(4),
+        Byte(5),
+        Byte(6),
+        Byte(7),
+        Byte(8),
+    ]
+    var ping = FrameParseResult.complete(Byte(6), Byte(0), UInt32(0), 8)
+    var ack_ping = FrameParseResult.complete(Byte(6), Byte(1), UInt32(0), 8)
+
+    var result = dispatcher.accept(ping, Span(payload))
+    assert_true(result.is_output())
+    assert_equal(result.output[4], Byte(1))
+    result = dispatcher.accept(ping, Span(payload))
+    assert_true(result.is_output())
+    result = dispatcher.accept(ping, Span(payload))
+    assert_true(result.is_output())
+    assert_false(dispatcher.is_failed())
+
+    # ACK frames do not count toward the control limit.
+    result = dispatcher.accept(ack_ping, Span(payload))
+    assert_true(result.is_ignored())
+    assert_false(dispatcher.is_failed())
+
+    var reset_payload: List[Byte] = [Byte(0), Byte(0), Byte(0), Byte(8)]
+    var reset = FrameParseResult.complete(Byte(3), Byte(0), UInt32(1), 4)
+    result = dispatcher.accept(reset, Span(reset_payload))
+    assert_true(result.is_reset())
+    result = dispatcher.accept(reset, Span(reset_payload))
+    assert_true(result.is_reset())
+    assert_false(dispatcher.is_failed())
+
+
+def _find_goaway_offset(wire: List[Byte]) raises -> Int:
+    var offset = 0
+    while offset + 9 <= len(wire):
+        var frame = parse_frame(Span(wire)[offset:])
+        assert_true(frame.is_complete())
+        if frame.frame_type == Byte(7):
+            return offset
+        offset += frame.consumed
+    return -1
+
+
+def test_http2_request_session_control_flood_emits_goaway_and_drains() raises:
+    var session = Http2RequestSession(
+        "build/http2/libnet_hpack",
+        4,
+        1024,
+        max_control_frames_per_second=3,
+        max_resets_per_second=100,
+    )
+    var bootstrap = List[Byte]()
+    var preface = "PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n".as_bytes()
+    for i in range(len(preface)):
+        bootstrap.append(preface[i])
+    var empty = List[Byte]()
+    var settings = encode_frame(Byte(4), Byte(0), UInt32(0), Span(empty))
+    for i in range(len(settings.wire)):
+        bootstrap.append(settings.wire[i])
+    var boot = session.consume(Span(bootstrap))
+    assert_true(boot.is_pending())
+    assert_false(session.is_failed())
+
+    var ping_payload: List[Byte] = [
+        Byte(1),
+        Byte(2),
+        Byte(3),
+        Byte(4),
+        Byte(5),
+        Byte(6),
+        Byte(7),
+        Byte(8),
+    ]
+    for _ in range(3):
+        var ping_wire = _frame(6, 0, 0, ping_payload)
+        var ack = session.consume(Span(ping_wire))
+        assert_true(ack.is_pending())
+        assert_false(session.is_failed())
+        assert_false(session.is_draining())
+
+    var flood_ping = _frame(6, 0, 0, ping_payload)
+    var flooded = session.consume(Span(flood_ping))
+    assert_true(flooded.is_pending())
+    assert_true(session.is_draining())
+    assert_true(session.is_failed())
+    var goaway_at = _find_goaway_offset(flooded.output)
+    assert_true(goaway_at >= 0)
+    var goaway_frame = parse_frame(Span(flooded.output)[goaway_at:])
+    assert_true(goaway_frame.is_complete())
+    assert_equal(goaway_frame.frame_type, Byte(7))
+    var goaway = parse_goaway_frame(
+        goaway_frame, Span(flooded.output)[goaway_at + 9 :]
+    )
+    assert_true(goaway.is_valid())
+    assert_equal(goaway.error_code, UInt32(11))
+    assert_equal(goaway.last_stream_id, UInt32(0))
+
+    var compressed: List[Byte] = [
+        Byte(0x82),
+        Byte(0x86),
+        Byte(0x84),
+        Byte(0x41),
+        Byte(0x0F),
+        Byte(ord("w")),
+        Byte(ord("w")),
+        Byte(ord("w")),
+        Byte(ord(".")),
+        Byte(ord("e")),
+        Byte(ord("x")),
+        Byte(ord("a")),
+        Byte(ord("m")),
+        Byte(ord("p")),
+        Byte(ord("l")),
+        Byte(ord("e")),
+        Byte(ord(".")),
+        Byte(ord("c")),
+        Byte(ord("o")),
+        Byte(ord("m")),
+    ]
+    var headers = _frame(1, 5, 1, compressed)
+    var after = session.consume(Span(headers))
+    assert_false(after.is_request())
+    assert_true(session.is_draining())
+
+
+def test_http2_request_session_rst_storm_while_healthy_stream_emits_goaway() raises:
+    # Mixed pattern: stream 3 stays open (HEADERS without END_STREAM) while
+    # RST_STREAM on stream 1 exceeds the tumbling reset budget.
+    var session = Http2RequestSession(
+        "build/http2/libnet_hpack",
+        4,
+        1024,
+        max_control_frames_per_second=1000,
+        max_resets_per_second=2,
+    )
+    var bootstrap = List[Byte]()
+    var preface = "PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n".as_bytes()
+    for i in range(len(preface)):
+        bootstrap.append(preface[i])
+    var empty = List[Byte]()
+    var settings = encode_frame(Byte(4), Byte(0), UInt32(0), Span(empty))
+    for i in range(len(settings.wire)):
+        bootstrap.append(settings.wire[i])
+    assert_true(session.consume(Span(bootstrap)).is_pending())
+
+    var compressed: List[Byte] = [
+        Byte(0x82),
+        Byte(0x86),
+        Byte(0x84),
+        Byte(0x41),
+        Byte(0x0F),
+        Byte(ord("w")),
+        Byte(ord("w")),
+        Byte(ord("w")),
+        Byte(ord(".")),
+        Byte(ord("e")),
+        Byte(ord("x")),
+        Byte(ord("a")),
+        Byte(ord("m")),
+        Byte(ord("p")),
+        Byte(ord("l")),
+        Byte(ord("e")),
+        Byte(ord(".")),
+        Byte(ord("c")),
+        Byte(ord("o")),
+        Byte(ord("m")),
+    ]
+    var stream1 = _frame(1, 5, 1, compressed)
+    var completed = session.consume(Span(stream1))
+    assert_true(completed.is_request())
+    assert_equal(completed.stream_id, UInt32(1))
+
+    # Healthy stream still assembling a body.
+    var stream3 = _frame(1, 4, 3, compressed)
+    assert_true(session.consume(Span(stream3)).is_pending())
+    assert_false(session.is_draining())
+
+    var reset_payload: List[Byte] = [Byte(0), Byte(0), Byte(0), Byte(8)]
+    for _ in range(2):
+        var reset = _frame(3, 0, 1, reset_payload)
+        assert_true(session.consume(Span(reset)).is_pending())
+        assert_false(session.is_draining())
+
+    var flood_reset = _frame(3, 0, 1, reset_payload)
+    var flooded = session.consume(Span(flood_reset))
+    assert_true(flooded.is_pending())
+    assert_true(session.is_draining())
+    assert_true(session.is_failed())
+    var goaway_at = _find_goaway_offset(flooded.output)
+    assert_true(goaway_at >= 0)
+    var goaway_frame = parse_frame(Span(flooded.output)[goaway_at:])
+    assert_true(goaway_frame.is_complete())
+    assert_equal(goaway_frame.frame_type, Byte(7))
+    var goaway = parse_goaway_frame(
+        goaway_frame, Span(flooded.output)[goaway_at + 9 :]
+    )
+    assert_true(goaway.is_valid())
+    assert_equal(goaway.error_code, UInt32(11))
+    assert_equal(goaway.last_stream_id, UInt32(3))
+
+    # No further request completes on the flooded connection.
+    var stream5 = _frame(1, 5, 5, compressed)
+    assert_false(session.consume(Span(stream5)).is_request())
+    var end_body: List[Byte] = List[Byte]()
+    var finish_healthy = _frame(0, 1, 3, end_body)
+    assert_false(session.consume(Span(finish_healthy)).is_request())
+    assert_true(session.is_draining())
+
+
+def test_http2_request_session_flood_isolates_sibling_session() raises:
+    var flooded = Http2RequestSession(
+        "build/http2/libnet_hpack",
+        4,
+        1024,
+        max_control_frames_per_second=1000,
+        max_resets_per_second=2,
+    )
+    var healthy = Http2RequestSession(
+        "build/http2/libnet_hpack",
+        4,
+        1024,
+        max_control_frames_per_second=1000,
+        max_resets_per_second=2,
+    )
+    var preface = "PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n".as_bytes()
+    var empty = List[Byte]()
+    var settings = encode_frame(Byte(4), Byte(0), UInt32(0), Span(empty))
+    var bootstrap = List[Byte]()
+    for i in range(len(preface)):
+        bootstrap.append(preface[i])
+    for i in range(len(settings.wire)):
+        bootstrap.append(settings.wire[i])
+    assert_true(flooded.consume(Span(bootstrap)).is_pending())
+    assert_true(healthy.consume(Span(bootstrap)).is_pending())
+
+    var compressed: List[Byte] = [
+        Byte(0x82),
+        Byte(0x86),
+        Byte(0x84),
+        Byte(0x41),
+        Byte(0x0F),
+        Byte(ord("w")),
+        Byte(ord("w")),
+        Byte(ord("w")),
+        Byte(ord(".")),
+        Byte(ord("e")),
+        Byte(ord("x")),
+        Byte(ord("a")),
+        Byte(ord("m")),
+        Byte(ord("p")),
+        Byte(ord("l")),
+        Byte(ord("e")),
+        Byte(ord(".")),
+        Byte(ord("c")),
+        Byte(ord("o")),
+        Byte(ord("m")),
+    ]
+    var open_stream = _frame(1, 5, 1, compressed)
+    assert_true(flooded.consume(Span(open_stream)).is_request())
+
+    var reset_payload: List[Byte] = [Byte(0), Byte(0), Byte(0), Byte(8)]
+    for _ in range(2):
+        assert_true(
+            flooded.consume(Span(_frame(3, 0, 1, reset_payload))).is_pending()
+        )
+    var storm = flooded.consume(Span(_frame(3, 0, 1, reset_payload)))
+    assert_true(storm.is_pending())
+    assert_true(flooded.is_draining())
+    var goaway_at = _find_goaway_offset(storm.output)
+    assert_true(goaway_at >= 0)
+    var goaway_frame = parse_frame(Span(storm.output)[goaway_at:])
+    var goaway = parse_goaway_frame(
+        goaway_frame, Span(storm.output)[goaway_at + 9 :]
+    )
+    assert_equal(goaway.error_code, UInt32(11))
+
+    # Sibling connection/session is unaffected.
+    var sibling = healthy.consume(Span(open_stream))
+    assert_true(sibling.is_request())
+    assert_equal(sibling.stream_id, UInt32(1))
+    assert_false(healthy.is_draining())
+    assert_false(healthy.is_failed())
 
 
 def test_http2_frame_reader_retains_fragmented_frame_and_leaves_next() raises:
@@ -516,7 +952,14 @@ def test_http2_frame_reader_retains_fragmented_frame_and_leaves_next() raises:
     assert_equal(partial.consumed, 5)
 
     var trailing_payload: List[Byte] = [
-        Byte(9), Byte(8), Byte(7), Byte(6), Byte(5), Byte(4), Byte(3), Byte(2)
+        Byte(9),
+        Byte(8),
+        Byte(7),
+        Byte(6),
+        Byte(5),
+        Byte(4),
+        Byte(3),
+        Byte(2),
     ]
     var trailing = _frame(6, 0, 0, trailing_payload)
     var combined = List[Byte]()
@@ -530,7 +973,7 @@ def test_http2_frame_reader_retains_fragmented_frame_and_leaves_next() raises:
     assert_equal(result.frame_type, Byte(8))
     assert_equal(result.stream_id, UInt32(3))
     assert_equal(result.payload[0], Byte(4))
-    var next = reader.consume(Span(combined)[result.consumed:])
+    var next = reader.consume(Span(combined)[result.consumed :])
     assert_true(next.is_frame())
     assert_equal(next.frame_type, Byte(6))
 
@@ -538,8 +981,15 @@ def test_http2_frame_reader_retains_fragmented_frame_and_leaves_next() raises:
 def test_http2_frame_reader_rejects_oversized_length_from_header() raises:
     var reader = Http2FrameReader(16384)
     var oversized: List[Byte] = [
-        Byte(0), Byte(0x40), Byte(1), Byte(0), Byte(0),
-        Byte(0), Byte(0), Byte(0), Byte(1),
+        Byte(0),
+        Byte(0x40),
+        Byte(1),
+        Byte(0),
+        Byte(0),
+        Byte(0),
+        Byte(0),
+        Byte(0),
+        Byte(1),
     ]
     var result = reader.consume(Span(oversized))
     assert_true(result.is_error())
@@ -554,7 +1004,16 @@ def test_http2_connection_input_bootstraps_then_acknowledges_coalesced_ping() ra
         wire.append(preface[i])
     var settings_payload: List[Byte] = List[Byte]()
     var settings = _frame(4, 0, 0, settings_payload)
-    var ping_payload: List[Byte] = [Byte(1), Byte(2), Byte(3), Byte(4), Byte(5), Byte(6), Byte(7), Byte(8)]
+    var ping_payload: List[Byte] = [
+        Byte(1),
+        Byte(2),
+        Byte(3),
+        Byte(4),
+        Byte(5),
+        Byte(6),
+        Byte(7),
+        Byte(8),
+    ]
     var ping = _frame(6, 0, 0, ping_payload)
     for i in range(len(settings)):
         wire.append(settings[i])
@@ -567,7 +1026,7 @@ def test_http2_connection_input_bootstraps_then_acknowledges_coalesced_ping() ra
     assert_equal(bootstrap.output[18], Byte(4))
     assert_equal(bootstrap.consumed, len(wire) - len(ping))
 
-    var ping_result = input.consume(Span(wire)[bootstrap.consumed:])
+    var ping_result = input.consume(Span(wire)[bootstrap.consumed :])
     assert_true(ping_result.is_output())
     assert_equal(ping_result.output[4], Byte(1))
     assert_equal(ping_result.output[16], Byte(8))
@@ -591,7 +1050,7 @@ def test_http2_connection_input_returns_stream_frame_payload() raises:
 
     var bootstrap = input.consume(Span(wire))
     assert_true(bootstrap.is_output())
-    var stream = input.consume(Span(wire)[bootstrap.consumed:])
+    var stream = input.consume(Span(wire)[bootstrap.consumed :])
     assert_true(stream.is_frame())
     assert_equal(stream.frame_type, Byte(1))
     assert_equal(stream.flags, Byte(5))
@@ -604,13 +1063,20 @@ def test_http2_connection_input_returns_stream_frame_payload() raises:
     assert_true(ignored.is_ignored())
 
     var goaway_payload: List[Byte] = [
-        Byte(0), Byte(0), Byte(0), Byte(1),
-        Byte(0), Byte(0), Byte(0), Byte(0),
+        Byte(0),
+        Byte(0),
+        Byte(0),
+        Byte(1),
+        Byte(0),
+        Byte(0),
+        Byte(0),
+        Byte(0),
     ]
     var goaway = _frame(7, 0, 0, goaway_payload)
     var drain = input.consume(Span(goaway))
     assert_true(drain.is_goaway())
     assert_equal(drain.stream_id, UInt32(1))
+
 
 def _append_hpack_field(mut wire: List[Byte], name: String, value: String):
     var name_bytes = name.as_bytes()
@@ -635,7 +1101,9 @@ def test_http2_request_headers_map_pseudo_and_regular_fields() raises:
     _append_hpack_field(encoded, String(":scheme"), String("https"))
     _append_hpack_field(encoded, String(":authority"), String("example.com"))
     _append_hpack_field(encoded, String(":path"), String("/items?q=1"))
-    _append_hpack_field(encoded, String("content-type"), String("application/json"))
+    _append_hpack_field(
+        encoded, String("content-type"), String("application/json")
+    )
     _append_hpack_field(encoded, String("x-tag"), String("one"))
     _append_hpack_field(encoded, String("x-tag"), String("two"))
     var result = decode_http2_request_headers(Span(encoded), 7)
@@ -715,7 +1183,9 @@ def test_http2_request_headers_validate_authority_port_syntax() raises:
     var encoded = List[Byte]()
     _append_hpack_field(encoded, String(":method"), String("GET"))
     _append_hpack_field(encoded, String(":scheme"), String("https"))
-    _append_hpack_field(encoded, String(":authority"), String("example.com:http"))
+    _append_hpack_field(
+        encoded, String(":authority"), String("example.com:http")
+    )
     _append_hpack_field(encoded, String(":path"), String("/"))
     assert_true(decode_http2_request_headers(Span(encoded), 4).is_error())
 
@@ -750,7 +1220,9 @@ def test_http2_request_stream_combines_headers_body_and_trailers() raises:
     assert_equal(len(request.body), 2)
     assert_equal(request.body[0], Byte(1))
     assert_equal(request.body[1], Byte(2))
-    assert_equal(request.trailers.get_first("x-check"), Optional[String]("done"))
+    assert_equal(
+        request.trailers.get_first("x-check"), Optional[String]("done")
+    )
 
 
 def test_http2_request_stream_reports_body_limit() raises:
@@ -774,7 +1246,9 @@ def test_http2_trailers_preserve_regular_fields() raises:
     _append_hpack_field(encoded, String("x-tag"), String("done"))
     var parsed = decode_http2_trailers(Span(encoded), 2)
     assert_true(parsed.is_valid())
-    assert_equal(parsed.trailers.get_first("grpc-status"), Optional[String]("0"))
+    assert_equal(
+        parsed.trailers.get_first("grpc-status"), Optional[String]("0")
+    )
     assert_equal(parsed.trailers.get_first("x-tag"), Optional[String]("done"))
 
 
@@ -1079,7 +1553,13 @@ def test_frame_encoder_rejects_invalid_stream_id_and_size() raises:
 
 def test_http2_headers_block_fragments_with_continuation() raises:
     var block: List[Byte] = [
-        Byte(1), Byte(2), Byte(3), Byte(4), Byte(5), Byte(6), Byte(7)
+        Byte(1),
+        Byte(2),
+        Byte(3),
+        Byte(4),
+        Byte(5),
+        Byte(6),
+        Byte(7),
     ]
     var encoded = encode_headers_block(UInt32(1), Span(block), True, 3, 64)
     assert_true(encoded.is_complete())
@@ -1108,7 +1588,13 @@ def test_http2_headers_block_fragments_with_continuation() raises:
 
 def test_http2_data_frames_fragment_and_end_stream() raises:
     var body: List[Byte] = [
-        Byte(10), Byte(11), Byte(12), Byte(13), Byte(14), Byte(15), Byte(16)
+        Byte(10),
+        Byte(11),
+        Byte(12),
+        Byte(13),
+        Byte(14),
+        Byte(15),
+        Byte(16),
     ]
     var encoded = encode_data_frames(UInt32(3), Span(body), True, 3, 64)
     assert_true(encoded.is_complete())
@@ -1116,7 +1602,7 @@ def test_http2_data_frames_fragment_and_end_stream() raises:
     assert_true(first.is_complete())
     assert_equal(first.frame_type, Byte(0))
     assert_equal(first.flags, Byte(0))
-    var second = parse_frame(Span(encoded.wire)[first.consumed:], 3)
+    var second = parse_frame(Span(encoded.wire)[first.consumed :], 3)
     assert_true(second.is_complete())
     assert_equal(second.flags, Byte(0))
     var final = parse_frame(
@@ -1388,6 +1874,7 @@ def test_http2_bootstrap_rejects_oversized_initial_window() raises:
     assert_true(not bootstrap.is_ready())
     assert_equal(bootstrap.connection_error_code(), UInt32(3))
 
+
 def test_http2_bootstrap_rejects_partial_settings_with_frame_size_error() raises:
     var bootstrap = Http2ServerBootstrap()
     var preface = "PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n".as_bytes()
@@ -1407,8 +1894,7 @@ def test_http2_bootstrap_rejects_partial_settings_with_frame_size_error() raises
     assert_equal(bootstrap.connection_error_code(), UInt32(6))
 
 
-def test_http2_bootstrap_rejects_oversized_settings_with_frame_size_error(
-) raises:
+def test_http2_bootstrap_rejects_oversized_settings_with_frame_size_error() raises:
     var bootstrap = Http2ServerBootstrap()
     var preface = "PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n".as_bytes()
     assert_true(bootstrap.consume_client_preface(preface).is_complete())
@@ -1453,14 +1939,31 @@ def test_http2_connection_bootstrap_handles_fragmented_preface_and_settings() ra
     for i in range(len(preface)):
         input.append(preface[i])
     var settings_payload: List[Byte] = [
-        Byte(0), Byte(1), Byte(0), Byte(0), Byte(0), Byte(128),
-        Byte(0), Byte(5), Byte(0), Byte(0), Byte(0x80), Byte(0),
+        Byte(0),
+        Byte(1),
+        Byte(0),
+        Byte(0),
+        Byte(0),
+        Byte(128),
+        Byte(0),
+        Byte(5),
+        Byte(0),
+        Byte(0),
+        Byte(0x80),
+        Byte(0),
     ]
     var client_settings = _frame(4, 0, 0, settings_payload)
     for i in range(len(client_settings)):
         input.append(client_settings[i])
     var ping_payload: List[Byte] = [
-        Byte(1), Byte(2), Byte(3), Byte(4), Byte(5), Byte(6), Byte(7), Byte(8)
+        Byte(1),
+        Byte(2),
+        Byte(3),
+        Byte(4),
+        Byte(5),
+        Byte(6),
+        Byte(7),
+        Byte(8),
     ]
     var ping = _frame(6, 0, 0, ping_payload)
     for i in range(len(ping)):
@@ -1475,7 +1978,9 @@ def test_http2_connection_bootstrap_handles_fragmented_preface_and_settings() ra
     assert_true(server_settings.is_complete())
     assert_equal(server_settings.frame_type, Byte(4))
     assert_equal(server_settings.flags, Byte(0))
-    var settings_ack = parse_frame(Span(result.output)[server_settings.consumed:])
+    var settings_ack = parse_frame(
+        Span(result.output)[server_settings.consumed :]
+    )
     assert_true(settings_ack.is_complete())
     assert_equal(settings_ack.frame_type, Byte(4))
     assert_equal(settings_ack.flags, Byte(1))
@@ -1483,7 +1988,7 @@ def test_http2_connection_bootstrap_handles_fragmented_preface_and_settings() ra
     assert_equal(peer_settings.header_table_size, UInt32(128))
     assert_equal(peer_settings.max_frame_size, UInt32(32768))
 
-    var remainder = parse_frame(Span(input)[result.consumed:])
+    var remainder = parse_frame(Span(input)[result.consumed :])
     assert_true(remainder.is_complete())
     assert_equal(remainder.frame_type, Byte(6))
 
@@ -1524,13 +2029,19 @@ def test_http2_connection_bootstrap_rejects_bad_preface_and_initial_ack() raises
     for i in range(len(preface)):
         oversized_input.append(preface[i])
     for byte in [
-        Byte(0), Byte(0x40), Byte(1), Byte(4), Byte(0), Byte(0), Byte(0),
-        Byte(0), Byte(0),
+        Byte(0),
+        Byte(0x40),
+        Byte(1),
+        Byte(4),
+        Byte(0),
+        Byte(0),
+        Byte(0),
+        Byte(0),
+        Byte(0),
     ]:
         oversized_input.append(byte)
     var oversized_bootstrap = Http2ConnectionBootstrap()
     assert_true(oversized_bootstrap.consume(Span(oversized_input)).is_error())
-
 
 
 def test_http2_bootstrap_rejects_initial_settings_ack() raises:

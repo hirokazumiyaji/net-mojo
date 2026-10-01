@@ -38,10 +38,7 @@ struct Http2ContinuationSequence(Movable):
             self._failed = True
             return False
 
-        if (
-            frame.frame_type == Byte(1)
-            and (frame.flags & Byte(4)) == Byte(0)
-        ):
+        if frame.frame_type == Byte(1) and (frame.flags & Byte(4)) == Byte(0):
             self._waiting_for_continuation = True
             self._continuation_stream_id = frame.stream_id
         return True
