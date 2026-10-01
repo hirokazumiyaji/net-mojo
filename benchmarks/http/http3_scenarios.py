@@ -40,6 +40,10 @@ class ScenarioProtocol(QuicConnectionProtocol):
         self.http: Optional[H3Connection] = None
         self.alpn: Optional[str] = None
         self._inflight: dict[int, dict] = {}
+        # Streams whose H3 receive processing is withheld (slow-consumer
+        # emulation): events are staged, not completed, until released.
+        self._held: set[int] = set()
+        self._staged: dict[int, list] = {}
         self.drop_rate = drop_rate
         self.dropped = 0
         self.sent = 0
@@ -72,21 +76,59 @@ class ScenarioProtocol(QuicConnectionProtocol):
             pending = self._inflight.get(http_event.stream_id)
             if pending is None:
                 continue
-            if isinstance(http_event, HeadersReceived):
-                pending["status"] = dict(http_event.headers).get(b":status")
-            elif isinstance(http_event, DataReceived):
-                pending["body"].extend(http_event.data)
-            if getattr(http_event, "stream_ended", False):
-                pending["done_at"] = time.perf_counter()
-                if not pending["future"].done():
-                    pending["future"].set_result(pending)
+            if http_event.stream_id in self._held:
+                # Withhold application-level consumption: stage the event
+                # without completing the stream. (Transport still flows;
+                # true window backpressure is not exposed by aioquic.)
+                self._staged.setdefault(http_event.stream_id, []).append(
+                    http_event
+                )
+                continue
+            self._consume(pending, http_event)
 
-    async def post_echo(self, body: bytes, authority: bytes) -> dict:
+    def _consume(self, pending: dict, http_event) -> None:
+        if isinstance(http_event, HeadersReceived):
+            pending["status"] = dict(http_event.headers).get(b":status")
+        elif isinstance(http_event, DataReceived):
+            pending["body"].extend(http_event.data)
+        if getattr(http_event, "stream_ended", False):
+            pending["done_at"] = time.perf_counter()
+            if not pending["future"].done():
+                pending["future"].set_result(pending)
+
+    def hold_stream(self, stream_id: int) -> None:
+        """Start withholding H3 receive processing for a stream."""
+        self._held.add(stream_id)
+
+    def held_bytes(self, stream_id: int) -> int:
+        """Bytes received at H3 level while consumption is withheld."""
+        total = 0
+        for ev in self._staged.get(stream_id, []):
+            if isinstance(ev, DataReceived):
+                total += len(ev.data)
+        return total
+
+    def release_stream(self, stream_id: int) -> None:
+        """Replay staged events, completing the stream normally."""
+        self._held.discard(stream_id)
+        pending = self._inflight.get(stream_id)
+        staged = self._staged.pop(stream_id, [])
+        if pending is None:
+            return
+        for ev in staged:
+            self._consume(pending, ev)
+
+    async def post_echo(
+        self, body: bytes, authority: bytes, *, hold: bool = False
+    ) -> dict:
         """POST /echo with a large body so the response spans many datagrams.
 
         Used for the slow-stream case: a 64-byte /fixed response can
         complete during the artificial delay even on a serializing server,
-        so a large echo response is needed to exercise multiplexing.
+        so a large echo response is needed to exercise multiplexing. With
+        hold=True, H3 receive processing is withheld (see hold_stream);
+        the pending record is returned immediately and the caller must
+        release_stream() then await_pending() it.
         """
         assert self.http is not None
         stream_id = self._quic.get_next_available_stream_id()
@@ -102,6 +144,8 @@ class ScenarioProtocol(QuicConnectionProtocol):
             "cancelled": False,
         }
         self._inflight[stream_id] = pending
+        if hold:
+            self.hold_stream(stream_id)
         self.http.send_headers(
             stream_id,
             [
@@ -121,10 +165,19 @@ class ScenarioProtocol(QuicConnectionProtocol):
                 end_stream=(off + 16384 >= len(body)),
             )
         self.transmit()
+        if hold:
+            return pending
         try:
             return await asyncio.wait_for(future, timeout=30.0)
         finally:
             self._inflight.pop(stream_id, None)
+
+    async def await_pending(self, pending: dict, timeout: float = 30.0) -> dict:
+        """Await a held stream previously returned by post_echo(hold=True)."""
+        try:
+            return await asyncio.wait_for(pending["future"], timeout=timeout)
+        finally:
+            self._inflight.pop(pending["stream_id"], None)
 
     async def get(
         self,
@@ -217,20 +270,19 @@ async def run_slow(url: str, slow_s: float, siblings: int) -> dict:
 
         # Slow stream uses a large echo body (256 KiB) so the response
         # spans many datagrams: a serializing server would stall siblings
-        # behind it. A 64-byte /fixed response would complete during the
-        # artificial delay even without multiplexing. Note: aioquic
-        # consumes transport data automatically, so this exercises
-        # application-level multiplexing with a large response rather
-        # than manual flow-control window backpressure.
+        # behind it. Consumption is withheld at the H3 event layer until
+        # siblings complete (see hold_stream): transport still flows, but
+        # the application does not observe completion early. Manual
+        # flow-control window backpressure is not exposed by aioquic, so
+        # this exercises application-level multiplexing with a large
+        # response; held_bytes proves bytes arrived while withheld.
         slow_body = b"x" * (256 * 1024)
 
-        async def _slow_echo() -> dict:
-            result = await client.post_echo(slow_body, authority)
-            if slow_s > 0:
-                await asyncio.sleep(slow_s)
-            return result
-
-        slow_task = asyncio.create_task(_slow_echo())
+        slow_pending = await client.post_echo(slow_body, authority, hold=True)
+        slow_id = slow_pending["stream_id"]
+        # Let the held stream receive while consumption is withheld;
+        # slow_s bounds this pre-sibling settle window.
+        await asyncio.sleep(max(slow_s, 0.05))
         sibling_tasks = [
             asyncio.create_task(client.get(path, authority))
             for _ in range(siblings)
@@ -238,7 +290,9 @@ async def run_slow(url: str, slow_s: float, siblings: int) -> dict:
         sibling_results = await asyncio.gather(
             *sibling_tasks, return_exceptions=True
         )
-        slow_result = await slow_task
+        held = client.held_bytes(slow_id)
+        client.release_stream(slow_id)
+        slow_result = await client.await_pending(slow_pending)
 
     sibling_ok = sum(
         1
@@ -249,14 +303,26 @@ async def run_slow(url: str, slow_s: float, siblings: int) -> dict:
     slow_ok = (
         isinstance(slow_result, dict) and slow_result.get("status") == b"200"
     )
+    slow_body_ok = bytes(slow_result.get("body", b"")) == slow_body if isinstance(
+        slow_result, dict
+    ) else False
     elapsed_ms = (time.perf_counter() - t0) * 1000
-    verdict = "pass" if slow_ok and sibling_ok == siblings else "fail"
+    # held > 0 proves response bytes arrived while consumption was
+    # withheld yet siblings still completed: genuine slow-consumer
+    # multiplexing overlap, not a post-completion sleep.
+    verdict = (
+        "pass"
+        if slow_ok and slow_body_ok and sibling_ok == siblings and held > 0
+        else "fail"
+    )
     return {
         "scenario": "slow",
         "verdict": verdict,
         "slow_ok": int(slow_ok),
+        "slow_body_ok": int(slow_body_ok),
         "sibling_ok": sibling_ok,
         "sibling_fail": sibling_fail,
+        "held_bytes": held,
         "elapsed_ms": elapsed_ms,
         "slow_s": slow_s,
         "siblings": siblings,
