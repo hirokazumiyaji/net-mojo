@@ -261,10 +261,14 @@ section records only the package-level boundaries.
 - Same-origin ops model: one `Server` may own a TCP TLS listener and a QUIC UDP
   endpoint on the same host:port (`examples/http3_hello.mojo`). Reuse the same
   certificate and key for both stacks; example PEMs under `build/tls/` are for
-  local smoke only. `ServerConfig` limits (`max_connections`, body/header/buffer
-  budgets, deadlines, `shutdown_grace`) apply across protocols; HTTP/2 stream
-  caps and the Issue #42 flood / QUIC transport-memory knobs land on sibling
-  PRs [#71](https://github.com/hirokazumiyaji/net-mojo/pull/71)–[#75](https://github.com/hirokazumiyaji/net-mojo/pull/75).
+  local smoke only. `ServerConfig` deadlines and `shutdown_grace` apply to both
+  stacks, but connection and memory bounds are enforced per stack, not shared:
+  `max_connections` caps TCP and QUIC independently (up to the configured
+  count in each), `total_buffer_budget` covers the HTTP connection path while
+  the QUIC provider enforces its own transport-memory limit plus separate
+  fixed 64 MiB request/response caps. Size the process for the sum of both
+  stacks. HTTP/2 stream caps and the Issue #42 flood / QUIC transport-memory
+  knobs land on sibling PRs [#71](https://github.com/hirokazumiyaji/net-mojo/pull/71)–[#75](https://github.com/hirokazumiyaji/net-mojo/pull/75).
 - `Alt-Svc` advertisement is opt-in ([PR #77](https://github.com/hirokazumiyaji/net-mojo/pull/77)):
   set `ServerConfig.alt_svc` (for example `h3=":443"; ma=86400`) when a QUIC
   endpoint is attached; leave it empty when QUIC is unavailable so HTTPS does
