@@ -78,7 +78,7 @@ pending response fields and bodies each have a 64 MiB aggregate provider cap
 `stats()`, so the provider reports a soft estimate of
 `connections.len() × 256 KiB` and refuses new Initial packets when accepting
 another connection would exceed
-`ServerConfig.quic_max_transport_memory_bytes` (default ~2.5 GiB, aligned with
+`ServerConfig.quic_max_transport_memory_bytes` (default 2,621,440,000 bytes = 10,000 × 256 KiB, aligned with
 10,000 connections). Existing connections continue to drain normally when the
 budget is exhausted. UDP send-path saturation under sustained would-block
 remains a separate verification item.
