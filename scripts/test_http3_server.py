@@ -49,10 +49,14 @@ class Http3ClientProtocol(QuicConnectionProtocol):
 
         if reorder_datagrams:
             if self._held_datagrams:
-                # Prior application datagram was held; send newer first (reorder).
-                datagrams = list(datagrams) + self._held_datagrams
-                self._held_datagrams = []
-                self.reordered_datagram_batches += 1
+                # A newer datagram must exist before the held one can be
+                # released ahead of it; otherwise pacing/cwnd left nothing
+                # new and sending alone is not a reorder.
+                if datagrams:
+                    datagrams = list(datagrams) + self._held_datagrams
+                    self._held_datagrams = []
+                    self.reordered_datagram_batches += 1
+                # else: keep holding until a real packet precedes it.
             elif len(datagrams) >= 2:
                 datagrams[0], datagrams[1] = datagrams[1], datagrams[0]
                 self.reordered_datagram_batches += 1
