@@ -172,10 +172,11 @@ async def _one_connection(
             workers.append(asyncio.create_task(worker()))
         await asyncio.gather(*workers)
 
-        if local["ok"] + local["warmup_ok"] == 0:
-            # Handshake finished after stop_at (short duration or
-            # out-of-band loss): this connection never completed a request,
-            # so it must not be treated as a clean measurement.
+        if local["ok"] == 0:
+            # No completion inside the measurement window: either the
+            # handshake finished after stop_at (short duration) or every
+            # response arrived late (out-of-band loss). Warmup-only
+            # successes do not make this a usable measurement.
             counters["failed"] += 1
 
 
