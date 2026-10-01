@@ -77,7 +77,8 @@ present in every worktree tip):
 | UDP send would-block preserves pending datagrams | Done — [PR #76](https://github.com/hirokazumiyaji/net-mojo/pull/76) |
 | Opt-in HTTPS `Alt-Svc` + same-origin TCP/UDP docs | Done — [PR #77](https://github.com/hirokazumiyaji/net-mojo/pull/77) + this ops PR |
 | Application datagram reorder + reset-storm siblings | Done — [PR #78](https://github.com/hirokazumiyaji/net-mojo/pull/78) |
-| Measured H2/H3 / multiplex benches | Done — [PR #79](https://github.com/hirokazumiyaji/net-mojo/pull/79)–[#81](https://github.com/hirokazumiyaji/net-mojo/pull/81) |
+| Measured H2 / H3 benches | Done — [PR #79](https://github.com/hirokazumiyaji/net-mojo/pull/79)–[#80](https://github.com/hirokazumiyaji/net-mojo/pull/80) |
+| Multiplex matrix + induced-loss measurements | Pending — harness in [PR #81](https://github.com/hirokazumiyaji/net-mojo/pull/81); numbers still to record |
 
 Still deferred / out of scope for #42: server push, CONNECT, enabling 0-RTT,
 broader independent-client matrices beyond aioquic/quiche, and CI workflow edits.
