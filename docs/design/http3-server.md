@@ -78,7 +78,7 @@ present in every worktree tip):
 | Opt-in HTTPS `Alt-Svc` + same-origin TCP/UDP docs | Done — [PR #77](https://github.com/hirokazumiyaji/net-mojo/pull/77) + this ops PR |
 | Application datagram reorder + reset-storm siblings | Done — [PR #78](https://github.com/hirokazumiyaji/net-mojo/pull/78) |
 | Measured H2 / H3 benches | Done — [PR #79](https://github.com/hirokazumiyaji/net-mojo/pull/79)–[#80](https://github.com/hirokazumiyaji/net-mojo/pull/80) |
-| Multiplex matrix + induced-loss measurements | Pending — harness in [PR #81](https://github.com/hirokazumiyaji/net-mojo/pull/81); numbers still to record |
+| Multiplex matrix + special scenarios | Partially done — [PR #81](https://github.com/hirokazumiyaji/net-mojo/pull/81) records the matrix and slow/cancel/loss numbers for H3 (5% client-side datagram drop) in `benchmarks/http/README.md`; the H2 loss row still needs a root-capable host for pf/dummynet |
 
 Still deferred / out of scope for #42: server push, CONNECT, enabling 0-RTT,
 broader independent-client matrices beyond aioquic/quiche, and CI workflow edits.
