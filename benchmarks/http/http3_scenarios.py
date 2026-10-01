@@ -1,0 +1,522 @@
+#!/usr/bin/env python3
+"""HTTP/3 special scenarios for Issue #42 PR 11 multiplex matrix.
+
+Scenarios (qualitative + limited timing; aioquic client):
+  slow   — one slow stream (delayed DATA consume) alongside N normal GETs
+  cancel — RST one in-flight stream (H3_REQUEST_CANCELLED) while siblings complete
+  loss   — drop a fraction of outbound UDP datagrams (client-side loss emulation)
+
+Usage:
+  pixi run -e tls-http3 python benchmarks/http/http3_scenarios.py \\
+    --url https://127.0.0.1:18453/fixed --scenario slow
+"""
+
+from __future__ import annotations
+
+import argparse
+import asyncio
+import random
+import ssl
+import sys
+import time
+from typing import List, Optional
+from urllib.parse import urlparse
+
+from aioquic.asyncio import connect
+from aioquic.asyncio.protocol import QuicConnectionProtocol
+from aioquic.h3.connection import H3_ALPN, H3Connection
+from aioquic.h3.events import DataReceived, HeadersReceived
+from aioquic.quic.configuration import QuicConfiguration
+from aioquic.quic.events import ProtocolNegotiated
+from aioquic.quic.packet import QuicProtocolVersion
+
+# HTTP/3 request cancelled (RFC 9114)
+H3_REQUEST_CANCELLED = 0x10C
+
+
+class ScenarioProtocol(QuicConnectionProtocol):
+    def __init__(self, *args, drop_rate: float = 0.0, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        self.http: Optional[H3Connection] = None
+        self.alpn: Optional[str] = None
+        self._inflight: dict[int, dict] = {}
+        self.drop_rate = drop_rate
+        self.dropped = 0
+        self.sent = 0
+
+    def transmit(self) -> None:  # type: ignore[override]
+        """Send queued datagrams, optionally dropping a fraction (loss scenario)."""
+        self._transmit_task = None
+        for data, addr in self._quic.datagrams_to_send(now=self._loop.time()):
+            self.sent += 1
+            if self.drop_rate > 0 and random.random() < self.drop_rate:
+                self.dropped += 1
+                continue
+            self._transport.sendto(data, addr)
+        timer_at = self._quic.get_timer()
+        if self._timer is not None and self._timer_at != timer_at:
+            self._timer.cancel()
+            self._timer = None
+        if self._timer is None and timer_at is not None:
+            self._timer = self._loop.call_at(timer_at, self._handle_timer)
+        self._timer_at = timer_at
+
+    def quic_event_received(self, event) -> None:
+        if isinstance(event, ProtocolNegotiated):
+            self.alpn = event.alpn_protocol
+            if event.alpn_protocol in H3_ALPN:
+                self.http = H3Connection(self._quic)
+        if self.http is None:
+            return
+        for http_event in self.http.handle_event(event):
+            pending = self._inflight.get(http_event.stream_id)
+            if pending is None:
+                continue
+            if isinstance(http_event, HeadersReceived):
+                pending["status"] = dict(http_event.headers).get(b":status")
+            elif isinstance(http_event, DataReceived):
+                pending["body"].extend(http_event.data)
+            if getattr(http_event, "stream_ended", False):
+                pending["done_at"] = time.perf_counter()
+                if not pending["future"].done():
+                    pending["future"].set_result(pending)
+
+    async def post_echo(self, body: bytes, authority: bytes) -> dict:
+        """POST /echo with a large body so the response spans many datagrams.
+
+        Used for the slow-stream case: a 64-byte /fixed response can
+        complete during the artificial delay even on a serializing server,
+        so a large echo response is needed to exercise multiplexing.
+        """
+        assert self.http is not None
+        stream_id = self._quic.get_next_available_stream_id()
+        loop = asyncio.get_running_loop()
+        future = loop.create_future()
+        pending = {
+            "future": future,
+            "body": bytearray(),
+            "status": None,
+            "start": time.perf_counter(),
+            "done_at": None,
+            "stream_id": stream_id,
+            "cancelled": False,
+        }
+        self._inflight[stream_id] = pending
+        self.http.send_headers(
+            stream_id,
+            [
+                (b":method", b"POST"),
+                (b":scheme", b"https"),
+                (b":authority", authority),
+                (b":path", b"/echo"),
+                (b"content-length", str(len(body)).encode()),
+            ],
+            end_stream=False,
+        )
+        # Chunk to respect flow control.
+        for off in range(0, len(body), 16384):
+            self.http.send_data(
+                stream_id,
+                body[off : off + 16384],
+                end_stream=(off + 16384 >= len(body)),
+            )
+        self.transmit()
+        try:
+            return await asyncio.wait_for(future, timeout=30.0)
+        finally:
+            self._inflight.pop(stream_id, None)
+
+    async def get(
+        self,
+        path: bytes,
+        authority: bytes,
+        *,
+        slow_s: float = 0.0,
+        cancel: bool = False,
+    ) -> dict:
+        assert self.http is not None
+        stream_id = self._quic.get_next_available_stream_id()
+        loop = asyncio.get_running_loop()
+        future = loop.create_future()
+        pending = {
+            "future": future,
+            "body": bytearray(),
+            "status": None,
+            "start": time.perf_counter(),
+            "done_at": None,
+            "stream_id": stream_id,
+            "cancelled": False,
+        }
+        self._inflight[stream_id] = pending
+        self.http.send_headers(
+            stream_id,
+            [
+                (b":method", b"GET"),
+                (b":scheme", b"https"),
+                (b":authority", authority),
+                (b":path", path),
+            ],
+            end_stream=True,
+        )
+        self.transmit()
+        if cancel:
+            await asyncio.sleep(0.005)
+            # Only a still-in-flight stream proves cancellation; a tiny
+            # /fixed response may already have completed in 5ms.
+            was_inflight = not future.done()
+            if was_inflight:
+                self._quic.reset_stream(stream_id, error_code=H3_REQUEST_CANCELLED)
+                self.transmit()
+            pending["cancelled"] = True
+            pending["was_inflight"] = was_inflight
+            self._inflight.pop(stream_id, None)
+            return pending
+        try:
+            if slow_s > 0:
+                # Delay before awaiting completion to emulate a slow consumer
+                # while other streams progress on the same connection.
+                await asyncio.sleep(slow_s)
+            return await asyncio.wait_for(future, timeout=30.0)
+        finally:
+            self._inflight.pop(stream_id, None)
+
+
+async def _wait_alpn(client: ScenarioProtocol) -> None:
+    for _ in range(50):
+        if client.alpn is not None:
+            break
+        await asyncio.sleep(0.01)
+    if client.alpn not in H3_ALPN and client.alpn != "h3":
+        raise RuntimeError(f"unexpected ALPN: {client.alpn!r}")
+
+
+async def run_slow(url: str, slow_s: float, siblings: int) -> dict:
+    parsed = urlparse(url)
+    host = parsed.hostname or "127.0.0.1"
+    port = parsed.port or 443
+    path = (parsed.path or "/").encode()
+    authority = f"{host}:{port}".encode()
+
+    configuration = QuicConfiguration(
+        is_client=True,
+        alpn_protocols=H3_ALPN,
+        server_name="localhost",
+    )
+    configuration.supported_versions = [QuicProtocolVersion.VERSION_1]
+    configuration.verify_mode = ssl.CERT_NONE
+
+    t0 = time.perf_counter()
+    async with connect(
+        host,
+        port,
+        configuration=configuration,
+        create_protocol=ScenarioProtocol,
+    ) as client:
+        assert isinstance(client, ScenarioProtocol)
+        await _wait_alpn(client)
+
+        # Slow stream uses a large echo body (256 KiB) so the response
+        # spans many datagrams: a serializing server would stall siblings
+        # behind it. A 64-byte /fixed response would complete during the
+        # artificial delay even without multiplexing. Note: aioquic
+        # consumes transport data automatically, so this exercises
+        # application-level multiplexing with a large response rather
+        # than manual flow-control window backpressure.
+        slow_body = b"x" * (256 * 1024)
+
+        async def _slow_echo() -> dict:
+            result = await client.post_echo(slow_body, authority)
+            if slow_s > 0:
+                await asyncio.sleep(slow_s)
+            return result
+
+        slow_task = asyncio.create_task(_slow_echo())
+        sibling_tasks = [
+            asyncio.create_task(client.get(path, authority))
+            for _ in range(siblings)
+        ]
+        sibling_results = await asyncio.gather(
+            *sibling_tasks, return_exceptions=True
+        )
+        slow_result = await slow_task
+
+    sibling_ok = sum(
+        1
+        for r in sibling_results
+        if isinstance(r, dict) and r.get("status") == b"200"
+    )
+    sibling_fail = siblings - sibling_ok
+    slow_ok = (
+        isinstance(slow_result, dict) and slow_result.get("status") == b"200"
+    )
+    elapsed_ms = (time.perf_counter() - t0) * 1000
+    verdict = "pass" if slow_ok and sibling_ok == siblings else "fail"
+    return {
+        "scenario": "slow",
+        "verdict": verdict,
+        "slow_ok": int(slow_ok),
+        "sibling_ok": sibling_ok,
+        "sibling_fail": sibling_fail,
+        "elapsed_ms": elapsed_ms,
+        "slow_s": slow_s,
+        "siblings": siblings,
+    }
+
+
+async def run_cancel(url: str, siblings: int) -> dict:
+    parsed = urlparse(url)
+    host = parsed.hostname or "127.0.0.1"
+    port = parsed.port or 443
+    path = (parsed.path or "/").encode()
+    authority = f"{host}:{port}".encode()
+
+    configuration = QuicConfiguration(
+        is_client=True,
+        alpn_protocols=H3_ALPN,
+        server_name="localhost",
+    )
+    configuration.supported_versions = [QuicProtocolVersion.VERSION_1]
+    configuration.verify_mode = ssl.CERT_NONE
+
+    t0 = time.perf_counter()
+    async with connect(
+        host,
+        port,
+        configuration=configuration,
+        create_protocol=ScenarioProtocol,
+    ) as client:
+        assert isinstance(client, ScenarioProtocol)
+        await _wait_alpn(client)
+
+        # Run cancellation concurrently with siblings so reset and sibling
+        # traffic overlap; the old code awaited the cancelled request to
+        # completion before starting siblings. Use a large echo for the
+        # cancel target so it is still in-flight (not already completed)
+        # when reset fires after 5ms.
+        cancel_body = b"y" * (256 * 1024)
+
+        async def _cancel_large() -> dict:
+            assert isinstance(client, ScenarioProtocol)
+            stream_id = client._quic.get_next_available_stream_id()
+            loop = asyncio.get_running_loop()
+            future = loop.create_future()
+            pending = {
+                "future": future,
+                "body": bytearray(),
+                "status": None,
+                "start": time.perf_counter(),
+                "done_at": None,
+                "stream_id": stream_id,
+                "cancelled": False,
+            }
+            assert client.http is not None
+            client._inflight[stream_id] = pending
+            client.http.send_headers(
+                stream_id,
+                [
+                    (b":method", b"POST"),
+                    (b":scheme", b"https"),
+                    (b":authority", authority),
+                    (b":path", b"/echo"),
+                    (b"content-length", str(len(cancel_body)).encode()),
+                ],
+                end_stream=False,
+            )
+            client.http.send_data(
+                stream_id, cancel_body[:16384], end_stream=False
+            )
+            client.transmit()
+            await asyncio.sleep(0.005)
+            was_inflight = not future.done()
+            if was_inflight:
+                client._quic.reset_stream(
+                    stream_id, error_code=H3_REQUEST_CANCELLED
+                )
+                client.transmit()
+            pending["cancelled"] = True
+            pending["was_inflight"] = was_inflight
+            client._inflight.pop(stream_id, None)
+            return pending
+
+        cancel_task = asyncio.create_task(_cancel_large())
+        sibling_tasks = [
+            asyncio.create_task(client.get(path, authority))
+            for _ in range(siblings)
+        ]
+        cancelled, sibling_results = await asyncio.gather(
+            cancel_task,
+            asyncio.gather(*sibling_tasks, return_exceptions=True),
+        )
+
+    sibling_ok = sum(
+        1
+        for r in sibling_results
+        if isinstance(r, dict) and r.get("status") == b"200"
+    )
+    elapsed_ms = (time.perf_counter() - t0) * 1000
+    # Pass: target was in-flight when reset fired (not already completed)
+    # and siblings still succeed (connection reusable).
+    verdict = (
+        "pass"
+        if cancelled.get("cancelled")
+        and cancelled.get("was_inflight")
+        and sibling_ok == siblings
+        else "fail"
+    )
+    return {
+        "scenario": "cancel",
+        "verdict": verdict,
+        "cancelled": int(bool(cancelled.get("cancelled"))),
+        "was_inflight": int(bool(cancelled.get("was_inflight"))),
+        "sibling_ok": sibling_ok,
+        "sibling_fail": siblings - sibling_ok,
+        "elapsed_ms": elapsed_ms,
+        "siblings": siblings,
+    }
+
+
+async def run_loss(
+    url: str, clients: int, streams: int, drop_rate: float, duration_s: float
+) -> dict:
+    """Sustained GET load with client-side outbound datagram drops."""
+    parsed = urlparse(url)
+    host = parsed.hostname or "127.0.0.1"
+    port = parsed.port or 443
+    path = (parsed.path or "/").encode()
+    authority = f"{host}:{port}".encode()
+
+    latencies: List[float] = []
+    counters = {"ok": 0, "failed": 0, "dropped": 0, "sent": 0}
+    stop_at = time.perf_counter() + duration_s
+
+    def factory(*args, **kwargs):
+        return ScenarioProtocol(*args, drop_rate=drop_rate, **kwargs)
+
+    async def one_conn() -> None:
+        configuration = QuicConfiguration(
+            is_client=True,
+            alpn_protocols=H3_ALPN,
+            server_name="localhost",
+        )
+        configuration.supported_versions = [QuicProtocolVersion.VERSION_1]
+        configuration.verify_mode = ssl.CERT_NONE
+        async with connect(
+            host,
+            port,
+            configuration=configuration,
+            create_protocol=factory,
+        ) as client:
+            assert isinstance(client, ScenarioProtocol)
+            await _wait_alpn(client)
+            sem = asyncio.Semaphore(streams)
+
+            async def one_request() -> None:
+                async with sem:
+                    try:
+                        result = await asyncio.wait_for(
+                            client.get(path, authority), timeout=10.0
+                        )
+                    except Exception:
+                        counters["failed"] += 1
+                        return
+                    if result.get("status") == b"200":
+                        counters["ok"] += 1
+                        latencies.append(
+                            (
+                                (result["done_at"] or time.perf_counter())
+                                - result["start"]
+                            )
+                            * 1_000_000.0
+                        )
+                    else:
+                        counters["failed"] += 1
+
+            workers = []
+
+            async def worker() -> None:
+                while time.perf_counter() < stop_at:
+                    await one_request()
+
+            for _ in range(streams):
+                workers.append(asyncio.create_task(worker()))
+            await asyncio.gather(*workers)
+            counters["dropped"] += client.dropped
+            counters["sent"] += client.sent
+
+    await asyncio.gather(*[one_conn() for _ in range(clients)])
+    measure_s = max(1e-9, duration_s)
+    latencies.sort()
+    p50 = latencies[int(0.50 * (len(latencies) - 1))] if latencies else float(
+        "nan"
+    )
+    p99 = latencies[int(0.99 * (len(latencies) - 1))] if latencies else float(
+        "nan"
+    )
+    req_s = counters["ok"] / measure_s
+    # Pass if some successes under loss (server stayed up) and drop actually occurred.
+    verdict = (
+        "pass"
+        if counters["ok"] > 0 and (drop_rate == 0 or counters["dropped"] > 0)
+        else "fail"
+    )
+    return {
+        "scenario": "loss",
+        "verdict": verdict,
+        "drop_rate": drop_rate,
+        "req_s": req_s,
+        "ok": counters["ok"],
+        "failed": counters["failed"],
+        "dropped": counters["dropped"],
+        "sent": counters["sent"],
+        "p50_us": p50,
+        "p99_us": p99,
+        "clients": clients,
+        "streams": streams,
+        "duration_s": duration_s,
+    }
+
+
+def _print_result(stats: dict) -> None:
+    parts = [f"{k}={v}" for k, v in stats.items()]
+    print(" ".join(parts))
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--url", required=True)
+    parser.add_argument(
+        "--scenario",
+        required=True,
+        choices=("slow", "cancel", "loss"),
+    )
+    parser.add_argument("--slow-s", type=float, default=0.25)
+    parser.add_argument("--siblings", type=int, default=8)
+    parser.add_argument("--clients", type=int, default=4)
+    parser.add_argument("--streams", type=int, default=4)
+    parser.add_argument("--drop-rate", type=float, default=0.05)
+    parser.add_argument("--duration", type=float, default=5.0)
+    parser.add_argument("--seed", type=int, default=42)
+    args = parser.parse_args()
+    random.seed(args.seed)
+
+    if args.scenario == "slow":
+        stats = asyncio.run(run_slow(args.url, args.slow_s, args.siblings))
+    elif args.scenario == "cancel":
+        stats = asyncio.run(run_cancel(args.url, args.siblings))
+    else:
+        stats = asyncio.run(
+            run_loss(
+                args.url,
+                args.clients,
+                args.streams,
+                args.drop_rate,
+                args.duration,
+            )
+        )
+    _print_result(stats)
+    if stats.get("verdict") != "pass":
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()
