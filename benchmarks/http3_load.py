@@ -140,6 +140,11 @@ async def _one_connection(
                     if now > stop_at:
                         counters["late"] = counters.get("late", 0) + 1
                         return
+                    # Validate the fixed response body: truncated/empty/wrong
+                    # bodies must not count as success for the /fixed workload.
+                    if path == b"/fixed" and bytes(result["body"]) != b"a" * 64:
+                        counters["failed"] += 1
+                        return
                     if now >= warmup_until:
                         counters["ok"] += 1
                         latencies.append(elapsed * 1_000_000.0)  # µs
@@ -251,6 +256,9 @@ def main() -> None:
             **stats
         )
     )
+    if stats["failed"] > 0:
+        print(f'{stats["failed"]} request(s) failed', file=sys.stderr)
+        raise SystemExit(1)
 
 
 if __name__ == "__main__":
