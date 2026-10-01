@@ -1966,6 +1966,11 @@ mod tests {
         let certificate_path = std::env::var("NET_HTTP_TEST_CERT").unwrap();
         let private_key_path = std::env::var("NET_HTTP_TEST_KEY").unwrap();
 
+        // Share one ticket-encryption key so the resume server can decrypt
+        // the ticket issued by the first server; otherwise resumption fails
+        // before the early-data policy is evaluated.
+        const TEST_TICKET_KEY: [u8; 48] = [0x0A; 48];
+
         let mut server_config = quiche::Config::new(quiche::PROTOCOL_VERSION).unwrap();
         server_config
             .set_application_protos(quiche::h3::APPLICATION_PROTOCOL)
@@ -1981,6 +1986,7 @@ mod tests {
         // server (and client) with early data enabled so the resumed
         // Initial can actually offer 0-RTT. The server under test below
         // uses production settings (disabled) to verify rejection.
+        server_config.set_ticket_key(&TEST_TICKET_KEY).unwrap();
         server_config.enable_early_data();
 
         let mut client_config = quiche::Config::new(quiche::PROTOCOL_VERSION).unwrap();
@@ -2082,6 +2088,9 @@ mod tests {
             .load_priv_key_from_pem_file(&private_key_path)
             .unwrap();
         super::apply_provider_quic_transport_settings(&mut resume_server_config);
+        resume_server_config
+            .set_ticket_key(&TEST_TICKET_KEY)
+            .unwrap();
 
         let mut resume_client_config = quiche::Config::new(quiche::PROTOCOL_VERSION).unwrap();
         resume_client_config
