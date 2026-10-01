@@ -1,0 +1,633 @@
+#!/usr/bin/env bash
+# Multiplex matrix + special scenarios for Issue #42 PR 11.
+#
+# Varies connections × streams independently for GET /fixed on HTTPS+H2 and
+# QUIC H3. Also runs slow-stream, cancel, and one loss scenario per protocol.
+#
+# Procedure is intentionally shortened vs full Phase 0 and labeled as such
+# (defaults: warmup 3 s, measure 8 s, 3 runs). Never invent numbers — only
+# record what this harness prints.
+#
+# Usage (from repository root, after tls/hpack/quic builds):
+#   bash benchmarks/http/run_multiplex_matrix.sh
+#
+# Environment overrides:
+#   WARMUP_S MEASURE_S RUNS CONNS STREAMS
+#   SKIP_H2=1 SKIP_H3=1 SKIP_SPECIAL=1
+#   SKIP_GO=1 SKIP_MOJO=1 SKIP_BASELINE=1
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
+cd "$ROOT"
+
+WARMUP_S="${WARMUP_S:-3}"
+MEASURE_S="${MEASURE_S:-8}"
+RUNS="${RUNS:-3}"
+CONNS="${CONNS:-1 16 64}"
+STREAMS="${STREAMS:-1 10}"
+OUT_DIR="${OUT_DIR:-build/bench/matrix}"
+GO_ADDR="127.0.0.1:18442"
+MOJO_H2_ADDR="127.0.0.1:18443"
+BASELINE_H3_ADDR="127.0.0.1:18452"
+MOJO_H3_ADDR="127.0.0.1:18453"
+GO_BIN="${GO_BIN:-$OUT_DIR/http_go_h2}"
+MOJO_H2_BIN="${MOJO_H2_BIN:-$OUT_DIR/http2_tls_server}"
+MOJO_H3_BIN="${MOJO_H3_BIN:-$OUT_DIR/http3_server}"
+PIXI_ENV_H2="${PIXI_ENV_H2:-tls-http2}"
+PIXI_ENV_H3="${PIXI_ENV_H3:-tls-http3}"
+PIXI_PYTHON_H3="${PIXI_PYTHON_H3:-$(cd "$ROOT" && pixi run -e "$PIXI_ENV_H3" python -c 'import sys; print(sys.executable)')}"
+
+mkdir -p "$OUT_DIR" "$OUT_DIR/h2" "$OUT_DIR/h3" "$OUT_DIR/special"
+
+echo "== multiplex matrix host =="
+uname -a
+sw_vers 2>/dev/null || true
+sysctl -n machdep.cpu.brand_string 2>/dev/null || true
+echo "procedure: SHORTENED warmup=${WARMUP_S}s measure=${MEASURE_S}s runs=${RUNS}"
+echo "matrix: conns=[${CONNS}] streams=[${STREAMS}] GET /fixed"
+echo
+
+kill_pid() {
+    local pid="${1:-}"
+    [ -n "$pid" ] || return 0
+    kill "$pid" 2>/dev/null || true
+    wait "$pid" 2>/dev/null || true
+}
+
+sample_server() {
+    local pid="$1"
+    local file="$2"
+    local cpu rss fds
+    cpu="$(ps -o %cpu= -p "$pid" 2>/dev/null | tr -d ' ' || echo "?")"
+    rss="$(ps -o rss= -p "$pid" 2>/dev/null | tr -d ' ' || echo "?")"
+    if command -v lsof >/dev/null; then
+        fds="$(lsof -nP -p "$pid" 2>/dev/null | wc -l | tr -d ' ')"
+    else
+        fds="?"
+    fi
+    printf 'cpu_pct=%s rss_kb=%s fd_count=%s\n' "$cpu" "$rss" "$fds" >"$file"
+}
+
+to_us() {
+    python3 - "$1" <<'PY'
+import sys
+s = sys.argv[1].strip()
+if s in ("", "N/A", "nan"):
+    print("nan")
+    raise SystemExit(0)
+num = float(''.join(c for c in s if c.isdigit() or c == '.' or c == '-'))
+if s.endswith("us"):
+    print(int(round(num)))
+elif s.endswith("ms"):
+    print(int(round(num * 1000)))
+elif s.endswith("s"):
+    print(int(round(num * 1_000_000)))
+else:
+    print(int(round(num)))
+PY
+}
+
+wait_listen() {
+    local hostport="$1"
+    local pid="$2"
+    local i
+    for i in $(seq 1 50); do
+        if ! kill -0 "$pid" 2>/dev/null; then
+            echo "server $pid exited before listen on $hostport" >&2
+            return 1
+        fi
+        if python3 - "$hostport" <<'PY'
+import socket, sys
+host, port = sys.argv[1].rsplit(":", 1)
+s = socket.socket()
+s.settimeout(0.2)
+try:
+    s.connect((host, int(port)))
+except OSError:
+    sys.exit(1)
+finally:
+    s.close()
+sys.exit(0)
+PY
+        then
+            return 0
+        fi
+        sleep 0.1
+    done
+    echo "timeout waiting for $hostport" >&2
+    return 1
+}
+
+wait_udp() {
+    local pid="$1"
+    local i
+    for i in $(seq 1 50); do
+        if ! kill -0 "$pid" 2>/dev/null; then
+            echo "server $pid exited before UDP ready" >&2
+            return 1
+        fi
+        sleep 0.1
+    done
+}
+
+# --- HTTP/2 matrix cell via h2load ---
+run_h2load_cell() {
+    local label="$1"
+    local url="$2"
+    local clients="$3"
+    local streams="$4"
+    local run_idx="$5"
+    local server_pid="$6"
+    local out="$OUT_DIR/h2/${label}_c${clients}_m${streams}_r${run_idx}.out"
+    local sample="$OUT_DIR/h2/${label}_c${clients}_m${streams}_r${run_idx}.sample"
+
+    (
+        sleep $((WARMUP_S + MEASURE_S / 2))
+        sample_server "$server_pid" "$sample"
+    ) &
+    local sampler_pid=$!
+
+    set +e
+    h2load \
+        --alpn-list=h2 \
+        -c "$clients" \
+        -m "$streams" \
+        -t 1 \
+        --warm-up-time="${WARMUP_S}s" \
+        -D "${MEASURE_S}s" \
+        "$url" >"$out" 2>&1
+    local rc=$?
+    set -e
+    wait "$sampler_pid" 2>/dev/null || true
+    if [ ! -f "$sample" ]; then
+        sample_server "$server_pid" "$sample"
+    fi
+
+    local req_s success failed
+    req_s="$(rg -o 'finished in [^,]+, ([0-9.]+) req/s' -r '$1' "$out" | head -1 || true)"
+    success="$(rg -o 'requests: .* ([0-9]+) succeeded' -r '$1' "$out" | head -1 || true)"
+    failed="$(rg -o 'requests: .* ([0-9]+) failed' -r '$1' "$out" | head -1 || true)"
+    local med_tok p95_tok p99_tok
+    med_tok="$(rg '^\s*request\s*:' "$out" | awk '{print $5}' | head -1 || true)"
+    p95_tok="$(rg '^\s*request\s*:' "$out" | awk '{print $6}' | head -1 || true)"
+    p99_tok="$(rg '^\s*request\s*:' "$out" | awk '{print $7}' | head -1 || true)"
+    local p50 p95 p99
+    p50="$(to_us "${med_tok:-}")"
+    p95="$(to_us "${p95_tok:-}")"
+    p99="$(to_us "${p99_tok:-}")"
+    local sample_line
+    sample_line="$(tr '\n' ' ' <"$sample" | sed 's/ *$//')"
+
+    printf '%s\tc=%s\tm=%s\trun=%s\treq_s=%s\tp50_us=%s\tp95_us=%s\tp99_us=%s\tsucceeded=%s\tfailed=%s\trc=%s\t%s\n' \
+        "$label" "$clients" "$streams" "$run_idx" \
+        "${req_s:-?}" "$p50" "$p95" "$p99" \
+        "${success:-?}" "${failed:-?}" "$rc" "$sample_line" \
+        | tee -a "$OUT_DIR/h2/summary.tsv"
+}
+
+run_h3_cell() {
+    local label="$1"
+    local url="$2"
+    local clients="$3"
+    local streams="$4"
+    local run_idx="$5"
+    local server_pid="$6"
+    local out="$OUT_DIR/h3/${label}_c${clients}_m${streams}_r${run_idx}.out"
+    local sample="$OUT_DIR/h3/${label}_c${clients}_m${streams}_r${run_idx}.sample"
+    local err="$OUT_DIR/h3/${label}_c${clients}_m${streams}_r${run_idx}.err"
+
+    (
+        sleep $((WARMUP_S + MEASURE_S / 2))
+        sample_server "$server_pid" "$sample"
+    ) &
+    local sampler_pid=$!
+
+    set +e
+    "$PIXI_PYTHON_H3" benchmarks/http3_load.py \
+        --url "$url" \
+        --clients "$clients" \
+        --streams "$streams" \
+        --warmup "$WARMUP_S" \
+        --duration "$MEASURE_S" \
+        >"$out" 2>"$err"
+    local rc=$?
+    set -e
+    wait "$sampler_pid" 2>/dev/null || true
+    if [ ! -f "$sample" ]; then
+        sample_server "$server_pid" "$sample"
+    fi
+
+    local line req_s p50 p95 p99 ok failed
+    line="$(rg -N '^req_s=' "$out" | tail -1 || true)"
+    req_s="$(printf '%s' "$line" | rg -o 'req_s=([0-9.]+)' -r '$1' || true)"
+    p50="$(printf '%s' "$line" | rg -o 'p50_us=([0-9.]+)' -r '$1' || true)"
+    p95="$(printf '%s' "$line" | rg -o 'p95_us=([0-9.]+)' -r '$1' || true)"
+    p99="$(printf '%s' "$line" | rg -o 'p99_us=([0-9.]+)' -r '$1' || true)"
+    ok="$(printf '%s' "$line" | rg -o 'ok=([0-9]+)' -r '$1' || true)"
+    failed="$(printf '%s' "$line" | rg -o 'failed=([0-9]+)' -r '$1' || true)"
+    local sample_line
+    sample_line="$(tr '\n' ' ' <"$sample" | sed 's/ *$//')"
+
+    printf '%s\tc=%s\tm=%s\trun=%s\treq_s=%s\tp50_us=%s\tp95_us=%s\tp99_us=%s\tok=%s\tfailed=%s\trc=%s\t%s\n' \
+        "$label" "$clients" "$streams" "$run_idx" \
+        "${req_s:-?}" "${p50:-?}" "${p95:-?}" "${p99:-?}" \
+        "${ok:-?}" "${failed:-?}" "$rc" "$sample_line" \
+        | tee -a "$OUT_DIR/h3/summary.tsv"
+}
+
+# --- H2 special scenarios (qualitative + limited timing) ---
+run_h2_special() {
+    local label="$1"   # go|mojo
+    local addr="$2"
+    local server_pid="$3"
+    local url="https://${addr}"
+    local special_log="$OUT_DIR/special/h2_${label}.log"
+    : >"$special_log"
+
+    echo "== H2 special scenarios ($label @ $addr) ==" | tee -a "$special_log"
+
+    # Slow-client tolerance (server-wide health, not same-connection HoL):
+    # curl --limit-rate on /json runs in its own H2 connection while
+    # sibling GETs via h2load use separate connections. This proves the
+    # server stays healthy under a slow client; it cannot detect
+    # connection-level head-of-line blocking, which requires all streams
+    # multiplexed on one measured connection (future single-client work).
+    local slow_out="$OUT_DIR/special/h2_${label}_slow.out"
+    local slow_t0
+    slow_t0="$(python3 -c 'import time; print(time.time())')"
+    set +e
+    curl -k --http2 --limit-rate 2k \
+        -o /dev/null -s -w 'slow_http_code=%{http_code} slow_time=%{time_total}\n' \
+        "${url}/json" >"$OUT_DIR/special/h2_${label}_slow_curl.txt" 2>&1 &
+    local slow_pid=$!
+    # Brief concurrent load (no warmup; short measure)
+    h2load --alpn-list=h2 -c 4 -m 4 -t 1 -D 3s "${url}/fixed" \
+        >"$slow_out" 2>&1
+    local h2load_rc=$?
+    wait "$slow_pid" 2>/dev/null
+    local slow_rc=$?
+    set -e
+    local slow_elapsed
+    slow_elapsed="$(python3 -c "import time; print(f'{time.time()-float('$slow_t0'):.3f}')")"
+    local sibling_req
+    sibling_req="$(rg -o 'finished in [^,]+, ([0-9.]+) req/s' -r '$1' "$slow_out" | head -1 || true)"
+    local sibling_fail
+    sibling_fail="$(rg -o 'requests: .* ([0-9]+) failed' -r '$1' "$slow_out" | head -1 || true)"
+    local slow_verdict=fail
+    if [ "${sibling_fail:-1}" = "0" ] && [ -n "$sibling_req" ] && kill -0 "$server_pid" 2>/dev/null; then
+        slow_verdict=pass
+    fi
+    printf 'proto=h2 label=%s scenario=slow verdict=%s sibling_req_s=%s sibling_failed=%s elapsed_s=%s h2load_rc=%s curl_rc=%s\n' \
+        "$label" "$slow_verdict" "${sibling_req:-?}" "${sibling_fail:-?}" \
+        "$slow_elapsed" "$h2load_rc" "$slow_rc" \
+        | tee -a "$OUT_DIR/special/summary.tsv" | tee -a "$special_log"
+    cat "$OUT_DIR/special/h2_${label}_slow_curl.txt" >>"$special_log" || true
+
+    # Cancel: start a slow large POST, abort the client mid-transfer, then
+    # verify the server process still accepts a new connection. Note: the
+    # sibling uses a fresh TLS/H2 connection (killing curl closes the
+    # original), so this proves process health after abort, not same-
+    # connection sibling-stream survival (which needs one connection with
+    # concurrent streams).
+    local cancel_body="$OUT_DIR/special/cancel_body_1m.bin"
+    dd if=/dev/zero of="$cancel_body" bs=1024 count=1024 status=none 2>/dev/null
+    set +e
+    curl -k --http2 --limit-rate 8k --max-time 30 \
+        -X POST --data-binary @"$cancel_body" \
+        -o /dev/null -s -w 'cancel_http_code=%{http_code} cancel_time=%{time_total}\n' \
+        "${url}/echo" >"$OUT_DIR/special/h2_${label}_cancel_curl.txt" 2>&1 &
+    local cancel_pid=$!
+    sleep 0.3
+    kill "$cancel_pid" 2>/dev/null
+    wait "$cancel_pid" 2>/dev/null
+    local cancel_curl_rc=$?
+    # Sibling must still work after abort.
+    local cancel_sib
+    cancel_sib="$(curl -k --http2 -s -o /dev/null -w '%{http_code}' --max-time 5 "${url}/fixed")"
+    local cancel_sib_rc=$?
+    set -e
+    local cancel_verdict=fail
+    # Pass if sibling 200 and server still up after client abort of in-flight POST.
+    if [ "$cancel_sib" = "200" ] && kill -0 "$server_pid" 2>/dev/null; then
+        cancel_verdict=pass
+    fi
+    printf 'proto=h2 label=%s scenario=cancel verdict=%s sibling_http=%s curl_rc=%s sib_rc=%s\n' \
+        "$label" "$cancel_verdict" "$cancel_sib" "$cancel_curl_rc" "$cancel_sib_rc" \
+        | tee -a "$OUT_DIR/special/summary.tsv" | tee -a "$special_log"
+    cat "$OUT_DIR/special/h2_${label}_cancel_curl.txt" >>"$special_log" || true
+
+    # Loss: attempt pf/dummynet; document if unavailable (no passwordless sudo).
+    local loss_note="$OUT_DIR/special/h2_${label}_loss.txt"
+    local loss_verdict=skip
+    local loss_detail="pf/dummynet requires root; sudo -n unavailable on this host"
+    if sudo -n true 2>/dev/null; then
+        # Best-effort: 5% loss via dnctl on loopback TCP to the server port.
+        local port="${addr##*:}"
+        set +e
+        sudo -n dnctl pipe 42 config plr 0.05 2>"$loss_note"
+        echo "dummynet in proto tcp from any to 127.0.0.1 port ${port} pipe 42" \
+            | sudo -n pfctl -a bench_matrix -f - 2>>"$loss_note"
+        h2load --alpn-list=h2 -c 8 -m 4 -t 1 -D 5s "${url}/fixed" \
+            >"$OUT_DIR/special/h2_${label}_loss_h2load.out" 2>&1
+        local loss_rc=$?
+        sudo -n pfctl -a bench_matrix -F all 2>>"$loss_note" || true
+        sudo -n dnctl -q flush 2>>"$loss_note" || true
+        set -e
+        local loss_req loss_fail
+        loss_req="$(rg -o 'finished in [^,]+, ([0-9.]+) req/s' -r '$1' \
+            "$OUT_DIR/special/h2_${label}_loss_h2load.out" | head -1 || true)"
+        loss_fail="$(rg -o 'requests: .* ([0-9]+) failed' -r '$1' \
+            "$OUT_DIR/special/h2_${label}_loss_h2load.out" | head -1 || true)"
+        if [ -n "$loss_req" ] && kill -0 "$server_pid" 2>/dev/null; then
+            loss_verdict=pass
+            loss_detail="dnctl plr=0.05 req_s=${loss_req} failed=${loss_fail:-?} rc=${loss_rc}"
+        else
+            loss_verdict=fail
+            loss_detail="dnctl configured but load failed rc=${loss_rc}"
+        fi
+    else
+        echo "$loss_detail" >"$loss_note"
+        # Soft stand-in: run a short clean cell and label skip (no invented loss %).
+        h2load --alpn-list=h2 -c 8 -m 4 -t 1 -D 3s "${url}/fixed" \
+            >"$OUT_DIR/special/h2_${label}_loss_baseline.out" 2>&1 || true
+        local base_req
+        base_req="$(rg -o 'finished in [^,]+, ([0-9.]+) req/s' -r '$1' \
+            "$OUT_DIR/special/h2_${label}_loss_baseline.out" | head -1 || true)"
+        loss_detail="${loss_detail}; no-loss reference req_s=${base_req:-?} (3s)"
+    fi
+    printf 'proto=h2 label=%s scenario=loss verdict=%s detail=%s\n' \
+        "$label" "$loss_verdict" "$loss_detail" \
+        | tee -a "$OUT_DIR/special/summary.tsv" | tee -a "$special_log"
+}
+
+run_h3_special() {
+    local label="$1"
+    local addr="$2"
+    local url="https://${addr}/fixed"
+    local special_log="$OUT_DIR/special/h3_${label}.log"
+    : >"$special_log"
+    echo "== H3 special scenarios ($label @ $addr) ==" | tee -a "$special_log"
+
+    local line
+    line="$("$PIXI_PYTHON_H3" benchmarks/http/http3_scenarios.py \
+        --url "$url" --scenario slow --slow-s 0.25 --siblings 8 \
+        2>>"$special_log")"
+    echo "$line" | tee -a "$special_log"
+    printf 'proto=h3 label=%s %s\n' "$label" "$line" \
+        | tee -a "$OUT_DIR/special/summary.tsv"
+
+    line="$("$PIXI_PYTHON_H3" benchmarks/http/http3_scenarios.py \
+        --url "$url" --scenario cancel --siblings 8 \
+        2>>"$special_log")"
+    echo "$line" | tee -a "$special_log"
+    printf 'proto=h3 label=%s %s\n' "$label" "$line" \
+        | tee -a "$OUT_DIR/special/summary.tsv"
+
+    # Loss: try pf first; always also run client-side drop (measurable without root).
+    local loss_pf_verdict=skip
+    local loss_pf_detail="sudo -n unavailable"
+    if sudo -n true 2>/dev/null; then
+        local port="${addr##*:}"
+        set +e
+        sudo -n dnctl pipe 43 config plr 0.05 \
+            >"$OUT_DIR/special/h3_${label}_pf.txt" 2>&1
+        echo "dummynet in proto udp from any to 127.0.0.1 port ${port} pipe 43" \
+            | sudo -n pfctl -a bench_matrix_h3 -f - \
+            >>"$OUT_DIR/special/h3_${label}_pf.txt" 2>&1
+        set -e
+        loss_pf_verdict=configured
+        loss_pf_detail="dnctl udp plr=0.05 on port ${port}"
+        # shellcheck disable=SC2064
+        trap "sudo -n pfctl -a bench_matrix_h3 -F all 2>/dev/null || true; sudo -n dnctl -q flush 2>/dev/null || true" RETURN
+    fi
+    printf 'proto=h3 label=%s scenario=loss_pf verdict=%s detail=%s\n' \
+        "$label" "$loss_pf_verdict" "$loss_pf_detail" \
+        | tee -a "$OUT_DIR/special/summary.tsv" | tee -a "$special_log"
+
+    # Tear down PF before the client-side drop run so the recorded
+    # method=client_datagram_drop measures standalone 5% client loss,
+    # not combined kernel + client loss.
+    if [ "$loss_pf_verdict" = "configured" ]; then
+        sudo -n pfctl -a bench_matrix_h3 -F all 2>/dev/null || true
+        sudo -n dnctl -q flush 2>/dev/null || true
+        trap - RETURN
+        loss_pf_verdict=cleaned
+    fi
+
+    line="$("$PIXI_PYTHON_H3" benchmarks/http/http3_scenarios.py \
+        --url "$url" --scenario loss --drop-rate 0.05 \
+        --clients 4 --streams 4 --duration 5 \
+        2>>"$special_log")"
+    echo "$line" | tee -a "$special_log"
+    printf 'proto=h3 label=%s %s method=client_datagram_drop\n' "$label" "$line" \
+        | tee -a "$OUT_DIR/special/summary.tsv"
+}
+
+# ========== HTTP/2 matrix ==========
+: >"$OUT_DIR/h2/summary.tsv"
+echo -e "label\tc\tm\trun\treq_s\tp50_us\tp95_us\tp99_us\tsucceeded\tfailed\trc\tsamples" \
+    >>"$OUT_DIR/h2/summary.tsv"
+: >"$OUT_DIR/special/summary.tsv"
+
+if [ "${SKIP_H2:-0}" != "1" ]; then
+    if ! command -v h2load >/dev/null; then
+        echo "h2load not found; install with: brew install nghttp2" >&2
+        exit 1
+    fi
+    for artifact in build/tls/libnet_tls build/tls/test-cert.pem build/tls/test-key.pem build/http2/libnet_hpack; do
+        [ -f "$artifact" ] || {
+            echo "missing $artifact; run tls-build + hpack-test" >&2
+            exit 1
+        }
+    done
+
+    if [ "${SKIP_GO:-0}" != "1" ]; then
+        echo "== build Go HTTPS+H2 =="
+        go -C benchmarks/http_go build -o "$ROOT/$GO_BIN" .
+        GOMAXPROCS=1 "$GO_BIN" -tls -addr "$GO_ADDR" \
+            -cert build/tls/test-cert.pem -key build/tls/test-key.pem \
+            >"$OUT_DIR/h2/go_server.log" 2>&1 &
+        GO_PID=$!
+        trap 'kill_pid "${GO_PID:-}"; kill_pid "${MOJO_H2_PID:-}"; kill_pid "${BASE_PID:-}"; kill_pid "${MOJO_H3_PID:-}"' EXIT
+        wait_listen "$GO_ADDR" "$GO_PID"
+        for clients in $CONNS; do
+            for streams in $STREAMS; do
+                for run in $(seq 1 "$RUNS"); do
+                    echo "== Go H2 GET /fixed c=${clients} m=${streams} run=${run} =="
+                    run_h2load_cell "go" "https://${GO_ADDR}/fixed" "$clients" "$streams" "$run" "$GO_PID"
+                done
+            done
+        done
+        if [ "${SKIP_SPECIAL:-0}" != "1" ]; then
+            run_h2_special "go" "$GO_ADDR" "$GO_PID"
+        fi
+        kill_pid "$GO_PID"
+        GO_PID=
+    fi
+
+    if [ "${SKIP_MOJO:-0}" != "1" ]; then
+        echo "== build Mojo HTTPS+H2 =="
+        pixi run -e "$PIXI_ENV_H2" mojo build --Werror -I . \
+            benchmarks/http2_tls_server.mojo -o "$MOJO_H2_BIN"
+        "$MOJO_H2_BIN" >"$OUT_DIR/h2/mojo_server.log" 2>&1 &
+        MOJO_H2_PID=$!
+        trap 'kill_pid "${GO_PID:-}"; kill_pid "${MOJO_H2_PID:-}"; kill_pid "${BASE_PID:-}"; kill_pid "${MOJO_H3_PID:-}"' EXIT
+        wait_listen "$MOJO_H2_ADDR" "$MOJO_H2_PID"
+        for clients in $CONNS; do
+            for streams in $STREAMS; do
+                for run in $(seq 1 "$RUNS"); do
+                    echo "== Mojo H2 GET /fixed c=${clients} m=${streams} run=${run} =="
+                    run_h2load_cell "mojo" "https://${MOJO_H2_ADDR}/fixed" "$clients" "$streams" "$run" "$MOJO_H2_PID"
+                done
+            done
+        done
+        if [ "${SKIP_SPECIAL:-0}" != "1" ]; then
+            run_h2_special "mojo" "$MOJO_H2_ADDR" "$MOJO_H2_PID"
+        fi
+        kill_pid "$MOJO_H2_PID"
+        MOJO_H2_PID=
+    fi
+fi
+
+# ========== HTTP/3 matrix ==========
+: >"$OUT_DIR/h3/summary.tsv"
+echo -e "label\tc\tm\trun\treq_s\tp50_us\tp95_us\tp99_us\tok\tfailed\trc\tsamples" \
+    >>"$OUT_DIR/h3/summary.tsv"
+
+if [ "${SKIP_H3:-0}" != "1" ]; then
+    for artifact in build/tls/test-cert.pem build/tls/test-key.pem build/quic/libnet_quic_provider; do
+        [ -f "$artifact" ] || {
+            echo "missing $artifact; run tls-build + quic-build" >&2
+            exit 1
+        }
+    done
+
+    if [ "${SKIP_BASELINE:-0}" != "1" ]; then
+        echo "== start aioquic H3 baseline =="
+        "$PIXI_PYTHON_H3" benchmarks/http3_aioquic_baseline.py \
+            --host 127.0.0.1 --port 18452 \
+            --certificate build/tls/test-cert.pem \
+            --private-key build/tls/test-key.pem \
+            >"$OUT_DIR/h3/baseline_server.log" 2>&1 &
+        BASE_PID=$!
+        trap 'kill_pid "${GO_PID:-}"; kill_pid "${MOJO_H2_PID:-}"; kill_pid "${BASE_PID:-}"; kill_pid "${MOJO_H3_PID:-}"' EXIT
+        wait_udp "$BASE_PID"
+        sleep 0.5
+        for clients in $CONNS; do
+            for streams in $STREAMS; do
+                for run in $(seq 1 "$RUNS"); do
+                    echo "== aioquic H3 GET /fixed c=${clients} m=${streams} run=${run} =="
+                    run_h3_cell "aioquic" "https://${BASELINE_H3_ADDR}/fixed" \
+                        "$clients" "$streams" "$run" "$BASE_PID"
+                done
+            done
+        done
+        if [ "${SKIP_SPECIAL:-0}" != "1" ]; then
+            run_h3_special "aioquic" "$BASELINE_H3_ADDR"
+        fi
+        kill_pid "$BASE_PID"
+        BASE_PID=
+    fi
+
+    if [ "${SKIP_MOJO:-0}" != "1" ]; then
+        echo "== build Mojo H3 =="
+        pixi run -e "$PIXI_ENV_H3" mojo build --Werror -I . \
+            benchmarks/http3_server.mojo -o "$MOJO_H3_BIN"
+        "$MOJO_H3_BIN" >"$OUT_DIR/h3/mojo_server.log" 2>&1 &
+        MOJO_H3_PID=$!
+        trap 'kill_pid "${GO_PID:-}"; kill_pid "${MOJO_H2_PID:-}"; kill_pid "${BASE_PID:-}"; kill_pid "${MOJO_H3_PID:-}"' EXIT
+        wait_udp "$MOJO_H3_PID"
+        sleep 0.5
+        for clients in $CONNS; do
+            for streams in $STREAMS; do
+                for run in $(seq 1 "$RUNS"); do
+                    echo "== Mojo H3 GET /fixed c=${clients} m=${streams} run=${run} =="
+                    run_h3_cell "mojo" "https://${MOJO_H3_ADDR}/fixed" \
+                        "$clients" "$streams" "$run" "$MOJO_H3_PID"
+                done
+            done
+        done
+        if [ "${SKIP_SPECIAL:-0}" != "1" ]; then
+            run_h3_special "mojo" "$MOJO_H3_ADDR"
+        fi
+        kill_pid "$MOJO_H3_PID"
+        MOJO_H3_PID=
+    fi
+fi
+
+echo
+echo "== H2 summary =="
+column -t -s $'\t' "$OUT_DIR/h2/summary.tsv" 2>/dev/null || cat "$OUT_DIR/h2/summary.tsv"
+echo
+echo "== H3 summary =="
+column -t -s $'\t' "$OUT_DIR/h3/summary.tsv" 2>/dev/null || cat "$OUT_DIR/h3/summary.tsv"
+echo
+echo "== Special scenarios =="
+cat "$OUT_DIR/special/summary.tsv"
+
+# Aggregate means for README convenience
+python3 - "$OUT_DIR" <<'PY'
+import collections, statistics, sys
+from pathlib import Path
+out = Path(sys.argv[1])
+
+def cell_num(s):
+    s = s or ""
+    if "=" in s:
+        s = s.split("=", 1)[1]
+    return float(s)
+
+def means(path):
+    if not path.exists():
+        return
+    lines = path.read_text().strip().splitlines()
+    if len(lines) < 2:
+        return
+    hdr = lines[0].split("\t")
+    rows = []
+    for line in lines[1:]:
+        cols = line.split("\t")
+        if len(cols) < 4:
+            continue
+        d = dict(zip(hdr, cols))
+        label = d.get("label", cols[0])
+        try:
+            c = int(cell_num(d.get("c", cols[1])))
+            m = int(cell_num(d.get("m", cols[2])))
+            req = cell_num(d.get("req_s", ""))
+            p50 = cell_num(d.get("p50_us", ""))
+            p95 = cell_num(d.get("p95_us", ""))
+            p99 = cell_num(d.get("p99_us", ""))
+        except ValueError:
+            continue
+        rows.append(
+            {
+                "label": label,
+                "c": c,
+                "m": m,
+                "req_s": req,
+                "p50": p50,
+                "p95": p95,
+                "p99": p99,
+            }
+        )
+    groups = collections.defaultdict(list)
+    for r in rows:
+        groups[(r["label"], r["c"], r["m"])].append(r)
+    print(f"\n== means ({path.name}) ==")
+    for key in sorted(groups, key=lambda k: (k[0], k[1], k[2])):
+        g = groups[key]
+
+        def avg(field):
+            vals = [x[field] for x in g if x[field] == x[field]]
+            return statistics.fmean(vals) if vals else float("nan")
+
+        print(
+            f"{key[0]}\tc={key[1]}\tm={key[2]}\tn={len(g)}\t"
+            f"req_s={avg('req_s'):.1f}\tp50={avg('p50'):.0f}\t"
+            f"p95={avg('p95'):.0f}\tp99={avg('p99'):.0f}"
+        )
+
+means(out / "h2" / "summary.tsv")
+means(out / "h3" / "summary.tsv")
+PY
