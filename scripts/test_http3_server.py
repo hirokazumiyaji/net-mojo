@@ -142,13 +142,16 @@ class Http3ClientProtocol(QuicConnectionProtocol):
             # is actually produced, so the held one is sent after it. Sending
             # must be observed (aioquic may pace or find no cwnd room), and an
             # empty transmit leaves nothing to reorder.
-            for _ in range(4):
+            deadline = self._loop.time() + 2.0
+            while self._held_datagrams and self._loop.time() < deadline:
                 self._quic.send_ping(self._ping_id)
                 self._ping_id += 1
-                sent = self.transmit(reorder_datagrams=True)
-                if sent > 0 and not self._held_datagrams:
-                    break
-            if self.reordered_datagram_batches < 1:
+                self.transmit(reorder_datagrams=True)
+                # Yield to the loop: pacing timers and ACKs from the server
+                # need real time to free congestion window before another
+                # datagram can be produced.
+                await asyncio.sleep(0.05)
+            if self._held_datagrams or self.reordered_datagram_batches < 1:
                 raise RuntimeError(
                     "reorder transmit never produced a newer datagram ahead of "
                     "the held one"
