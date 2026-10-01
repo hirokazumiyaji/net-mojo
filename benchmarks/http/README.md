@@ -277,12 +277,17 @@ WARMUP_S=10 MEASURE_S=30 RUNS=5 CLIENTS=64 STREAMS="1 10" \
 
 ### Results (mean of 5 runs; req/s and latency from aioquic load client; CPU/RSS/fd mid-measure)
 
-| Server | Conns | Streams | Loss % | req/s (mean) | p50 (µs) | p95 (µs) | p99 (µs) | CPU % | RSS (MB) | fd |
+| Server | Conns | Streams | Loss % | req/s (mean) | p50 (µs) | p95 (µs) | p99 (µs) | CPU % | RSS (MB) | fd* |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| aioquic H3 | 64 | 1 | 0 | 4,984 | 12,575 | 13,838 | 14,763 | ~100 | ~106 | 47 |
-| Mojo H3 | 64 | 1 | 0 | 8,426 | 5,875 | 6,817 | 7,329 | ~50 | ~32 | 18 |
-| aioquic H3 | 64 | 10 | 0 | 4,465 | 136,645 | 186,740 | 221,746 | ~98 | ~153 | 47 |
-| Mojo H3 | 64 | 10 | 0 | 7,237 | 86,051 | 91,238 | 102,805 | ~43 | ~38 | 18 |
+| aioquic H3 | 64 | 1 | 0 | 4,984 | 12,575 | 13,838 | 14,763 | ~100 | ~106 | 47* |
+| Mojo H3 | 64 | 1 | 0 | 8,426 | 5,875 | 6,817 | 7,329 | ~50 | ~32 | 18* |
+| aioquic H3 | 64 | 10 | 0 | 4,465 | 136,645 | 186,740 | 221,746 | ~98 | ~153 | 47* |
+| Mojo H3 | 64 | 10 | 0 | 7,237 | 86,051 | 91,238 | 102,805 | ~43 | ~38 | 18* |
+
+\* `fd` was counted with the old `lsof -p | wc -l` sampler (includes the
+header plus `cwd`/`txt`/mapped files). The harness now counts numeric
+descriptors only; these published values are inflated and will be recomputed
+on the next full run.
 
 Per-run req/s ranges: aioquic m=1 4,904–5,045; Mojo m=1 8,315–8,567;
 aioquic m=10 4,183–4,744; Mojo m=10 7,208–7,262. All runs: 0 failed.

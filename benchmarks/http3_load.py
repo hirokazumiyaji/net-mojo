@@ -225,6 +225,11 @@ async def run_load(
         )
         for _ in range(clients)
     ]
+    if clients < 1:
+        raise RuntimeError(f"--clients must be >= 1, got {clients}")
+    if streams < 1:
+        raise RuntimeError(f"--streams must be >= 1, got {streams}")
+
     results = await asyncio.gather(*tasks, return_exceptions=True)
     measure_s = max(1e-9, duration_s)
     for r in results:
@@ -274,6 +279,11 @@ def main() -> None:
     )
     if stats["failed"] > 0:
         print(f'{stats["failed"]} request(s) failed', file=sys.stderr)
+        raise SystemExit(1)
+    if stats["samples"] == 0:
+        # No completion inside the measurement window: an empty experiment
+        # must never be reported as a valid (zero-throughput) run.
+        print("no measurement samples collected", file=sys.stderr)
         raise SystemExit(1)
 
 
