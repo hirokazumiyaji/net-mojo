@@ -478,13 +478,19 @@ struct QuicUDPEndpoint(Movable):
                 packet.value().destination.copy()
             )
 
-        if self._send_would_block_once:
-            # Deterministic test hook: simulate EAGAIN without touching the
-            # kernel send queue. Pending bytes are preserved and write
-            # interest stays armed, matching real would-block behavior.
-            self._send_would_block_once = False
-            return False
         try:
+            if self._send_would_block_once:
+                # Deterministic test hook: simulate EAGAIN at the socket-send
+                # boundary so both injected and real would-block outcomes
+                # flow through the same timeout handler below (which must
+                # preserve pending and keep write interest armed).
+                self._send_would_block_once = False
+                raise NetError(
+                    NetErrorKind.timeout(),
+                    "send QUIC datagram",
+                    None,
+                    "injected send would-block for test",
+                )
             var written = self._socket.try_send_to(
                 Span(self._send_buffer)[0 : self._pending_length],
                 self._pending_destination.value(),
