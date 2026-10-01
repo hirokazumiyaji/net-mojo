@@ -186,7 +186,8 @@ run_h2load() {
     local out="$OUT_DIR/${label}_c${clients}_m${streams}_r${run_idx}.out"
 
     (
-        sleep $((WARMUP_S + MEASURE_S / 2))
+        # WARMUP_S / MEASURE_S accept floats, so avoid Bash integers here.
+        sleep "$(python3 -c 'import sys; print(float(sys.argv[1]) + float(sys.argv[2]) / 2)' "$WARMUP_S" "$MEASURE_S")"
         sample_server "$server_pid" "$sample"
     ) &
     local sampler_pid=$!
