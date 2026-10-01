@@ -278,19 +278,28 @@ run_h2_special() {
 
     echo "== H2 special scenarios ($label @ $addr) ==" | tee -a "$special_log"
 
+    # 1 MiB body reused by the slow-upload and cancel scenarios.
+    local body_file="$OUT_DIR/special/upload_body_1m.bin"
+    dd if=/dev/zero of="$body_file" bs=1024 count=1024 status=none 2>/dev/null
+
     # Slow-client tolerance (server-wide health, not same-connection HoL):
-    # curl --limit-rate on /json runs in its own H2 connection while
-    # sibling GETs via h2load use separate connections. This proves the
-    # server stays healthy under a slow client; it cannot detect
-    # connection-level head-of-line blocking, which requires all streams
-    # multiplexed on one measured connection (future single-client work).
+    # curl --limit-rate runs in its own H2 connection while sibling GETs via
+    # h2load use separate connections. This proves the server stays healthy
+    # under a slow client; it cannot detect connection-level head-of-line
+    # blocking, which requires all streams multiplexed on one measured
+    # connection (future single-client work).
     local slow_out="$OUT_DIR/special/h2_${label}_slow.out"
     local slow_t0
     slow_t0="$(python3 -c 'import time; print(time.time())')"
     set +e
-    curl -k --http2 --limit-rate 2k \
+    # /json is 1 KiB, so a 2 KiB/s cap finishes in well under a second.
+    # POST /echo instead: rate-limiting the request body keeps the stream
+    # open for the whole concurrent-load window, so the slow client is
+    # genuinely active while siblings run.
+    curl -k --http2 --limit-rate 8k --max-time 30 \
+        -X POST --data-binary @"$body_file" \
         -o /dev/null -s -w 'slow_http_code=%{http_code} slow_time=%{time_total}\n' \
-        "${url}/json" >"$OUT_DIR/special/h2_${label}_slow_curl.txt" 2>&1 &
+        "${url}/echo" >"$OUT_DIR/special/h2_${label}_slow_curl.txt" 2>&1 &
     local slow_pid=$!
     # Brief concurrent load (no warmup; short measure)
     h2load --alpn-list=h2 -c 4 -m 4 -t 1 -D 3s "${url}/fixed" \
@@ -325,11 +334,9 @@ run_h2_special() {
     # original), so this proves process health after abort, not same-
     # connection sibling-stream survival (which needs one connection with
     # concurrent streams).
-    local cancel_body="$OUT_DIR/special/cancel_body_1m.bin"
-    dd if=/dev/zero of="$cancel_body" bs=1024 count=1024 status=none 2>/dev/null
     set +e
     curl -k --http2 --limit-rate 8k --max-time 30 \
-        -X POST --data-binary @"$cancel_body" \
+        -X POST --data-binary @"$body_file" \
         -o /dev/null -s -w 'cancel_http_code=%{http_code} cancel_time=%{time_total}\n' \
         "${url}/echo" >"$OUT_DIR/special/h2_${label}_cancel_curl.txt" 2>&1 &
     local cancel_pid=$!
@@ -508,7 +515,12 @@ if [ "${SKIP_H2:-0}" != "1" ]; then
 
     if [ "${SKIP_GO:-0}" != "1" ]; then
         echo "== build Go HTTPS+H2 =="
-        go -C benchmarks/http_go build -o "$ROOT/$GO_BIN" .
+        local go_bin="$GO_BIN"
+        case "$go_bin" in
+            /*) ;;
+            *) go_bin="$ROOT/$go_bin" ;;
+        esac
+        go -C benchmarks/http_go build -o "$go_bin" .
         GOMAXPROCS=1 "$GO_BIN" -tls -addr "$GO_ADDR" \
             -cert build/tls/test-cert.pem -key build/tls/test-key.pem \
             >"$OUT_DIR/h2/go_server.log" 2>&1 &

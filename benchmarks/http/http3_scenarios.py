@@ -280,9 +280,10 @@ async def run_slow(url: str, slow_s: float, siblings: int) -> dict:
 
         slow_pending = await client.post_echo(slow_body, authority, hold=True)
         slow_id = slow_pending["stream_id"]
-        # Let the held stream receive while consumption is withheld;
-        # slow_s bounds this pre-sibling settle window.
-        await asyncio.sleep(max(slow_s, 0.05))
+        # Siblings are dispatched immediately, before the held response can
+        # complete: any await/sleep here would let the server finish the
+        # response first and make the scenario a post-completion sleep.
+        slow_pending_at_sibling_dispatch = not slow_pending["future"].done()
         sibling_tasks = [
             asyncio.create_task(client.get(path, authority))
             for _ in range(siblings)
@@ -290,6 +291,11 @@ async def run_slow(url: str, slow_s: float, siblings: int) -> dict:
         sibling_results = await asyncio.gather(
             *sibling_tasks, return_exceptions=True
         )
+        # Siblings must have finished while the slow stream was still
+        # incomplete (its future is resolved only on release).
+        slow_unfinished_during_siblings = not slow_pending["future"].done()
+        if slow_s > 0:
+            await asyncio.sleep(slow_s)
         held = client.held_bytes(slow_id)
         client.release_stream(slow_id)
         slow_result = await client.await_pending(slow_pending)
@@ -312,7 +318,12 @@ async def run_slow(url: str, slow_s: float, siblings: int) -> dict:
     # multiplexing overlap, not a post-completion sleep.
     verdict = (
         "pass"
-        if slow_ok and slow_body_ok and sibling_ok == siblings and held > 0
+        if slow_ok
+        and slow_body_ok
+        and sibling_ok == siblings
+        and held > 0
+        and slow_pending_at_sibling_dispatch
+        and slow_unfinished_during_siblings
         else "fail"
     )
     return {
@@ -323,6 +334,7 @@ async def run_slow(url: str, slow_s: float, siblings: int) -> dict:
         "sibling_ok": sibling_ok,
         "sibling_fail": sibling_fail,
         "held_bytes": held,
+        "slow_unfinished_during_siblings": int(slow_unfinished_during_siblings),
         "elapsed_ms": elapsed_ms,
         "slow_s": slow_s,
         "siblings": siblings,
