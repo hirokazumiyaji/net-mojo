@@ -14,8 +14,10 @@ from net.http import (
     ServerConfig,
     ServerControl,
     has_body_for_status,
+    maybe_inject_alt_svc,
     split_path_query,
 )
+from net.http._encoder import encode_response
 
 
 struct _HelloHandler(Handler):
@@ -284,6 +286,44 @@ def test_server_config_defaults_match_design_table() raises:
     assert_equal(config.max_bytes_per_tick, 65536)
     assert_equal(config.max_requests_per_tick, 16)
     assert_equal(config.hpack_library_path, String("build/http2/libnet_hpack"))
+    assert_equal(config.alt_svc, String(""))
+
+
+def test_alt_svc_injects_when_configured() raises:
+    var writer = ResponseWriter(1024)
+    writer.write_string("ok")
+    maybe_inject_alt_svc(writer, String('h3=":8443"; ma=86400'))
+    var found = writer.headers.get_first("Alt-Svc")
+    assert_true(Bool(found))
+    assert_equal(found.value(), String('h3=":8443"; ma=86400'))
+    var wire = encode_response(
+        writer, False, "Thu, 01 Jan 1970 00:00:00 GMT", 100, 32768
+    )
+    var text = String(from_utf8_lossy=Span(wire))
+    assert_true(text.find('Alt-Svc: h3=":8443"; ma=86400\r\n') >= 0)
+
+
+def test_alt_svc_absent_when_disabled() raises:
+    var writer = ResponseWriter(1024)
+    writer.write_string("ok")
+    maybe_inject_alt_svc(writer, String(""))
+    assert_false(Bool(writer.headers.get_first("Alt-Svc")))
+    var wire = encode_response(
+        writer, False, "Thu, 01 Jan 1970 00:00:00 GMT", 100, 32768
+    )
+    var text = String(from_utf8_lossy=Span(wire))
+    assert_true(text.find("Alt-Svc:") < 0)
+
+
+def test_alt_svc_handler_supplied_wins() raises:
+    var writer = ResponseWriter(1024)
+    writer.headers.add(String("Alt-Svc"), String('h3=":9443"; ma=60'))
+    writer.write_string("ok")
+    maybe_inject_alt_svc(writer, String('h3=":8443"; ma=86400'))
+    var found = writer.headers.get_first("Alt-Svc")
+    assert_true(Bool(found))
+    assert_equal(found.value(), String('h3=":9443"; ma=60'))
+    assert_equal(writer.headers.count("Alt-Svc"), 1)
 
 
 def test_control_shutdown_is_idempotent() raises:

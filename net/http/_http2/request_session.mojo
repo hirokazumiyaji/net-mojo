@@ -135,9 +135,13 @@ struct Http2RequestSession(Movable):
         max_trailer_count: Int = 32,
         header_deadline: Timeout = Timeout.nanoseconds(5_000_000_000),
         body_deadline: Timeout = Timeout.nanoseconds(30_000_000_000),
+        max_control_frames_per_second: Int = 1000,
+        max_resets_per_second: Int = 100,
     ):
         self._input = Http2ServerConnectionInput(
-            max_concurrent_streams=max_active_streams
+            max_concurrent_streams=max_active_streams,
+            max_control_frames_per_second=max_control_frames_per_second,
+            max_resets_per_second=max_resets_per_second,
         )
         self._decoder = None
         self._library_path = library_path^
@@ -242,6 +246,22 @@ struct Http2RequestSession(Movable):
                     self._failed = True
                     return Http2RequestSessionResult.error(consumed, output^)
             _append_session_output(output, Span(input.output))
+            if input.is_flood():
+                # Flooded: queue ENHANCE_YOUR_CALM GOAWAY and mark the
+                # session failed so the server flushes pending output and
+                # then closes the connection. `is_failed` gates
+                # close-after-flush; leaving it false keeps the connection
+                # open until idle timeout with no further readable progress.
+                self._draining = True
+                self._failed = True
+                var goaway = encode_goaway_frame(
+                    self._last_stream_id, UInt32(11)
+                )
+                if not goaway.is_complete():
+                    self._failed = True
+                    return Http2RequestSessionResult.error(consumed, output^)
+                _append_session_output(output, Span(goaway.wire))
+                return Http2RequestSessionResult.pending(consumed, output^)
 
             if (
                 self._pending_headers_at == NO_DEADLINE
@@ -572,6 +592,9 @@ struct Http2RequestSession(Movable):
 
     def is_failed(self) -> Bool:
         return self._failed
+
+    def is_draining(self) -> Bool:
+        return self._draining
 
     def peer_settings(self) -> Http2PeerSettingsSnapshot:
         return self._input.peer_settings()

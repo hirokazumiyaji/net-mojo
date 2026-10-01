@@ -41,7 +41,7 @@ Deferred (not required to close #42): HTTP/2 response trailers; full H1↔H2 app
 - Add `ServerConfig` fields (defaults conservative, documented):
   - `http2_max_control_frames_per_second: Int = 1000`
   - `http2_max_resets_per_second: Int = 100`
-  - Sliding 1-second windows counted on the connection session (monotonic clock already used for deadlines).
+  - Tumbling 1-second windows counted on the connection session (monotonic clock already used for deadlines).
 - On exceed: emit `GOAWAY` with `ENHANCE_YOUR_CALM` (or `PROTOCOL_ERROR` if that code is not yet wired) and begin drain; do not process further application DATA/HEADERS on that connection.
 - Count: PING (non-ACK), SETTINGS (non-ACK), WINDOW_UPDATE, PRIORITY if present, and RST_STREAM (separate reset counter).
 

@@ -22,6 +22,9 @@ underscore (see README "Versioning and compatibility"). Anything under
   optional quiche provider. Requests share the HTTP handler; shutdown sends
   staged GOAWAY frames, rejects streams above the final boundary, and sends an
   `H3_NO_ERROR` close after the configured grace period.
+- Opt-in HTTPS `Alt-Svc` advertisement via `ServerConfig.alt_svc`. When set,
+  TLS responses inject that header unless the handler already supplied
+  `Alt-Svc`; empty (default) leaves HTTPS unchanged for UDP-unavailable hosts.
 - Optional OpenSSL-backed nonblocking TLS server transport in the Pixi `tls`
   environment, used by HTTPS HTTP/1.1 and HTTP/2 ALPN `h2`.
 - `net.http` plaintext HTTP/1.1 origin server (single event loop, epoll
