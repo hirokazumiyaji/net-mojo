@@ -54,8 +54,10 @@ sustained would-block
 pending datagrams and retry when the socket becomes writable — no
 drop-without-retry.
 
-Still deferred: enabling 0-RTT, full path migration, and macOS Mojo end-to-end
-HTTP/3 packaging verification.
+Still deferred: enabling 0-RTT and full path migration. macOS Mojo end-to-end
+HTTP/3 is covered in CI (`http3` job on `macos-14`, `http3-client-test` against
+the Mojo fixture); only packaged-artifact distribution verification remains
+optional.
 
 ## Source material
 

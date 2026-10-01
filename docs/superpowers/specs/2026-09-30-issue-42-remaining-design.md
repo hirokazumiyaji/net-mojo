@@ -20,7 +20,7 @@ Phases 0–6 and the core of Phases 7–9 are already in tree on `main` (through
 | HTTP/3 | No Alt-Svc; broader reorder/reset stress incomplete | [#77](https://github.com/hirokazumiyaji/net-mojo/pull/77)–[#78](https://github.com/hirokazumiyaji/net-mojo/pull/78) (sibling branches) |
 | Phase 10 | No HTTP/2 or HTTP/3 harnesses or recorded results | [#79](https://github.com/hirokazumiyaji/net-mojo/pull/79)–[#81](https://github.com/hirokazumiyaji/net-mojo/pull/81) (this stack) |
 
-Deferred (not required to close #42): HTTP/2 response trailers; full H1↔H2 application-contract mirror suite; macOS end-to-end Mojo HTTP/3 validation; enabling 0-RTT; CI workflow edits.
+Deferred (not required to close #42): HTTP/2 response trailers; full H1↔H2 application-contract mirror suite; enabling 0-RTT; CI workflow edits. macOS end-to-end Mojo HTTP/3 validation is **not** deferred: the checked `http3` workflow runs `quic-suite`, `http3-client-test`, package smoke, and the example build on `macos-14` (`.github/workflows/ci.yml`), so the independent aioquic client already drives the Mojo fixture on macOS.
 
 ## Design principles
 
