@@ -134,9 +134,12 @@ Constraints (see `docs/design/http-server.md` for the full contract):
   them with `pixi run -e tls-http2 tls-suite` plus
   `pixi run -e tls-http2 hpack-mojo-test`, and `pixi run -e tls-http3 quic-suite`
   plus `pixi run -e tls-http3 http3-client-test`.
-- HTTP/3 does not automatically advertise `Alt-Svc`; configure HTTPS and UDP
-  endpoints separately. Protocol behavior, limits, and unsupported features
-  are documented in [HTTP/2](docs/design/http2-server.md) and
+- HTTP/3 does not automatically advertise `Alt-Svc`. Set
+  `ServerConfig.alt_svc` (for example `h3=":443"; ma=86400`) when a QUIC
+  endpoint is attached on the same origin; leave it empty so UDP-unavailable
+  environments still serve HTTPS without advertising H3. Protocol behavior,
+  limits, and unsupported features are documented in
+  [HTTP/2](docs/design/http2-server.md) and
   [HTTP/3](docs/design/http3-server.md).
 - HTTP/3 CI and independent-client coverage run on Linux x86_64 and aarch64;
   end-to-end HTTP/3 validation on macOS remains outstanding.

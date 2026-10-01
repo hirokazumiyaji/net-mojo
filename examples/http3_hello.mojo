@@ -29,7 +29,11 @@ def main() raises:
         "build/tls/test-key.pem",
         "h2,http/1.1",
     )
-    var server = Server(ServerConfig.default())
+    # Opt-in Alt-Svc so HTTPS clients discover the same-origin HTTP/3 UDP port.
+    # Leave alt_svc empty when no QUIC endpoint is attached.
+    var config = ServerConfig.default()
+    config.alt_svc = String('h3=":8443"; ma=86400')
+    var server = Server(config^)
     server.add_quic_endpoint(endpoint^)
     var handler = HelloHandler()
     server.serve_tls(tcp^, tls_context^, handler)

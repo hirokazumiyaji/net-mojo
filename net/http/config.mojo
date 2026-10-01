@@ -36,6 +36,11 @@ struct ServerConfig(Copyable, Movable):
     var max_bytes_per_tick: Int
     var max_requests_per_tick: Int
     var hpack_library_path: String
+    # Opt-in HTTPS Alt-Svc advertisement (empty disables). Set the full
+    # header value, e.g. `h3=":443"; ma=86400`, when a QUIC/HTTP/3 endpoint
+    # is attached on the same origin. UDP-unavailable deployments leave
+    # this empty and continue serving HTTPS without advertising H3.
+    var alt_svc: String
 
     @staticmethod
     def default() raises -> Self:
@@ -66,4 +71,5 @@ struct ServerConfig(Copyable, Movable):
             max_bytes_per_tick=65536,
             max_requests_per_tick=16,
             hpack_library_path=String("build/http2/libnet_hpack"),
+            alt_svc=String(""),
         )
