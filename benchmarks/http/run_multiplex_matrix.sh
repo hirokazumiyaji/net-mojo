@@ -35,7 +35,19 @@ MOJO_H2_BIN="${MOJO_H2_BIN:-$OUT_DIR/http2_tls_server}"
 MOJO_H3_BIN="${MOJO_H3_BIN:-$OUT_DIR/http3_server}"
 PIXI_ENV_H2="${PIXI_ENV_H2:-tls-http2}"
 PIXI_ENV_H3="${PIXI_ENV_H3:-tls-http3}"
-PIXI_PYTHON_H3="${PIXI_PYTHON_H3:-$(cd "$ROOT" && pixi run -e "$PIXI_ENV_H3" python -c 'import sys; print(sys.executable)')}"
+# Resolved lazily inside the H3 branch so H2-only/Go-only runs
+# (SKIP_H3=1) never require pixi or the tls-http3 env at startup.
+PIXI_PYTHON_H3="${PIXI_PYTHON_H3:-}"
+MATRIX_FAILURES=0
+
+h3_python() {
+    if [ -n "${PIXI_PYTHON_H3:-}" ]; then
+        printf '%s' "$PIXI_PYTHON_H3"
+        return 0
+    fi
+    PIXI_PYTHON_H3="$(cd "$ROOT" && pixi run -e "$PIXI_ENV_H3" python -c 'import sys; print(sys.executable)')"
+    printf '%s' "$PIXI_PYTHON_H3"
+}
 
 mkdir -p "$OUT_DIR" "$OUT_DIR/h2" "$OUT_DIR/h3" "$OUT_DIR/special"
 
@@ -61,7 +73,8 @@ sample_server() {
     cpu="$(ps -o %cpu= -p "$pid" 2>/dev/null | tr -d ' ' || echo "?")"
     rss="$(ps -o rss= -p "$pid" 2>/dev/null | tr -d ' ' || echo "?")"
     if command -v lsof >/dev/null; then
-        fds="$(lsof -nP -p "$pid" 2>/dev/null | wc -l | tr -d ' ')"
+        fds="$(lsof -nP -p "$pid" 2>/dev/null | awk 'NR>1 && $4 ~ /^[0-9]+[rwu-]*$/ {n++} END{print n+0}')"
+        [ -n "$fds" ] || fds="?"
     else
         fds="?"
     fi
@@ -163,10 +176,12 @@ run_h2load_cell() {
         sample_server "$server_pid" "$sample"
     fi
 
-    local req_s success failed
+    local req_s success failed errored timedout
     req_s="$(rg -o 'finished in [^,]+, ([0-9.]+) req/s' -r '$1' "$out" | head -1 || true)"
     success="$(rg -o 'requests: .* ([0-9]+) succeeded' -r '$1' "$out" | head -1 || true)"
     failed="$(rg -o 'requests: .* ([0-9]+) failed' -r '$1' "$out" | head -1 || true)"
+    errored="$(rg -o 'requests: .* ([0-9]+) errored' -r '$1' "$out" | head -1 || true)"
+    timedout="$(rg -o 'requests: .* ([0-9]+) timeout' -r '$1' "$out" | head -1 || true)"
     local med_tok p95_tok p99_tok
     med_tok="$(rg '^\s*request\s*:' "$out" | awk '{print $5}' | head -1 || true)"
     p95_tok="$(rg '^\s*request\s*:' "$out" | awk '{print $6}' | head -1 || true)"
@@ -183,6 +198,15 @@ run_h2load_cell() {
         "${req_s:-?}" "$p50" "$p95" "$p99" \
         "${success:-?}" "${failed:-?}" "$rc" "$sample_line" \
         | tee -a "$OUT_DIR/h2/summary.tsv"
+    local cell_failed=0
+    if [ "$rc" -ne 0 ]; then cell_failed=1; fi
+    if [ -n "${failed:-}" ] && [ "${failed}" != "0" ]; then cell_failed=1; fi
+    if [ -n "${errored:-}" ] && [ "${errored}" != "0" ]; then cell_failed=1; fi
+    if [ -n "${timedout:-}" ] && [ "${timedout}" != "0" ]; then cell_failed=1; fi
+    if [ "$cell_failed" -ne 0 ]; then
+        MATRIX_FAILURES=$((MATRIX_FAILURES + 1))
+        echo "matrix cell failed: h2 $label c=$clients m=$streams run=$run_idx rc=$rc failed=${failed:-?} errored=${errored:-?} timeout=${timedout:-?}" >&2
+    fi
 }
 
 run_h3_cell() {
@@ -203,7 +227,7 @@ run_h3_cell() {
     local sampler_pid=$!
 
     set +e
-    "$PIXI_PYTHON_H3" benchmarks/http3_load.py \
+    $(h3_python) benchmarks/http3_load.py \
         --url "$url" \
         --clients "$clients" \
         --streams "$streams" \
@@ -233,6 +257,14 @@ run_h3_cell() {
         "${req_s:-?}" "${p50:-?}" "${p95:-?}" "${p99:-?}" \
         "${ok:-?}" "${failed:-?}" "$rc" "$sample_line" \
         | tee -a "$OUT_DIR/h3/summary.tsv"
+    local cell_failed=0
+    if [ "$rc" -ne 0 ]; then cell_failed=1; fi
+    if [ -n "${failed:-}" ] && [ "${failed}" != "0" ]; then cell_failed=1; fi
+    if [ -z "${req_s:-}" ]; then cell_failed=1; fi
+    if [ "$cell_failed" -ne 0 ]; then
+        MATRIX_FAILURES=$((MATRIX_FAILURES + 1))
+        echo "matrix cell failed: h3 $label c=$clients m=$streams run=$run_idx rc=$rc failed=${failed:-?}" >&2
+    fi
 }
 
 # --- H2 special scenarios (qualitative + limited timing) ---
@@ -322,17 +354,29 @@ run_h2_special() {
     local loss_detail="pf/dummynet requires root; sudo -n unavailable on this host"
     if sudo -n true 2>/dev/null; then
         # Best-effort: 5% loss via dnctl on loopback TCP to the server port.
+        # Verify impairment was actually configured; otherwise a clean run
+        # must not be reported as an impaired pass.
         local port="${addr##*:}"
         set +e
         sudo -n dnctl pipe 42 config plr 0.05 2>"$loss_note"
+        local dnctl_rc=$?
         echo "dummynet in proto tcp from any to 127.0.0.1 port ${port} pipe 42" \
             | sudo -n pfctl -a bench_matrix -f - 2>>"$loss_note"
-        h2load --alpn-list=h2 -c 8 -m 4 -t 1 -D 5s "${url}/fixed" \
-            >"$OUT_DIR/special/h2_${label}_loss_h2load.out" 2>&1
-        local loss_rc=$?
-        sudo -n pfctl -a bench_matrix -F all 2>>"$loss_note" || true
-        sudo -n dnctl -q flush 2>>"$loss_note" || true
-        set -e
+        local pfctl_rc=$?
+        if [ "$dnctl_rc" -ne 0 ] || [ "$pfctl_rc" -ne 0 ] \
+            || ! command -v dnctl >/dev/null; then
+            loss_verdict=skip
+            loss_detail="loss impairment not configured (dnctl_rc=$dnctl_rc pfctl_rc=$pfctl_rc); no impaired run attempted"
+            sudo -n pfctl -a bench_matrix -F all 2>>"$loss_note" || true
+            sudo -n dnctl -q flush 2>>"$loss_note" || true
+            set -e
+        else
+            h2load --alpn-list=h2 -c 8 -m 4 -t 1 -D 5s "${url}/fixed" \
+                >"$OUT_DIR/special/h2_${label}_loss_h2load.out" 2>&1
+            local loss_rc=$?
+            sudo -n pfctl -a bench_matrix -F all 2>>"$loss_note" || true
+            sudo -n dnctl -q flush 2>>"$loss_note" || true
+            set -e
         local loss_req loss_fail
         loss_req="$(rg -o 'finished in [^,]+, ([0-9.]+) req/s' -r '$1' \
             "$OUT_DIR/special/h2_${label}_loss_h2load.out" | head -1 || true)"
@@ -344,6 +388,7 @@ run_h2_special() {
         else
             loss_verdict=fail
             loss_detail="dnctl configured but load failed rc=${loss_rc}"
+        fi
         fi
     else
         echo "$loss_detail" >"$loss_note"
@@ -369,14 +414,14 @@ run_h3_special() {
     echo "== H3 special scenarios ($label @ $addr) ==" | tee -a "$special_log"
 
     local line
-    line="$("$PIXI_PYTHON_H3" benchmarks/http/http3_scenarios.py \
+    line="$($(h3_python) benchmarks/http/http3_scenarios.py \
         --url "$url" --scenario slow --slow-s 0.25 --siblings 8 \
         2>>"$special_log")"
     echo "$line" | tee -a "$special_log"
     printf 'proto=h3 label=%s %s\n' "$label" "$line" \
         | tee -a "$OUT_DIR/special/summary.tsv"
 
-    line="$("$PIXI_PYTHON_H3" benchmarks/http/http3_scenarios.py \
+    line="$($(h3_python) benchmarks/http/http3_scenarios.py \
         --url "$url" --scenario cancel --siblings 8 \
         2>>"$special_log")"
     echo "$line" | tee -a "$special_log"
@@ -414,7 +459,7 @@ run_h3_special() {
         loss_pf_verdict=cleaned
     fi
 
-    line="$("$PIXI_PYTHON_H3" benchmarks/http/http3_scenarios.py \
+    line="$($(h3_python) benchmarks/http/http3_scenarios.py \
         --url "$url" --scenario loss --drop-rate 0.05 \
         --clients 4 --streams 4 --duration 5 \
         2>>"$special_log")"
@@ -434,12 +479,20 @@ if [ "${SKIP_H2:-0}" != "1" ]; then
         echo "h2load not found; install with: brew install nghttp2" >&2
         exit 1
     fi
-    for artifact in build/tls/libnet_tls build/tls/test-cert.pem build/tls/test-key.pem build/http2/libnet_hpack; do
+    for artifact in build/tls/test-cert.pem build/tls/test-key.pem; do
         [ -f "$artifact" ] || {
-            echo "missing $artifact; run tls-build + hpack-test" >&2
+            echo "missing $artifact; run tls-build" >&2
             exit 1
         }
     done
+    if [ "${SKIP_MOJO:-0}" != "1" ]; then
+        for artifact in build/tls/libnet_tls build/http2/libnet_hpack; do
+            [ -f "$artifact" ] || {
+                echo "missing $artifact; run tls-build + hpack-test (or SKIP_MOJO=1 for Go-only)" >&2
+                exit 1
+            }
+        done
+    fi
 
     if [ "${SKIP_GO:-0}" != "1" ]; then
         echo "== build Go HTTPS+H2 =="
@@ -495,16 +548,22 @@ echo -e "label\tc\tm\trun\treq_s\tp50_us\tp95_us\tp99_us\tok\tfailed\trc\tsample
     >>"$OUT_DIR/h3/summary.tsv"
 
 if [ "${SKIP_H3:-0}" != "1" ]; then
-    for artifact in build/tls/test-cert.pem build/tls/test-key.pem build/quic/libnet_quic_provider; do
+    for artifact in build/tls/test-cert.pem build/tls/test-key.pem; do
         [ -f "$artifact" ] || {
-            echo "missing $artifact; run tls-build + quic-build" >&2
+            echo "missing $artifact; run tls-build" >&2
             exit 1
         }
     done
+    if [ "${SKIP_MOJO:-0}" != "1" ]; then
+        [ -f build/quic/libnet_quic_provider ] || {
+            echo "missing build/quic/libnet_quic_provider; run quic-build (or SKIP_MOJO=1 for baseline-only)" >&2
+            exit 1
+        }
+    fi
 
     if [ "${SKIP_BASELINE:-0}" != "1" ]; then
         echo "== start aioquic H3 baseline =="
-        "$PIXI_PYTHON_H3" benchmarks/http3_aioquic_baseline.py \
+        $(h3_python) benchmarks/http3_aioquic_baseline.py \
             --host 127.0.0.1 --port 18452 \
             --certificate build/tls/test-cert.pem \
             --private-key build/tls/test-key.pem \
@@ -564,6 +623,10 @@ column -t -s $'\t' "$OUT_DIR/h3/summary.tsv" 2>/dev/null || cat "$OUT_DIR/h3/sum
 echo
 echo "== Special scenarios =="
 cat "$OUT_DIR/special/summary.tsv"
+if [ "$MATRIX_FAILURES" -gt 0 ]; then
+    echo "$MATRIX_FAILURES matrix cell(s) failed" >&2
+    exit 1
+fi
 
 # Aggregate means for README convenience
 python3 - "$OUT_DIR" <<'PY'
