@@ -49,10 +49,14 @@ for artifact in build/tls/libnet_tls build/tls/test-cert.pem build/tls/test-key.
         exit 1
     }
 done
-[ -f build/http2/libnet_hpack ] || {
-    echo "missing build/http2/libnet_hpack; run: pixi run -e tls-http2 hpack-test" >&2
-    exit 1
-}
+if [ "${SKIP_MOJO:-0}" != "1" ]; then
+    for artifact in build/tls/libnet_tls build/http2/libnet_hpack; do
+        [ -f "$artifact" ] || {
+            echo "missing $artifact; run tls-build + hpack-test (or SKIP_MOJO=1 for Go-only)" >&2
+            exit 1
+        }
+    done
+fi
 
 echo "== host =="
 uname -a
