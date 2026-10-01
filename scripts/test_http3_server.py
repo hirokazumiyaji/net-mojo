@@ -221,7 +221,11 @@ class Http3ClientProtocol(QuicConnectionProtocol):
         # ACK can arrive to free capacity.
         while reset_packets < 3 and self._loop.time() < deadline:
             sender.reset_pending = True
-            if self.transmit() > 0:
+            self.transmit()
+            # get_reset_frame() clears reset_pending only when the frame is
+            # actually written, so this counts reset-bearing datagrams
+            # rather than any datagram (ACK-only) this transmit emitted.
+            if not sender.reset_pending:
                 reset_packets += 1
                 continue
             await asyncio.sleep(0.05)
