@@ -124,6 +124,10 @@ async def _one_connection(
             raise RuntimeError(f"unexpected ALPN: {client.alpn!r}")
 
         sem = asyncio.Semaphore(streams)
+        # Per-connection tally so a connection whose handshake completed
+        # only after stop_at (short duration, out-of-band loss) is counted
+        # as failed instead of silently contributing zero samples.
+        local = {"ok": 0, "warmup_ok": 0, "failed": 0}
 
         async def one_request() -> None:
             async with sem:
@@ -133,6 +137,7 @@ async def _one_connection(
                     )
                 except Exception:
                     counters["failed"] += 1
+                    local["failed"] += 1
                     return
                 elapsed = (result["done_at"] or time.perf_counter()) - result["start"]
                 now = time.perf_counter()
@@ -144,14 +149,18 @@ async def _one_connection(
                     # bodies must not count as success for the /fixed workload.
                     if path == b"/fixed" and bytes(result["body"]) != b"a" * 64:
                         counters["failed"] += 1
+                        local["failed"] += 1
                         return
                     if now >= warmup_until:
                         counters["ok"] += 1
+                        local["ok"] += 1
                         latencies.append(elapsed * 1_000_000.0)  # µs
                     else:
                         counters["warmup_ok"] += 1
+                        local["warmup_ok"] += 1
                 else:
                     counters["failed"] += 1
+                    local["failed"] += 1
 
         workers = []
 
@@ -162,6 +171,12 @@ async def _one_connection(
         for _ in range(streams):
             workers.append(asyncio.create_task(worker()))
         await asyncio.gather(*workers)
+
+        if local["ok"] + local["warmup_ok"] == 0:
+            # Handshake finished after stop_at (short duration or
+            # out-of-band loss): this connection never completed a request,
+            # so it must not be treated as a clean measurement.
+            counters["failed"] += 1
 
 
 def _percentile(sorted_vals: List[float], p: float) -> float:
