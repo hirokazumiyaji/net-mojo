@@ -1113,9 +1113,27 @@ struct Server(Movable):
         self._sync_interests(idx)
 
     def _sync_interests(mut self, idx: Int) raises NetError:
+        var want_read = self._conns[idx].wants_read()
+        if (
+            self._conns[idx].protocol == PROTOCOL_HTTP2
+            and self._conns[idx].http2_session
+            and self._conns[idx].http2_session.value().is_failed()
+            and self._conns[idx].pending_remaining() > 0
+        ):
+            # A failed HTTP/2 session is draining its GOAWAY: it never
+            # consumes another byte, so only the flush is left. Ordinary
+            # read interest stays true for STATE_SENDING_HTTP2_CONTROL, and
+            # a level-triggered reactor would keep waking this connection on
+            # attacker-controlled readability while the write is stuck. A
+            # TLS write blocked on WANT_READ still needs a read event to
+            # retry, and wants_write() drops write interest in that case.
+            want_read = (
+                self._conns[idx].tls_write_would_block
+                and self._conns[idx].tls_write_wants_read
+            )
         _ = self._reactor.modify(
             self._conns[idx].token,
-            self._conns[idx].wants_read(),
+            want_read,
             self._conns[idx].wants_write(),
         )
 
@@ -1246,20 +1264,10 @@ struct Server(Movable):
                 # Failed session draining GOAWAY: flush pending output only.
                 # Do not read or parse further bytes; the failed session can
                 # never drain them and they would consume shared budget.
-                # Drop ordinary read interest (wants_read() stays true for
-                # STATE_SENDING_HTTP2_CONTROL, which would keep waking this
-                # connection on attacker-controlled readability), but retain
-                # TLS-required readability: when the GOAWAY write returns
-                # WANT_READ, the TLS layer needs a read event to retry it.
-                var want_read = (
-                    self._conns[idx].tls_write_would_block
-                    and self._conns[idx].tls_write_wants_read
-                )
-                _ = self._reactor.modify(
-                    self._conns[idx].token,
-                    want_read,
-                    self._conns[idx].wants_write(),
-                )
+                # _sync_interests drops ordinary read interest here and keeps
+                # only the readiness the flush needs, including the read
+                # event a TLS write blocked on WANT_READ requires.
+                self._sync_interests(idx)
                 return
             var read_event = (
                 self._conns[idx].read_ready(readable, writable)
