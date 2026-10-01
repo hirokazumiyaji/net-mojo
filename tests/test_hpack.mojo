@@ -49,14 +49,26 @@ def _append_frame[
 def test_hpack_inflater_decodes_huffman_header_block() raises:
     var inflater = Http2HpackInflater("build/http2/libnet_hpack", 4096)
     var block: List[Byte] = [
-        Byte(0x82), Byte(0x86), Byte(0x84), Byte(0x41), Byte(0x8C), Byte(0xF1),
-        Byte(0xE3), Byte(0xC2), Byte(0xE5), Byte(0xF2), Byte(0x3A), Byte(0x6B),
-        Byte(0xA0), Byte(0xAB), Byte(0x90), Byte(0xF4), Byte(0xFF),
+        Byte(0x82),
+        Byte(0x86),
+        Byte(0x84),
+        Byte(0x41),
+        Byte(0x8C),
+        Byte(0xF1),
+        Byte(0xE3),
+        Byte(0xC2),
+        Byte(0xE5),
+        Byte(0xF2),
+        Byte(0x3A),
+        Byte(0x6B),
+        Byte(0xA0),
+        Byte(0xAB),
+        Byte(0x90),
+        Byte(0xF4),
+        Byte(0xFF),
     ]
     var output = Array[Byte, 512](fill=0)
-    var result = inflater.decode(
-        Span(block), 1024, 16, Span(output)
-    )
+    var result = inflater.decode(Span(block), 1024, 16, Span(output))
     assert_true(result.is_success())
     assert_equal(result.field_count, 4)
     assert_true(result.output_length > 0)
@@ -128,7 +140,7 @@ def test_shared_response_encodes_to_http2_headers_and_data() raises:
     assert_true(decoded.is_success())
     assert_equal(decoded.field_count, 4)
 
-    var data = parse_frame(Span(encoded.wire)[headers.consumed:])
+    var data = parse_frame(Span(encoded.wire)[headers.consumed :])
     assert_true(data.is_complete())
     assert_equal(data.frame_type, Byte(0))
     assert_equal(data.flags, Byte(1))
@@ -172,21 +184,28 @@ def test_failed_response_encoding_poisoned_deflater() raises:
 def test_hpack_inflater_preserves_dynamic_table_after_limit() raises:
     var inflater = Http2HpackInflater("build/http2/libnet_hpack", 4096)
     var literal: List[Byte] = [
-        Byte(0x40), Byte(0x06), Byte(ord("x")), Byte(ord("-")), Byte(ord("t")),
-        Byte(ord("e")), Byte(ord("s")), Byte(ord("t")), Byte(0x05), Byte(ord("f")),
-        Byte(ord("i")), Byte(ord("r")), Byte(ord("s")), Byte(ord("t")),
+        Byte(0x40),
+        Byte(0x06),
+        Byte(ord("x")),
+        Byte(ord("-")),
+        Byte(ord("t")),
+        Byte(ord("e")),
+        Byte(ord("s")),
+        Byte(ord("t")),
+        Byte(0x05),
+        Byte(ord("f")),
+        Byte(ord("i")),
+        Byte(ord("r")),
+        Byte(ord("s")),
+        Byte(ord("t")),
     ]
     var output = Array[Byte, 128](fill=0)
-    var result = inflater.decode(
-        Span(literal), 0, 16, Span(output)
-    )
+    var result = inflater.decode(Span(literal), 0, 16, Span(output))
     assert_true(result.is_too_large())
     assert_equal(result.field_count, 1)
 
     var indexed: List[Byte] = [Byte(0xBE)]
-    result = inflater.decode(
-        Span(indexed), 1024, 16, Span(output)
-    )
+    result = inflater.decode(Span(indexed), 1024, 16, Span(output))
     assert_true(result.is_success())
     assert_equal(result.field_count, 1)
     assert_equal(result.output_length, 19)
@@ -198,9 +217,7 @@ def test_hpack_inflater_reports_decoded_output_limit() raises:
     var inflater = Http2HpackInflater("build/http2/libnet_hpack", 4096)
     var block: List[Byte] = [Byte(0x82), Byte(0x86)]
     var output = Array[Byte, 4](fill=0)
-    var result = inflater.decode(
-        Span(block), 1024, 16, Span(output)
-    )
+    var result = inflater.decode(Span(block), 1024, 16, Span(output))
     assert_true(result.is_too_large())
     assert_equal(result.field_count, 2)
 
@@ -210,9 +227,7 @@ def test_hpack_inflater_applies_table_limit_between_blocks() raises:
     assert_true(inflater.set_max_table_size(32))
     var update: List[Byte] = [Byte(0x3F), Byte(0x01)]
     var output = Array[Byte, 8](fill=0)
-    var result = inflater.decode(
-        Span(update), 1024, 16, Span(output)
-    )
+    var result = inflater.decode(Span(update), 1024, 16, Span(output))
     assert_true(result.is_success())
     assert_equal(result.field_count, 0)
 
@@ -226,10 +241,23 @@ def test_header_decoder_handles_fragmented_header_block() raises:
     assert_true(result.is_pending())
 
     var continuation: List[Byte] = [
-        Byte(0x84), Byte(0x41), Byte(0x0F), Byte(ord("w")), Byte(ord("w")),
-        Byte(ord("w")), Byte(ord(".")), Byte(ord("e")), Byte(ord("x")),
-        Byte(ord("a")), Byte(ord("m")), Byte(ord("p")), Byte(ord("l")),
-        Byte(ord("e")), Byte(ord(".")), Byte(ord("c")), Byte(ord("o")),
+        Byte(0x84),
+        Byte(0x41),
+        Byte(0x0F),
+        Byte(ord("w")),
+        Byte(ord("w")),
+        Byte(ord("w")),
+        Byte(ord(".")),
+        Byte(ord("e")),
+        Byte(ord("x")),
+        Byte(ord("a")),
+        Byte(ord("m")),
+        Byte(ord("p")),
+        Byte(ord("l")),
+        Byte(ord("e")),
+        Byte(ord(".")),
+        Byte(ord("c")),
+        Byte(ord("o")),
         Byte(ord("m")),
     ]
     var continuation_frame = FrameParseResult.complete(
@@ -270,9 +298,7 @@ def test_header_decoder_distinguishes_size_and_compression_errors() raises:
     var block: List[Byte] = [Byte(0x82), Byte(0x86)]
     var output = Array[Byte, 128](fill=0)
     var headers = FrameParseResult.complete(Byte(1), Byte(4), UInt32(1), 2)
-    var too_large = decoder.consume(
-        headers, Span(block), 0, 16, Span(output)
-    )
+    var too_large = decoder.consume(headers, Span(block), 0, 16, Span(output))
     assert_true(too_large.is_too_large())
     assert_equal(too_large.field_count, 2)
 
@@ -298,16 +324,12 @@ def test_header_decoder_fails_connection_on_invalid_continuation_sequence() rais
     assert_true(result.is_pending())
 
     var continuation: List[Byte] = [Byte(0x86)]
-    var wrong_stream = FrameParseResult.complete(
-        Byte(9), Byte(4), UInt32(3), 1
-    )
+    var wrong_stream = FrameParseResult.complete(Byte(9), Byte(4), UInt32(3), 1)
     result = decoder.consume(
         wrong_stream, Span(continuation), 1024, 16, Span(output)
     )
     assert_true(result.is_protocol_error())
-    var next_headers = FrameParseResult.complete(
-        Byte(1), Byte(4), UInt32(3), 1
-    )
+    var next_headers = FrameParseResult.complete(Byte(1), Byte(4), UInt32(3), 1)
     result = decoder.consume(
         next_headers, Span(continuation), 1024, 16, Span(output)
     )
@@ -317,11 +339,26 @@ def test_header_decoder_fails_connection_on_invalid_continuation_sequence() rais
 def test_hpack_headers_become_a_shared_http2_request() raises:
     var decoder = Http2HeaderDecoder("build/http2/libnet_hpack", 4096, 1024)
     var compressed: List[Byte] = [
-        Byte(0x82), Byte(0x86), Byte(0x84), Byte(0x41), Byte(0x0F),
-        Byte(ord("w")), Byte(ord("w")), Byte(ord("w")), Byte(ord(".")),
-        Byte(ord("e")), Byte(ord("x")), Byte(ord("a")), Byte(ord("m")),
-        Byte(ord("p")), Byte(ord("l")), Byte(ord("e")), Byte(ord(".")),
-        Byte(ord("c")), Byte(ord("o")), Byte(ord("m")),
+        Byte(0x82),
+        Byte(0x86),
+        Byte(0x84),
+        Byte(0x41),
+        Byte(0x0F),
+        Byte(ord("w")),
+        Byte(ord("w")),
+        Byte(ord("w")),
+        Byte(ord(".")),
+        Byte(ord("e")),
+        Byte(ord("x")),
+        Byte(ord("a")),
+        Byte(ord("m")),
+        Byte(ord("p")),
+        Byte(ord("l")),
+        Byte(ord("e")),
+        Byte(ord(".")),
+        Byte(ord("c")),
+        Byte(ord("o")),
+        Byte(ord("m")),
     ]
     var frame = FrameParseResult.complete(
         Byte(1), Byte(4), UInt32(1), len(compressed)
@@ -360,10 +397,23 @@ def test_http2_request_session_completes_fragmented_header_only_request() raises
     for i in range(len(headers.wire)):
         wire.append(headers.wire[i])
     var rest: List[Byte] = [
-        Byte(0x84), Byte(0x41), Byte(0x0F), Byte(ord("w")), Byte(ord("w")),
-        Byte(ord("w")), Byte(ord(".")), Byte(ord("e")), Byte(ord("x")),
-        Byte(ord("a")), Byte(ord("m")), Byte(ord("p")), Byte(ord("l")),
-        Byte(ord("e")), Byte(ord(".")), Byte(ord("c")), Byte(ord("o")),
+        Byte(0x84),
+        Byte(0x41),
+        Byte(0x0F),
+        Byte(ord("w")),
+        Byte(ord("w")),
+        Byte(ord("w")),
+        Byte(ord(".")),
+        Byte(ord("e")),
+        Byte(ord("x")),
+        Byte(ord("a")),
+        Byte(ord("m")),
+        Byte(ord("p")),
+        Byte(ord("l")),
+        Byte(ord("e")),
+        Byte(ord(".")),
+        Byte(ord("c")),
+        Byte(ord("o")),
         Byte(ord("m")),
     ]
     var continuation = encode_frame(Byte(9), Byte(4), UInt32(1), Span(rest))
@@ -387,11 +437,26 @@ def test_http2_request_session_goaway_uses_last_admitted_stream() raises:
     var empty = List[Byte]()
     _append_frame(wire, Byte(4), Byte(0), UInt32(0), Span(empty))
     var compressed: List[Byte] = [
-        Byte(0x82), Byte(0x86), Byte(0x84), Byte(0x41), Byte(0x0F),
-        Byte(ord("w")), Byte(ord("w")), Byte(ord("w")), Byte(ord(".")),
-        Byte(ord("e")), Byte(ord("x")), Byte(ord("a")), Byte(ord("m")),
-        Byte(ord("p")), Byte(ord("l")), Byte(ord("e")), Byte(ord(".")),
-        Byte(ord("c")), Byte(ord("o")), Byte(ord("m")),
+        Byte(0x82),
+        Byte(0x86),
+        Byte(0x84),
+        Byte(0x41),
+        Byte(0x0F),
+        Byte(ord("w")),
+        Byte(ord("w")),
+        Byte(ord("w")),
+        Byte(ord(".")),
+        Byte(ord("e")),
+        Byte(ord("x")),
+        Byte(ord("a")),
+        Byte(ord("m")),
+        Byte(ord("p")),
+        Byte(ord("l")),
+        Byte(ord("e")),
+        Byte(ord(".")),
+        Byte(ord("c")),
+        Byte(ord("o")),
+        Byte(ord("m")),
     ]
     _append_frame(wire, Byte(1), Byte(5), UInt32(3), Span(compressed))
     var request = session.consume(Span(wire))
@@ -458,11 +523,26 @@ def test_http2_request_session_reset_flood_uses_last_stream_id() raises:
     var empty = List[Byte]()
     _append_frame(wire, Byte(4), Byte(0), UInt32(0), Span(empty))
     var compressed: List[Byte] = [
-        Byte(0x82), Byte(0x86), Byte(0x84), Byte(0x41), Byte(0x0F),
-        Byte(ord("w")), Byte(ord("w")), Byte(ord("w")), Byte(ord(".")),
-        Byte(ord("e")), Byte(ord("x")), Byte(ord("a")), Byte(ord("m")),
-        Byte(ord("p")), Byte(ord("l")), Byte(ord("e")), Byte(ord(".")),
-        Byte(ord("c")), Byte(ord("o")), Byte(ord("m")),
+        Byte(0x82),
+        Byte(0x86),
+        Byte(0x84),
+        Byte(0x41),
+        Byte(0x0F),
+        Byte(ord("w")),
+        Byte(ord("w")),
+        Byte(ord("w")),
+        Byte(ord(".")),
+        Byte(ord("e")),
+        Byte(ord("x")),
+        Byte(ord("a")),
+        Byte(ord("m")),
+        Byte(ord("p")),
+        Byte(ord("l")),
+        Byte(ord("e")),
+        Byte(ord(".")),
+        Byte(ord("c")),
+        Byte(ord("o")),
+        Byte(ord("m")),
     ]
     _append_frame(wire, Byte(1), Byte(5), UInt32(3), Span(compressed))
     var request = session.consume(Span(wire))
@@ -510,11 +590,26 @@ def test_http2_request_session_completes_data_body() raises:
     for i in range(len(settings.wire)):
         wire.append(settings.wire[i])
     var compressed: List[Byte] = [
-        Byte(0x82), Byte(0x86), Byte(0x84), Byte(0x41), Byte(0x0F),
-        Byte(ord("w")), Byte(ord("w")), Byte(ord("w")), Byte(ord(".")),
-        Byte(ord("e")), Byte(ord("x")), Byte(ord("a")), Byte(ord("m")),
-        Byte(ord("p")), Byte(ord("l")), Byte(ord("e")), Byte(ord(".")),
-        Byte(ord("c")), Byte(ord("o")), Byte(ord("m")),
+        Byte(0x82),
+        Byte(0x86),
+        Byte(0x84),
+        Byte(0x41),
+        Byte(0x0F),
+        Byte(ord("w")),
+        Byte(ord("w")),
+        Byte(ord("w")),
+        Byte(ord(".")),
+        Byte(ord("e")),
+        Byte(ord("x")),
+        Byte(ord("a")),
+        Byte(ord("m")),
+        Byte(ord("p")),
+        Byte(ord("l")),
+        Byte(ord("e")),
+        Byte(ord(".")),
+        Byte(ord("c")),
+        Byte(ord("o")),
+        Byte(ord("m")),
     ]
     var headers = encode_frame(Byte(1), Byte(4), UInt32(1), Span(compressed))
     for i in range(len(headers.wire)):
@@ -542,11 +637,26 @@ def test_http2_request_session_keeps_interleaved_bodies_on_their_streams() raise
     _append_frame(wire, Byte(4), Byte(0), UInt32(0), Span(empty))
 
     var compressed: List[Byte] = [
-        Byte(0x82), Byte(0x86), Byte(0x84), Byte(0x41), Byte(0x0F),
-        Byte(ord("w")), Byte(ord("w")), Byte(ord("w")), Byte(ord(".")),
-        Byte(ord("e")), Byte(ord("x")), Byte(ord("a")), Byte(ord("m")),
-        Byte(ord("p")), Byte(ord("l")), Byte(ord("e")), Byte(ord(".")),
-        Byte(ord("c")), Byte(ord("o")), Byte(ord("m")),
+        Byte(0x82),
+        Byte(0x86),
+        Byte(0x84),
+        Byte(0x41),
+        Byte(0x0F),
+        Byte(ord("w")),
+        Byte(ord("w")),
+        Byte(ord("w")),
+        Byte(ord(".")),
+        Byte(ord("e")),
+        Byte(ord("x")),
+        Byte(ord("a")),
+        Byte(ord("m")),
+        Byte(ord("p")),
+        Byte(ord("l")),
+        Byte(ord("e")),
+        Byte(ord(".")),
+        Byte(ord("c")),
+        Byte(ord("o")),
+        Byte(ord("m")),
     ]
     _append_frame(wire, Byte(1), Byte(4), UInt32(1), Span(compressed))
     _append_frame(wire, Byte(1), Byte(4), UInt32(3), Span(compressed))
@@ -581,11 +691,26 @@ def test_http2_request_session_refuses_over_limit_stream_without_failing_connect
     var empty: List[Byte] = List[Byte]()
     _append_frame(wire, Byte(4), Byte(0), UInt32(0), Span(empty))
     var compressed: List[Byte] = [
-        Byte(0x82), Byte(0x86), Byte(0x84), Byte(0x41), Byte(0x0F),
-        Byte(ord("w")), Byte(ord("w")), Byte(ord("w")), Byte(ord(".")),
-        Byte(ord("e")), Byte(ord("x")), Byte(ord("a")), Byte(ord("m")),
-        Byte(ord("p")), Byte(ord("l")), Byte(ord("e")), Byte(ord(".")),
-        Byte(ord("c")), Byte(ord("o")), Byte(ord("m")),
+        Byte(0x82),
+        Byte(0x86),
+        Byte(0x84),
+        Byte(0x41),
+        Byte(0x0F),
+        Byte(ord("w")),
+        Byte(ord("w")),
+        Byte(ord("w")),
+        Byte(ord(".")),
+        Byte(ord("e")),
+        Byte(ord("x")),
+        Byte(ord("a")),
+        Byte(ord("m")),
+        Byte(ord("p")),
+        Byte(ord("l")),
+        Byte(ord("e")),
+        Byte(ord(".")),
+        Byte(ord("c")),
+        Byte(ord("o")),
+        Byte(ord("m")),
     ]
     _append_frame(wire, Byte(1), Byte(4), UInt32(1), Span(compressed))
     _append_frame(wire, Byte(1), Byte(4), UInt32(3), Span(compressed))
@@ -605,7 +730,7 @@ def test_http2_request_session_refuses_over_limit_stream_without_failing_connect
     assert_equal(Span(refused.output)[13], Byte(0))
     assert_equal(Span(refused.output)[14], Byte(1))
     var server_ack = parse_frame(
-        Span(refused.output)[server_settings.consumed:]
+        Span(refused.output)[server_settings.consumed :]
     )
     assert_true(server_ack.is_complete())
     assert_equal(server_ack.flags, Byte(1))
@@ -615,7 +740,7 @@ def test_http2_request_session_refuses_over_limit_stream_without_failing_connect
     assert_equal(rst.frame_type, Byte(3))
     assert_equal(rst.stream_id, UInt32(3))
     var rst_fields = parse_rst_stream_frame(
-        rst, Span(refused.output)[rst_offset + 9:]
+        rst, Span(refused.output)[rst_offset + 9 :]
     )
     assert_true(rst_fields.is_valid())
     assert_equal(rst_fields.error_code, UInt32(7))
@@ -658,11 +783,26 @@ def test_http2_request_session_resets_only_stream_for_oversized_body() raises:
     var empty: List[Byte] = List[Byte]()
     _append_frame(wire, Byte(4), Byte(0), UInt32(0), Span(empty))
     var compressed: List[Byte] = [
-        Byte(0x82), Byte(0x86), Byte(0x84), Byte(0x41), Byte(0x0F),
-        Byte(ord("w")), Byte(ord("w")), Byte(ord("w")), Byte(ord(".")),
-        Byte(ord("e")), Byte(ord("x")), Byte(ord("a")), Byte(ord("m")),
-        Byte(ord("p")), Byte(ord("l")), Byte(ord("e")), Byte(ord(".")),
-        Byte(ord("c")), Byte(ord("o")), Byte(ord("m")),
+        Byte(0x82),
+        Byte(0x86),
+        Byte(0x84),
+        Byte(0x41),
+        Byte(0x0F),
+        Byte(ord("w")),
+        Byte(ord("w")),
+        Byte(ord("w")),
+        Byte(ord(".")),
+        Byte(ord("e")),
+        Byte(ord("x")),
+        Byte(ord("a")),
+        Byte(ord("m")),
+        Byte(ord("p")),
+        Byte(ord("l")),
+        Byte(ord("e")),
+        Byte(ord(".")),
+        Byte(ord("c")),
+        Byte(ord("o")),
+        Byte(ord("m")),
     ]
     _append_frame(wire, Byte(1), Byte(4), UInt32(1), Span(compressed))
     var body: List[Byte] = [Byte(1), Byte(2), Byte(3)]
@@ -679,9 +819,7 @@ def test_http2_request_session_resets_only_stream_for_oversized_body() raises:
     var reset_found = False
     var connection_credit_found = False
     while output_offset < len(result.output):
-        var output_frame = parse_frame(
-            Span(result.output)[output_offset:]
-        )
+        var output_frame = parse_frame(Span(result.output)[output_offset:])
         assert_true(output_frame.is_complete())
         if output_frame.frame_type == Byte(3):
             var reset_fields = parse_rst_stream_frame(
@@ -728,11 +866,26 @@ def test_http2_request_session_returns_data_receive_credit() raises:
     var empty: List[Byte] = List[Byte]()
     _append_frame(wire, Byte(4), Byte(0), UInt32(0), Span(empty))
     var compressed: List[Byte] = [
-        Byte(0x82), Byte(0x86), Byte(0x84), Byte(0x41), Byte(0x0F),
-        Byte(ord("w")), Byte(ord("w")), Byte(ord("w")), Byte(ord(".")),
-        Byte(ord("e")), Byte(ord("x")), Byte(ord("a")), Byte(ord("m")),
-        Byte(ord("p")), Byte(ord("l")), Byte(ord("e")), Byte(ord(".")),
-        Byte(ord("c")), Byte(ord("o")), Byte(ord("m")),
+        Byte(0x82),
+        Byte(0x86),
+        Byte(0x84),
+        Byte(0x41),
+        Byte(0x0F),
+        Byte(ord("w")),
+        Byte(ord("w")),
+        Byte(ord("w")),
+        Byte(ord(".")),
+        Byte(ord("e")),
+        Byte(ord("x")),
+        Byte(ord("a")),
+        Byte(ord("m")),
+        Byte(ord("p")),
+        Byte(ord("l")),
+        Byte(ord("e")),
+        Byte(ord(".")),
+        Byte(ord("c")),
+        Byte(ord("o")),
+        Byte(ord("m")),
     ]
     _append_frame(wire, Byte(1), Byte(4), UInt32(1), Span(compressed))
     var body: List[Byte] = [Byte(1), Byte(2), Byte(3)]
@@ -759,15 +912,35 @@ def test_http2_request_session_exposes_peer_stream_send_window() raises:
     for i in range(len(preface)):
         wire.append(preface[i])
     var settings: List[Byte] = [
-        Byte(0), Byte(4), Byte(0), Byte(0), Byte(0), Byte(0)
+        Byte(0),
+        Byte(4),
+        Byte(0),
+        Byte(0),
+        Byte(0),
+        Byte(0),
     ]
     _append_frame(wire, Byte(4), Byte(0), UInt32(0), Span(settings))
     var compressed: List[Byte] = [
-        Byte(0x82), Byte(0x86), Byte(0x84), Byte(0x41), Byte(0x0F),
-        Byte(ord("w")), Byte(ord("w")), Byte(ord("w")), Byte(ord(".")),
-        Byte(ord("e")), Byte(ord("x")), Byte(ord("a")), Byte(ord("m")),
-        Byte(ord("p")), Byte(ord("l")), Byte(ord("e")), Byte(ord(".")),
-        Byte(ord("c")), Byte(ord("o")), Byte(ord("m")),
+        Byte(0x82),
+        Byte(0x86),
+        Byte(0x84),
+        Byte(0x41),
+        Byte(0x0F),
+        Byte(ord("w")),
+        Byte(ord("w")),
+        Byte(ord("w")),
+        Byte(ord(".")),
+        Byte(ord("e")),
+        Byte(ord("x")),
+        Byte(ord("a")),
+        Byte(ord("m")),
+        Byte(ord("p")),
+        Byte(ord("l")),
+        Byte(ord("e")),
+        Byte(ord(".")),
+        Byte(ord("c")),
+        Byte(ord("o")),
+        Byte(ord("m")),
     ]
     _append_frame(wire, Byte(1), Byte(5), UInt32(1), Span(compressed))
 
@@ -783,17 +956,37 @@ def test_http2_request_session_debits_connection_window_updates() raises:
     for i in range(len(preface)):
         wire.append(preface[i])
     var settings: List[Byte] = [
-        Byte(0), Byte(4), Byte(0), Byte(1), Byte(0x86), Byte(0xA0)
+        Byte(0),
+        Byte(4),
+        Byte(0),
+        Byte(1),
+        Byte(0x86),
+        Byte(0xA0),
     ]
     _append_frame(wire, Byte(4), Byte(0), UInt32(0), Span(settings))
     var increment: List[Byte] = [Byte(0), Byte(0), Byte(0), Byte(10)]
     _append_frame(wire, Byte(8), Byte(0), UInt32(0), Span(increment))
     var compressed: List[Byte] = [
-        Byte(0x82), Byte(0x86), Byte(0x84), Byte(0x41), Byte(0x0F),
-        Byte(ord("w")), Byte(ord("w")), Byte(ord("w")), Byte(ord(".")),
-        Byte(ord("e")), Byte(ord("x")), Byte(ord("a")), Byte(ord("m")),
-        Byte(ord("p")), Byte(ord("l")), Byte(ord("e")), Byte(ord(".")),
-        Byte(ord("c")), Byte(ord("o")), Byte(ord("m")),
+        Byte(0x82),
+        Byte(0x86),
+        Byte(0x84),
+        Byte(0x41),
+        Byte(0x0F),
+        Byte(ord("w")),
+        Byte(ord("w")),
+        Byte(ord("w")),
+        Byte(ord(".")),
+        Byte(ord("e")),
+        Byte(ord("x")),
+        Byte(ord("a")),
+        Byte(ord("m")),
+        Byte(ord("p")),
+        Byte(ord("l")),
+        Byte(ord("e")),
+        Byte(ord(".")),
+        Byte(ord("c")),
+        Byte(ord("o")),
+        Byte(ord("m")),
     ]
     _append_frame(wire, Byte(1), Byte(5), UInt32(1), Span(compressed))
 
@@ -811,11 +1004,26 @@ def test_http2_request_session_tracks_outbound_credit_per_stream() raises:
     var empty: List[Byte] = List[Byte]()
     _append_frame(wire, Byte(4), Byte(0), UInt32(0), Span(empty))
     var compressed: List[Byte] = [
-        Byte(0x82), Byte(0x86), Byte(0x84), Byte(0x41), Byte(0x0F),
-        Byte(ord("w")), Byte(ord("w")), Byte(ord("w")), Byte(ord(".")),
-        Byte(ord("e")), Byte(ord("x")), Byte(ord("a")), Byte(ord("m")),
-        Byte(ord("p")), Byte(ord("l")), Byte(ord("e")), Byte(ord(".")),
-        Byte(ord("c")), Byte(ord("o")), Byte(ord("m")),
+        Byte(0x82),
+        Byte(0x86),
+        Byte(0x84),
+        Byte(0x41),
+        Byte(0x0F),
+        Byte(ord("w")),
+        Byte(ord("w")),
+        Byte(ord("w")),
+        Byte(ord(".")),
+        Byte(ord("e")),
+        Byte(ord("x")),
+        Byte(ord("a")),
+        Byte(ord("m")),
+        Byte(ord("p")),
+        Byte(ord("l")),
+        Byte(ord("e")),
+        Byte(ord(".")),
+        Byte(ord("c")),
+        Byte(ord("o")),
+        Byte(ord("m")),
     ]
     _append_frame(wire, Byte(1), Byte(5), UInt32(1), Span(compressed))
     _append_frame(wire, Byte(1), Byte(5), UInt32(3), Span(compressed))
@@ -827,9 +1035,7 @@ def test_http2_request_session_tracks_outbound_credit_per_stream() raises:
     assert_equal(session.send_window(UInt32(3)), 65535)
 
     var updates = List[Byte]()
-    var connection_increment: List[Byte] = [
-        Byte(0), Byte(0), Byte(0), Byte(10)
-    ]
+    var connection_increment: List[Byte] = [Byte(0), Byte(0), Byte(0), Byte(10)]
     var first_increment: List[Byte] = [Byte(0), Byte(0), Byte(0), Byte(3)]
     var second_increment: List[Byte] = [Byte(0), Byte(0), Byte(0), Byte(7)]
     _append_frame(
@@ -856,15 +1062,35 @@ def test_http2_response_scheduler_resumes_each_stream_after_window_update() rais
     for i in range(len(preface)):
         wire.append(preface[i])
     var initial_window: List[Byte] = [
-        Byte(0), Byte(4), Byte(0), Byte(0), Byte(0), Byte(2)
+        Byte(0),
+        Byte(4),
+        Byte(0),
+        Byte(0),
+        Byte(0),
+        Byte(2),
     ]
     _append_frame(wire, Byte(4), Byte(0), UInt32(0), Span(initial_window))
     var compressed: List[Byte] = [
-        Byte(0x82), Byte(0x86), Byte(0x84), Byte(0x41), Byte(0x0F),
-        Byte(ord("w")), Byte(ord("w")), Byte(ord("w")), Byte(ord(".")),
-        Byte(ord("e")), Byte(ord("x")), Byte(ord("a")), Byte(ord("m")),
-        Byte(ord("p")), Byte(ord("l")), Byte(ord("e")), Byte(ord(".")),
-        Byte(ord("c")), Byte(ord("o")), Byte(ord("m")),
+        Byte(0x82),
+        Byte(0x86),
+        Byte(0x84),
+        Byte(0x41),
+        Byte(0x0F),
+        Byte(ord("w")),
+        Byte(ord("w")),
+        Byte(ord("w")),
+        Byte(ord(".")),
+        Byte(ord("e")),
+        Byte(ord("x")),
+        Byte(ord("a")),
+        Byte(ord("m")),
+        Byte(ord("p")),
+        Byte(ord("l")),
+        Byte(ord("e")),
+        Byte(ord(".")),
+        Byte(ord("c")),
+        Byte(ord("o")),
+        Byte(ord("m")),
     ]
     _append_frame(wire, Byte(1), Byte(5), UInt32(1), Span(compressed))
     _append_frame(wire, Byte(1), Byte(5), UInt32(3), Span(compressed))
@@ -872,9 +1098,7 @@ def test_http2_response_scheduler_resumes_each_stream_after_window_update() rais
     assert_true(first.is_request())
     var second = session.consume(Span(wire)[first.consumed :])
     assert_true(second.is_request())
-    var stream_three_credit: List[Byte] = [
-        Byte(0), Byte(0), Byte(0), Byte(2)
-    ]
+    var stream_three_credit: List[Byte] = [Byte(0), Byte(0), Byte(0), Byte(2)]
     var update = List[Byte]()
     _append_frame(
         update, Byte(8), Byte(0), UInt32(3), Span(stream_three_credit)
@@ -885,22 +1109,28 @@ def test_http2_response_scheduler_resumes_each_stream_after_window_update() rais
     var header_payload = List[Byte]()
     var first_headers = List[Byte]()
     var second_headers = List[Byte]()
-    _append_frame(first_headers, Byte(1), Byte(0), UInt32(1), Span(header_payload))
-    _append_frame(second_headers, Byte(1), Byte(0), UInt32(3), Span(header_payload))
+    _append_frame(
+        first_headers, Byte(1), Byte(0), UInt32(1), Span(header_payload)
+    )
+    _append_frame(
+        second_headers, Byte(1), Byte(0), UInt32(3), Span(header_payload)
+    )
     var first_body: List[Byte] = [
-        Byte(ord("a")), Byte(ord("b")), Byte(ord("c")),
-        Byte(ord("d")), Byte(ord("e")),
+        Byte(ord("a")),
+        Byte(ord("b")),
+        Byte(ord("c")),
+        Byte(ord("d")),
+        Byte(ord("e")),
     ]
     var second_body: List[Byte] = [
-        Byte(ord("v")), Byte(ord("w")), Byte(ord("x")),
-        Byte(ord("y")), Byte(ord("z")),
+        Byte(ord("v")),
+        Byte(ord("w")),
+        Byte(ord("x")),
+        Byte(ord("y")),
+        Byte(ord("z")),
     ]
-    assert_true(
-        scheduler.enqueue(UInt32(1), first_headers^, first_body^)
-    )
-    assert_true(
-        scheduler.enqueue(UInt32(3), second_headers^, second_body^)
-    )
+    assert_true(scheduler.enqueue(UInt32(1), first_headers^, first_body^))
+    assert_true(scheduler.enqueue(UInt32(3), second_headers^, second_body^))
     var first_batch = scheduler.drain(session, 2, 256)
     assert_equal(len(first_batch.completed_streams), 0)
     var first_data_streams = List[UInt32]()
@@ -919,12 +1149,8 @@ def test_http2_response_scheduler_resumes_each_stream_after_window_update() rais
     assert_equal(session.send_window(UInt32(3)), 0)
 
     var more_credit = List[Byte]()
-    var first_increment: List[Byte] = [
-        Byte(0), Byte(0), Byte(0), Byte(3)
-    ]
-    var second_increment: List[Byte] = [
-        Byte(0), Byte(0), Byte(0), Byte(1)
-    ]
+    var first_increment: List[Byte] = [Byte(0), Byte(0), Byte(0), Byte(3)]
+    var second_increment: List[Byte] = [Byte(0), Byte(0), Byte(0), Byte(1)]
     _append_frame(
         more_credit, Byte(8), Byte(0), UInt32(1), Span(first_increment)
     )
@@ -959,9 +1185,7 @@ def test_http2_response_scheduler_resumes_each_stream_after_window_update() rais
     _append_frame(
         cancel_headers, Byte(1), Byte(0), UInt32(5), Span(header_payload)
     )
-    assert_true(
-        cancelled.enqueue(UInt32(5), cancel_headers^, cancel_body^)
-    )
+    assert_true(cancelled.enqueue(UInt32(5), cancel_headers^, cancel_body^))
     assert_equal(cancelled.cancel(UInt32(5)), 11)
     assert_equal(cancelled.cancel(UInt32(5)), 0)
     assert_equal(cancelled.queued_count(), 0)
@@ -976,11 +1200,26 @@ def test_http2_request_session_reports_reset_stream_for_response_cancel() raises
     var empty = List[Byte]()
     _append_frame(wire, Byte(4), Byte(0), UInt32(0), Span(empty))
     var compressed: List[Byte] = [
-        Byte(0x82), Byte(0x86), Byte(0x84), Byte(0x41), Byte(0x0F),
-        Byte(ord("w")), Byte(ord("w")), Byte(ord("w")), Byte(ord(".")),
-        Byte(ord("e")), Byte(ord("x")), Byte(ord("a")), Byte(ord("m")),
-        Byte(ord("p")), Byte(ord("l")), Byte(ord("e")), Byte(ord(".")),
-        Byte(ord("c")), Byte(ord("o")), Byte(ord("m")),
+        Byte(0x82),
+        Byte(0x86),
+        Byte(0x84),
+        Byte(0x41),
+        Byte(0x0F),
+        Byte(ord("w")),
+        Byte(ord("w")),
+        Byte(ord("w")),
+        Byte(ord(".")),
+        Byte(ord("e")),
+        Byte(ord("x")),
+        Byte(ord("a")),
+        Byte(ord("m")),
+        Byte(ord("p")),
+        Byte(ord("l")),
+        Byte(ord("e")),
+        Byte(ord(".")),
+        Byte(ord("c")),
+        Byte(ord("o")),
+        Byte(ord("m")),
     ]
     _append_frame(wire, Byte(1), Byte(5), UInt32(1), Span(compressed))
     var request = session.consume(Span(wire))
@@ -1018,11 +1257,26 @@ def test_http2_request_session_rejects_reset_on_idle_server_stream() raises:
     var empty = List[Byte]()
     _append_frame(wire, Byte(4), Byte(0), UInt32(0), Span(empty))
     var compressed: List[Byte] = [
-        Byte(0x82), Byte(0x86), Byte(0x84), Byte(0x41), Byte(0x0F),
-        Byte(ord("w")), Byte(ord("w")), Byte(ord("w")), Byte(ord(".")),
-        Byte(ord("e")), Byte(ord("x")), Byte(ord("a")), Byte(ord("m")),
-        Byte(ord("p")), Byte(ord("l")), Byte(ord("e")), Byte(ord(".")),
-        Byte(ord("c")), Byte(ord("o")), Byte(ord("m")),
+        Byte(0x82),
+        Byte(0x86),
+        Byte(0x84),
+        Byte(0x41),
+        Byte(0x0F),
+        Byte(ord("w")),
+        Byte(ord("w")),
+        Byte(ord("w")),
+        Byte(ord(".")),
+        Byte(ord("e")),
+        Byte(ord("x")),
+        Byte(ord("a")),
+        Byte(ord("m")),
+        Byte(ord("p")),
+        Byte(ord("l")),
+        Byte(ord("e")),
+        Byte(ord(".")),
+        Byte(ord("c")),
+        Byte(ord("o")),
+        Byte(ord("m")),
     ]
     _append_frame(wire, Byte(1), Byte(5), UInt32(3), Span(compressed))
     var request = session.consume(Span(wire))
@@ -1043,11 +1297,26 @@ def test_http2_request_session_returns_padding_flow_credit() raises:
     var empty: List[Byte] = List[Byte]()
     _append_frame(wire, Byte(4), Byte(0), UInt32(0), Span(empty))
     var compressed: List[Byte] = [
-        Byte(0x82), Byte(0x86), Byte(0x84), Byte(0x41), Byte(0x0F),
-        Byte(ord("w")), Byte(ord("w")), Byte(ord("w")), Byte(ord(".")),
-        Byte(ord("e")), Byte(ord("x")), Byte(ord("a")), Byte(ord("m")),
-        Byte(ord("p")), Byte(ord("l")), Byte(ord("e")), Byte(ord(".")),
-        Byte(ord("c")), Byte(ord("o")), Byte(ord("m")),
+        Byte(0x82),
+        Byte(0x86),
+        Byte(0x84),
+        Byte(0x41),
+        Byte(0x0F),
+        Byte(ord("w")),
+        Byte(ord("w")),
+        Byte(ord("w")),
+        Byte(ord(".")),
+        Byte(ord("e")),
+        Byte(ord("x")),
+        Byte(ord("a")),
+        Byte(ord("m")),
+        Byte(ord("p")),
+        Byte(ord("l")),
+        Byte(ord("e")),
+        Byte(ord(".")),
+        Byte(ord("c")),
+        Byte(ord("o")),
+        Byte(ord("m")),
     ]
     _append_frame(wire, Byte(1), Byte(4), UInt32(1), Span(compressed))
     var padded: List[Byte] = [Byte(2), Byte(ord("x")), Byte(0), Byte(0)]
@@ -1059,6 +1328,7 @@ def test_http2_request_session_returns_padding_flow_credit() raises:
     assert_equal(len(result.output), 50)
     assert_equal(result.output[36], Byte(4))
     assert_equal(result.output[49], Byte(4))
+
 
 def main() raises:
     TestSuite.discover_tests[__functions_in_module()]().run()

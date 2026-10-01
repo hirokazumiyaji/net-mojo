@@ -54,9 +54,7 @@ struct Http2ConnectionBootstrap(Movable):
         self._frame = List[Byte]()
         self._preface_complete = False
         self._ready = False
-        self._failed = (
-            max_frame_size < 16384 or max_frame_size > 0xFFFFFF
-        )
+        self._failed = max_frame_size < 16384 or max_frame_size > 0xFFFFFF
 
     def consume[
         origin: Origin

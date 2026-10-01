@@ -370,7 +370,9 @@ def encode_error(
     if should_close:
         _append_string(out, String("Connection: close\r\n"))
     if alt_svc.byte_length() > 0:
-        _append_string(out, String("Alt-Svc: ") + String(alt_svc) + String("\r\n"))
+        _append_string(
+            out, String("Alt-Svc: ") + String(alt_svc) + String("\r\n")
+        )
     _append_string(out, String("\r\n"))
     if not is_head:
         _append_string(out, body)

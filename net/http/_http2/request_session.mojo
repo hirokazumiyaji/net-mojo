@@ -284,7 +284,9 @@ struct Http2RequestSession(Movable):
                     )
                     if decoded.is_complete():
                         self._pending_headers_at = NO_DEADLINE
-                        var is_new_stream = self._find_stream(decoded.stream_id) < 0
+                        var is_new_stream = (
+                            self._find_stream(decoded.stream_id) < 0
+                        )
                         if self._draining and is_new_stream:
                             var reset = encode_rst_stream_frame(
                                 decoded.stream_id, UInt32(7)
@@ -332,8 +334,13 @@ struct Http2RequestSession(Movable):
                             )
                         if request_result.is_pending():
                             var index = self._find_stream(decoded.stream_id)
-                            if index >= 0 and self._streams[index].body_at == NO_DEADLINE:
-                                self._streams[index].body_at = deadline_from_now(
+                            if (
+                                index >= 0
+                                and self._streams[index].body_at == NO_DEADLINE
+                            ):
+                                self._streams[
+                                    index
+                                ].body_at = deadline_from_now(
                                     self._body_deadline
                                 )
                     elif decoded.is_pending():
@@ -403,14 +410,11 @@ struct Http2RequestSession(Movable):
                             consumed, input.stream_id, output^, request^
                         )
             elif input.is_reset():
-                if (
-                    input.stream_id > self._last_stream_id
-                    or (input.stream_id & UInt32(1)) == UInt32(0)
-                ):
+                if input.stream_id > self._last_stream_id or (
+                    input.stream_id & UInt32(1)
+                ) == UInt32(0):
                     self._failed = True
-                    return Http2RequestSessionResult.error(
-                        consumed, output^
-                    )
+                    return Http2RequestSessionResult.error(consumed, output^)
                 self._remove_stream(input.stream_id)
                 return Http2RequestSessionResult.pending(
                     consumed, output^, input.stream_id
@@ -421,16 +425,18 @@ struct Http2RequestSession(Movable):
                         Int(input.value)
                     ):
                         self._failed = True
-                        return Http2RequestSessionResult.error(consumed, output^)
+                        return Http2RequestSessionResult.error(
+                            consumed, output^
+                        )
                 else:
                     var send_index = self._find_send_stream(input.stream_id)
-                    if (
-                        send_index >= 0
-                        and not self._send_streams[send_index].window
-                            .apply_window_update(Int(input.value))
-                    ):
+                    if send_index >= 0 and not self._send_streams[
+                        send_index
+                    ].window.apply_window_update(Int(input.value)):
                         self._failed = True
-                        return Http2RequestSessionResult.error(consumed, output^)
+                        return Http2RequestSessionResult.error(
+                            consumed, output^
+                        )
 
             if input.consumed == 0:
                 break
@@ -491,8 +497,7 @@ struct Http2RequestSession(Movable):
                 Int(self._input.peer_settings().initial_window_size), 65535
             )
             var send_entry = _Http2SendWindowEntry(
-                stream_id=decoded.stream_id,
-                window=initial_send_window^
+                stream_id=decoded.stream_id, window=initial_send_window^
             )
             self._send_streams.append(send_entry^)
             index = len(self._streams) - 1
@@ -516,10 +521,9 @@ struct Http2RequestSession(Movable):
         if not data.is_valid():
             return Http2RequestStreamResult.error()
         if index < 0:
-            if (
-                (frame.stream_id & UInt32(1)) == UInt32(1)
-                and frame.stream_id <= self._last_stream_id
-            ):
+            if (frame.stream_id & UInt32(1)) == UInt32(
+                1
+            ) and frame.stream_id <= self._last_stream_id:
                 # DATA may already be in flight before the peer sees RST/END.
                 # Still account for connection flow control and return credit.
                 if frame.payload_length > 0:
@@ -536,11 +540,10 @@ struct Http2RequestSession(Movable):
                     )
                 return Http2RequestStreamResult.pending()
             return Http2RequestStreamResult.error()
-        if (
-            not self._receive_window.receive_data(frame.payload_length)
-            or not self._streams[index].receive_window.receive_data(
-                frame.payload_length
-            )
+        if not self._receive_window.receive_data(
+            frame.payload_length
+        ) or not self._streams[index].receive_window.receive_data(
+            frame.payload_length
         ):
             return Http2RequestStreamResult.error()
         var received = self._streams[index].stream.receive_data(data, payload)
@@ -560,11 +563,10 @@ struct Http2RequestSession(Movable):
         if not received.is_pending() and not received.is_complete():
             return received^
         if frame.payload_length > 0:
-            if (
-                not self._receive_window.release_received(frame.payload_length)
-                or not self._streams[index].receive_window.release_received(
-                    frame.payload_length
-                )
+            if not self._receive_window.release_received(
+                frame.payload_length
+            ) or not self._streams[index].receive_window.release_received(
+                frame.payload_length
             ):
                 return Http2RequestStreamResult.error()
             _append_window_update(output, UInt32(0), frame.payload_length)
