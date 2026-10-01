@@ -164,35 +164,28 @@ class Http3ClientProtocol(QuicConnectionProtocol):
         sibling_a_id, sibling_a = self._start_post(b"data", trailers=False)
         sibling_b_id, sibling_b = self._start_post(b"data", trailers=False)
 
-        storm_id = self._quic.get_next_available_stream_id()
-        self.http.send_headers(
-            storm_id,
-            [
-                (b":method", b"POST"),
-                (b":scheme", b"https"),
-                (b":authority", b"localhost"),
-                (b":path", b"/echo?source=quic"),
-                (b"content-length", b"4"),
-            ],
-            end_stream=False,
-        )
-        self.http.send_data(storm_id, b"da", end_stream=False)
-        self.transmit()
-
-        # Reset-storm the in-flight stream; siblings must still finish.
-        # aioquic 1.3.0 allows reset() once per stream sender, so generate
-        # repeated on-wire reset traffic by duplicating the reset datagrams
-        # instead of calling reset_stream repeatedly.
-        self._quic.reset_stream(storm_id, error_code=H3_REQUEST_CANCELLED)
-        reset_datagrams = list(
-            self._quic.datagrams_to_send(now=self._loop.time())
-        )
-        for data, address in reset_datagrams:
-            self._transport.sendto(data, address)
-        for _ in range(2):
-            for data, address in reset_datagrams:
-                self._transport.sendto(data, address)
-        self.transmit()
+        # Reset-storm with distinct streams; siblings must still finish.
+        # aioquic allows reset() once per stream sender and re-sending the
+        # same encrypted datagram reuses the QUIC packet number (discarded
+        # as duplicate before H3 dispatch), so reset three separate
+        # in-flight streams once each for genuine repeated reset traffic.
+        for _ in range(3):
+            storm_id = self._quic.get_next_available_stream_id()
+            self.http.send_headers(
+                storm_id,
+                [
+                    (b":method", b"POST"),
+                    (b":scheme", b"https"),
+                    (b":authority", b"localhost"),
+                    (b":path", b"/echo?source=quic"),
+                    (b"content-length", b"4"),
+                ],
+                end_stream=False,
+            )
+            self.http.send_data(storm_id, b"da", end_stream=False)
+            self.transmit()
+            self._quic.reset_stream(storm_id, error_code=H3_REQUEST_CANCELLED)
+            self.transmit()
 
         try:
             for stream_id, response, label in (
