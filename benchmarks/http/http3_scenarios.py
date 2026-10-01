@@ -33,6 +33,24 @@ from aioquic.quic.packet import QuicProtocolVersion
 # HTTP/3 request cancelled (RFC 9114)
 H3_REQUEST_CANCELLED = 0x10C
 
+# Expected /fixed response, shared with the main H3 loader
+# (benchmarks/http3_load.py) so every scenario validates payloads alike.
+FIXED_PATH = b"/fixed"
+FIXED_BODY = b"a" * 64
+
+
+def _body_ok(path: bytes, result) -> bool:
+    """True when a response carries the exact expected body for `path`.
+
+    A 200 with a truncated or corrupted body is not a valid measurement, so
+    scenarios count a request only when its payload matches the fixture.
+    """
+    if not isinstance(result, dict):
+        return False
+    if path == FIXED_PATH and bytes(result.get("body", b"")) != FIXED_BODY:
+        return False
+    return True
+
 
 class ScenarioProtocol(QuicConnectionProtocol):
     def __init__(self, *args, drop_rate: float = 0.0, **kwargs) -> None:
@@ -300,18 +318,31 @@ async def run_slow(url: str, slow_s: float, siblings: int) -> dict:
         client.release_stream(slow_id)
         slow_result = await client.await_pending(slow_pending)
 
+    # Siblings must return the exact /fixed payload: a 200 with a truncated
+    # or corrupted body is a multiplexing failure, not a success.
     sibling_ok = sum(
         1
         for r in sibling_results
-        if isinstance(r, dict) and r.get("status") == b"200"
+        if isinstance(r, dict)
+        and r.get("status") == b"200"
+        and _body_ok(path, r)
+    )
+    sibling_body_bad = sum(
+        1
+        for r in sibling_results
+        if isinstance(r, dict)
+        and r.get("status") == b"200"
+        and not _body_ok(path, r)
     )
     sibling_fail = siblings - sibling_ok
     slow_ok = (
         isinstance(slow_result, dict) and slow_result.get("status") == b"200"
     )
-    slow_body_ok = bytes(slow_result.get("body", b"")) == slow_body if isinstance(
-        slow_result, dict
-    ) else False
+    slow_body_ok = (
+        bytes(slow_result.get("body", b"")) == slow_body
+        if isinstance(slow_result, dict)
+        else False
+    )
     elapsed_ms = (time.perf_counter() - t0) * 1000
     # held > 0 proves response bytes arrived while consumption was
     # withheld yet siblings still completed: genuine slow-consumer
@@ -332,6 +363,7 @@ async def run_slow(url: str, slow_s: float, siblings: int) -> dict:
         "slow_ok": int(slow_ok),
         "slow_body_ok": int(slow_body_ok),
         "sibling_ok": sibling_ok,
+        "sibling_body_bad": sibling_body_bad,
         "sibling_fail": sibling_fail,
         "held_bytes": held,
         "slow_unfinished_during_siblings": int(slow_unfinished_during_siblings),
@@ -534,7 +566,7 @@ async def run_loss(
                             return
                         # Same payload check as the main H3 loader: a 200
                         # with a wrong body is not a valid measurement.
-                        if bytes(result["body"]) != b"a" * 64:
+                        if bytes(result["body"]) != FIXED_BODY:
                             counters["failed"] += 1
                             return
                         counters["ok"] += 1
