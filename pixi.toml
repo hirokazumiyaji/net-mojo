@@ -6,22 +6,22 @@ version = "0.1.0"
 
 [tasks]
 format = "mojo format net tests examples benchmarks"
-test-core = "mojo run --Werror -I . tests/test_core.mojo"
-test-ip = "mojo run --Werror -I . tests/test_ip.mojo"
-test-address = "mojo run --Werror -I . tests/test_address.mojo"
-test-sys = "mojo run --Werror -I . tests/test_sys.mojo"
-test-tcp = "mojo run --Werror -I . tests/test_tcp.mojo"
-test-udp = "mojo run --Werror -I . tests/test_udp.mojo"
-test-unix = "mojo run --Werror -I . tests/test_unix.mojo"
-test-poll = "mojo run --Werror -I . tests/test_poll.mojo"
-test-reactor = "mojo run --Werror -I . tests/test_reactor.mojo"
-test-http-api = "mojo run --Werror -I . tests/test_http_api.mojo"
-test-http-parser = "mojo run --Werror -I . tests/test_http_parser.mojo"
-test-http-response = "mojo run --Werror -I . tests/test_http_response.mojo"
-test-http-server = "mojo run --Werror -I . tests/test_http_server.mojo"
-test-http2 = "mojo run --Werror -I . tests/test_http2.mojo"
-test-http-detach = "mojo run --Werror -I . tests/test_http_detach.mojo"
-test-actor = "mojo run --Werror -I . tests/test_actor.mojo"
+test-core = "mojo run --Werror --ignore-deprecated=String.as_c_string_slice --ignore-deprecated=CStringSpan.unsafe_ptr -I . tests/test_core.mojo"
+test-ip = "mojo run --Werror --ignore-deprecated=String.as_c_string_slice --ignore-deprecated=CStringSpan.unsafe_ptr -I . tests/test_ip.mojo"
+test-address = "mojo run --Werror --ignore-deprecated=String.as_c_string_slice --ignore-deprecated=CStringSpan.unsafe_ptr -I . tests/test_address.mojo"
+test-sys = "mojo run --Werror --ignore-deprecated=String.as_c_string_slice --ignore-deprecated=CStringSpan.unsafe_ptr -I . tests/test_sys.mojo"
+test-tcp = "mojo run --Werror --ignore-deprecated=String.as_c_string_slice --ignore-deprecated=CStringSpan.unsafe_ptr -I . tests/test_tcp.mojo"
+test-udp = "mojo run --Werror --ignore-deprecated=String.as_c_string_slice --ignore-deprecated=CStringSpan.unsafe_ptr -I . tests/test_udp.mojo"
+test-unix = "mojo run --Werror --ignore-deprecated=String.as_c_string_slice --ignore-deprecated=CStringSpan.unsafe_ptr -I . tests/test_unix.mojo"
+test-poll = "mojo run --Werror --ignore-deprecated=String.as_c_string_slice --ignore-deprecated=CStringSpan.unsafe_ptr -I . tests/test_poll.mojo"
+test-reactor = "mojo run --Werror --ignore-deprecated=String.as_c_string_slice --ignore-deprecated=CStringSpan.unsafe_ptr -I . tests/test_reactor.mojo"
+test-http-api = "mojo run --Werror --ignore-deprecated=String.as_c_string_slice --ignore-deprecated=CStringSpan.unsafe_ptr -I . tests/test_http_api.mojo"
+test-http-parser = "mojo run --Werror --ignore-deprecated=String.as_c_string_slice --ignore-deprecated=CStringSpan.unsafe_ptr -I . tests/test_http_parser.mojo"
+test-http-response = "mojo run --Werror --ignore-deprecated=String.as_c_string_slice --ignore-deprecated=CStringSpan.unsafe_ptr -I . tests/test_http_response.mojo"
+test-http-server = "mojo run --Werror --ignore-deprecated=String.as_c_string_slice --ignore-deprecated=CStringSpan.unsafe_ptr -I . tests/test_http_server.mojo"
+test-http2 = "mojo run --Werror --ignore-deprecated=String.as_c_string_slice --ignore-deprecated=CStringSpan.unsafe_ptr -I . tests/test_http2.mojo"
+test-http-detach = "mojo run --Werror --ignore-deprecated=String.as_c_string_slice --ignore-deprecated=CStringSpan.unsafe_ptr -I . tests/test_http_detach.mojo"
+test-actor = "mojo run --Werror --ignore-deprecated=String.as_c_string_slice --ignore-deprecated=CStringSpan.unsafe_ptr -I . tests/test_actor.mojo"
 sanitize-sys = "mojo run --sanitize address -I . tests/test_sys.mojo"
 sanitize-tcp = "mojo run --sanitize address -I . tests/test_tcp.mojo"
 sanitize-udp = "mojo run --sanitize address -I . tests/test_udp.mojo"
@@ -57,19 +57,19 @@ test = { depends-on = [
   "test-http-detach",
   "test-actor",
 ] }
-example-tcp = "mojo run --Werror -I . examples/tcp_echo.mojo"
-example-udp = "mojo run --Werror -I . examples/udp_echo.mojo"
-example-unix = "mojo run --Werror -I . examples/unix_echo.mojo"
-example-http-hello = "mojo run --Werror -I . examples/http_hello.mojo"
-example-http-json = "mojo run --Werror -I . examples/http_json.mojo"
-example-http-sse = "mojo run --Werror -I . examples/http_sse.mojo"
+example-tcp = "mojo run --Werror --ignore-deprecated=String.as_c_string_slice --ignore-deprecated=CStringSpan.unsafe_ptr -I . examples/tcp_echo.mojo"
+example-udp = "mojo run --Werror --ignore-deprecated=String.as_c_string_slice --ignore-deprecated=CStringSpan.unsafe_ptr -I . examples/udp_echo.mojo"
+example-unix = "mojo run --Werror --ignore-deprecated=String.as_c_string_slice --ignore-deprecated=CStringSpan.unsafe_ptr -I . examples/unix_echo.mojo"
+example-http-hello = "mojo run --Werror --ignore-deprecated=String.as_c_string_slice --ignore-deprecated=CStringSpan.unsafe_ptr -I . examples/http_hello.mojo"
+example-http-json = "mojo run --Werror --ignore-deprecated=String.as_c_string_slice --ignore-deprecated=CStringSpan.unsafe_ptr -I . examples/http_json.mojo"
+example-http-sse = "mojo run --Werror --ignore-deprecated=String.as_c_string_slice --ignore-deprecated=CStringSpan.unsafe_ptr -I . examples/http_sse.mojo"
 package = "mkdir -p build && mojo precompile net -o build/net.mojoc"
-test-package = "mojo run --Werror -I build tests/package_smoke.mojo"
-benchmark-ip = "mojo run --Werror -I . benchmarks/ip_parse.mojo"
-benchmark-loopback = "mojo run --Werror -I . benchmarks/loopback_io.mojo"
-benchmark-http-parse = "mojo run --Werror -I . benchmarks/http_parse.mojo"
-benchmark-http-server = "mojo run --Werror -I . benchmarks/http_server.mojo"
-benchmark-http-stream = "mojo run --Werror -I . benchmarks/http_stream.mojo"
+test-package = "mojo run --Werror --ignore-deprecated=String.as_c_string_slice --ignore-deprecated=CStringSpan.unsafe_ptr -I build tests/package_smoke.mojo"
+benchmark-ip = "mojo run --Werror --ignore-deprecated=String.as_c_string_slice --ignore-deprecated=CStringSpan.unsafe_ptr -I . benchmarks/ip_parse.mojo"
+benchmark-loopback = "mojo run --Werror --ignore-deprecated=String.as_c_string_slice --ignore-deprecated=CStringSpan.unsafe_ptr -I . benchmarks/loopback_io.mojo"
+benchmark-http-parse = "mojo run --Werror --ignore-deprecated=String.as_c_string_slice --ignore-deprecated=CStringSpan.unsafe_ptr -I . benchmarks/http_parse.mojo"
+benchmark-http-server = "mojo run --Werror --ignore-deprecated=String.as_c_string_slice --ignore-deprecated=CStringSpan.unsafe_ptr -I . benchmarks/http_server.mojo"
+benchmark-http-stream = "mojo run --Werror --ignore-deprecated=String.as_c_string_slice --ignore-deprecated=CStringSpan.unsafe_ptr -I . benchmarks/http_stream.mojo"
 
 [feature.tls.dependencies]
 c-compiler = "*"
@@ -84,10 +84,10 @@ pkg-config = "*"
 
 [feature.http2.tasks]
 hpack-test = "bash scripts/build_hpack_shim.sh"
-hpack-mojo-test = { cmd = "mojo run --Werror -I . tests/test_hpack.mojo", depends-on = [
+hpack-mojo-test = { cmd = "mojo run --Werror --ignore-deprecated=String.as_c_string_slice --ignore-deprecated=CStringSpan.unsafe_ptr -I . tests/test_hpack.mojo", depends-on = [
   "hpack-test",
 ] }
-http2-package-smoke = { cmd = "mojo run --Werror -I build tests/http2_package_smoke.mojo", depends-on = [
+http2-package-smoke = { cmd = "mojo run --Werror --ignore-deprecated=String.as_c_string_slice --ignore-deprecated=CStringSpan.unsafe_ptr -I build tests/http2_package_smoke.mojo", depends-on = [
   "package",
   "hpack-test",
 ] }
@@ -116,7 +116,7 @@ quic-test = { cmd = "build/quic/test_quic_provider build/tls/test-cert.pem build
   "tls-build",
   "quic-build",
 ] }
-quic-mojo-test = { cmd = "mojo run --Werror -I . tests/test_quic_provider.mojo", depends-on = [
+quic-mojo-test = { cmd = "mojo run --Werror --ignore-deprecated=String.as_c_string_slice --ignore-deprecated=CStringSpan.unsafe_ptr -I . tests/test_quic_provider.mojo", depends-on = [
   "tls-build",
   "quic-build",
 ] }
@@ -129,7 +129,7 @@ http3-client-test = { cmd = "python3 scripts/test_http3_server.py", depends-on =
   "tls-build",
   "quic-build",
 ] }
-http3-package-smoke = { cmd = "mojo run --Werror -I build tests/http3_package_smoke.mojo", depends-on = [
+http3-package-smoke = { cmd = "mojo run --Werror --ignore-deprecated=String.as_c_string_slice --ignore-deprecated=CStringSpan.unsafe_ptr -I build tests/http3_package_smoke.mojo", depends-on = [
   "package",
   "tls-build",
   "quic-build",
@@ -141,10 +141,10 @@ http3-example-build = { cmd = "bash scripts/check_http3_example.sh", depends-on 
 
 [feature.tls.tasks]
 tls-build = "bash scripts/build_tls_shim.sh"
-tls-test = { cmd = "mojo run --Werror -I . tests/test_tls.mojo", depends-on = [
+tls-test = { cmd = "mojo run --Werror --ignore-deprecated=String.as_c_string_slice --ignore-deprecated=CStringSpan.unsafe_ptr -I . tests/test_tls.mojo", depends-on = [
   "tls-build",
 ] }
-https-state-test = { cmd = "mojo run --Werror -I . tests/test_https_server.mojo", depends-on = [
+https-state-test = { cmd = "mojo run --Werror --ignore-deprecated=String.as_c_string_slice --ignore-deprecated=CStringSpan.unsafe_ptr -I . tests/test_https_server.mojo", depends-on = [
   "tls-build",
 ] }
 https-client-test = { cmd = "python3 scripts/test_https_server.py", depends-on = [
@@ -159,7 +159,7 @@ tls-suite = { depends-on = [
   "https-client-test",
   "https-example-build",
 ] }
-example-https-hello = { cmd = "mojo run --Werror -I . examples/https_hello.mojo", depends-on = [
+example-https-hello = { cmd = "mojo run --Werror --ignore-deprecated=String.as_c_string_slice --ignore-deprecated=CStringSpan.unsafe_ptr -I . examples/https_hello.mojo", depends-on = [
   "tls-build",
 ] }
 
