@@ -139,10 +139,12 @@ async def _one_connection(
                     counters["failed"] += 1
                     local["failed"] += 1
                     return
-                elapsed = (result["done_at"] or time.perf_counter()) - result["start"]
-                now = time.perf_counter()
+                # Classify by when the stream actually ended (done_at), not by
+                # the later timestamp at which this task is rescheduled.
+                done_at = result["done_at"] or time.perf_counter()
+                elapsed = done_at - result["start"]
                 if result["status"] == b"200":
-                    if now > stop_at:
+                    if done_at > stop_at:
                         counters["late"] = counters.get("late", 0) + 1
                         return
                     # Validate the fixed response body: truncated/empty/wrong
@@ -151,7 +153,7 @@ async def _one_connection(
                         counters["failed"] += 1
                         local["failed"] += 1
                         return
-                    if now >= warmup_until:
+                    if done_at >= warmup_until:
                         counters["ok"] += 1
                         local["ok"] += 1
                         latencies.append(elapsed * 1_000_000.0)  # µs
