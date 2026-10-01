@@ -42,8 +42,10 @@ class Http3ClientProtocol(QuicConnectionProtocol):
         self._ping_id = 1
 
     def transmit(self, drop_next_datagram=False, reorder_datagrams=False):
+        """Flush queued datagrams; returns the number actually sent."""
         self._transmit_task = None
         datagrams = list(self._quic.datagrams_to_send(now=self._loop.time()))
+        sent = 0
 
         if reorder_datagrams:
             if self._held_datagrams:
@@ -66,6 +68,7 @@ class Http3ClientProtocol(QuicConnectionProtocol):
                 dropped = True
                 continue
             self._transport.sendto(data, address)
+            sent += 1
 
         timer_at = self._quic.get_timer()
         if self._timer is not None and self._timer_at != timer_at:
@@ -74,6 +77,7 @@ class Http3ClientProtocol(QuicConnectionProtocol):
         if self._timer is None and timer_at is not None:
             self._timer = self._loop.call_at(timer_at, self._handle_timer)
         self._timer_at = timer_at
+        return sent
 
     def quic_event_received(self, event):
         if isinstance(event, ProtocolNegotiated):
@@ -130,10 +134,21 @@ class Http3ClientProtocol(QuicConnectionProtocol):
             reorder_datagrams=reorder_datagrams,
         )
         if reorder_datagrams and self._held_datagrams:
-            # Single application datagram: emit a PING so we can reorder across packets.
-            self._quic.send_ping(self._ping_id)
-            self._ping_id += 1
-            self.transmit(reorder_datagrams=True)
+            # Single application datagram: emit PINGs until a newer datagram
+            # is actually produced, so the held one is sent after it. Sending
+            # must be observed (aioquic may pace or find no cwnd room), and an
+            # empty transmit leaves nothing to reorder.
+            for _ in range(4):
+                self._quic.send_ping(self._ping_id)
+                self._ping_id += 1
+                sent = self.transmit(reorder_datagrams=True)
+                if sent > 0 and not self._held_datagrams:
+                    break
+            if self.reordered_datagram_batches < 1:
+                raise RuntimeError(
+                    "reorder transmit never produced a newer datagram ahead of "
+                    "the held one"
+                )
         try:
             result = await asyncio.wait_for(response["future"], timeout=10)
             result["stream_id"] = stream_id
@@ -191,11 +206,20 @@ class Http3ClientProtocol(QuicConnectionProtocol):
         self.transmit()
         self._quic.reset_stream(storm_id, error_code=H3_REQUEST_CANCELLED)
         sender = self._quic._get_or_create_stream_for_send(storm_id).sender
-        for _ in range(3):
+        reset_packets = 0
+        for _ in range(6):
             # Re-arm so this transmit emits a fresh RESET_STREAM frame for
-            # the already-reset stream (new packet number each round).
+            # the already-reset stream. Each accepted transmit carries a new
+            # packet number, so repeated packets must actually go on the wire.
             sender.reset_pending = True
-            self.transmit()
+            if self.transmit() > 0:
+                reset_packets += 1
+            if reset_packets >= 3:
+                break
+        if reset_packets < 3:
+            raise RuntimeError(
+                f"expected 3 distinct reset packets, emitted {reset_packets}"
+            )
 
         try:
             for stream_id, response, label in (
