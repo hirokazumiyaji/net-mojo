@@ -1084,7 +1084,19 @@ struct Server(Movable):
             self._mark_detached_cancelled(idx)
             self._cleanup_detached_state(idx)
             self._remove_detached_conn(idx)
-        var wire = encode_error(status, True, self._tick_date, is_head=is_head)
+        # TLS error responses also advertise Alt-Svc when configured,
+        # matching the handler path (_inject_alt_svc_for_tls).
+        var wire: List[Byte]
+        if self._conns[idx].is_tls() and self.config.alt_svc.byte_length() > 0:
+            wire = encode_error(
+                status,
+                True,
+                self._tick_date,
+                is_head=is_head,
+                alt_svc=self.config.alt_svc,
+            )
+        else:
+            wire = encode_error(status, True, self._tick_date, is_head=is_head)
         # Error responses use a small fixed body: when even that does not
         # fit the remaining budget, close bare.
         if not self._budget.try_reserve(len(wire)):
