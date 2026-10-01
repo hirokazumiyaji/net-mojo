@@ -46,7 +46,6 @@ else:
     JSON_BODY = _JSON[:1024]
 
 MAX_ECHO = 1 << 20
-SERVER_NAME = f"aioquic-baseline/{aioquic.__version__}"
 
 
 def _header_map(headers: List[Tuple[bytes, bytes]]) -> Dict[bytes, bytes]:
@@ -136,9 +135,12 @@ class Http3BaselineProtocol(QuicConnectionProtocol):
 
         self._http.send_headers(
             stream_id=stream_id,
+            # Same header set as the Mojo handler (:status, content-type,
+            # content-length): an extra `server` field would charge only
+            # this baseline with additional QPACK bytes on the measured
+            # 64-byte workload.
             headers=[
                 (b":status", status),
-                (b"server", SERVER_NAME.encode()),
                 (b"content-type", content_type),
                 (b"content-length", str(len(body)).encode()),
             ],

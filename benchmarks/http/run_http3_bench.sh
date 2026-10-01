@@ -126,7 +126,9 @@ run_load() {
     local log="$OUT_DIR/${label}_c${clients}_m${streams}_r${run_idx}.log"
 
     (
-        sleep $((WARMUP_S + MEASURE_S / 2))
+        # WARMUP_S / MEASURE_S accept floats (the loader parses them as
+        # such), so compute the sampler delay without Bash integers.
+        sleep "$(python3 -c 'import sys; print(float(sys.argv[1]) + float(sys.argv[2]) / 2)' "$WARMUP_S" "$MEASURE_S")"
         sample_server "$server_pid" "$sample"
     ) &
     local sampler_pid=$!
