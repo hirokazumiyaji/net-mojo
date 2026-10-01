@@ -314,6 +314,10 @@ run_h2_special() {
         "$slow_elapsed" "$h2load_rc" "$slow_rc" \
         | tee -a "$OUT_DIR/special/summary.tsv" | tee -a "$special_log"
     cat "$OUT_DIR/special/h2_${label}_slow_curl.txt" >>"$special_log" || true
+    if [ "$slow_verdict" = "fail" ]; then
+        MATRIX_FAILURES=$((MATRIX_FAILURES + 1))
+        echo "H2 special scenario failed: $label slow" >&2
+    fi
 
     # Cancel: start a slow large POST, abort the client mid-transfer, then
     # verify the server process still accepts a new connection. Note: the
@@ -347,6 +351,10 @@ run_h2_special() {
         "$label" "$cancel_verdict" "$cancel_sib" "$cancel_curl_rc" "$cancel_sib_rc" \
         | tee -a "$OUT_DIR/special/summary.tsv" | tee -a "$special_log"
     cat "$OUT_DIR/special/h2_${label}_cancel_curl.txt" >>"$special_log" || true
+    if [ "$cancel_verdict" = "fail" ]; then
+        MATRIX_FAILURES=$((MATRIX_FAILURES + 1))
+        echo "H2 special scenario failed: $label cancel" >&2
+    fi
 
     # Loss: attempt pf/dummynet; document if unavailable (no passwordless sudo).
     local loss_note="$OUT_DIR/special/h2_${label}_loss.txt"
@@ -403,6 +411,10 @@ run_h2_special() {
     printf 'proto=h2 label=%s scenario=loss verdict=%s detail=%s\n' \
         "$label" "$loss_verdict" "$loss_detail" \
         | tee -a "$OUT_DIR/special/summary.tsv" | tee -a "$special_log"
+    if [ "$loss_verdict" = "fail" ]; then
+        MATRIX_FAILURES=$((MATRIX_FAILURES + 1))
+        echo "H2 special scenario failed: $label loss" >&2
+    fi
 }
 
 run_h3_special() {
