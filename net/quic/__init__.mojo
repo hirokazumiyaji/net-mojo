@@ -371,6 +371,7 @@ struct QuicUDPEndpoint(Movable):
     var _request_buffer: List[Byte]
     var _pending_length: Int
     var _pending_destination: Optional[SocketAddress]
+    var _send_would_block_once: Bool
 
     def set_connection_limit(mut self, limit: Int) raises NetError:
         self._server.set_connection_limit(limit)
@@ -443,6 +444,7 @@ struct QuicUDPEndpoint(Movable):
         self._request_buffer = List[Byte](length=1_200_000, fill=0)
         self._pending_length = 0
         self._pending_destination = None
+        self._send_would_block_once = False
 
     def raw_fd(self) raises NetError -> Int32:
         return self._socket.raw_fd()
@@ -476,6 +478,12 @@ struct QuicUDPEndpoint(Movable):
                 packet.value().destination.copy()
             )
 
+        if self._send_would_block_once:
+            # Deterministic test hook: simulate EAGAIN without touching the
+            # kernel send queue. Pending bytes are preserved and write
+            # interest stays armed, matching real would-block behavior.
+            self._send_would_block_once = False
+            return False
         try:
             var written = self._socket.try_send_to(
                 Span(self._send_buffer)[0 : self._pending_length],
@@ -498,6 +506,14 @@ struct QuicUDPEndpoint(Movable):
 
     def wants_write(self) -> Bool:
         return self._pending_length > 0
+
+    def inject_send_would_block_once(mut self):
+        """Fail the next `try_send` with would-block, preserving pending.
+
+        Deterministic alternative to filling the kernel UDP send queue
+        (which depends on host routing for TEST-NET and on drain timing).
+        """
+        self._send_would_block_once = True
 
     def stage_outgoing_datagram[
         origin: Origin

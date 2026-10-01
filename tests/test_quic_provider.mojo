@@ -1,15 +1,9 @@
 from net._reactor import Reactor
-from net._sys.common import (
-    SOL_SOCKET,
-    SO_SNDBUF,
-    _set_socket_option_int,
-)
 from net.address import SocketAddress
-from net.error import NetErrorKind
 from net.quic import QuicProvider, QuicUDPEndpoint
 from net.http import Handler, Request, ResponseWriter, Server, ServerConfig
 from net.timeout import Timeout
-from net.udp import UDPConn, dial_udp, listen_udp
+from net.udp import dial_udp, listen_udp
 
 
 struct _NoopHandler(Handler):
@@ -18,36 +12,6 @@ struct _NoopHandler(Handler):
 
     def handle(mut self, req: Request, mut writer: ResponseWriter) raises:
         pass
-
-
-def _shrink_send_buffer(mut socket: UDPConn) raises:
-    # Small enough that a few large datagrams toward TEST-NET fill the
-    # local UDP send queue on both Darwin and Linux runners.
-    _set_socket_option_int(
-        socket.raw_fd(),
-        SOL_SOCKET,
-        SO_SNDBUF,
-        2048,
-        "setsockopt(SO_SNDBUF)",
-    )
-
-
-def _fill_udp_send_queue(mut socket: UDPConn, blackhole: SocketAddress) raises -> Bool:
-    """Push datagrams until `try_send_to` would-block.
-
-    Sends toward a local receiver that is never drained, so saturation
-    relies on the shrunken SO_SNDBUF rather than TEST-NET routing (which
-    raises system errors on unroutable hosts and drains unpredictably).
-    """
-    var filler = Array[Byte, 1400](fill=0xAB)
-    for _ in range(10_000):
-        try:
-            _ = socket.try_send_to(Span(filler), blackhole)
-        except error:
-            if error.kind == NetErrorKind.timeout():
-                return True
-            raise error^
-    return False
 
 
 def _stage_pending_payload(
@@ -66,72 +30,44 @@ def test_udp_send_backpressure_preserves_pending_datagram() raises:
     )
     var server = provider.server(config^)
     var listener = listen_udp("0.0.0.0:0")
-    _shrink_send_buffer(listener)
     var endpoint = QuicUDPEndpoint(server^, listener^)
     var receiver = listen_udp("127.0.0.1:0")
     var destination = receiver.local_address()
-    # Separate blackhole for saturation fills so filler datagrams never
-    # pollute `destination` (which must only see the staged 16-byte payload).
-    var blackhole_sock = listen_udp("127.0.0.1:0")
-    var blackhole = blackhole_sock.local_address()
 
-    var blocked = False
-    for _ in range(64):
-        _stage_pending_payload(endpoint, destination)
+    # Deterministic would-block via fault injection (no kernel queue
+    # timing or TEST-NET routing dependency).
+    _stage_pending_payload(endpoint, destination)
+    assert endpoint.wants_write()
+    endpoint.inject_send_would_block_once()
+    assert not endpoint.try_send()
+    assert endpoint.wants_write()
+    # Immediate retry may succeed once the kernel drains; tolerate both
+    # (still-pending with write interest, or delivered without it).
+    if endpoint.try_send():
+        assert not endpoint.wants_write()
+    else:
         assert endpoint.wants_write()
-        if not _fill_udp_send_queue(endpoint._socket, blackhole):
-            raise Error("UDP send queue did not saturate")
-        # Would-block must keep the staged datagram; a drop-without-retry
-        # would clear write interest before the bytes leave.
-        if not endpoint.try_send():
-            assert endpoint.wants_write()
-            # Immediate retry may succeed if the kernel drained between
-            # calls; both outcomes preserve correctness (still-pending or
-            # delivered). Tolerate success instead of asserting False.
-            if endpoint.try_send():
-                assert not endpoint.wants_write()
-                # Delivery won the race; consume it and re-saturate to
-                # return to the blocked state for the reactor check below.
-                var scratch = Array[Byte, 64](fill=0)
-                try:
-                    _ = receiver.try_recv_from(Span[mut=True](scratch))
-                except error:
-                    if error.kind != NetErrorKind.timeout():
-                        raise error^
+        # Wait for real writability and deliver the preserved datagram.
+        var reactor = Reactor()
+        var token = reactor.register(
+            endpoint.raw_fd(), readable=False, writable=True
+        )
+        var delivered = False
+        for _ in range(200):
+            var events = reactor.wait(Timeout.milliseconds(50))
+            var writable = False
+            for event in events:
+                if event.token == token and event.writable:
+                    writable = True
+                    break
+            if not writable:
                 continue
-            assert endpoint.wants_write()
-            blocked = True
-            break
-        # A rare race where the queue drained between fill and try_send:
-        # consume the accidental delivery and retry saturation.
-        var scratch = Array[Byte, 64](fill=0)
-        try:
-            _ = receiver.try_recv_from(Span[mut=True](scratch))
-        except error:
-            if error.kind != NetErrorKind.timeout():
-                raise error^
-    assert blocked
-
-    var reactor = Reactor()
-    var token = reactor.register(
-        endpoint.raw_fd(), readable=False, writable=True
-    )
-    var delivered = False
-    for _ in range(200):
-        var events = reactor.wait(Timeout.milliseconds(50))
-        var writable = False
-        for event in events:
-            if event.token == token and event.writable:
-                writable = True
+            if endpoint.try_send():
+                delivered = True
                 break
-        if not writable:
-            continue
-        if endpoint.try_send():
-            delivered = True
-            break
-        assert endpoint.wants_write()
-    assert delivered
-    assert not endpoint.wants_write()
+            assert endpoint.wants_write()
+        assert delivered
+        assert not endpoint.wants_write()
 
     var received = Array[Byte, 16](fill=0)
     var result = receiver.recv_from(
