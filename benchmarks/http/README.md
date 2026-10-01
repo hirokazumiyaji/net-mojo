@@ -382,8 +382,8 @@ All runs: 0 failed, rc=0.
 | h2 | Mojo | loss | skip | pf/dummynet needs root; no-loss reference 35,860 req/s |
 | h3 | aioquic | slow | pass | held 262,144 B while 8/8 siblings completed |
 | h3 | Mojo | slow | pass | held 262,144 B while 8/8 siblings completed |
-| h3 | aioquic | cancel | pass | reset target in-flight; 8/8 siblings completed |
-| h3 | Mojo | cancel | pass | reset target in-flight; 8/8 siblings completed |
+| h3 | aioquic | cancel | pass | reset target in-flight; 8/8 siblings outstanding across the reset and completed |
+| h3 | Mojo | cancel | pass | reset target in-flight; 8/8 siblings outstanding across the reset and completed |
 | h3 | aioquic | loss | pass | 5% client datagram drop, req/s 5,460, 0 failed |
 | h3 | Mojo | loss | pass | 5% client datagram drop, req/s 6,134, 0 failed |
 
@@ -408,8 +408,10 @@ at both connection counts, and latency stays at or below Go except at 16×1
 where Go's single-stream aggregate hides per-request cost. The 16×1 HTTP/2
 shortfall (69%) is consistent with the PR 9 single-stream result and is
 carried forward as profiling follow-up (TLS/HPACK path cost), not a feature
-cut. HTTP/3 exceeds the Python baseline in every cell with lower median and
-p99 latency. Slow-stream and cancellation scenarios pass on both stacks:
+cut. HTTP/3 exceeds the Python baseline in every cell, with lower median
+latency everywhere and lower p99 in every cell except 1 conn × 10 streams
+(2,023 µs vs 1,961 µs, still within 1.2x). Slow-stream and cancellation
+scenarios pass on both stacks:
 the server keeps serving siblings while a large stream is held (H3) or a
 throttled upload is in flight (H2). Loss via pf/dummynet is skipped on this
 host (no passwordless sudo); the measurable 5% client-side datagram drop

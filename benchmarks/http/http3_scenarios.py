@@ -406,6 +406,14 @@ async def run_cancel(url: str, siblings: int) -> dict:
             client.transmit()
             await asyncio.sleep(0.005)
             was_inflight = not future.done()
+            # Siblings must still be outstanding when the reset fires; on
+            # loopback a 64-byte /fixed can complete before the sleep ends,
+            # which would hide a server that breaks the connection on reset.
+            siblings_outstanding = sum(
+                1
+                for sid, p in client._inflight.items()
+                if sid != stream_id and not p["future"].done()
+            )
             if was_inflight:
                 client._quic.reset_stream(
                     stream_id, error_code=H3_REQUEST_CANCELLED
@@ -413,13 +421,24 @@ async def run_cancel(url: str, siblings: int) -> dict:
                 client.transmit()
             pending["cancelled"] = True
             pending["was_inflight"] = was_inflight
+            pending["siblings_outstanding_at_reset"] = siblings_outstanding
             client._inflight.pop(stream_id, None)
             return pending
 
+        async def _sibling() -> dict:
+            assert isinstance(client, ScenarioProtocol)
+            result = await client.post_echo(sibling_body, authority)
+            body_ok = bytes(result.get("body", b"")) == sibling_body
+            return {"status": result.get("status"), "body_ok": body_ok}
+
         cancel_task = asyncio.create_task(_cancel_large())
+        # Siblings use a large echo so they are still in flight when the
+        # reset fires: 64-byte /fixed responses finish within the 5 ms
+        # window on loopback, which would leave nothing to prove the
+        # connection survives the reset.
+        sibling_body = b"z" * (256 * 1024)
         sibling_tasks = [
-            asyncio.create_task(client.get(path, authority))
-            for _ in range(siblings)
+            asyncio.create_task(_sibling()) for _ in range(siblings)
         ]
         cancelled, sibling_results = await asyncio.gather(
             cancel_task,
@@ -429,15 +448,20 @@ async def run_cancel(url: str, siblings: int) -> dict:
     sibling_ok = sum(
         1
         for r in sibling_results
-        if isinstance(r, dict) and r.get("status") == b"200"
+        if isinstance(r, dict)
+        and r.get("status") == b"200"
+        and r.get("body_ok")
     )
     elapsed_ms = (time.perf_counter() - t0) * 1000
-    # Pass: target was in-flight when reset fired (not already completed)
-    # and siblings still succeed (connection reusable).
+    siblings_outstanding = int(cancelled.get("siblings_outstanding_at_reset", 0))
+    # Pass: target was in-flight when reset fired (not already completed),
+    # at least one sibling was still outstanding across the reset, and all
+    # siblings still succeed (connection reusable).
     verdict = (
         "pass"
         if cancelled.get("cancelled")
         and cancelled.get("was_inflight")
+        and siblings_outstanding > 0
         and sibling_ok == siblings
         else "fail"
     )
@@ -446,6 +470,7 @@ async def run_cancel(url: str, siblings: int) -> dict:
         "verdict": verdict,
         "cancelled": int(bool(cancelled.get("cancelled"))),
         "was_inflight": int(bool(cancelled.get("was_inflight"))),
+        "siblings_outstanding_at_reset": siblings_outstanding,
         "sibling_ok": sibling_ok,
         "sibling_fail": siblings - sibling_ok,
         "elapsed_ms": elapsed_ms,
@@ -504,6 +529,11 @@ async def run_loss(
                         # would inflate throughput and contaminate percentiles.
                         if done_at > stop_at:
                             counters["late"] = counters.get("late", 0) + 1
+                            return
+                        # Same payload check as the main H3 loader: a 200
+                        # with a wrong body is not a valid measurement.
+                        if bytes(result["body"]) != b"a" * 64:
+                            counters["failed"] += 1
                             return
                         counters["ok"] += 1
                         latencies.append((done_at - result["start"]) * 1_000_000.0)
