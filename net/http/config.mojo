@@ -43,7 +43,7 @@ struct ServerConfig(Copyable, Movable):
         return Self(
             max_connections=10000,
             # Soft estimate: 10_000 connections × 256 KiB per-conn quiche charge.
-            quic_max_transport_memory_bytes=2560000000,
+            quic_max_transport_memory_bytes=2621440000,
             max_http2_streams_per_connection=100,
             max_request_line=8192,
             max_headers_bytes=32768,
