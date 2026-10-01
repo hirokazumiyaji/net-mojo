@@ -81,6 +81,14 @@ class Http3BaselineProtocol(QuicConnectionProtocol):
     def _http_event_received(self, event: H3Event) -> None:
         assert self._http is not None
         if isinstance(event, HeadersReceived):
+            existing = self._pending.get(event.stream_id)
+            if existing is not None:
+                # Trailers arrive as a second HeadersReceived without
+                # pseudo-headers; retain the initial method/path/body.
+                if event.stream_ended:
+                    existing.ended = True
+                    self._respond(event.stream_id, existing)
+                return
             headers = _header_map(event.headers)
             method = headers.get(b":method", b"")
             path = headers.get(b":path", b"/")

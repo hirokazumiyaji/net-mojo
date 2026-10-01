@@ -137,6 +137,9 @@ async def _one_connection(
                 elapsed = (result["done_at"] or time.perf_counter()) - result["start"]
                 now = time.perf_counter()
                 if result["status"] == b"200":
+                    if now > stop_at:
+                        counters["late"] = counters.get("late", 0) + 1
+                        return
                     if now >= warmup_until:
                         counters["ok"] += 1
                         latencies.append(elapsed * 1_000_000.0)  # µs
