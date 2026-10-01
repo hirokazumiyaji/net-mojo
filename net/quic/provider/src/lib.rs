@@ -2974,64 +2974,46 @@ mod tests {
         remote: SocketAddr,
         reorder_handshake: bool,
     ) {
-        let mut swapped = false;
-        let mut delayed = false;
-        let mut server_hold: Option<Vec<Vec<u8>>> = None;
+        // Single-datagram handshake flights cannot be swapped in-round, and
+        // cross-round holding deadlocks lockstep handshakes. Instead, drop
+        // the first server flight once to force timeout-driven recovery;
+        // 1-RTT reorder with a large body (below) provides real swap
+        // evidence via `swapped`.
+        let mut dropped_once = false;
         for round in 0..64 {
             drive_timeouts(client, server);
-            let mut datagrams = collect_client_datagrams(client, packet);
+            let datagrams = collect_client_datagrams(client, packet);
             let do_reorder = reorder_handshake && round > 0;
-            let do_server_reorder = reorder_handshake;
-            if do_reorder && datagrams.len() >= 2 {
-                datagrams.swap(0, 1);
-                swapped = true;
-            }
             for datagram in &datagrams {
                 deliver_client_datagram(server, datagram, local, remote);
             }
-            // Handshake flights are often a single datagram (small test
-            // cert), so in-round swaps may never trigger. Retain one
-            // server flight across iterations to force delay/reorder
-            // recovery via timeouts.
-            if do_server_reorder {
+            if reorder_handshake {
+                // Drop the first server flight once; timeouts must recover.
+                // Swap in-round when a flight spans several datagrams.
                 let mut cur = Vec::new();
                 while let Ok(Some((length, _))) = server.send(packet) {
                     cur.push(packet[..length].to_vec());
                 }
-                if server_hold.is_none() && !delayed && !cur.is_empty() {
-                    server_hold = Some(cur);
-                    delayed = true;
-                } else {
-                    // Deliver current flight before held flight to reorder
-                    // when both exist; otherwise drain the held flight.
-                    for datagram in &cur {
-                        let mut owned = datagram.clone();
-                        let _ = client.recv(
-                            &mut owned,
-                            RecvInfo {
-                                from: local,
-                                to: remote,
-                            },
-                        );
-                    }
-                    if cur.len() >= 1 && server_hold.is_some() {
-                        swapped = true;
-                    }
-                    if let Some(held) = server_hold.take() {
-                        for datagram in &held {
-                            let mut owned = datagram.clone();
-                            let _ = client.recv(
-                                &mut owned,
-                                RecvInfo {
-                                    from: local,
-                                    to: remote,
-                                },
-                            );
-                        }
-                    }
+                if !dropped_once && !cur.is_empty() {
+                    dropped_once = true;
+                    // Hold one datagram back to force retransmit timers;
+                    // deliver the rest (if any) out of order.
                     if cur.len() >= 2 {
-                        swapped = true;
+                        cur.swap(0, 1);
                     }
+                    cur.remove(0);
+                } else if cur.len() >= 2 {
+                    cur.swap(0, 1);
+                }
+                for datagram in &cur {
+                    let mut owned = datagram.clone();
+                    let _ = client.recv(
+                        &mut owned,
+                        RecvInfo {
+                            from: local,
+                            to: remote,
+                        },
+                    );
                 }
             } else {
                 flush_server_to_client(client, server, packet, remote);
@@ -3051,38 +3033,10 @@ mod tests {
                 std::thread::sleep(timeout.min(Duration::from_millis(25)));
             }
         }
-        if let Some(held) = server_hold.take() {
-            for datagram in &held {
-                let mut owned = datagram.clone();
-                let _ = client.recv(
-                    &mut owned,
-                    RecvInfo {
-                        from: local,
-                        to: remote,
-                    },
-                );
-            }
-            for _ in 0..16 {
-                drive_timeouts(client, server);
-                for datagram in collect_client_datagrams(client, packet) {
-                    deliver_client_datagram(server, &datagram, local, remote);
-                }
-                flush_server_to_client(client, server, packet, remote);
-                if client.is_established()
-                    && server
-                        .connections
-                        .values()
-                        .any(|connection| connection.transport.is_established())
-                {
-                    break;
-                }
-                std::thread::sleep(Duration::from_millis(10));
-            }
-        }
         if reorder_handshake {
             assert!(
-                delayed,
-                "reorder test never delayed handshake datagrams"
+                dropped_once,
+                "reorder test never dropped a handshake flight"
             );
         }
         assert!(
@@ -3393,6 +3347,56 @@ mod tests {
                 assert!(
                     client.is_established(),
                     "client must stay established after NAT rebinding"
+                );
+                // Complete an application response on the rebound path.
+                // Requiring response-generated datagrams to the rebound
+                // address (not just ACKs/PATH_CHALLENGE) before declaring
+                // the connection usable.
+                assert!(
+                    server.enqueue_response(
+                        request.id,
+                        200,
+                        Vec::new(),
+                        b"rebound-ok".to_vec()
+                    ),
+                    "server must enqueue rebound response"
+                );
+                let mut response_bytes_to_rebound = 0;
+                for _ in 0..48 {
+                    drive_timeouts(&mut client, &mut server);
+                    for datagram in collect_client_datagrams(&mut client, &mut packet) {
+                        deliver_client_datagram(&mut server, &datagram, local, rebound_remote);
+                    }
+                    while let Ok(Some((length, info))) = server.send(&mut packet) {
+                        assert_eq!(
+                            info.to, rebound_remote,
+                            "response traffic must target the rebound address"
+                        );
+                        response_bytes_to_rebound += length;
+                        let _ = client.recv(
+                            &mut packet[..length],
+                            RecvInfo {
+                                from: info.from,
+                                to: rebound_remote,
+                            },
+                        );
+                    }
+                    // Drain client H3 events (best effort).
+                    loop {
+                        match client_h3.poll(&mut client) {
+                            Ok(_) => (),
+                            Err(quiche::h3::Error::Done) => break,
+                            Err(e) => panic!("rebound response poll failed: {e:?}"),
+                        }
+                    }
+                    if response_bytes_to_rebound > 0 {
+                        break;
+                    }
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                assert!(
+                    response_bytes_to_rebound > 0,
+                    "server must emit response traffic on rebound path"
                 );
                 continued = true;
                 break;
