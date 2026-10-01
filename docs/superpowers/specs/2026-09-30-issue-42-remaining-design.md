@@ -150,7 +150,7 @@ Depends on PR 4. aioquic/quiche client scripts: reorder application datagrams; r
 ## Success criteria for #42 (non-CI)
 
 - [x] PRs 1–8 implemented on the open stack ([#71](https://github.com/hirokazumiyaji/net-mojo/pull/71)–[#78](https://github.com/hirokazumiyaji/net-mojo/pull/78); sibling branches — code not in this worktree tip).
-- [x] PRs 9–11 with real numbers in `benchmarks/http/README.md` ([#79](https://github.com/hirokazumiyaji/net-mojo/pull/79)–[#81](https://github.com/hirokazumiyaji/net-mojo/pull/81); this branch stack).
+- [ ] PRs 9–11 with real numbers in `benchmarks/http/README.md` ([#79](https://github.com/hirokazumiyaji/net-mojo/pull/79)–[#81](https://github.com/hirokazumiyaji/net-mojo/pull/81); this branch stack). Harnesses and PR 9/10 measurements are committed; the multiplex matrix numbers and induced-loss runs are still outstanding.
 - [x] PR 12 docs match the intended ops model and record stack status honestly (this PR; no claim that #71–#78 code lives here).
 - [x] Shared handler serves H1/H2/H3; TLS ALPN `h2` and QUIC ALPN `h3` verified by independent clients (already on `main`; extended by #78).
 - [x] Flood bounds, explicit 0-RTT off, Alt-Svc, transport memory story documented and tested (#71–#77 on sibling branches; ops docs here).
