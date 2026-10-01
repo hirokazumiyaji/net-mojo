@@ -300,24 +300,56 @@ def test_http2_reset_flood_isolates_connections():
             if error_code != 11:
                 raise RuntimeError(f"expected ENHANCE_YOUR_CALM, got {error_code}")
 
-            # No further request completes on the flooded connection.
+            # No further request completes on the flooded connection, and the
+            # server must close it after flushing GOAWAY (not leave it idle
+            # until timeout). A timeout here means the leak is present.
             client_a.sendall(_h2_headers_frame(5, flags=0x05))
-            saw_success = False
+            closed = False
             try:
-                for _ in range(8):
-                    frame_type, flags, stream_id, payload = read_h2_frame(client_a)
+                for _ in range(16):
+                    frame_type, flags, stream_id, payload = read_h2_frame(
+                        client_a
+                    )
                     if stream_id == 5 and frame_type == 1:
-                        saw_success = True
-                        break
-                    if stream_id == 5 and frame_type == 3:
-                        break
-                    if frame_type == 7:
-                        break
-            except (TimeoutError, socket.timeout, ssl.SSLError, OSError, RuntimeError):
-                pass
-            if saw_success:
+                        raise RuntimeError(
+                            "flooded connection completed a request after GOAWAY"
+                        )
+                    # RST for stream 5 or another GOAWAY does not prove the
+                    # connection closed; keep reading until EOF/reset.
+                    continue
+            except (TimeoutError, socket.timeout) as exc:
                 raise RuntimeError(
-                    "flooded connection completed a request after GOAWAY"
+                    "flooded connection stayed open after GOAWAY "
+                    "(expected EOF/reset, got timeout)"
+                ) from exc
+            except RuntimeError as exc:
+                if "connection closed" in str(exc) or "incomplete HTTP/2" in str(
+                    exc
+                ):
+                    closed = True
+                else:
+                    raise
+            except (ssl.SSLError, OSError) as exc:
+                msg = str(exc).lower()
+                if any(
+                    s in msg
+                    for s in (
+                        "closed",
+                        "reset",
+                        "eof",
+                        "broken pipe",
+                        "connection",
+                    )
+                ):
+                    closed = True
+                else:
+                    raise RuntimeError(
+                        f"unexpected error waiting for flooded close: {exc!r}"
+                    ) from exc
+            if not closed:
+                raise RuntimeError(
+                    "flooded connection stayed open after GOAWAY "
+                    "(expected EOF/reset)"
                 )
 
             # Connection B remains healthy.
@@ -477,7 +509,7 @@ try:
                 limited_headers[0] != 1
                 or limited_headers[2] != 1
                 or (limited_headers[1] & 1) != 0
-or not hpack_starts_with_status_200(limited_headers[3])
+                or not hpack_starts_with_status_200(limited_headers[3])
             ):
                 raise RuntimeError(
                     f"server exceeded a zero HTTP/2 send window: {limited_headers!r}"
