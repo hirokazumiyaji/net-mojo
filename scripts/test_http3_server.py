@@ -180,8 +180,18 @@ class Http3ClientProtocol(QuicConnectionProtocol):
         self.transmit()
 
         # Reset-storm the in-flight stream; siblings must still finish.
-        for _ in range(3):
-            self._quic.reset_stream(storm_id, error_code=H3_REQUEST_CANCELLED)
+        # aioquic 1.3.0 allows reset() once per stream sender, so generate
+        # repeated on-wire reset traffic by duplicating the reset datagrams
+        # instead of calling reset_stream repeatedly.
+        self._quic.reset_stream(storm_id, error_code=H3_REQUEST_CANCELLED)
+        reset_datagrams = list(
+            self._quic.datagrams_to_send(now=self._loop.time())
+        )
+        for data, address in reset_datagrams:
+            self._transport.sendto(data, address)
+        for _ in range(2):
+            for data, address in reset_datagrams:
+                self._transport.sendto(data, address)
         self.transmit()
 
         try:
