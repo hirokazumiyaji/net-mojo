@@ -197,12 +197,17 @@ WARMUP_S=10 MEASURE_S=30 RUNS=5 CLIENTS=64 STREAMS="1 10" \
 
 ### Results (mean of 5 runs; req/s from h2load; latency = h2load request median/p95/p99)
 
-| Server | Conns | Streams | req/s (mean) | p50 (µs) | p95 (µs) | p99 (µs) | CPU % | RSS (MB) | fd |
+| Server | Conns | Streams | req/s (mean) | p50 (µs) | p95 (µs) | p99 (µs) | CPU % | RSS (MB) | fd* |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| Go HTTPS+H2 | 64 | 1 | 42,551 | 1,300 | 2,368 | 2,882 | ~99 | ~20 | 75 |
-| Mojo HTTPS+H2 | 64 | 1 | 32,504 | 1,966 | 2,070 | 2,180 | ~99 | ~38 | 85 |
-| Go HTTPS+H2 | 64 | 10 | 52,101 | 11,554 | 21,252 | 25,592 | ~99 | ~32 | 75 |
-| Mojo HTTPS+H2 | 64 | 10 | 51,223 | 11,964 | 15,662 | 17,802 | ~99 | ~39 | 85 |
+| Go HTTPS+H2 | 64 | 1 | 42,551 | 1,300 | 2,368 | 2,882 | ~99 | ~20 | 75* |
+| Mojo HTTPS+H2 | 64 | 1 | 32,504 | 1,966 | 2,070 | 2,180 | ~99 | ~38 | 85* |
+| Go HTTPS+H2 | 64 | 10 | 52,101 | 11,554 | 21,252 | 25,592 | ~99 | ~32 | 75* |
+| Mojo HTTPS+H2 | 64 | 10 | 51,223 | 11,964 | 15,662 | 17,802 | ~99 | ~39 | 85* |
+
+\* `fd` was counted with the old `lsof -p | wc -l` sampler (includes header,
+`cwd`/`txt`/mapped libraries). The harness now counts numeric FDs only;
+these published values are inflated and will be recomputed on the next full
+run.
 
 Per-run req/s ranges: Go m=1 42,164–43,082; Mojo m=1 32,485–32,531; Go m=10 51,928–52,205; Mojo m=10 50,551–51,526. All runs: 0 failed / 0 errored.
 

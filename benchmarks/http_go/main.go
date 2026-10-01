@@ -75,9 +75,12 @@ func echoHandler(w http.ResponseWriter, r *http.Request) {
 	// The body is now fully consumed: restart a 30s write phase so a
 	// slow upload does not eat the response budget. Go arms
 	// WriteTimeout at header completion, which would otherwise leave
-	// about a second to write after a 29s body.
-	if c, ok := r.Context().Value(connKey{}).(net.Conn); ok {
-		_ = c.SetWriteDeadline(time.Now().Add(30 * time.Second))
+	// about a second to write after a 29s body. Skipped for HTTP/2:
+	// the deadline is connection-wide and would affect sibling streams.
+	if r.ProtoMajor < 2 {
+		if c, ok := r.Context().Value(connKey{}).(net.Conn); ok {
+			_ = c.SetWriteDeadline(time.Now().Add(30 * time.Second))
+		}
 	}
 	if len(body) > maxBody {
 		http.Error(w, "Content Too Large", http.StatusRequestEntityTooLarge)
@@ -96,8 +99,14 @@ type connKey struct{}
 // otherwise runs from the first byte, so a client spending most
 // of the header budget would steal time from the body phase that the
 // Mojo server grants separately (5s headers, then a fresh 30s body).
+// Skipped for multiplexed HTTP/2 (ProtoMajor == 2): the deadline would
+// apply connection-wide and one stream could reset/expire siblings.
 func withBodyDeadline(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.ProtoMajor >= 2 {
+			next.ServeHTTP(w, r)
+			return
+		}
 		if c, ok := r.Context().Value(connKey{}).(net.Conn); ok {
 			// Best effort: a failed reset just leaves ReadTimeout armed.
 			_ = c.SetReadDeadline(time.Now().Add(30 * time.Second))
