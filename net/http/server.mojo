@@ -1246,7 +1246,14 @@ struct Server(Movable):
                 # Failed session draining GOAWAY: flush pending output only.
                 # Do not read or parse further bytes; the failed session can
                 # never drain them and they would consume shared budget.
-                self._sync_interests(idx)
+                # Drop read interest as well: wants_read() stays true for
+                # STATE_SENDING_HTTP2_CONTROL, which would keep waking this
+                # connection on attacker-controlled readability.
+                _ = self._reactor.modify(
+                    self._conns[idx].token,
+                    False,
+                    self._conns[idx].wants_write(),
+                )
                 return
             var read_event = (
                 self._conns[idx].read_ready(readable, writable)
