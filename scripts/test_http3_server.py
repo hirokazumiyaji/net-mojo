@@ -214,15 +214,17 @@ class Http3ClientProtocol(QuicConnectionProtocol):
         self._quic.reset_stream(storm_id, error_code=H3_REQUEST_CANCELLED)
         sender = self._quic._get_or_create_stream_for_send(storm_id).sender
         reset_packets = 0
-        for _ in range(6):
-            # Re-arm so this transmit emits a fresh RESET_STREAM frame for
-            # the already-reset stream. Each accepted transmit carries a new
-            # packet number, so repeated packets must actually go on the wire.
+        deadline = self._loop.time() + 3.0
+        # Re-arm so each transmit emits a fresh RESET_STREAM frame for the
+        # already-reset stream. Yield between attempts: aioquic's pacer or
+        # congestion window may suppress a packet, and without yielding no
+        # ACK can arrive to free capacity.
+        while reset_packets < 3 and self._loop.time() < deadline:
             sender.reset_pending = True
             if self.transmit() > 0:
                 reset_packets += 1
-            if reset_packets >= 3:
-                break
+                continue
+            await asyncio.sleep(0.05)
         if reset_packets < 3:
             raise RuntimeError(
                 f"expected 3 distinct reset packets, emitted {reset_packets}"
