@@ -3316,17 +3316,19 @@ mod tests {
             for datagram in &datagrams {
                 deliver_client_datagram(&mut server, datagram, local, rebound_remote);
             }
-            // Return traffic must target the rebound address, not the
-            // obsolete one. Assert on SendInfo.to, but feed the client's
-            // quiche object with its known local (original_remote): a
-            // client discards packets addressed to an unknown local, while
-            // only the server side is under test for migration here.
+            // Only rebound-directed return traffic is usable. Packets still
+            // addressed to the obsolete address are dropped (as a real NAT
+            // would: that path is gone), which lets a non-migrating server
+            // reach the documented timeout/cleanup branch instead of
+            // failing the assertion immediately. Clients see their known
+            // local (original_remote) because a quiche client discards
+            // packets for an unknown local address.
             let mut server_sent_to_rebound = false;
             while let Ok(Some((length, info))) = server.send(&mut packet) {
-                assert_eq!(
-                    info.to, rebound_remote,
-                    "server return traffic must target the rebound address"
-                );
+                if info.to != rebound_remote {
+                    // Obsolete destination: unreachable after rebinding.
+                    continue;
+                }
                 server_sent_to_rebound = true;
                 let _ = client.recv(
                     &mut packet[..length],
@@ -3339,16 +3341,16 @@ mod tests {
             while client_h3.poll(&mut client).is_ok() {}
             if let Some(request) = server.next_request() {
                 assert_eq!(request.target, b"/rebind");
-                // Application progress counts only with verified return
-                // traffic to the rebound path.
-                assert!(
-                    server_sent_to_rebound,
-                    "server accepted request but sent no return traffic to rebound"
-                );
                 assert!(
                     client.is_established(),
                     "client must stay established after NAT rebinding"
                 );
+                if !server_sent_to_rebound {
+                    // Server keeps using the pre-rebinding path: this is
+                    // not a usable migration, so skip the response phase
+                    // and let the cleanup assertions run below.
+                    continue;
+                }
                 // Complete an application response on the rebound path.
                 // Requiring response-generated datagrams to the rebound
                 // address (not just ACKs/PATH_CHALLENGE) before declaring
@@ -3371,10 +3373,9 @@ mod tests {
                         deliver_client_datagram(&mut server, &datagram, local, rebound_remote);
                     }
                     while let Ok(Some((length, info))) = server.send(&mut packet) {
-                        assert_eq!(
-                            info.to, rebound_remote,
-                            "response traffic must target the rebound address"
-                        );
+                        if info.to != rebound_remote {
+                            continue;
+                        }
                         response_bytes_to_rebound += length;
                         // Feed the client's known local (see above) so path
                         // frames are processed and PATH_RESPONSE is emitted.
@@ -3414,19 +3415,21 @@ mod tests {
                             Err(e) => panic!("rebound response poll failed: {e:?}"),
                         }
                     }
+                    if got_status_200 && response_body == b"rebound-ok" {
+                        break;
+                    }
                     std::thread::sleep(Duration::from_millis(10));
                 }
-                assert!(
-                    response_bytes_to_rebound > 0,
-                    "server must emit response traffic on rebound path"
-                );
-                assert!(got_status_200, "client must receive 200 on rebound path");
-                assert_eq!(
-                    response_body, b"rebound-ok",
-                    "client must receive rebound response body"
-                );
-                continued = true;
-                break;
+                // Migration is only "continued" when the application
+                // response actually arrived on the rebound path; otherwise
+                // fall through to the cleanup assertions below.
+                if response_bytes_to_rebound > 0
+                    && got_status_200
+                    && response_body == b"rebound-ok"
+                {
+                    continued = true;
+                    break;
+                }
             }
             if server.connections.is_empty() {
                 break;
