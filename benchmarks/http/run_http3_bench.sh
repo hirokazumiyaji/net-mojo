@@ -36,6 +36,7 @@ BASELINE_ADDR="127.0.0.1:18452"
 MOJO_ADDR="127.0.0.1:18453"
 OUT_DIR="${OUT_DIR:-build/bench/http3}"
 MOJO_BIN="${MOJO_BIN:-$OUT_DIR/http3_server}"
+BENCH_FAILURES=0
 PIXI_ENV="${PIXI_ENV:-tls-http3}"
 # Resolve the env interpreter once so backgrounded servers are the real
 # Python process (not a pixi wrapper), which matters for CPU/RSS sampling.
@@ -72,7 +73,8 @@ sample_server() {
     cpu="$(ps -o %cpu= -p "$pid" 2>/dev/null | tr -d ' ' || echo "?")"
     rss="$(ps -o rss= -p "$pid" 2>/dev/null | tr -d ' ' || echo "?")"
     if command -v lsof >/dev/null; then
-        fds="$(lsof -nP -p "$pid" 2>/dev/null | wc -l | tr -d ' ')"
+        fds="$(lsof -nP -p "$pid" 2>/dev/null | awk 'NR>1 && $4 ~ /^[0-9]+[rwu-]*$/ {n++} END{print n+0}')"
+        [ -n "$fds" ] || fds="?"
     else
         fds="?"
     fi
@@ -163,6 +165,10 @@ run_load() {
         | tee -a "$OUT_DIR/summary.tsv"
 
     cp "$out" "$log"
+    if [ "$rc" -ne 0 ]; then
+        BENCH_FAILURES=$((BENCH_FAILURES + 1))
+        echo "benchmark failed: $label c=$clients m=$streams run=$run_idx rc=$rc (see $out)" >&2
+    fi
     return 0
 }
 
@@ -224,3 +230,7 @@ fi
 echo
 echo "== summary ($OUT_DIR/summary.tsv) =="
 column -t -s $'\t' "$OUT_DIR/summary.tsv" 2>/dev/null || cat "$OUT_DIR/summary.tsv"
+if [ "$BENCH_FAILURES" -gt 0 ]; then
+    echo "$BENCH_FAILURES benchmark run(s) failed" >&2
+    exit 1
+fi
