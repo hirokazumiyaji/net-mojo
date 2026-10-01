@@ -2974,16 +2974,15 @@ mod tests {
         remote: SocketAddr,
         reorder_handshake: bool,
     ) {
-        // Single-datagram handshake flights cannot be swapped in-round, and
-        // cross-round holding deadlocks lockstep handshakes. Instead, drop
-        // the first server flight once to force timeout-driven recovery;
-        // 1-RTT reorder with a large body (below) provides real swap
-        // evidence via `swapped`.
+        // Handshake phase exercises packet-loss recovery: single-datagram
+        // lockstep flights cannot be swapped in-round, and holding one
+        // across rounds deadlocks the handshake, so drop the first server
+        // flight once to force timeout-driven recovery. Real reorder
+        // evidence comes from the 1-RTT large-body swap below.
         let mut dropped_once = false;
-        for round in 0..64 {
+        for _ in 0..64 {
             drive_timeouts(client, server);
             let datagrams = collect_client_datagrams(client, packet);
-            let do_reorder = reorder_handshake && round > 0;
             for datagram in &datagrams {
                 deliver_client_datagram(server, datagram, local, remote);
             }
@@ -3318,8 +3317,10 @@ mod tests {
                 deliver_client_datagram(&mut server, datagram, local, rebound_remote);
             }
             // Return traffic must target the rebound address, not the
-            // obsolete one. Deliver server output to the client at the
-            // rebound address and track whether the server actually did so.
+            // obsolete one. Assert on SendInfo.to, but feed the client's
+            // quiche object with its known local (original_remote): a
+            // client discards packets addressed to an unknown local, while
+            // only the server side is under test for migration here.
             let mut server_sent_to_rebound = false;
             while let Ok(Some((length, info))) = server.send(&mut packet) {
                 assert_eq!(
@@ -3331,7 +3332,7 @@ mod tests {
                     &mut packet[..length],
                     RecvInfo {
                         from: info.from,
-                        to: rebound_remote,
+                        to: original_remote,
                     },
                 );
             }
@@ -3362,6 +3363,8 @@ mod tests {
                     "server must enqueue rebound response"
                 );
                 let mut response_bytes_to_rebound = 0;
+                let mut got_status_200 = false;
+                let mut response_body = Vec::new();
                 for _ in 0..48 {
                     drive_timeouts(&mut client, &mut server);
                     for datagram in collect_client_datagrams(&mut client, &mut packet) {
@@ -3373,30 +3376,54 @@ mod tests {
                             "response traffic must target the rebound address"
                         );
                         response_bytes_to_rebound += length;
+                        // Feed the client's known local (see above) so path
+                        // frames are processed and PATH_RESPONSE is emitted.
                         let _ = client.recv(
                             &mut packet[..length],
                             RecvInfo {
                                 from: info.from,
-                                to: rebound_remote,
+                                to: original_remote,
                             },
                         );
                     }
-                    // Drain client H3 events (best effort).
+                    // Drain client H3 events, consuming response bytes via
+                    // recv_body: poll() only reports Data readability, so an
+                    // unconsumed body would be reported again on the next
+                    // poll instead of reaching Done.
                     loop {
                         match client_h3.poll(&mut client) {
+                            Ok((id, quiche::h3::Event::Headers { list, .. })) => {
+                                for header in list {
+                                    if header.name() == b":status"
+                                        && header.value() == b"200"
+                                    {
+                                        got_status_200 = true;
+                                    }
+                                }
+                            }
+                            Ok((id, quiche::h3::Event::Data)) => {
+                                let mut buf = [0; 1024];
+                                while let Ok(n) =
+                                    client_h3.recv_body(&mut client, id, &mut buf)
+                                {
+                                    response_body.extend_from_slice(&buf[..n]);
+                                }
+                            }
                             Ok(_) => (),
                             Err(quiche::h3::Error::Done) => break,
                             Err(e) => panic!("rebound response poll failed: {e:?}"),
                         }
-                    }
-                    if response_bytes_to_rebound > 0 {
-                        break;
                     }
                     std::thread::sleep(Duration::from_millis(10));
                 }
                 assert!(
                     response_bytes_to_rebound > 0,
                     "server must emit response traffic on rebound path"
+                );
+                assert!(got_status_200, "client must receive 200 on rebound path");
+                assert_eq!(
+                    response_body, b"rebound-ok",
+                    "client must receive rebound response body"
                 );
                 continued = true;
                 break;
@@ -3414,9 +3441,11 @@ mod tests {
         }
 
         if continued {
-            // Path accepted: connection remains routed and usable.
-            assert_eq!(server.connections.len(), 1);
-            assert!(!server.routes.is_empty());
+            // Path accepted: the rebound request completed and the client
+            // received the response on the rebound path, proving the
+            // connection is routed and usable. The tight 150ms idle budget
+            // in this test may retire the connection right after serving,
+            // so the close handshake below must handle both cases.
             client.close(true, 0, b"done").ok();
             for _ in 0..32 {
                 drive_timeouts(&mut client, &mut server);
