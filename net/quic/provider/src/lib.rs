@@ -1977,6 +1977,11 @@ mod tests {
             .load_priv_key_from_pem_file(&private_key_path)
             .unwrap();
         super::apply_provider_quic_transport_settings(&mut server_config);
+        // Issue an early-data-capable ticket: the first handshake uses a
+        // server (and client) with early data enabled so the resumed
+        // Initial can actually offer 0-RTT. The server under test below
+        // uses production settings (disabled) to verify rejection.
+        server_config.enable_early_data();
 
         let mut client_config = quiche::Config::new(quiche::PROTOCOL_VERSION).unwrap();
         client_config
@@ -1984,6 +1989,7 @@ mod tests {
             .unwrap();
         client_config.verify_peer(false);
         super::apply_provider_quic_transport_settings(&mut client_config);
+        client_config.enable_early_data();
 
         let client_address = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 54321);
         let server_address = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 4433);
@@ -2061,7 +2067,10 @@ mod tests {
             .expect("session ticket after handshake")
             .to_vec();
 
-        // Resumed connection with the same provider settings must not enter early data.
+        // Resuming client offers 0-RTT; production server must reject it.
+        // Only the server under test uses provider settings (early data
+        // disabled). The resuming client enables early data so the Initial
+        // actually contains a 0-RTT offer.
         let mut resume_server_config = quiche::Config::new(quiche::PROTOCOL_VERSION).unwrap();
         resume_server_config
             .set_application_protos(quiche::h3::APPLICATION_PROTOCOL)
@@ -2079,7 +2088,14 @@ mod tests {
             .set_application_protos(quiche::h3::APPLICATION_PROTOCOL)
             .unwrap();
         resume_client_config.verify_peer(false);
-        super::apply_provider_quic_transport_settings(&mut resume_client_config);
+        resume_client_config.set_initial_max_data(10_000_000);
+        resume_client_config.set_initial_max_stream_data_bidi_local(1_000_000);
+        resume_client_config.set_initial_max_stream_data_bidi_remote(1_000_000);
+        resume_client_config.set_initial_max_stream_data_uni(1_000_000);
+        resume_client_config.set_initial_max_streams_bidi(100);
+        resume_client_config.set_initial_max_streams_uni(3);
+        resume_client_config.set_max_idle_timeout(60_000);
+        resume_client_config.enable_early_data();
 
         let resume_client_scid = [0x33; 16];
         let resume_server_scid = [0x54; 16];
@@ -2094,8 +2110,8 @@ mod tests {
         resume_client.set_session(&session).unwrap();
         let (resume_initial_length, _) = resume_client.send(&mut packet).unwrap();
         assert!(
-            !resume_client.is_in_early_data(),
-            "provider configs must not offer 0-RTT after set_session"
+            resume_client.is_in_early_data(),
+            "resuming client must offer 0-RTT so the server can reject it"
         );
 
         let resume_dcid = Header::from_slice(&mut packet[..resume_initial_length], 16)
