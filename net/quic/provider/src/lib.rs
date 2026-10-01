@@ -2965,23 +2965,75 @@ mod tests {
         remote: SocketAddr,
         reorder_handshake: bool,
     ) {
+        let mut swapped = false;
+        let mut delayed = false;
+        let mut server_hold: Option<Vec<Vec<u8>>> = None;
         for round in 0..64 {
-            pump_in_memory(
-                client,
-                server,
-                packet,
-                local,
-                remote,
-                reorder_handshake && round > 0,
-                false,
-            );
+            drive_timeouts(client, server);
+            let mut datagrams = collect_client_datagrams(client, packet);
+            let do_reorder = reorder_handshake && round > 0;
+            let do_server_reorder = reorder_handshake;
+            if do_reorder && datagrams.len() >= 2 {
+                datagrams.swap(0, 1);
+                swapped = true;
+            }
+            for datagram in &datagrams {
+                deliver_client_datagram(server, datagram, local, remote);
+            }
+            // Handshake flights are often a single datagram (small test
+            // cert), so in-round swaps may never trigger. Retain one
+            // server flight across iterations to force delay/reorder
+            // recovery via timeouts.
+            if do_server_reorder {
+                let mut cur = Vec::new();
+                while let Ok(Some((length, _))) = server.send(packet) {
+                    cur.push(packet[..length].to_vec());
+                }
+                if server_hold.is_none() && !delayed && !cur.is_empty() {
+                    server_hold = Some(cur);
+                    delayed = true;
+                } else {
+                    // Deliver current flight before held flight to reorder
+                    // when both exist; otherwise drain the held flight.
+                    for datagram in &cur {
+                        let mut owned = datagram.clone();
+                        let _ = client.recv(
+                            &mut owned,
+                            RecvInfo {
+                                from: local,
+                                to: remote,
+                            },
+                        );
+                    }
+                    if cur.len() >= 1 && server_hold.is_some() {
+                        swapped = true;
+                    }
+                    if let Some(held) = server_hold.take() {
+                        for datagram in &held {
+                            let mut owned = datagram.clone();
+                            let _ = client.recv(
+                                &mut owned,
+                                RecvInfo {
+                                    from: local,
+                                    to: remote,
+                                },
+                            );
+                        }
+                    }
+                    if cur.len() >= 2 {
+                        swapped = true;
+                    }
+                }
+            } else {
+                flush_server_to_client(client, server, packet, remote);
+            }
             if client.is_established()
                 && server
                     .connections
                     .values()
                     .any(|connection| connection.transport.is_established())
             {
-                return;
+                break;
             }
             // Loss/reorder recovery is timer-driven; advance when quiche asks.
             if let Some(timeout) = client.timeout().filter(|timeout| !timeout.is_zero()) {
@@ -2989,6 +3041,40 @@ mod tests {
             } else if let Some(timeout) = server.timeout().filter(|timeout| !timeout.is_zero()) {
                 std::thread::sleep(timeout.min(Duration::from_millis(25)));
             }
+        }
+        if let Some(held) = server_hold.take() {
+            for datagram in &held {
+                let mut owned = datagram.clone();
+                let _ = client.recv(
+                    &mut owned,
+                    RecvInfo {
+                        from: local,
+                        to: remote,
+                    },
+                );
+            }
+            for _ in 0..16 {
+                drive_timeouts(client, server);
+                for datagram in collect_client_datagrams(client, packet) {
+                    deliver_client_datagram(server, &datagram, local, remote);
+                }
+                flush_server_to_client(client, server, packet, remote);
+                if client.is_established()
+                    && server
+                        .connections
+                        .values()
+                        .any(|connection| connection.transport.is_established())
+                {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        }
+        if reorder_handshake {
+            assert!(
+                delayed,
+                "reorder test never delayed handshake datagrams"
+            );
         }
         assert!(
             client.is_established(),
@@ -3010,28 +3096,77 @@ mod tests {
             &quiche::h3::Config::new().unwrap(),
         )
         .unwrap();
+        // Reorder case needs multiple datagrams per round to actually swap;
+        // use a larger body so 1-RTT data spans several QUIC datagrams.
+        let body: Vec<u8> = if reorder_request_datagrams {
+            vec![0x41; 32 * 1024]
+        } else {
+            b"ping".to_vec()
+        };
+        let content_length = body.len().to_string();
         let request_headers = [
             quiche::h3::Header::new(b":method", b"POST"),
             quiche::h3::Header::new(b":scheme", b"https"),
             quiche::h3::Header::new(b":authority", b"localhost"),
             quiche::h3::Header::new(b":path", b"/stress"),
-            quiche::h3::Header::new(b"content-length", b"4"),
+            quiche::h3::Header::new(b"content-length", content_length.as_bytes()),
         ];
         let stream_id = client_h3
             .send_request(client, &request_headers, false)
             .unwrap();
-        assert_eq!(
-            client_h3
-                .send_body(client, stream_id, b"ping", true)
-                .unwrap(),
-            4
-        );
+        let mut sent = 0;
+        // Send what fits now; remainder is streamed inside the pump loop
+        // as flow control opens (large reorder body would otherwise hit
+        // Done immediately).
+        while sent < body.len() {
+            let end = (sent + 4096).min(body.len());
+            let fin = end == body.len();
+            match client_h3.send_body(client, stream_id, &body[sent..end], fin) {
+                Ok(wrote) => {
+                    sent += wrote;
+                    if wrote == 0 || fin {
+                        break;
+                    }
+                }
+                Err(quiche::h3::Error::Done) => break,
+                Err(e) => panic!("unexpected send_body error: {e:?}"),
+            }
+        }
 
-        for round in 0..64 {
+        let mut swapped = false;
+        let mut carry: Option<Vec<u8>> = None;
+        for _ in 0..64 {
             drive_timeouts(client, server);
+            // Stream remaining request body as credit allows.
+            while sent < body.len() {
+                let end = (sent + 4096).min(body.len());
+                let fin = end == body.len();
+                match client_h3.send_body(client, stream_id, &body[sent..end], fin)
+                {
+                    Ok(wrote) => {
+                        sent += wrote;
+                        if wrote == 0 {
+                            break;
+                        }
+                        if fin && sent >= body.len() {
+                            break;
+                        }
+                    }
+                    Err(quiche::h3::Error::Done) => break,
+                    Err(e) => panic!("unexpected send_body error: {e:?}"),
+                }
+            }
             let mut datagrams = collect_client_datagrams(client, packet);
-            if reorder_request_datagrams && datagrams.len() >= 2 {
-                datagrams.swap(0, 1);
+            if let Some(stashed) = carry.take() {
+                datagrams.insert(0, stashed);
+            }
+            if reorder_request_datagrams {
+                if datagrams.len() >= 2 {
+                    datagrams.swap(0, 1);
+                    swapped = true;
+                } else if datagrams.len() == 1 {
+                    carry = datagrams.pop();
+                }
             }
             for datagram in &datagrams {
                 deliver_client_datagram(server, datagram, local, remote);
@@ -3049,7 +3184,26 @@ mod tests {
             } else if let Some(timeout) = server.timeout().filter(|timeout| !timeout.is_zero()) {
                 std::thread::sleep(timeout.min(Duration::from_millis(25)));
             }
-            let _ = round;
+        }
+        if let Some(stashed) = carry.take() {
+            deliver_client_datagram(server, &stashed, local, remote);
+            for _ in 0..16 {
+                drive_timeouts(client, server);
+                for datagram in collect_client_datagrams(client, packet) {
+                    deliver_client_datagram(server, &datagram, local, remote);
+                }
+                flush_server_to_client(client, server, packet, remote);
+                if !server.requests.is_empty() {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        }
+        if reorder_request_datagrams {
+            assert!(
+                swapped,
+                "reorder test never swapped 1-RTT datagrams"
+            );
         }
 
         server
@@ -3139,7 +3293,8 @@ mod tests {
             false,
             true,
         );
-        assert_eq!(request.body, b"ping");
+        assert_eq!(request.body.len(), 32 * 1024);
+        assert!(request.body.iter().all(|b| *b == 0x41));
     }
 
     #[test]
@@ -3199,9 +3354,37 @@ mod tests {
             for datagram in &datagrams {
                 deliver_client_datagram(&mut server, datagram, local, rebound_remote);
             }
-            flush_server_to_client(&mut client, &mut server, &mut packet, original_remote);
+            // Return traffic must target the rebound address, not the
+            // obsolete one. Deliver server output to the client at the
+            // rebound address and track whether the server actually did so.
+            let mut server_sent_to_rebound = false;
+            while let Ok(Some((length, info))) = server.send(&mut packet) {
+                assert_eq!(
+                    info.to, rebound_remote,
+                    "server return traffic must target the rebound address"
+                );
+                server_sent_to_rebound = true;
+                let _ = client.recv(
+                    &mut packet[..length],
+                    RecvInfo {
+                        from: info.from,
+                        to: rebound_remote,
+                    },
+                );
+            }
             while client_h3.poll(&mut client).is_ok() {}
-            if server.next_request().is_some() {
+            if let Some(request) = server.next_request() {
+                assert_eq!(request.target, b"/rebind");
+                // Application progress counts only with verified return
+                // traffic to the rebound path.
+                assert!(
+                    server_sent_to_rebound,
+                    "server accepted request but sent no return traffic to rebound"
+                );
+                assert!(
+                    client.is_established(),
+                    "client must stay established after NAT rebinding"
+                );
                 continued = true;
                 break;
             }
@@ -3227,7 +3410,15 @@ mod tests {
                 for datagram in collect_client_datagrams(&mut client, &mut packet) {
                     deliver_client_datagram(&mut server, &datagram, local, rebound_remote);
                 }
-                flush_server_to_client(&mut client, &mut server, &mut packet, original_remote);
+                while let Ok(Some((length, info))) = server.send(&mut packet) {
+                    let _ = client.recv(
+                        &mut packet[..length],
+                        RecvInfo {
+                            from: info.from,
+                            to: rebound_remote,
+                        },
+                    );
+                }
                 if server.connections.is_empty() {
                     break;
                 }
