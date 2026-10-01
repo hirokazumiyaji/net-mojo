@@ -532,10 +532,14 @@ async def run_loss(
         "nan"
     )
     req_s = counters["ok"] / measure_s
-    # Pass if some successes under loss (server stayed up) and drop actually occurred.
+    # QUIC recovers from dropped datagrams via retransmission, so a valid
+    # loss run completes requests with no request or connection failures.
+    # Partial runs (timeouts / non-200) must not be presented as a pass.
     verdict = (
         "pass"
-        if counters["ok"] > 0 and (drop_rate == 0 or counters["dropped"] > 0)
+        if counters["ok"] > 0
+        and counters["failed"] == 0
+        and (drop_rate == 0 or counters["dropped"] > 0)
         else "fail"
     )
     return {
