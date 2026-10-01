@@ -341,7 +341,12 @@ run_h2_special() {
         "${url}/echo" >"$OUT_DIR/special/h2_${label}_cancel_curl.txt" 2>&1 &
     local cancel_pid=$!
     sleep 0.3
-    kill "$cancel_pid" 2>/dev/null
+    # The upload must still be in flight; otherwise no abort was exercised.
+    local cancel_running=false
+    if kill -0 "$cancel_pid" 2>/dev/null; then
+        cancel_running=true
+        kill "$cancel_pid" 2>/dev/null
+    fi
     wait "$cancel_pid" 2>/dev/null
     local cancel_curl_rc=$?
     # Sibling must still work after abort.
@@ -350,12 +355,18 @@ run_h2_special() {
     local cancel_sib_rc=$?
     set -e
     local cancel_verdict=fail
-    # Pass if sibling 200 and server still up after client abort of in-flight POST.
-    if [ "$cancel_sib" = "200" ] && kill -0 "$server_pid" 2>/dev/null; then
+    # Pass only when an in-flight upload was aborted, the sibling got 200,
+    # and the server is still up.
+    if [ "$cancel_running" = "true" ] && [ "$cancel_sib" = "200" ] \
+        && kill -0 "$server_pid" 2>/dev/null; then
         cancel_verdict=pass
     fi
-    printf 'proto=h2 label=%s scenario=cancel verdict=%s sibling_http=%s curl_rc=%s sib_rc=%s\n' \
-        "$label" "$cancel_verdict" "$cancel_sib" "$cancel_curl_rc" "$cancel_sib_rc" \
+    if [ "$cancel_running" != "true" ]; then
+        cancel_verdict=skip
+    fi
+    printf 'proto=h2 label=%s scenario=cancel verdict=%s target_was_running=%s sibling_http=%s curl_rc=%s sib_rc=%s\n' \
+        "$label" "$cancel_verdict" "$cancel_running" "$cancel_sib" \
+        "$cancel_curl_rc" "$cancel_sib_rc" \
         | tee -a "$OUT_DIR/special/summary.tsv" | tee -a "$special_log"
     cat "$OUT_DIR/special/h2_${label}_cancel_curl.txt" >>"$special_log" || true
     if [ "$cancel_verdict" = "fail" ]; then
@@ -392,18 +403,38 @@ run_h2_special() {
             sudo -n pfctl -a bench_matrix -F all 2>>"$loss_note" || true
             sudo -n dnctl -q flush 2>>"$loss_note" || true
             set -e
-        local loss_req loss_fail
-        loss_req="$(rg -o 'finished in [^,]+, ([0-9.]+) req/s' -r '$1' \
-            "$OUT_DIR/special/h2_${label}_loss_h2load.out" | head -1 || true)"
-        loss_fail="$(rg -o 'requests: .* ([0-9]+) failed' -r '$1' \
-            "$OUT_DIR/special/h2_${label}_loss_h2load.out" | head -1 || true)"
-        if [ -n "$loss_req" ] && kill -0 "$server_pid" 2>/dev/null; then
-            loss_verdict=pass
-            loss_detail="dnctl plr=0.05 req_s=${loss_req} failed=${loss_fail:-?} rc=${loss_rc}"
-        else
-            loss_verdict=fail
-            loss_detail="dnctl configured but load failed rc=${loss_rc}"
-        fi
+            local loss_req loss_fail
+            loss_req="$(rg -o 'finished in [^,]+, ([0-9.]+) req/s' -r '$1' \
+                "$OUT_DIR/special/h2_${label}_loss_h2load.out" | head -1 || true)"
+            loss_fail="$(rg -o 'requests: .* ([0-9]+) failed' -r '$1' \
+                "$OUT_DIR/special/h2_${label}_loss_h2load.out" | head -1 || true)"
+            local loss_errored loss_timeout
+            loss_errored="$(rg -o 'requests: .* ([0-9]+) errored' -r '$1' \
+                "$OUT_DIR/special/h2_${label}_loss_h2load.out" | head -1 || true)"
+            loss_timeout="$(rg -o 'requests: .* ([0-9]+) timeout' -r '$1' \
+                "$OUT_DIR/special/h2_${label}_loss_h2load.out" | head -1 || true)"
+            # A loss run that lost every request (req_s 0.00), reported
+            # failures, or exited nonzero is not a valid measurement.
+            local loss_ok=true
+            if [ "$loss_rc" -ne 0 ]; then loss_ok=false; fi
+            if [ "${loss_fail:-0}" != "0" ]; then loss_ok=false; fi
+            if [ -n "${loss_errored:-}" ] && [ "$loss_errored" != "0" ]; then
+                loss_ok=false
+            fi
+            if [ -n "${loss_timeout:-}" ] && [ "$loss_timeout" != "0" ]; then
+                loss_ok=false
+            fi
+            if [ -z "$loss_req" ] || [ "${loss_req%%.*}" = "0" ]; then
+                loss_ok=false
+            fi
+            if ! kill -0 "$server_pid" 2>/dev/null; then loss_ok=false; fi
+            if [ "$loss_ok" = "true" ]; then
+                loss_verdict=pass
+                loss_detail="dnctl plr=0.05 req_s=${loss_req} failed=${loss_fail:-?} rc=${loss_rc}"
+            else
+                loss_verdict=fail
+                loss_detail="dnctl configured but load invalid rc=${loss_rc} req_s=${loss_req:-?} failed=${loss_fail:-?} errored=${loss_errored:-?} timeout=${loss_timeout:-?}"
+            fi
         fi
     else
         echo "$loss_detail" >"$loss_note"

@@ -498,14 +498,15 @@ async def run_loss(
                         counters["failed"] += 1
                         return
                     if result.get("status") == b"200":
+                        done_at = result["done_at"] or time.perf_counter()
+                        # Exclude completions after the measurement window:
+                        # req_s divides by duration_s, so late successes
+                        # would inflate throughput and contaminate percentiles.
+                        if done_at > stop_at:
+                            counters["late"] = counters.get("late", 0) + 1
+                            return
                         counters["ok"] += 1
-                        latencies.append(
-                            (
-                                (result["done_at"] or time.perf_counter())
-                                - result["start"]
-                            )
-                            * 1_000_000.0
-                        )
+                        latencies.append((done_at - result["start"]) * 1_000_000.0)
                     else:
                         counters["failed"] += 1
 
