@@ -1,4 +1,5 @@
 import asyncio
+import os
 import ssl
 import subprocess
 import sys
@@ -160,15 +161,16 @@ class Http3ClientProtocol(QuicConnectionProtocol):
         await asyncio.sleep(0.05)
 
     async def reset_storm_with_siblings(self):
-        """Reset storm while two sibling streams on the same connection complete.
+        """Storm repeated resets on one stream while siblings complete.
 
-        Phase 1 preserves the original single-stream storm scenario: one
-        in-flight stream is reset and siblings must finish (catches server
-        mishandling of a reset for an already-reset request). Phase 2 resets
-        three further distinct streams once each: aioquic allows reset()
-        once per stream sender and re-sending identical bytes reuses the
-        QUIC packet number (discarded as duplicate), so distinct streams
-        provide genuine repeated reset traffic with distinct packets.
+        The same already-reset `storm_id` receives three RESET_STREAM
+        frames, each in a distinct QUIC packet (distinct packet numbers):
+        pinned aioquic's `reset_stream()` is a no-op past the first call
+        and re-sending identical datagram bytes would reuse packet numbers
+        (discarded as duplicates), so the test re-arms the stream sender's
+        pending reset before each transmit. This catches server mishandling
+        of repeated resets for an already-reset request while proving
+        sibling streams still complete on the same connection.
         """
         sibling_a_id, sibling_a = self._start_post(b"data", trailers=False)
         sibling_b_id, sibling_b = self._start_post(b"data", trailers=False)
@@ -188,24 +190,11 @@ class Http3ClientProtocol(QuicConnectionProtocol):
         self.http.send_data(storm_id, b"da", end_stream=False)
         self.transmit()
         self._quic.reset_stream(storm_id, error_code=H3_REQUEST_CANCELLED)
-        self.transmit()
-
+        sender = self._quic._get_or_create_stream_for_send(storm_id).sender
         for _ in range(3):
-            extra_id = self._quic.get_next_available_stream_id()
-            self.http.send_headers(
-                extra_id,
-                [
-                    (b":method", b"POST"),
-                    (b":scheme", b"https"),
-                    (b":authority", b"localhost"),
-                    (b":path", b"/echo?source=quic"),
-                    (b"content-length", b"4"),
-                ],
-                end_stream=False,
-            )
-            self.http.send_data(extra_id, b"da", end_stream=False)
-            self.transmit()
-            self._quic.reset_stream(extra_id, error_code=H3_REQUEST_CANCELLED)
+            # Re-arm so this transmit emits a fresh RESET_STREAM frame for
+            # the already-reset stream (new packet number each round).
+            sender.reset_pending = True
             self.transmit()
 
         try:
@@ -335,11 +324,17 @@ async def run_client(address):
             raise RuntimeError(f"expected H3_NO_ERROR close, got {close_code}")
 
 
+fixture_env = dict(os.environ)
+# This flow completes 5 requests (reordered POST, two reset-storm
+# siblings, trailers POST, final POST); the shared fixture defaults to
+# the same count, set explicitly so the Rust test's "2" cannot leak in.
+fixture_env["HTTP3_FIXTURE_EXPECT"] = "5"
 process = subprocess.Popen(
     ["mojo", "run", "--Werror", "-I", ".", "tests/http3_server_fixture.mojo"],
     stdout=subprocess.PIPE,
     stderr=subprocess.PIPE,
     text=True,
+    env=fixture_env,
 )
 
 try:

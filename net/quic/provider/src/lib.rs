@@ -2660,6 +2660,9 @@ mod tests {
                 ".",
                 "tests/http3_server_fixture.mojo",
             ])
+            // This test serves exactly 2 POSTs; the shared fixture defaults
+            // to 5 (aioquic script) and would otherwise wait forever.
+            .env("HTTP3_FIXTURE_EXPECT", "2")
             .stdout(Stdio::piped())
             .stderr(Stdio::inherit())
             .spawn()
