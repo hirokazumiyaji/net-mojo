@@ -2095,6 +2095,16 @@ struct Server(Movable):
                 self._conns[idx].idle_at = deadline_from_now(
                     self.config.idle_timeout
                 )
+            var http2_failed = (
+                self._conns[idx].http2_session
+                and self._conns[idx].http2_session.value().is_failed()
+            )
+            if http2_failed:
+                # Flooded session: the control flush (ACK + ENHANCE_YOUR_CALM
+                # GOAWAY) is all the peer will get. Do not schedule more
+                # application responses; the connection closes once pending
+                # output reaches zero.
+                return
             self._drain_http2_responses(idx)
             return
         if was_100:
