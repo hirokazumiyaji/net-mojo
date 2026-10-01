@@ -131,6 +131,30 @@ PY
     return 1
 }
 
+verify_fixed_h2() {
+    # Preflight: GET /fixed over HTTP/2 must return 200 with exactly the
+    # 64-byte payload both servers serve. Measuring a non-equivalent
+    # handler would make the Go/Mojo comparison meaningless.
+    local label="$1"
+    local addr="$2"
+    local body="$OUT_DIR/special/${label}_verify_body.bin"
+    local result code ver
+    result="$(curl -k --http2 -sS --max-time 10 -o "$body" \
+        -w '%{http_code} %{http_version}' "https://${addr}/fixed")"
+    code="${result% *}"
+    ver="${result#* }"
+    if [ "$code" != "200" ] || [ "$ver" != "2" ] \
+        || [ ! -f "$body" ] \
+        || [ "$(wc -c <"$body" | tr -d ' ')" != "64" ] \
+        || ! cmp -s "$body" <(printf 'a%.0s' $(seq 64)); then
+        echo "$label /fixed preflight failed (code=$code http/$ver):" >&2
+        head -c 80 "$body" 2>/dev/null >&2 || true
+        echo >&2
+        return 1
+    fi
+    echo "$label /fixed preflight ok (HTTP/2 200, 64-byte body)"
+}
+
 wait_udp() {
     local pid="$1"
     local i
@@ -394,14 +418,14 @@ run_h2_special() {
             loss_verdict=skip
             loss_detail="loss impairment not configured (dnctl_rc=$dnctl_rc pfctl_rc=$pfctl_rc); no impaired run attempted"
             sudo -n pfctl -a bench_matrix -F all 2>>"$loss_note" || true
-            sudo -n dnctl -q flush 2>>"$loss_note" || true
+            sudo -n dnctl -q flush pipe 42 2>>"$loss_note" || true
             set -e
         else
             h2load --alpn-list=h2 -c 8 -m 4 -t 1 -D 5s "${url}/fixed" \
                 >"$OUT_DIR/special/h2_${label}_loss_h2load.out" 2>&1
             local loss_rc=$?
             sudo -n pfctl -a bench_matrix -F all 2>>"$loss_note" || true
-            sudo -n dnctl -q flush 2>>"$loss_note" || true
+            sudo -n dnctl -q flush pipe 42 2>>"$loss_note" || true
             set -e
             local loss_req loss_fail
             loss_req="$(rg -o 'finished in [^,]+, ([0-9.]+) req/s' -r '$1' \
@@ -493,7 +517,7 @@ run_h3_special() {
         loss_pf_verdict=configured
         loss_pf_detail="dnctl udp plr=0.05 on port ${port}"
         # shellcheck disable=SC2064
-        trap "sudo -n pfctl -a bench_matrix_h3 -F all 2>/dev/null || true; sudo -n dnctl -q flush 2>/dev/null || true" RETURN
+        trap "sudo -n pfctl -a bench_matrix_h3 -F all 2>/dev/null || true; sudo -n dnctl -q flush pipe 43 2>/dev/null || true" RETURN
     fi
     printf 'proto=h3 label=%s scenario=loss_pf verdict=%s detail=%s\n' \
         "$label" "$loss_pf_verdict" "$loss_pf_detail" \
@@ -504,7 +528,7 @@ run_h3_special() {
     # not combined kernel + client loss.
     if [ "$loss_pf_verdict" = "configured" ]; then
         sudo -n pfctl -a bench_matrix_h3 -F all 2>/dev/null || true
-        sudo -n dnctl -q flush 2>/dev/null || true
+        sudo -n dnctl -q flush pipe 43 2>/dev/null || true
         trap - RETURN
         loss_pf_verdict=cleaned
     fi
@@ -559,6 +583,7 @@ if [ "${SKIP_H2:-0}" != "1" ]; then
         GO_PID=$!
         trap 'kill_pid "${GO_PID:-}"; kill_pid "${MOJO_H2_PID:-}"; kill_pid "${BASE_PID:-}"; kill_pid "${MOJO_H3_PID:-}"' EXIT
         wait_listen "$GO_ADDR" "$GO_PID"
+        verify_fixed_h2 "go" "$GO_ADDR"
         for clients in $CONNS; do
             for streams in $STREAMS; do
                 for run in $(seq 1 "$RUNS"); do
@@ -582,6 +607,7 @@ if [ "${SKIP_H2:-0}" != "1" ]; then
         MOJO_H2_PID=$!
         trap 'kill_pid "${GO_PID:-}"; kill_pid "${MOJO_H2_PID:-}"; kill_pid "${BASE_PID:-}"; kill_pid "${MOJO_H3_PID:-}"' EXIT
         wait_listen "$MOJO_H2_ADDR" "$MOJO_H2_PID"
+        verify_fixed_h2 "mojo" "$MOJO_H2_ADDR"
         for clients in $CONNS; do
             for streams in $STREAMS; do
                 for run in $(seq 1 "$RUNS"); do

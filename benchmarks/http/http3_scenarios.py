@@ -512,8 +512,10 @@ async def run_loss(
             assert isinstance(client, ScenarioProtocol)
             await _wait_alpn(client)
             sem = asyncio.Semaphore(streams)
+            conn_ok = 0
 
             async def one_request() -> None:
+                nonlocal conn_ok
                 async with sem:
                     try:
                         result = await asyncio.wait_for(
@@ -536,6 +538,7 @@ async def run_loss(
                             counters["failed"] += 1
                             return
                         counters["ok"] += 1
+                        conn_ok += 1
                         latencies.append((done_at - result["start"]) * 1_000_000.0)
                     else:
                         counters["failed"] += 1
@@ -549,6 +552,11 @@ async def run_loss(
             for _ in range(streams):
                 workers.append(asyncio.create_task(worker()))
             await asyncio.gather(*workers)
+            # A connection whose handshake finished after stop_at issues no
+            # request at all; count it so a short run cannot report fewer
+            # effective clients than requested and still pass.
+            if conn_ok == 0:
+                counters["failed"] += 1
             counters["dropped"] += client.dropped
             counters["sent"] += client.sent
 
