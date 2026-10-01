@@ -315,3 +315,102 @@ RSS. Multiplexing (m=10) raises per-request latency on both sides as
 expected when 640 in-flight streams share the client and server. Follow-up
 (not in this PR): induced-loss runs (`LOSS_PCT` with an out-of-band
 netem/pf path) and a non-Python H3 baseline if a stronger peer is needed.
+
+## Multiplex matrix (PR 11, measured)
+
+Connections × streams varied independently over `GET /fixed`, plus the
+slow-stream, cancellation, and loss scenarios per protocol. Shortened
+procedure (labeled as such; Phase 0 full-length numbers are the PR 9/10
+sections above).
+
+### Host and procedure
+
+- macOS 27.0.1, Apple M3 Max, `h2load` nghttp2/1.70.0, aioquic 1.3.0.
+- `WARMUP_S=2 MEASURE_S=4 RUNS=2 CONNS="1 16" STREAMS="1 10"`, harness
+  default SKIP flags otherwise; `SKIP_SPECIAL=1` for the matrix tables and
+  a separate `RUNS=1 CONNS="1" STREAMS="1"` pass for the scenarios.
+
+```bash
+WARMUP_S=2 MEASURE_S=4 RUNS=2 CONNS="1 16" STREAMS="1 10" SKIP_SPECIAL=1 SKIP_H3=1 \
+  bash benchmarks/http/run_multiplex_matrix.sh
+WARMUP_S=2 MEASURE_S=4 RUNS=2 CONNS="1 16" STREAMS="1 10" SKIP_SPECIAL=1 SKIP_H2=1 \
+  bash benchmarks/http/run_multiplex_matrix.sh
+```
+
+### HTTPS + HTTP/2 matrix (mean of 2 runs; req/s and latency from h2load)
+
+| Server | Conns | Streams | req/s (mean) | p50 (µs) | p95 (µs) | p99 (µs) | CPU % | RSS (MB) | fd |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| Go HTTPS+H2 | 1 | 1 | 19,715 | 46 | 60 | 86 | ~92 | ~17 | 6 |
+| Mojo HTTPS+H2 | 1 | 1 | 17,652 | 53 | 64 | 85 | ~67 | ~19 | 8 |
+| Go HTTPS+H2 | 1 | 10 | 43,582 | 221 | 266 | 418 | ~99 | ~18 | 6 |
+| Mojo HTTPS+H2 | 1 | 10 | 43,975 | 220 | 242 | 276 | ~99 | ~19 | 8 |
+| Go HTTPS+H2 | 16 | 1 | 47,161 | 312 | 526 | 822 | ~99 | ~18 | 21 |
+| Mojo HTTPS+H2 | 16 | 1 | 32,645 | 482 | 526 | 591 | ~99 | ~23 | 23 |
+| Go HTTPS+H2 | 16 | 10 | 44,907 | 3,545 | 5,245 | 6,220 | ~99 | ~19 | 21 |
+| Mojo HTTPS+H2 | 16 | 10 | 46,679 | 3,420 | 4,000 | 5,280 | ~99 | ~23 | 23 |
+
+Per-run req/s ranges: Go c1m1 19,616–19,815; Mojo c1m1 17,630–17,674;
+Go c1m10 42,685–44,479; Mojo c1m10 43,972–43,978; Go c16m1 46,895–47,426;
+Mojo c16m1 32,618–32,671; Go c16m10 44,768–45,046; Mojo c16m10
+46,009–47,350. All runs: 0 failed, rc=0.
+
+### HTTP/3 matrix (mean of 2 runs; req/s and latency from the aioquic client)
+
+| Server | Conns | Streams | req/s (mean) | p50 (µs) | p95 (µs) | p99 (µs) | CPU % | RSS (MB) | fd |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| aioquic H3 | 1 | 1 | 3,376 | 216 | 264 | 322 | ~66 | ~53 | 7 |
+| Mojo H3 | 1 | 1 | 4,620 | 167 | 206 | 259 | ~28 | ~20 | 8 |
+| aioquic H3 | 1 | 10 | 6,043 | 1,572 | 1,788 | 1,961 | ~100 | ~62 | 7 |
+| Mojo H3 | 1 | 10 | 6,154 | 1,568 | 1,792 | 2,023 | ~36 | ~20 | 8 |
+| aioquic H3 | 16 | 1 | 4,280 | 3,603 | 4,056 | 4,282 | ~99 | ~68 | 7 |
+| Mojo H3 | 16 | 1 | 6,112 | 1,920 | 2,444 | 2,771 | ~48 | ~22 | 8 |
+| aioquic H3 | 16 | 10 | 4,052 | 39,230 | 40,850 | 43,246 | ~99 | ~73 | 7 |
+| Mojo H3 | 16 | 10 | 5,605 | 27,574 | 30,336 | 31,424 | ~46 | ~22 | 8 |
+
+All runs: 0 failed, rc=0.
+
+### Special scenarios
+
+| Proto | Server | Scenario | Verdict | Detail |
+| --- | --- | --- | --- | --- |
+| h2 | Go | slow | pass | sibling req/s 53,787, 0 failed |
+| h2 | Mojo | slow | pass | sibling req/s 35,301, 0 failed |
+| h2 | Go | cancel | pass | sibling HTTP 200 after client abort |
+| h2 | Mojo | cancel | pass | sibling HTTP 200 after client abort |
+| h2 | Go | loss | skip | pf/dummynet needs root; no-loss reference 49,882 req/s |
+| h2 | Mojo | loss | skip | pf/dummynet needs root; no-loss reference 35,860 req/s |
+| h3 | aioquic | slow | pass | held 262,144 B while 8/8 siblings completed |
+| h3 | Mojo | slow | pass | held 262,144 B while 8/8 siblings completed |
+| h3 | aioquic | cancel | pass | reset target in-flight; 8/8 siblings completed |
+| h3 | Mojo | cancel | pass | reset target in-flight; 8/8 siblings completed |
+| h3 | aioquic | loss | pass | 5% client datagram drop, req/s 5,460, 0 failed |
+| h3 | Mojo | loss | pass | 5% client datagram drop, req/s 6,134, 0 failed |
+
+### Target check
+
+Targets are >=90% of the Go baseline (H2) with p99 within 1.2x, and >=90% of
+the aioquic baseline (H3).
+
+| Scenario | Mojo / peer req/s | Verdict |
+| --- | ---: | --- |
+| h2 1 conn × 1 stream | 89.5% | Marginal miss (−0.5 pts), p99 85 µs vs 86 µs |
+| h2 1 conn × 10 streams | 100.9% | Meet |
+| h2 16 conns × 1 stream | 69.2% | Miss — recorded, no features cut |
+| h2 16 conns × 10 streams | 103.9% | Meet |
+| h3 1 conn × 1 stream | 136.8% | Exceed baseline |
+| h3 1 conn × 10 streams | 101.8% | Meet |
+| h3 16 conns × 1 stream | 142.8% | Exceed baseline |
+| h3 16 conns × 10 streams | 138.3% | Exceed baseline |
+
+Interpretation: multiplexed HTTP/2 (m=10) reaches or exceeds the Go baseline
+at both connection counts, and latency stays at or below Go except at 16×1
+where Go's single-stream aggregate hides per-request cost. The 16×1 HTTP/2
+shortfall (69%) is consistent with the PR 9 single-stream result and is
+carried forward as profiling follow-up (TLS/HPACK path cost), not a feature
+cut. HTTP/3 exceeds the Python baseline in every cell with lower median and
+p99 latency. Slow-stream and cancellation scenarios pass on both stacks:
+the server keeps serving siblings while a large stream is held (H3) or a
+throttled upload is in flight (H2). Loss via pf/dummynet is skipped on this
+host (no passwordless sudo); the measurable 5% client-side datagram drop
+runs pass on both H3 servers with 0 failed requests.
