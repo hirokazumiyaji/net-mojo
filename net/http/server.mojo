@@ -1239,6 +1239,15 @@ struct Server(Movable):
             ):
                 self._close_conn(idx)
                 return
+            if (
+                self._conns[idx].http2_session
+                and self._conns[idx].http2_session.value().is_failed()
+            ):
+                # Failed session draining GOAWAY: flush pending output only.
+                # Do not read or parse further bytes; the failed session can
+                # never drain them and they would consume shared budget.
+                self._sync_interests(idx)
+                return
             var read_event = (
                 self._conns[idx].read_ready(readable, writable)
                 or self._conns[idx].tls_pending() > 0
