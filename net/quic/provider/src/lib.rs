@@ -826,12 +826,19 @@ const MAX_HTTP3_REQUEST_STREAM_ID: u64 = (1 << 62) - 4;
 const MAX_HTTP3_BUFFERED_REQUEST_BYTES: usize = 64 * 1024 * 1024;
 const MAX_HTTP3_REQUEST_BODY_BYTES: usize = 1024 * 1024;
 const MAX_HTTP3_BUFFERED_RESPONSE_BYTES: usize = 64 * 1024 * 1024;
-/// Soft per-connection estimate for quiche transport heap/state.
-/// Quiche's `stats()` does not report allocator-backed memory, so admission
-/// uses `connections.len() *` this constant instead of an exact RSS probe.
+/// Soft per-connection estimate for quiche transport heap/state (handshake,
+/// packet buffers, TLS session). Quiche's `stats()` does not report
+/// allocator-backed memory, so admission uses `connections.len() *` this
+/// constant instead of an exact RSS probe. This is an admission heuristic,
+/// not a hard RSS guarantee: a connection with a large in-flight window can
+/// transiently exceed it, which is why application request/response bytes
+/// are capped separately at 64 MiB aggregates and operators should keep
+/// headroom in `quic_max_transport_memory_bytes`. Measured per-connection
+/// RSS calibration remains follow-up work per the remaining-design spec.
 const ESTIMATED_QUIC_TRANSPORT_BYTES_PER_CONNECTION: usize = 256 * 1024;
-/// Default soft cap (~2.5 GiB) so `max_connections` remains the primary gate
-/// unless operators lower `quic_max_transport_memory_bytes`.
+/// Default soft cap (10,000 × 256 KiB = 2,621,440,000) so `max_connections`
+/// remains the primary gate unless operators lower
+/// `quic_max_transport_memory_bytes`.
 const DEFAULT_MAX_QUIC_TRANSPORT_MEMORY_BYTES: usize =
     10_000 * ESTIMATED_QUIC_TRANSPORT_BYTES_PER_CONNECTION;
 const H3_EXCESSIVE_LOAD: u64 = 0x107;
