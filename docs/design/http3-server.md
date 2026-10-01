@@ -80,8 +80,9 @@ present in every worktree tip):
 | Measured H2/H3 / multiplex benches | Done — [PR #79](https://github.com/hirokazumiyaji/net-mojo/pull/79)–[#81](https://github.com/hirokazumiyaji/net-mojo/pull/81) |
 
 Still deferred / out of scope for #42: server push, CONNECT, enabling 0-RTT,
-broader independent-client matrices beyond aioquic/quiche, macOS end-to-end
-Mojo HTTP/3 validation, and CI workflow edits.
+broader independent-client matrices beyond aioquic/quiche, and CI workflow edits.
+(macOS end-to-end Mojo HTTP/3 validation already runs in CI via the `http3`
+job on macos-14 with `http3-client-test`.)
 
 Closed or timed-out QUIC connections are removed with their connection-ID
 routes, pending request routes, and queued completed requests. New connections
@@ -90,6 +91,6 @@ pending response fields and bodies each have a 64 MiB aggregate provider cap.
 Quiche does not expose allocator-backed transport memory in `stats()`, so the
 provider reports a soft estimate of `connections.len() × 256 KiB` and refuses
 new Initial packets when accepting another connection would exceed
-`ServerConfig.quic_max_transport_memory_bytes` (default ~2.5 GiB, aligned with
+`ServerConfig.quic_max_transport_memory_bytes` (default 2,621,440,000 bytes = 10,000 × 256 KiB, aligned with
 10,000 connections; [PR #75](https://github.com/hirokazumiyaji/net-mojo/pull/75)).
 Existing connections continue to drain normally when the budget is exhausted.

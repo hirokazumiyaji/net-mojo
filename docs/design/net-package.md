@@ -261,8 +261,12 @@ section records only the package-level boundaries.
 - Same-origin ops model: one `Server` may own a TCP TLS listener and a QUIC UDP
   endpoint on the same host:port (`examples/http3_hello.mojo`). Reuse the same
   certificate and key for both stacks; example PEMs under `build/tls/` are for
-  local smoke only. `ServerConfig` deadlines and `shutdown_grace` apply to both
-  stacks, but connection and memory bounds are enforced per stack, not shared:
+  local smoke only. Only `header_deadline`, `body_deadline`, `idle_timeout`,
+  and `write_deadline` are forwarded to the QUIC endpoint
+  (`Server.add_quic_endpoint`); `tls_handshake_timeout`,
+  `detached_response_timeout`, and `stream_idle_timeout` have no effect on
+  HTTP/3, and `shutdown_grace` orchestrates both stacks at the `Server`
+  level. Connection and memory bounds are enforced per stack, not shared:
   `max_connections` caps TCP and QUIC independently (up to the configured
   count in each), `total_buffer_budget` covers the HTTP connection path while
   the QUIC provider enforces its own transport-memory limit plus separate
