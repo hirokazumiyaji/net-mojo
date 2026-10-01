@@ -515,7 +515,8 @@ if [ "${SKIP_H2:-0}" != "1" ]; then
 
     if [ "${SKIP_GO:-0}" != "1" ]; then
         echo "== build Go HTTPS+H2 =="
-        local go_bin="$GO_BIN"
+        # GO_BIN may already be absolute when OUT_DIR is overridden.
+        go_bin="$GO_BIN"
         case "$go_bin" in
             /*) ;;
             *) go_bin="$ROOT/$go_bin" ;;
