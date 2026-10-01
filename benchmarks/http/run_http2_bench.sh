@@ -36,6 +36,10 @@ if ! command -v h2load >/dev/null; then
     echo "h2load not found; install with: brew install nghttp2" >&2
     exit 1
 fi
+if ! command -v curl >/dev/null; then
+    echo "curl not found; install with: brew install curl" >&2
+    exit 1
+fi
 
 mkdir -p "$OUT_DIR"
 
@@ -68,12 +72,51 @@ echo "procedure: warmup=${WARMUP_S}s measure=${MEASURE_S}s runs=${RUNS} clients=
 echo
 
 build_go() {
-    go -C benchmarks/http_go build -o "$ROOT/$GO_BIN" .
+    local out_bin="$GO_BIN"
+    case "$out_bin" in
+        /*) ;;
+        *) out_bin="$ROOT/$out_bin" ;;
+    esac
+    go -C benchmarks/http_go build -o "$out_bin" .
 }
 
 build_mojo() {
+    local out_bin="$MOJO_BIN"
+    case "$out_bin" in
+        /*) ;;
+        *) out_bin="$ROOT/$out_bin" ;;
+    esac
     pixi run -e tls-http2 mojo build --Werror -I . \
-        benchmarks/http2_tls_server.mojo -o "$MOJO_BIN"
+        benchmarks/http2_tls_server.mojo -o "$out_bin"
+}
+
+verify_fixed_h2() {
+    # Preflight: GET /fixed over HTTP/2 and assert status plus the exact
+    # 64-byte body both servers must serve identically. ALPN alone cannot
+    # catch a handler serving the wrong payload, which would invalidate
+    # the throughput comparison.
+    local label="$1"
+    local addr="$2"
+    local body="$OUT_DIR/${label}_verify_body.bin"
+    local result code ver
+    result="$(curl -k --http2 -sS --max-time 10 -o "$body" \
+        -w '%{http_code} %{http_version}' "https://${addr}/fixed")"
+    code="${result% *}"
+    ver="${result#* }"
+    [ "$code" = "200" ] || {
+        echo "$label /fixed: expected HTTP 200, got $code" >&2
+        return 1
+    }
+    [ "$ver" = "2" ] || {
+        echo "$label /fixed: expected HTTP/2, got HTTP/$ver" >&2
+        return 1
+    }
+    if [ ! -f "$body" ] || [ "$(wc -c <"$body" | tr -d ' ')" != "64" ] \
+        || ! cmp -s "$body" <(python3 -c 'import sys; sys.stdout.buffer.write(b"a" * 64)'); then
+        echo "$label /fixed: body is not the expected 64-byte payload" >&2
+        return 1
+    fi
+    echo "$label /fixed verify ok (HTTP/2 200, 64-byte body)"
 }
 
 sample_server() {
@@ -274,6 +317,7 @@ with socket.create_connection((host, int(port)), timeout=3) as raw:
         assert s.selected_alpn_protocol() == "h2", s.selected_alpn_protocol()
 print("go alpn=h2 ok")
 PY
+    verify_fixed_h2 "go" "$GO_ADDR"
     for streams in $STREAMS; do
         for run in $(seq 1 "$RUNS"); do
             echo "== Go GET /fixed c=${CLIENTS} m=${streams} run=${run} =="
@@ -304,6 +348,7 @@ with socket.create_connection((host, int(port)), timeout=3) as raw:
         assert s.selected_alpn_protocol() == "h2", s.selected_alpn_protocol()
 print("mojo alpn=h2 ok")
 PY
+    verify_fixed_h2 "mojo" "$MOJO_ADDR"
     for streams in $STREAMS; do
         for run in $(seq 1 "$RUNS"); do
             echo "== Mojo GET /fixed c=${CLIENTS} m=${streams} run=${run} =="
