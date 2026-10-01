@@ -167,9 +167,16 @@ run_load() {
         | tee -a "$OUT_DIR/summary.tsv"
 
     cp "$out" "$log"
-    if [ "$rc" -ne 0 ]; then
+    local cell_failed=0
+    if [ "$rc" -ne 0 ]; then cell_failed=1; fi
+    # The loader now exits nonzero on failed>0 as well, but reject the
+    # parsed failure count directly so partial measurements can never be
+    # accepted even if run through an older loader.
+    if [ -n "${failed:-}" ] && [ "${failed}" != "0" ]; then cell_failed=1; fi
+    if [ -z "${req_s:-}" ]; then cell_failed=1; fi
+    if [ "$cell_failed" -ne 0 ]; then
         BENCH_FAILURES=$((BENCH_FAILURES + 1))
-        echo "benchmark failed: $label c=$clients m=$streams run=$run_idx rc=$rc (see $out)" >&2
+        echo "benchmark failed: $label c=$clients m=$streams run=$run_idx rc=$rc failed=${failed:-?} (see $out)" >&2
     fi
     return 0
 }
