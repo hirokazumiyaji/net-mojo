@@ -393,6 +393,14 @@ run_h3_cell() {
     local sample="$OUT_DIR/h3/${label}_c${clients}_m${streams}_r${run_idx}.sample"
     local err="$OUT_DIR/h3/${label}_c${clients}_m${streams}_r${run_idx}.err"
 
+    # Resolve the interpreter in this shell *before* the sampler starts.
+    # `$(h3_python)` would run the helper in a subshell, discard its cache
+    # assignment, and re-run `pixi` after the sampler is already sleeping —
+    # shifting the CPU/RSS/FD sample earlier than warmup+half-measure.
+    if [ -z "${PIXI_PYTHON_H3:-}" ]; then
+        PIXI_PYTHON_H3="$(cd "$ROOT" && pixi run -e "$PIXI_ENV_H3" python -c 'import sys; print(sys.executable)')"
+    fi
+
     # Drop any sample from an earlier run: if the sampler never fires, the
     # fallback below would otherwise publish a stale .sample file.
     rm -f "$sample"
@@ -403,7 +411,7 @@ run_h3_cell() {
     local sampler_pid=$!
 
     set +e
-    $(h3_python) benchmarks/http3_load.py \
+    "$PIXI_PYTHON_H3" benchmarks/http3_load.py \
         --url "$url" \
         --clients "$clients" \
         --streams "$streams" \
