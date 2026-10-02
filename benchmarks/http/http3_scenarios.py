@@ -3,7 +3,8 @@
 
 Scenarios (qualitative + limited timing; aioquic client):
   slow   — one slow stream (delayed DATA consume) alongside N normal GETs
-  cancel — RST one in-flight stream (H3_REQUEST_CANCELLED) while siblings complete
+  cancel — RST one in-flight stream (H3_REQUEST_CANCELLED) while siblings
+           complete, then GET /fixed on the same connection
   loss   — drop a fraction of outbound UDP datagrams (client-side loss emulation)
 
 Usage:
@@ -507,6 +508,19 @@ async def run_cancel(url: str, siblings: int) -> dict:
             cancel_task,
             asyncio.gather(*sibling_tasks, return_exceptions=True),
         )
+        # Match H2 cancel: a server that GOAWAYs / drains on RST can still
+        # finish already-admitted siblings. Probe a fresh GET on the same
+        # connection before claiming it remains reusable.
+        post_reset_ok = False
+        try:
+            after = await client.get(FIXED_PATH, authority)
+            post_reset_ok = (
+                isinstance(after, dict)
+                and after.get("status") == b"200"
+                and _body_ok(FIXED_PATH, after)
+            )
+        except Exception:
+            post_reset_ok = False
 
     sibling_ok = sum(
         1
@@ -518,14 +532,16 @@ async def run_cancel(url: str, siblings: int) -> dict:
     elapsed_ms = (time.perf_counter() - t0) * 1000
     siblings_outstanding = int(cancelled.get("siblings_outstanding_at_reset", 0))
     # Pass: target was in-flight when reset fired (not already completed),
-    # at least one sibling was still outstanding across the reset, and all
-    # siblings still succeed (connection reusable).
+    # at least one sibling was still outstanding across the reset, all
+    # siblings still succeed, and a post-reset request on the same
+    # connection succeeds (connection reusable, not drained).
     verdict = (
         "pass"
         if cancelled.get("cancelled")
         and cancelled.get("was_inflight")
         and siblings_outstanding > 0
         and sibling_ok == siblings
+        and post_reset_ok
         else "fail"
     )
     return {
@@ -536,6 +552,7 @@ async def run_cancel(url: str, siblings: int) -> dict:
         "siblings_outstanding_at_reset": siblings_outstanding,
         "sibling_ok": sibling_ok,
         "sibling_fail": siblings - sibling_ok,
+        "post_reset_ok": int(post_reset_ok),
         "elapsed_ms": elapsed_ms,
         "siblings": siblings,
     }
