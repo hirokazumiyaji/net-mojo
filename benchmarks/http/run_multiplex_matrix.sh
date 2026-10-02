@@ -620,6 +620,16 @@ run_h2_special() {
             loss_detail="no free dummynet pipe id in 42-61 (or lock/claim failed); no impaired run attempted"
             if [ "$dnctl_locked" -eq 1 ]; then dnctl_lock_release; fi
         else
+            # Pipe+lock are live immediately after claim. Install cleanup
+            # before anchor work so SIGINT/SIGTERM cannot leave a configured
+            # pipe or a held DNCTL_LOCK_DIR. Extend with PF once the rule is
+            # installed below.
+            # shellcheck disable=SC2064
+            trap "sudo -n dnctl -q pipe ${loss_pipe} delete 2>/dev/null || true; rm -f ${DNCTL_LOCK_DIR}/pid 2>/dev/null || true; rmdir ${DNCTL_LOCK_DIR} 2>/dev/null || true; kill_pid \"\${GO_PID:-}\"; kill_pid \"\${MOJO_H2_PID:-}\"; kill_pid \"\${BASE_PID:-}\"; kill_pid \"\${MOJO_H3_PID:-}\"" EXIT
+            # shellcheck disable=SC2064
+            trap "sudo -n dnctl -q pipe ${loss_pipe} delete 2>/dev/null || true; rm -f ${DNCTL_LOCK_DIR}/pid 2>/dev/null || true; rmdir ${DNCTL_LOCK_DIR} 2>/dev/null || true" RETURN
+            trap 'exit 130' INT
+            trap 'exit 143' TERM
             # Allocate a unique empty child under an evaluated parent.
             # Reusing a fixed leaf would let -f/-F destroy host rules there.
             local loss_anchor
@@ -629,6 +639,8 @@ run_h2_special() {
                 loss_detail="no usable dummynet anchor (PF disabled, no parent, or nonempty leaf); no impaired run attempted"
                 dnctl_delete_pipe "$loss_pipe" "$loss_note"
                 dnctl_lock_release
+                trap 'kill_pid "${GO_PID:-}"; kill_pid "${MOJO_H2_PID:-}"; kill_pid "${BASE_PID:-}"; kill_pid "${MOJO_H3_PID:-}"' EXIT
+                trap - RETURN INT TERM
             else
             set +e
             echo "dummynet in proto tcp from any to 127.0.0.1 port ${port} pipe ${loss_pipe}" \
@@ -647,21 +659,15 @@ run_h2_special() {
                 sudo -n pfctl -a "$loss_anchor" -F all 2>>"$loss_note" || true
                 dnctl_delete_pipe "$loss_pipe" "$loss_note"
                 dnctl_lock_release
+                trap 'kill_pid "${GO_PID:-}"; kill_pid "${MOJO_H2_PID:-}"; kill_pid "${BASE_PID:-}"; kill_pid "${MOJO_H3_PID:-}"' EXIT
+                trap - RETURN INT TERM
                 set -e
             else
-                # Install cleanup as soon as impairment is live. RETURN
-                # covers early function return; EXIT covers normal and
-                # signal-driven shell exit (INT/TERM re-enter via exit so
-                # EXIT runs — RETURN alone does not fire on SIGTERM).
-                # Preserve the top-level server kill_pid EXIT handler.
-                # Flush only this unique anchor — never a shared host leaf.
-                # Release the dnctl lock after pipe delete so peers can claim.
+                # Extend cleanup with the live PF anchor.
                 # shellcheck disable=SC2064
                 trap "sudo -n pfctl -a ${loss_anchor} -F all 2>/dev/null || true; sudo -n dnctl -q pipe ${loss_pipe} delete 2>/dev/null || true; rm -f ${DNCTL_LOCK_DIR}/pid 2>/dev/null || true; rmdir ${DNCTL_LOCK_DIR} 2>/dev/null || true; kill_pid \"\${GO_PID:-}\"; kill_pid \"\${MOJO_H2_PID:-}\"; kill_pid \"\${BASE_PID:-}\"; kill_pid \"\${MOJO_H3_PID:-}\"" EXIT
                 # shellcheck disable=SC2064
                 trap "sudo -n pfctl -a ${loss_anchor} -F all 2>/dev/null || true; sudo -n dnctl -q pipe ${loss_pipe} delete 2>/dev/null || true; rm -f ${DNCTL_LOCK_DIR}/pid 2>/dev/null || true; rmdir ${DNCTL_LOCK_DIR} 2>/dev/null || true" RETURN
-                trap 'exit 130' INT
-                trap 'exit 143' TERM
                 h2load --alpn-list=h2 -c 8 -m 4 -t 1 -D 5s "${url}/fixed" \
                     >"$OUT_DIR/special/h2_${label}_loss_h2load.out" 2>&1
                 local loss_rc=$?
@@ -800,12 +806,22 @@ run_h3_special() {
             loss_pf_detail="no free dummynet pipe id in 62-81 (or lock/claim failed)"
             if [ "$dnctl_locked" -eq 1 ]; then dnctl_lock_release; fi
         else
+            # Pipe+lock are live immediately after claim — clean them up on
+            # signal/exit before PF work; extend with the anchor once live.
+            # shellcheck disable=SC2064
+            trap "sudo -n dnctl -q pipe ${loss_pipe} delete 2>/dev/null || true; rm -f ${DNCTL_LOCK_DIR}/pid 2>/dev/null || true; rmdir ${DNCTL_LOCK_DIR} 2>/dev/null || true; kill_pid \"\${GO_PID:-}\"; kill_pid \"\${MOJO_H2_PID:-}\"; kill_pid \"\${BASE_PID:-}\"; kill_pid \"\${MOJO_H3_PID:-}\"" EXIT
+            # shellcheck disable=SC2064
+            trap "sudo -n dnctl -q pipe ${loss_pipe} delete 2>/dev/null || true; rm -f ${DNCTL_LOCK_DIR}/pid 2>/dev/null || true; rmdir ${DNCTL_LOCK_DIR} 2>/dev/null || true" RETURN
+            trap 'exit 130' INT
+            trap 'exit 143' TERM
             local loss_anchor
             loss_anchor="$(pf_alloc_dummynet_anchor net_mojo_bench_h3 "$pf_note" || true)"
             if [ -z "$loss_anchor" ]; then
                 loss_pf_detail="no usable dummynet anchor (PF disabled, no parent, or nonempty leaf)"
                 dnctl_delete_pipe "$loss_pipe" "$pf_note"
                 dnctl_lock_release
+                trap 'kill_pid "${GO_PID:-}"; kill_pid "${MOJO_H2_PID:-}"; kill_pid "${BASE_PID:-}"; kill_pid "${MOJO_H3_PID:-}"' EXIT
+                trap - RETURN INT TERM
                 loss_pipe=""
             else
             set +e
@@ -828,18 +844,17 @@ run_h3_special() {
                 sudo -n pfctl -a "$loss_anchor" -F all 2>>"$pf_note" || true
                 dnctl_delete_pipe "$loss_pipe" "$pf_note"
                 dnctl_lock_release
+                trap 'kill_pid "${GO_PID:-}"; kill_pid "${MOJO_H2_PID:-}"; kill_pid "${BASE_PID:-}"; kill_pid "${MOJO_H3_PID:-}"' EXIT
+                trap - RETURN INT TERM
                 loss_pipe=""
             else
                 loss_pf_verdict=configured
                 loss_pf_detail="dnctl udp plr=0.05 on port ${port} pipe ${loss_pipe} anchor=${loss_anchor}"
-                # RETURN for early return; EXIT+INT/TERM for signal kill.
-                # Flush only this unique anchor — never a shared host leaf.
+                # Extend cleanup with the live PF anchor.
                 # shellcheck disable=SC2064
                 trap "sudo -n pfctl -a ${loss_anchor} -F all 2>/dev/null || true; sudo -n dnctl -q pipe ${loss_pipe} delete 2>/dev/null || true; rm -f ${DNCTL_LOCK_DIR}/pid 2>/dev/null || true; rmdir ${DNCTL_LOCK_DIR} 2>/dev/null || true; kill_pid \"\${GO_PID:-}\"; kill_pid \"\${MOJO_H2_PID:-}\"; kill_pid \"\${BASE_PID:-}\"; kill_pid \"\${MOJO_H3_PID:-}\"" EXIT
                 # shellcheck disable=SC2064
                 trap "sudo -n pfctl -a ${loss_anchor} -F all 2>/dev/null || true; sudo -n dnctl -q pipe ${loss_pipe} delete 2>/dev/null || true; rm -f ${DNCTL_LOCK_DIR}/pid 2>/dev/null || true; rmdir ${DNCTL_LOCK_DIR} 2>/dev/null || true" RETURN
-                trap 'exit 130' INT
-                trap 'exit 143' TERM
             fi
             fi
         fi
