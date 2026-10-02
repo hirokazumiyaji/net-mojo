@@ -7,14 +7,20 @@ import sys
 def read_h2_frame(client):
     header = bytearray()
     while len(header) < 9:
-        chunk = client.recv(9 - len(header))
+        try:
+            chunk = client.recv(9 - len(header))
+        except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError) as exc:
+            raise RuntimeError("connection closed before HTTP/2 response") from exc
         if not chunk:
             raise RuntimeError("connection closed before HTTP/2 response")
         header.extend(chunk)
     length = int.from_bytes(header[:3], "big")
     payload = bytearray()
     while len(payload) < length:
-        chunk = client.recv(length - len(payload))
+        try:
+            chunk = client.recv(length - len(payload))
+        except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError) as exc:
+            raise RuntimeError("incomplete HTTP/2 response frame") from exc
         if not chunk:
             raise RuntimeError("incomplete HTTP/2 response frame")
         payload.extend(chunk)

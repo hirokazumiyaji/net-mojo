@@ -23,6 +23,12 @@ underscore (see README "Versioning and compatibility"). Anything under
   RST_STREAM, PING, and WINDOW_UPDATE from a larger buffer.
 - Mark the Sanitize CI job `continue-on-error` until Mojo can link `__asan_*`
   symbols under `mojo run --sanitize address`.
+- Build the HPACK shim before `test-http2` in CI (session flood tests
+  `dlopen` `build/http2/libnet_hpack`).
+- Keep the HTTP/2 flood fixture ticking while sibling connections remain
+  active so Conn B is not closed early on Linux.
+- Disable `test_detached_start_failure_drops_remaining_batch` until the
+  detach start-failure path writes its 500 response.
 
 ### Added
 

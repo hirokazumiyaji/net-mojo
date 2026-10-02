@@ -33,11 +33,12 @@ def main() raises:
     )
     print(String("READY ") + String(server.local_address().port))
     var handler = _FloodHandler()
-    # Conn A may complete one request before the storm; Conn B must still succeed.
-    while handler.requests < 2:
+    # Wait for the first client so we do not exit before peers connect.
+    while server.active_connections() == 0:
         _ = server.tick(handler, Timeout.seconds(2))
-    # Flush GOAWAY / drain while peers finish assertions.
-    for _ in range(64):
-        if server.active_connections() == 0:
-            break
-        _ = server.tick(handler, Timeout.milliseconds(50))
+    # Conn A may complete one request before the storm; Conn B must still
+    # succeed. Keep ticking while any connection is alive so the sibling
+    # response can flush after GOAWAY drains Conn A (Linux CI previously
+    # hit BrokenPipe when the server stopped accepting work too early).
+    while handler.requests < 2 or server.active_connections() > 0:
+        _ = server.tick(handler, Timeout.milliseconds(100))

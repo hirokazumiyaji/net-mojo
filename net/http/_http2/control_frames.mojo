@@ -140,7 +140,7 @@ def parse_goaway_frame[
         or frame.frame_type != Byte(7)
         or frame.stream_id != UInt32(0)
         or frame.payload_length < 8
-        or len(payload) != frame.payload_length
+        or len(payload) < frame.payload_length
     ):
         return GoAwayFrameResult.error()
 
