@@ -13,8 +13,9 @@ Scenarios:
   slow   — hold one large POST /echo upload open while N GET /fixed siblings
            run on the same connection, then release it
   cancel — RST_STREAM a target whose large POST /echo response is mid-flight
-           under withheld stream credit (queued response), while siblings
-           complete, then verify the connection still admits a full echo
+           under withheld stream credit, while sibling echoes stay
+           flow-control-blocked across the reset; burn Mojo's buffer budget
+           with repeated cancel cycles, then require a full echo reuse
 
 The slow case is a deterministic version of the earlier `--limit-rate`
 upload: the target stream's request body is deliberately left incomplete, so
@@ -65,15 +66,20 @@ FIXED_BODY = b"a" * 64
 ECHO_BODY_LEN = 1 << 20
 ECHO_PREFIX_LEN = 32 * 1024
 
-# Headroom on the connection-level receive window. Slow-scenario siblings are
-# tiny /fixed bodies; cancel-scenario siblings are full echo responses under
-# per-stream withhold. Raising the connection window once keeps stream-level
-# withholding from exhausting the shared connection window.
-CONN_WINDOW = 8 * ECHO_BODY_LEN
+# Headroom on the connection-level receive window. Cancel opens several
+# FC-blocked 1 MiB echoes at once (target + siblings), so the connection
+# window must cover many initial per-stream windows without stalling.
+CONN_WINDOW = 32 * ECHO_BODY_LEN
 
-# Per-request wall-clock budget. The scenarios are sub-second on loopback;
-# anything slower means the server is not making progress.
+# Per-request wall-clock budget for slow. Cancel burns Mojo's buffer budget
+# with repeated RST cycles and needs a longer ceiling.
 REQUEST_TIMEOUT_S = 30.0
+CANCEL_TIMEOUT_S = 300.0
+
+# Mojo H2 defaults from net/http/config.mojo — used to size the cancel
+# capacity-release proof. Go has no such budget; the extra cycles are
+# harmless there and still fail a server that pins cancelled reservations.
+H2_TOTAL_BUFFER_BUDGET = 268435456
 
 # Default SETTINGS_MAX_FRAME_SIZE. Uploads are split into frames of this
 # size so neither scenario depends on a larger negotiated frame size.
@@ -477,35 +483,61 @@ def run_cancel(url: str, siblings: int) -> dict:
 
     t0 = time.perf_counter()
     body = b"y" * ECHO_BODY_LEN
-    with connect_h2(host, port, REQUEST_TIMEOUT_S) as sock:
+    # If each cancelled response kept a full max_response_body reservation,
+    # this many cycles would exhaust total_buffer_budget (config.mojo).
+    reserve_cycles = (H2_TOTAL_BUFFER_BUDGET // ECHO_BODY_LEN) + 1
+    with connect_h2(host, port, CANCEL_TIMEOUT_S) as sock:
         client = H2ScenarioClient(sock, authority)
-        deadline = time.perf_counter() + REQUEST_TIMEOUT_S
-        # Target must have a queued mid-response when RST_STREAM fires.
-        # An incomplete upload never reaches the response scheduler, so it
-        # cannot exercise "RST_STREAM cancels the corresponding queued
-        # response and releases its buffer reservation"
-        # (docs/design/http2-server.md). Finish the request, withhold stream
-        # credit until some DATA arrives, then reset that stalled response.
+        deadline = time.perf_counter() + CANCEL_TIMEOUT_S
+        # Phase 1: burn reserved capacity. A server that pins each cancelled
+        # response's buffer reservation will refuse later work once the
+        # configured budget is exceeded.
+        cycles_done = 0
+        for _ in range(reserve_cycles):
+            tid = client.post_echo(body, deadline, withhold=True)
+            if not client.wait_flow_blocked([tid], deadline):
+                break
+            client.reset(tid)
+            client.abandon(tid)
+            cycles_done += 1
+            if client.terminated is not None:
+                break
+
+        # Phase 2: RST a queued mid-response while siblings are also
+        # FC-blocked, then release siblings only after the reset.
         target = client.post_echo(body, deadline, withhold=True)
         target_blocked = client.wait_flow_blocked([target], deadline)
         target_bytes_at_reset = len(client.body(target))
-        # Siblings share the connection while the target response is stalled.
-        sib_ids = [client.get() for _ in range(siblings)]
+        sib_ids = [
+            client.post_echo(body, deadline, withhold=True)
+            for _ in range(siblings)
+        ]
+        siblings_blocked = client.wait_flow_blocked(sib_ids, deadline)
         reset_sent = False
-        if target_blocked and client.response_blocked(target):
+        if (
+            target_blocked
+            and siblings_blocked
+            and client.response_blocked(target)
+            and all(client.response_blocked(sid) for sid in sib_ids)
+        ):
             client.reset(target)
             client.abandon(target)
             reset_sent = True
+        # Siblings must still be incomplete after the server processes RST.
+        siblings_blocked_after_reset = all(
+            client.response_blocked(sid) for sid in sib_ids
+        )
+        for sid in sib_ids:
+            client.release(sid)
         siblings_done = client.wait_siblings(sib_ids, deadline)
         # RFC 7540 5.1: the receiver of RST_STREAM may answer with its own
         # RST_STREAM but need not, so this is recorded, not required.
         peer_reset = client.resets.get(target)
-        # Prove admission/reservation was released: another full-size echo
-        # must be accepted and completed on the same connection.
+        # Phase 3: after burning the budget with cancels, a full echo and a
+        # GET must still be admitted — reservation must have been released.
         reuse_id = client.post_echo(body, deadline, withhold=False)
         reuse_done = client.wait_stream(reuse_id, deadline)
         reuse_ok = reuse_done and client.echo_ok(reuse_id, body)
-        # And a small GET still works afterwards.
         after_id = client.get()
         after_ok = client.wait_stream(after_id, deadline) and client.fixed_ok(
             after_id
@@ -513,12 +545,15 @@ def run_cancel(url: str, siblings: int) -> dict:
         terminated = client.terminated
     elapsed_ms = (time.perf_counter() - t0) * 1000
 
-    sibling_ok = sum(1 for sid in sib_ids if client.fixed_ok(sid))
+    sibling_ok = sum(1 for sid in sib_ids if client.echo_ok(sid, body))
     verdict = (
         "pass"
-        if target_blocked
+        if cycles_done >= reserve_cycles
+        and target_blocked
         and target_bytes_at_reset > 0
+        and siblings_blocked
         and reset_sent
+        and siblings_blocked_after_reset
         and siblings_done
         and sibling_ok == siblings
         and reuse_ok
@@ -530,8 +565,12 @@ def run_cancel(url: str, siblings: int) -> dict:
         "scenario": "cancel",
         "verdict": verdict,
         "conn": "single",
+        "reserve_cycles": cycles_done,
+        "reserve_cycles_required": reserve_cycles,
         "target_response_blocked": int(target_blocked),
         "target_bytes_at_reset": target_bytes_at_reset,
+        "siblings_blocked_at_reset": int(siblings_blocked),
+        "siblings_blocked_after_reset": int(siblings_blocked_after_reset),
         "reset_sent": int(reset_sent),
         "peer_reset_code": peer_reset,
         "sibling_ok": sibling_ok,
