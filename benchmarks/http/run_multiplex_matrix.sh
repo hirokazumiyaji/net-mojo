@@ -459,16 +459,24 @@ run_h2_special() {
                 dnctl_delete_pipe "$loss_pipe" "$loss_note"
                 set -e
             else
-                # Install cleanup as soon as impairment is live so an
-                # interrupt or early return cannot leave PF/dummynet active.
+                # Install cleanup as soon as impairment is live. RETURN
+                # covers early function return; EXIT covers normal and
+                # signal-driven shell exit (INT/TERM re-enter via exit so
+                # EXIT runs — RETURN alone does not fire on SIGTERM).
+                # Preserve the top-level server kill_pid EXIT handler.
+                # shellcheck disable=SC2064
+                trap "sudo -n pfctl -a bench_matrix -F all 2>/dev/null || true; sudo -n dnctl -q pipe ${loss_pipe} delete 2>/dev/null || true; kill_pid \"\${GO_PID:-}\"; kill_pid \"\${MOJO_H2_PID:-}\"; kill_pid \"\${BASE_PID:-}\"; kill_pid \"\${MOJO_H3_PID:-}\"" EXIT
                 # shellcheck disable=SC2064
                 trap "sudo -n pfctl -a bench_matrix -F all 2>/dev/null || true; sudo -n dnctl -q pipe ${loss_pipe} delete 2>/dev/null || true" RETURN
+                trap 'exit 130' INT
+                trap 'exit 143' TERM
                 h2load --alpn-list=h2 -c 8 -m 4 -t 1 -D 5s "${url}/fixed" \
                     >"$OUT_DIR/special/h2_${label}_loss_h2load.out" 2>&1
                 local loss_rc=$?
                 sudo -n pfctl -a bench_matrix -F all 2>>"$loss_note" || true
                 dnctl_delete_pipe "$loss_pipe" "$loss_note"
-                trap - RETURN
+                trap 'kill_pid "${GO_PID:-}"; kill_pid "${MOJO_H2_PID:-}"; kill_pid "${BASE_PID:-}"; kill_pid "${MOJO_H3_PID:-}"' EXIT
+                trap - RETURN INT TERM
                 set -e
                 local loss_req loss_fail
                 loss_req="$(rg -o 'finished in [^,]+, ([0-9.]+) req/s' -r '$1' \
@@ -584,14 +592,31 @@ run_h3_special() {
             set +e
             sudo -n dnctl pipe "$loss_pipe" config plr 0.05 \
                 >"$pf_note" 2>&1
+            local dnctl_rc=$?
             echo "dummynet in proto udp from any to 127.0.0.1 port ${port} pipe ${loss_pipe}" \
                 | sudo -n pfctl -a bench_matrix_h3 -f - \
                 >>"$pf_note" 2>&1
+            local pfctl_rc=$?
             set -e
-            loss_pf_verdict=configured
-            loss_pf_detail="dnctl udp plr=0.05 on port ${port} pipe ${loss_pipe}"
-            # shellcheck disable=SC2064
-            trap "sudo -n pfctl -a bench_matrix_h3 -F all 2>/dev/null || true; sudo -n dnctl -q pipe ${loss_pipe} delete 2>/dev/null || true" RETURN
+            # Do not claim configured when either step failed (e.g. PF
+            # disabled); match the H2 loss path's status checks.
+            if [ "$dnctl_rc" -ne 0 ] || [ "$pfctl_rc" -ne 0 ]; then
+                loss_pf_verdict=skip
+                loss_pf_detail="loss impairment not configured (dnctl_rc=$dnctl_rc pfctl_rc=$pfctl_rc)"
+                sudo -n pfctl -a bench_matrix_h3 -F all 2>>"$pf_note" || true
+                dnctl_delete_pipe "$loss_pipe" "$pf_note"
+                loss_pipe=""
+            else
+                loss_pf_verdict=configured
+                loss_pf_detail="dnctl udp plr=0.05 on port ${port} pipe ${loss_pipe}"
+                # RETURN for early return; EXIT+INT/TERM for signal kill.
+                # shellcheck disable=SC2064
+                trap "sudo -n pfctl -a bench_matrix_h3 -F all 2>/dev/null || true; sudo -n dnctl -q pipe ${loss_pipe} delete 2>/dev/null || true; kill_pid \"\${GO_PID:-}\"; kill_pid \"\${MOJO_H2_PID:-}\"; kill_pid \"\${BASE_PID:-}\"; kill_pid \"\${MOJO_H3_PID:-}\"" EXIT
+                # shellcheck disable=SC2064
+                trap "sudo -n pfctl -a bench_matrix_h3 -F all 2>/dev/null || true; sudo -n dnctl -q pipe ${loss_pipe} delete 2>/dev/null || true" RETURN
+                trap 'exit 130' INT
+                trap 'exit 143' TERM
+            fi
         fi
     fi
     printf 'proto=h3 label=%s scenario=loss_pf verdict=%s detail=%s\n' \
@@ -604,7 +629,8 @@ run_h3_special() {
     if [ "$loss_pf_verdict" = "configured" ]; then
         sudo -n pfctl -a bench_matrix_h3 -F all 2>/dev/null || true
         dnctl_delete_pipe "$loss_pipe" /dev/null
-        trap - RETURN
+        trap 'kill_pid "${GO_PID:-}"; kill_pid "${MOJO_H2_PID:-}"; kill_pid "${BASE_PID:-}"; kill_pid "${MOJO_H3_PID:-}"' EXIT
+        trap - RETURN INT TERM
         loss_pf_verdict=cleaned
     fi
 
