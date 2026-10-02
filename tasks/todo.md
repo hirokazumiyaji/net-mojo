@@ -381,3 +381,23 @@
 - The independent quiche client completed TLS/ALPN negotiation, sent an HTTP/3 POST over localhost UDP, and received `handled:data` from the shared Mojo `Handler`.
 - `quic-suite` passed, including the C provider smoke test, Mojo FFI test, and all three Rust provider tests.
 - `cargo fmt` and `git diff --check` passed.
+
+## CI failure repair (PR #88, 2026-10-03)
+
+- [x] Inspect latest failed CI run and group failures by cause.
+- [x] Reproduce and fix Linux HTTPS/HTTP2 reset-flood sibling connection failure.
+- [x] Fix sanitizer task mirror extraction and verify missing tasks are detected.
+- [x] Run affected integration suites, core tests, formatting and package checks.
+- [x] Review final diff and record verification results.
+- [ ] Commit and push the verified fix to existing PR #88, then check GitHub CI.
+
+Plan reviewed: preserve reset-flood isolation assertions; fix the responsible transport or fixture behavior using process-exit evidence. Keep workflow task checks strict.
+
+### CI repair review
+
+- Reproduced the original sibling BrokenPipe on Linux aarch64 with Mojo 1.1. The server remained alive and closed only the flooded connection. Clearing the Python client's OpenSSL error queue made the same test pass; CPython's system-error path returns before clearing this thread-local queue.
+- Check B immediately after A's flood GOAWAY, then provoke and verify A's terminal I/O. Keep the existing response, stream rejection, and bounded connection-close assertions. Accept an already closed socket when sending the final probe.
+- Restrict workflow task extraction to actual inline run steps. Both mirror checks pass and reject missing/extra tasks and missing aggregate dependencies.
+- Linux: core 384/384; tls and tls-http2 integration suites; package and package smoke; HTTP/2 provider package smoke and example build all passed. Mojo formatting left all 110 files unchanged.
+- macOS: tls-http2 integration suite passed outside the sandbox. Python syntax and git diff --check passed. Independent review found no actionable issues.
+- The existing nonblocking sanitizer runtime issue reproduces independently: Mojo 1.1 cannot resolve ASan runtime symbols. No sanitizer checks were removed or weakened.
