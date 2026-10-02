@@ -17,6 +17,12 @@ underscore (see README "Versioning and compatibility"). Anything under
 - Require Mojo 1.1 only: drop the `mojo-1-0` Pixi environment and CI job, and
   migrate `String.as_c_string_slice` / `CStringSpan.unsafe_ptr` to
   `as_c_string_span` / `ptr`.
+- Detect macOS arm64 via `CompilationTarget.is_arm()` instead of
+  `is_apple_silicon()` (the latter also requires AMX, which CI runners omit).
+- Accept trailing bytes after fixed-length HTTP/2 control payloads when parsing
+  RST_STREAM, PING, and WINDOW_UPDATE from a larger buffer.
+- Mark the Sanitize CI job `continue-on-error` until Mojo can link `__asan_*`
+  symbols under `mojo run --sanitize address`.
 
 ### Added
 

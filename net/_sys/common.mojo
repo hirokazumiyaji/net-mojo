@@ -353,9 +353,9 @@ def _verify_abi_layouts():
     # numbers, SOCK_*/O_* flags, and sockaddr/addrinfo/msghdr layouts in
     # net/_sys/linux.mojo match on either target (only alpha/mips/sparc
     # style ABIs differ), so any 64-bit Linux target is accepted.
-    comptime assert (
-        _DARWIN and CompilationTarget.is_apple_silicon() and is_64bit()
-    ) or (
+    # Prefer `is_arm()` over `is_apple_silicon()`: the latter also requires
+    # AMX, which GitHub's macOS runners do not always report even on arm64.
+    comptime assert (_DARWIN and CompilationTarget.is_arm() and is_64bit()) or (
         _LINUX and is_64bit()
     ), "net supports only macOS arm64 and 64-bit Linux"
     comptime assert size_of[_PollFD]() == 8, "invalid pollfd ABI"

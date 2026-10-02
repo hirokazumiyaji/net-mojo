@@ -85,7 +85,7 @@ def parse_rst_stream_frame[
         or frame.frame_type != Byte(3)
         or frame.stream_id == UInt32(0)
         or frame.payload_length != 4
-        or len(payload) != 4
+        or len(payload) < 4
     ):
         return RstStreamFrameResult.error()
 
@@ -120,7 +120,7 @@ def parse_ping_frame[
         or frame.frame_type != Byte(6)
         or frame.stream_id != UInt32(0)
         or frame.payload_length != 8
-        or len(payload) != 8
+        or len(payload) < 8
     ):
         return PingFrameResult.error()
 
