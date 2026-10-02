@@ -80,6 +80,10 @@ CANCEL_TIMEOUT_S = 300.0
 # capacity-release proof. Go has no such budget; the extra cycles are
 # harmless there and still fail a server that pins cancelled reservations.
 H2_TOTAL_BUFFER_BUDGET = 268435456
+# Default peer initial stream window. Cancel waits until the response is
+# FC-blocked here; the normal drain path releases those sent bytes, so only
+# the unsent residual can leak if RST forgets to free the reservation.
+INITIAL_STREAM_WINDOW = 65535
 # Stay under http2_max_resets_per_second (100): a correct Mojo server
 # GOAWAYs with ENHANCE_YOUR_CALM above this rate
 # (docs/design/http2-server.md).
@@ -488,26 +492,31 @@ def run_cancel(url: str, siblings: int) -> dict:
 
     t0 = time.perf_counter()
     body = b"y" * ECHO_BODY_LEN
-    # If each cancelled response kept a full max_response_body reservation,
-    # this many cycles would exhaust total_buffer_budget (config.mojo).
-    reserve_cycles = (H2_TOTAL_BUFFER_BUDGET // ECHO_BODY_LEN) + 1
     with connect_h2(host, port, CANCEL_TIMEOUT_S) as sock:
         client = H2ScenarioClient(sock, authority)
         deadline = time.perf_counter() + CANCEL_TIMEOUT_S
-        # Phase 1: burn reserved capacity. A server that pins each cancelled
-        # response's buffer reservation will refuse later work once the
-        # configured budget is exceeded. Pace RST_STREAM below Mojo's
-        # http2_max_resets_per_second so a correct flood defense does not
-        # GOAWAY the connection before the release assertion runs.
+        # Phase 1: burn reserved capacity from the *unsent* residual. Each
+        # cycle waits until the initial stream window has drained; those
+        # sent bytes are released by the normal path (server.mojo drain).
+        # A cancel that frees the stream but leaves the queued remainder
+        # charged therefore leaks about (echo - window) per cycle — size
+        # the burn from that residual until it would exceed the budget.
+        # Pace RST_STREAM below Mojo's http2_max_resets_per_second so a
+        # correct flood defense does not GOAWAY before the release check.
         cycles_done = 0
+        leaked_estimate = 0
         reset_window_start = time.perf_counter()
         resets_in_window = 0
-        for _ in range(reserve_cycles):
+        while leaked_estimate <= H2_TOTAL_BUFFER_BUDGET:
+            if time.perf_counter() >= deadline:
+                break
             tid = client.post_echo(body, deadline, withhold=True)
             if not client.wait_flow_blocked([tid], deadline):
                 break
+            sent = len(client.body(tid))
             client.reset(tid)
             client.abandon(tid)
+            leaked_estimate += max(0, ECHO_BODY_LEN - sent)
             cycles_done += 1
             resets_in_window += 1
             if resets_in_window >= RESET_BUDGET_PER_WINDOW:
@@ -564,7 +573,7 @@ def run_cancel(url: str, siblings: int) -> dict:
     sibling_ok = sum(1 for sid in sib_ids if client.echo_ok(sid, body))
     verdict = (
         "pass"
-        if cycles_done >= reserve_cycles
+        if leaked_estimate > H2_TOTAL_BUFFER_BUDGET
         and target_blocked
         and target_bytes_at_reset > 0
         and siblings_blocked
@@ -582,7 +591,8 @@ def run_cancel(url: str, siblings: int) -> dict:
         "verdict": verdict,
         "conn": "single",
         "reserve_cycles": cycles_done,
-        "reserve_cycles_required": reserve_cycles,
+        "leaked_estimate": leaked_estimate,
+        "budget": H2_TOTAL_BUFFER_BUDGET,
         "target_response_blocked": int(target_blocked),
         "target_bytes_at_reset": target_bytes_at_reset,
         "siblings_blocked_at_reset": int(siblings_blocked),

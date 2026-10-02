@@ -385,13 +385,13 @@ those are separate processes and therefore always separate connections;
 | --- | --- | --- | --- | --- |
 | h2 | Go | slow | pass | 1 conn: 8/8 siblings exact 64 B while the upload stream was still open; echo completed after release |
 | h2 | Mojo | slow | not run | see note below |
-| h2 | Go | cancel | pass | 1 conn: 257 cancel cycles (budget/echo+1); target+8 siblings FC-blocked across RST (65535 B at reset); siblings completed after release; post-reset full echo + GET /fixed OK |
+| h2 | Go | cancel | pass | 1 conn: 274 cancel cycles (unsent residual > 256 MiB budget); target+8 siblings FC-blocked across RST (65535 B at reset); siblings completed after release; post-reset full echo + GET /fixed OK |
 | h2 | Mojo | cancel | not run | see note below |
 | h2 | Go | loss | skip | pf/dummynet needs root; no-loss reference 49,882 req/s |
 | h2 | Mojo | loss | skip | pf/dummynet needs root; no-loss reference 35,860 req/s |
 | h3 | aioquic | slow | pass | 1 conn incomplete upload: 8/8 siblings exact 64 B while POST /echo was still open; echo completed after finish (`method=incomplete_upload`) |
 | h3 | Mojo | slow | pass † | held 262,144 B while 8/8 siblings completed |
-| h3 | aioquic | cancel | pass | reset target in-flight; 8/8 siblings outstanding across the reset and completed; post-reset GET /fixed on the same connection OK |
+| h3 | aioquic | cancel | pass | 257 incomplete-reset cycles (256 KiB each > 64 MiB request-body budget); reset target in-flight; 8/8 siblings outstanding across the reset and completed; post-reset GET /fixed on the same connection OK |
 | h3 | Mojo | cancel | pass † | reset target in-flight; 8/8 siblings completed |
 | h3 | aioquic | loss | pass | 5% client datagram drop, req/s 5,460, 0 failed |
 | h3 | Mojo | loss | pass † | 5% client datagram drop, req/s 6,134, 0 failed |

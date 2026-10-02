@@ -5,8 +5,9 @@ Scenarios (qualitative + limited timing; aioquic client):
   slow   — hold one large POST /echo upload open while N GET /fixed siblings
            run on the same connection, then finish the upload (matches H2;
            aioquic cannot withhold QUIC MAX_STREAM_DATA for a slow reader)
-  cancel — RST one in-flight stream (H3_REQUEST_CANCELLED) while siblings
-           complete, then GET /fixed on the same connection
+  cancel — RST one in-flight stream (H3_REQUEST_CANCELLED) after burning
+           the provider request-body budget with incomplete-reset cycles,
+           while siblings complete, then GET /fixed on the same connection
   loss   — drop a fraction of outbound UDP datagrams (client-side loss emulation)
 
 Usage:
@@ -35,6 +36,14 @@ from aioquic.quic.packet import QuicProtocolVersion
 
 # HTTP/3 request cancelled (RFC 9114)
 H3_REQUEST_CANCELLED = 0x10C
+
+# Aggregate request-body budget across active streams
+# (docs/design/http3-server.md). Cancel burns this with incomplete uploads
+# so a server that ignores RESET_STREAM cleanup fails later admission.
+H3_REQUEST_BODY_BUDGET = 64 * 1024 * 1024
+# Bytes sent before each incomplete reset. Received DATA is what the
+# provider charges against the budget before the stream is cancelled.
+CANCEL_PARTIAL = 256 * 1024
 
 # Expected /fixed response, shared with the main H3 loader
 # (benchmarks/http3_load.py) so every scenario validates payloads alike.
@@ -462,6 +471,13 @@ async def run_cancel(url: str, siblings: int) -> dict:
     configuration.verify_mode = ssl.CERT_NONE
 
     t0 = time.perf_counter()
+    # Declared larger than CANCEL_PARTIAL so END_STREAM never arrives and
+    # the peer must keep the incomplete request until RESET_STREAM.
+    cancel_declared = CANCEL_PARTIAL * 2
+    cancel_body = b"y" * cancel_declared
+    # If each incomplete cancel kept its buffered DATA charged, this many
+    # cycles would exhaust the provider request-body budget.
+    reserve_cycles = (H3_REQUEST_BODY_BUDGET // CANCEL_PARTIAL) + 1
     async with connect(
         host,
         port,
@@ -471,13 +487,65 @@ async def run_cancel(url: str, siblings: int) -> dict:
         assert isinstance(client, ScenarioProtocol)
         await _wait_alpn(client)
 
-        # Run cancellation concurrently with siblings so reset and sibling
-        # traffic overlap; the old code awaited the cancelled request to
-        # completion before starting siblings. Use a large echo for the
-        # cancel target so it is still in-flight (not already completed)
-        # when reset fires after 5ms.
-        cancel_body = b"y" * (256 * 1024)
+        async def _incomplete_reset() -> int:
+            """Send a partial POST /echo and RESET_STREAM it mid-request.
 
+            Returns bytes sent before the reset (the amount a forgetful
+            server would keep charged against the request-body budget).
+            """
+            assert isinstance(client, ScenarioProtocol)
+            stream_id = client._quic.get_next_available_stream_id()
+            loop = asyncio.get_running_loop()
+            future = loop.create_future()
+            pending = {
+                "future": future,
+                "body": bytearray(),
+                "status": None,
+                "start": time.perf_counter(),
+                "done_at": None,
+                "stream_id": stream_id,
+                "cancelled": False,
+            }
+            assert client.http is not None
+            client._inflight[stream_id] = pending
+            partial = cancel_body[:CANCEL_PARTIAL]
+            client.http.send_headers(
+                stream_id,
+                [
+                    (b":method", b"POST"),
+                    (b":scheme", b"https"),
+                    (b":authority", authority),
+                    (b":path", b"/echo"),
+                    (b"content-length", str(len(cancel_body)).encode()),
+                ],
+                end_stream=False,
+            )
+            client.http.send_data(stream_id, partial, end_stream=False)
+            client.transmit()
+            # Let the peer buffer the DATA before we cancel.
+            await asyncio.sleep(0.002)
+            was_inflight = not future.done()
+            if was_inflight:
+                client._quic.reset_stream(
+                    stream_id, error_code=H3_REQUEST_CANCELLED
+                )
+                client.transmit()
+            pending["cancelled"] = True
+            pending["was_inflight"] = was_inflight
+            client._inflight.pop(stream_id, None)
+            return len(partial) if was_inflight else 0
+
+        # Phase 1: prove the peer processes RESET_STREAM cleanup. A server
+        # that ignores cancel and keeps incomplete request bodies charged
+        # will refuse later work once the documented budget is exceeded.
+        leaked_estimate = 0
+        cycles_done = 0
+        for _ in range(reserve_cycles):
+            leaked_estimate += await _incomplete_reset()
+            cycles_done += 1
+
+        # Phase 2: concurrent cancel + siblings so reset overlaps sibling
+        # traffic (siblings remain outstanding across the reset).
         async def _cancel_large() -> dict:
             assert isinstance(client, ScenarioProtocol)
             stream_id = client._quic.get_next_available_stream_id()
@@ -506,7 +574,7 @@ async def run_cancel(url: str, siblings: int) -> dict:
                 end_stream=False,
             )
             client.http.send_data(
-                stream_id, cancel_body[:16384], end_stream=False
+                stream_id, cancel_body[:CANCEL_PARTIAL], end_stream=False
             )
             client.transmit()
             await asyncio.sleep(0.005)
@@ -541,7 +609,7 @@ async def run_cancel(url: str, siblings: int) -> dict:
         # reset fires: 64-byte /fixed responses finish within the 5 ms
         # window on loopback, which would leave nothing to prove the
         # connection survives the reset.
-        sibling_body = b"z" * (256 * 1024)
+        sibling_body = b"z" * CANCEL_PARTIAL
         sibling_tasks = [
             asyncio.create_task(_sibling()) for _ in range(siblings)
         ]
@@ -551,7 +619,8 @@ async def run_cancel(url: str, siblings: int) -> dict:
         )
         # Match H2 cancel: a server that GOAWAYs / drains on RST can still
         # finish already-admitted siblings. Probe a fresh GET on the same
-        # connection before claiming it remains reusable.
+        # connection before claiming it remains reusable — and after the
+        # budget burn, so pinned incomplete bodies would block admission.
         post_reset_ok = False
         try:
             after = await client.get(FIXED_PATH, authority)
@@ -572,13 +641,15 @@ async def run_cancel(url: str, siblings: int) -> dict:
     )
     elapsed_ms = (time.perf_counter() - t0) * 1000
     siblings_outstanding = int(cancelled.get("siblings_outstanding_at_reset", 0))
-    # Pass: target was in-flight when reset fired (not already completed),
+    # Pass: budget burn completed, target was in-flight when reset fired,
     # at least one sibling was still outstanding across the reset, all
     # siblings still succeed, and a post-reset request on the same
-    # connection succeeds (connection reusable, not drained).
+    # connection succeeds (connection reusable; cancel released capacity).
     verdict = (
         "pass"
-        if cancelled.get("cancelled")
+        if cycles_done >= reserve_cycles
+        and leaked_estimate > H3_REQUEST_BODY_BUDGET
+        and cancelled.get("cancelled")
         and cancelled.get("was_inflight")
         and siblings_outstanding > 0
         and sibling_ok == siblings
@@ -588,6 +659,9 @@ async def run_cancel(url: str, siblings: int) -> dict:
     return {
         "scenario": "cancel",
         "verdict": verdict,
+        "reserve_cycles": cycles_done,
+        "leaked_estimate": leaked_estimate,
+        "budget": H3_REQUEST_BODY_BUDGET,
         "cancelled": int(bool(cancelled.get("cancelled"))),
         "was_inflight": int(bool(cancelled.get("was_inflight"))),
         "siblings_outstanding_at_reset": siblings_outstanding,
