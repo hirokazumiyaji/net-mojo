@@ -7,8 +7,7 @@ decision. Usage instructions are out of scope here.
 ## Goals
 
 - Provide synchronous IPv4/IPv6 addressing, OS name resolution, TCP, UDP, and
-  Unix stream sockets for Mojo 1.1, while retaining core compatibility with
-  Mojo 1.0.
+  Unix stream sockets for Mojo 1.0.0.
 - Keep core `net` dependent on Mojo `std` and the documented libc/POSIX ABI,
   with no C shim or third-party runtime. Optional protocol features may add
   isolated native dependencies.
@@ -257,9 +256,37 @@ section records only the package-level boundaries.
   bounds incomplete peers. Core `net` and plaintext server builds remain
   OpenSSL-free. HTTP/3 uses a separately configured QUIC UDP endpoint and the
   same shared `Request`/`Headers`/`Handler`/`ResponseWriter` semantics; wire
-  formats and state machines stay per protocol. Advertise HTTP/3 to HTTPS
-  clients by setting `ServerConfig.alt_svc` (for example `h3=":443"; ma=86400`)
-  when that UDP endpoint is attached; leave it empty when QUIC is unavailable.
+  formats and state machines stay per protocol. There is no `net/http/_http3/`
+  package — HTTP/3 framing stays in the quiche provider.
+- Same-origin ops model: one `Server` may own a TCP TLS listener and a QUIC UDP
+  endpoint on the same host:port (`examples/http3_hello.mojo`). Reuse the same
+  certificate and key for both stacks; example PEMs under `build/tls/` are for
+  local smoke only. Only `header_deadline`, `body_deadline`, `idle_timeout`,
+  and `write_deadline` are forwarded to the QUIC endpoint
+  (`Server.add_quic_endpoint`); `tls_handshake_timeout`,
+  `detached_response_timeout`, and `stream_idle_timeout` have no effect on
+  HTTP/3, and `shutdown_grace` orchestrates both stacks at the `Server`
+  level. Connection and memory bounds are enforced per stack, not shared:
+  `max_connections` caps TCP and QUIC independently (up to the configured
+  count in each), `total_buffer_budget` covers the HTTP connection path while
+  the QUIC provider enforces its own transport-memory limit plus separate
+  fixed 64 MiB request/response caps. Size the process for the sum of both
+  stacks. HTTP/2 stream caps and the Issue #42 flood / QUIC transport-memory
+  knobs land on sibling PRs [#71](https://github.com/hirokazumiyaji/net-mojo/pull/71)–[#75](https://github.com/hirokazumiyaji/net-mojo/pull/75).
+- `Alt-Svc` advertisement is opt-in ([PR #77](https://github.com/hirokazumiyaji/net-mojo/pull/77)):
+  set `ServerConfig.alt_svc` (for example `h3=":443"; ma=86400`) when a QUIC
+  endpoint is attached; leave it empty when QUIC is unavailable so HTTPS does
+  not advertise H3. Handler-supplied `Alt-Svc` wins. Misconfigured advertisement
+  without a listening H3 endpoint is a documentation/ops error only.
+- Shutdown remains cooperative and single-threaded (`request_shutdown` between
+  `tick`s): stop accepting, close idle TCP, drain in-flight work through
+  `shutdown_grace`, and for HTTP/3 send staged GOAWAY then `H3_NO_ERROR` close.
+  Cross-thread shutdown with a wakeup fd is still future work.
+- Dependency updates: bump OpenSSL / libnghttp2 ranges in `pixi.toml` and
+  refresh `pixi.lock`; bump quiche in `net/quic/provider` and refresh its
+  `Cargo.lock`; rebuild optional `tls-http2` / `tls-http3` artifacts and re-run
+  those suites. Do not fold provider upgrades into core `net` CI matrix edits
+  without an explicit follow-up.
 
 ## Testing
 

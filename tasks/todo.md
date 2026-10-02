@@ -260,6 +260,7 @@
 
 - [x] Record the current provider boundary, request mapping, fixed transport and HTTP limits, and verified integration coverage.
 - [x] Identify independent interoperability, loss/cancel stress, aggregate memory bounds, GOAWAY/drain, and Alt-Svc as outstanding.
+- [x] Close those outstanding items on the Issue #42 remaining stack: flood/0-RTT/packet stress/transport memory/UDP backpressure/Alt-Svc/H3 reorder-reset ([PRs #71](https://github.com/hirokazumiyaji/net-mojo/pull/71)–[#78](https://github.com/hirokazumiyaji/net-mojo/pull/78), sibling branches) and measured H2/H3 benches ([#79](https://github.com/hirokazumiyaji/net-mojo/pull/79)–[#81](https://github.com/hirokazumiyaji/net-mojo/pull/81)). Ops docs + design sync are this PR. Still deferred: server push, CONNECT, 0-RTT enablement, CI YAML edits. macOS Mojo e2e H3 is covered by the checked `http3` job on `macos-14` (`http3-client-test` against the Mojo fixture).
 
 ## Review
 

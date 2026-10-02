@@ -33,7 +33,8 @@ response bodies to 1 MiB per response. The provider configures a 32 KiB HTTP/3
 field-section limit. Pending response field and body bytes are capped at 64 MiB
 across the provider; a stream that exceeds this queue budget is reset with
 `H3_EXCESSIVE_LOAD`. Quiche transport memory is estimated separately (see
-limits below) and does not share those 64 MiB application queue caps.
+limits below; [PR #75](https://github.com/hirokazumiyaji/net-mojo/pull/75)) and
+does not share those 64 MiB application queue caps.
 
 The QUIC provider uses a 10,000,000 byte connection receive limit, 1,000,000
 bytes of bidirectional and unidirectional stream receive credit, an initial
@@ -65,21 +66,32 @@ expires.
 
 The QUIC engine supplies HTTP/3 control and QPACK behavior; the application does
 not implement duplicate control streams or a second QPACK implementation.
-Interoperability coverage currently uses aioquic 1.3.0 and quiche. Broader
-independent-client coverage and cancellation/reset stress remain outstanding.
-HTTPS can opt in to `Alt-Svc` advertisement via `ServerConfig.alt_svc` when a
-QUIC endpoint is attached; empty `alt_svc` keeps HTTPS-only deployments from
-advertising H3. Server push and CONNECT are not supported.
+Interoperability coverage currently uses aioquic 1.3.0 and quiche. Issue #42
+remaining PRs close the previously open gaps on sibling branches (not all
+present in every worktree tip):
+
+| Item | Status |
+| --- | --- |
+| Duplicate / reorder / NAT rebinding stress | Done — [PR #74](https://github.com/hirokazumiyaji/net-mojo/pull/74) |
+| Soft quiche transport-memory admission | Done — [PR #75](https://github.com/hirokazumiyaji/net-mojo/pull/75) |
+| UDP send would-block preserves pending datagrams | Done — [PR #76](https://github.com/hirokazumiyaji/net-mojo/pull/76) |
+| Opt-in HTTPS `Alt-Svc` + same-origin TCP/UDP docs | Done — [PR #77](https://github.com/hirokazumiyaji/net-mojo/pull/77) + this ops PR |
+| Application datagram reorder + reset-storm siblings | Done — [PR #78](https://github.com/hirokazumiyaji/net-mojo/pull/78) |
+| Measured H2 / H3 benches | Done — [PR #79](https://github.com/hirokazumiyaji/net-mojo/pull/79)–[#80](https://github.com/hirokazumiyaji/net-mojo/pull/80) |
+| Multiplex matrix + special scenarios | Partially done — [PR #81](https://github.com/hirokazumiyaji/net-mojo/pull/81) records the H2/H3 throughput matrix and specials for Go/aioquic under the current single-connection harness in `benchmarks/http/README.md`; `h2 \| Mojo` specials are not run (Mojo build blocked on this host) and `h3 \| Mojo` specials predate the current criteria (†); H2 loss still needs a root-capable host for pf/dummynet |
+
+Still deferred / out of scope for #42: server push, CONNECT, enabling 0-RTT,
+broader independent-client matrices beyond aioquic/quiche, and CI workflow edits.
+(macOS end-to-end Mojo HTTP/3 validation already runs in CI via the `http3`
+job on macos-14 with `http3-client-test`.)
 
 Closed or timed-out QUIC connections are removed with their connection-ID
 routes, pending request routes, and queued completed requests. New connections
 are capped by `ServerConfig.max_connections`. Request-body buffering and
-pending response fields and bodies each have a 64 MiB aggregate provider cap
-(unchanged). Quiche does not expose allocator-backed transport memory in
-`stats()`, so the provider reports a soft estimate of
-`connections.len() × 256 KiB` and refuses new Initial packets when accepting
-another connection would exceed
+pending response fields and bodies each have a 64 MiB aggregate provider cap.
+Quiche does not expose allocator-backed transport memory in `stats()`, so the
+provider reports a soft estimate of `connections.len() × 256 KiB` and refuses
+new Initial packets when accepting another connection would exceed
 `ServerConfig.quic_max_transport_memory_bytes` (default 2,621,440,000 bytes = 10,000 × 256 KiB, aligned with
-10,000 connections). Existing connections continue to drain normally when the
-budget is exhausted. UDP send-path saturation under sustained would-block
-remains a separate verification item.
+10,000 connections; [PR #75](https://github.com/hirokazumiyaji/net-mojo/pull/75)).
+Existing connections continue to drain normally when the budget is exhausted.

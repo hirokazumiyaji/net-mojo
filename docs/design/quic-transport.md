@@ -22,15 +22,42 @@ The recommendation is conditional on those build and packaging probes. The appli
 
 ### 0-RTT / early data
 
-Provider config construction (`apply_provider_quic_transport_settings` in `net/quic/provider/src/lib.rs`) explicitly keeps TLS early data disabled. Quiche only exposes `Config::enable_early_data()` as an opt-in and has no `disable_*` setter; the provider never calls that API (`PROVIDER_ENABLE_EARLY_DATA` is false). Session tickets may still be issued for resumption, but connections must not enter early data / 0-RTT.
+Provider config construction (`apply_provider_quic_transport_settings` in
+`net/quic/provider/src/lib.rs`) explicitly keeps TLS early data disabled
+([PR #73](https://github.com/hirokazumiyaji/net-mojo/pull/73)). Quiche only
+exposes `Config::enable_early_data()` as an opt-in and has no `disable_*`
+setter; the provider never calls that API (`PROVIDER_ENABLE_EARLY_DATA` is
+false). Session tickets may still be issued for resumption, but connections
+must not enter early data / 0-RTT.
 
 ### Packet stress (duplicate / reorder / NAT rebinding)
 
-Provider Rust tests drive an in-memory quiche client against `QuicServer::recv_datagram` / `send` / `on_timeout` without a UDP socket:
+Provider Rust tests ([PR #74](https://github.com/hirokazumiyaji/net-mojo/pull/74))
+drive an in-memory quiche client against `QuicServer::recv_datagram` / `send` /
+`on_timeout` without a UDP socket:
 
 - Duplicate client datagrams must still complete an HTTP/3 request.
-- Swapped consecutive handshake or 1-RTT datagrams must recover via loss-detection timers.
-- Mid-connection change of the observed client UDP address must either continue serving or idle/timeout-clean without leaking CID `routes` or connection maps. Full path migration beyond quiche’s built-in behavior is out of scope.
+- Swapped consecutive handshake or 1-RTT datagrams must recover via
+  loss-detection timers.
+- Mid-connection change of the observed client UDP address must either continue
+  serving or idle/timeout-clean without leaking CID `routes` or connection maps.
+  Full path migration beyond quiche’s built-in behavior is out of scope.
+
+### Transport memory and UDP send backpressure
+
+Soft transport-memory admission
+([PR #75](https://github.com/hirokazumiyaji/net-mojo/pull/75)) refuses new
+connections when `connections.len() × 256 KiB` would exceed
+`ServerConfig.quic_max_transport_memory_bytes`. UDP send saturation under
+sustained would-block
+([PR #76](https://github.com/hirokazumiyaji/net-mojo/pull/76)) must preserve
+pending datagrams and retry when the socket becomes writable — no
+drop-without-retry.
+
+Still deferred: enabling 0-RTT and full path migration. macOS Mojo end-to-end
+HTTP/3 is covered in CI (`http3` job on `macos-14`, `http3-client-test` against
+the Mojo fixture); only packaged-artifact distribution verification remains
+optional.
 
 ## Source material
 
