@@ -156,5 +156,3 @@ def _host_is_valid(data: StringSlice) -> Bool:
             return False
         hostname = String(from_utf8_lossy=bytes[0:last_colon])
     return _is_reg_name(hostname)
-
-

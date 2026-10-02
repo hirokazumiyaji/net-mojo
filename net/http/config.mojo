@@ -11,7 +11,12 @@ from net import Timeout
 @fieldwise_init
 struct ServerConfig(Copyable, Movable):
     var max_connections: Int
+    var quic_max_transport_memory_bytes: Int
     var max_http2_streams_per_connection: Int
+    # Tumbling 1s window; non-ACK PING/SETTINGS, WINDOW_UPDATE, PRIORITY.
+    var http2_max_control_frames_per_second: Int
+    # Tumbling 1s window for RST_STREAM; separate from control-frame budget.
+    var http2_max_resets_per_second: Int
     var max_request_line: Int
     var max_headers_bytes: Int
     var max_headers_count: Int
@@ -36,12 +41,21 @@ struct ServerConfig(Copyable, Movable):
     var max_bytes_per_tick: Int
     var max_requests_per_tick: Int
     var hpack_library_path: String
+    # Opt-in HTTPS Alt-Svc advertisement (empty disables). Set the full
+    # header value, e.g. `h3=":443"; ma=86400`, when a QUIC/HTTP/3 endpoint
+    # is attached on the same origin. UDP-unavailable deployments leave
+    # this empty and continue serving HTTPS without advertising H3.
+    var alt_svc: String
 
     @staticmethod
     def default() raises -> Self:
         return Self(
             max_connections=10000,
+            # Soft estimate: 10_000 connections × 256 KiB per-conn quiche charge.
+            quic_max_transport_memory_bytes=2621440000,
             max_http2_streams_per_connection=100,
+            http2_max_control_frames_per_second=1000,
+            http2_max_resets_per_second=100,
             max_request_line=8192,
             max_headers_bytes=32768,
             max_headers_count=100,
@@ -66,4 +80,5 @@ struct ServerConfig(Copyable, Movable):
             max_bytes_per_tick=65536,
             max_requests_per_tick=16,
             hpack_library_path=String("build/http2/libnet_hpack"),
+            alt_svc=String(""),
         )

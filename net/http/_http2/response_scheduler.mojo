@@ -139,9 +139,9 @@ struct Http2ResponseScheduler(Movable):
                 flags,
                 stream_id,
                 Span(self._responses[index].body)[
-                    self._responses[index].body_offset : self._responses[
-                        index
-                    ].body_offset
+                    self._responses[index]
+                    .body_offset : self._responses[index]
+                    .body_offset
                     + payload_length
                 ],
                 max_frame_size,

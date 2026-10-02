@@ -10,6 +10,38 @@ use std::time::{Duration, Instant};
 use quiche::h3::NameValue;
 use quiche::{Connection, ConnectionId, RecvInfo, SendInfo};
 
+/// Whether provider quiche configs enable TLS early data (0-RTT).
+///
+/// Quiche only exposes [`quiche::Config::enable_early_data`] as an opt-in.
+/// First-ship HTTP/3 keeps 0-RTT off: never call that API on provider configs.
+const PROVIDER_ENABLE_EARLY_DATA: bool = false;
+
+/// Keep early data / 0-RTT disabled on a quiche config.
+///
+/// Quiche 0.29 has no `disable_early_data` or `set_enable_early_data(false)`.
+/// Early data stays off unless [`quiche::Config::enable_early_data`] is called;
+/// this helper is the explicit policy call site. Do not call `enable_early_data`
+/// while [`PROVIDER_ENABLE_EARLY_DATA`] is false.
+fn disable_quic_early_data(_config: &mut quiche::Config) {
+    assert!(
+        !PROVIDER_ENABLE_EARLY_DATA,
+        "provider must not enable quiche early data / 0-RTT"
+    );
+    // Intentionally do not call Config::enable_early_data().
+}
+
+/// Apply shared provider transport settings (including explicit 0-RTT disable).
+fn apply_provider_quic_transport_settings(config: &mut quiche::Config) {
+    disable_quic_early_data(config);
+    config.set_initial_max_data(10_000_000);
+    config.set_initial_max_stream_data_bidi_local(1_000_000);
+    config.set_initial_max_stream_data_bidi_remote(1_000_000);
+    config.set_initial_max_stream_data_uni(1_000_000);
+    config.set_initial_max_streams_bidi(100);
+    config.set_initial_max_streams_uni(3);
+    config.set_max_idle_timeout(60_000);
+}
+
 pub struct NetQuicServerConfig {
     _inner: Option<quiche::Config>,
 }
@@ -56,13 +88,7 @@ pub unsafe extern "C" fn net_quic_server_config_new(
     {
         return ptr::null_mut();
     }
-    config.set_initial_max_data(10_000_000);
-    config.set_initial_max_stream_data_bidi_local(1_000_000);
-    config.set_initial_max_stream_data_bidi_remote(1_000_000);
-    config.set_initial_max_stream_data_uni(1_000_000);
-    config.set_initial_max_streams_bidi(100);
-    config.set_initial_max_streams_uni(3);
-    config.set_max_idle_timeout(60_000);
+    apply_provider_quic_transport_settings(&mut config);
 
     Box::into_raw(Box::new(NetQuicServerConfig {
         _inner: Some(config),
@@ -109,6 +135,28 @@ pub unsafe extern "C" fn net_quic_server_set_connection_limit(
     }
     unsafe { &mut *server }._inner.max_connections = limit;
     1
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn net_quic_server_set_transport_memory_limit(
+    server: *mut NetQuicServer,
+    limit: usize,
+) -> i32 {
+    if server.is_null() {
+        return -1;
+    }
+    unsafe { &mut *server }._inner.max_transport_memory_bytes = limit;
+    1
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn net_quic_server_transport_memory_bytes(
+    server: *const NetQuicServer,
+) -> usize {
+    if server.is_null() {
+        return 0;
+    }
+    unsafe { &*server }._inner.estimated_transport_memory_bytes()
 }
 
 #[unsafe(no_mangle)]
@@ -733,6 +781,7 @@ pub struct QuicServer {
     next_request_id: u64,
     random: File,
     max_connections: usize,
+    max_transport_memory_bytes: usize,
     max_request_body_bytes: usize,
     max_request_headers_bytes: usize,
     max_request_headers_count: usize,
@@ -777,6 +826,21 @@ const MAX_HTTP3_REQUEST_STREAM_ID: u64 = (1 << 62) - 4;
 const MAX_HTTP3_BUFFERED_REQUEST_BYTES: usize = 64 * 1024 * 1024;
 const MAX_HTTP3_REQUEST_BODY_BYTES: usize = 1024 * 1024;
 const MAX_HTTP3_BUFFERED_RESPONSE_BYTES: usize = 64 * 1024 * 1024;
+/// Soft per-connection estimate for quiche transport heap/state (handshake,
+/// packet buffers, TLS session). Quiche's `stats()` does not report
+/// allocator-backed memory, so admission uses `connections.len() *` this
+/// constant instead of an exact RSS probe. This is an admission heuristic,
+/// not a hard RSS guarantee: a connection with a large in-flight window can
+/// transiently exceed it, which is why application request/response bytes
+/// are capped separately at 64 MiB aggregates and operators should keep
+/// headroom in `quic_max_transport_memory_bytes`. Measured per-connection
+/// RSS calibration remains follow-up work per the remaining-design spec.
+const ESTIMATED_QUIC_TRANSPORT_BYTES_PER_CONNECTION: usize = 256 * 1024;
+/// Default soft cap (10,000 × 256 KiB = 2,621,440,000) so `max_connections`
+/// remains the primary gate unless operators lower
+/// `quic_max_transport_memory_bytes`.
+const DEFAULT_MAX_QUIC_TRANSPORT_MEMORY_BYTES: usize =
+    10_000 * ESTIMATED_QUIC_TRANSPORT_BYTES_PER_CONNECTION;
 const H3_EXCESSIVE_LOAD: u64 = 0x107;
 // RFC 9114 assigns 0x105 to H3_FRAME_UNEXPECTED and 0x10b to H3_REQUEST_REJECTED.
 const H3_FRAME_UNEXPECTED: u64 = 0x105;
@@ -864,6 +928,7 @@ impl QuicServer {
             next_request_id: 1,
             random: File::open("/dev/urandom")?,
             max_connections: 10_000,
+            max_transport_memory_bytes: DEFAULT_MAX_QUIC_TRANSPORT_MEMORY_BYTES,
             max_request_body_bytes: MAX_HTTP3_REQUEST_BODY_BYTES,
             max_request_headers_bytes: 32_768,
             max_request_headers_count: 100,
@@ -947,6 +1012,18 @@ impl QuicServer {
         self.connections.is_empty()
     }
 
+    pub fn estimated_transport_memory_bytes(&self) -> usize {
+        self.connections
+            .len()
+            .saturating_mul(ESTIMATED_QUIC_TRANSPORT_BYTES_PER_CONNECTION)
+    }
+
+    fn would_exceed_transport_memory_budget(&self) -> bool {
+        self.estimated_transport_memory_bytes()
+            .saturating_add(ESTIMATED_QUIC_TRANSPORT_BYTES_PER_CONNECTION)
+            > self.max_transport_memory_bytes
+    }
+
     pub fn recv_datagram(
         &mut self,
         packet: &mut [u8],
@@ -962,6 +1039,9 @@ impl QuicServer {
                     return Err(quiche::Error::Done.into());
                 }
                 if self.connections.len() >= self.max_connections {
+                    return Err(quiche::Error::Done.into());
+                }
+                if self.would_exceed_transport_memory_budget() {
                     return Err(quiche::Error::Done.into());
                 }
                 let mut source_id = [0; 16];
@@ -1931,6 +2011,201 @@ mod tests {
     }
 
     #[test]
+    fn provider_quic_config_keeps_early_data_disabled_on_session_resume() {
+        assert!(
+            !super::PROVIDER_ENABLE_EARLY_DATA,
+            "provider must ship with 0-RTT / early data disabled"
+        );
+
+        let certificate_path = std::env::var("NET_HTTP_TEST_CERT").unwrap();
+        let private_key_path = std::env::var("NET_HTTP_TEST_KEY").unwrap();
+
+        // Share one ticket-encryption key so the resume server can decrypt
+        // the ticket issued by the first server; otherwise resumption fails
+        // before the early-data policy is evaluated.
+        const TEST_TICKET_KEY: [u8; 48] = [0x0A; 48];
+
+        let mut server_config = quiche::Config::new(quiche::PROTOCOL_VERSION).unwrap();
+        server_config
+            .set_application_protos(quiche::h3::APPLICATION_PROTOCOL)
+            .unwrap();
+        server_config
+            .load_cert_chain_from_pem_file(&certificate_path)
+            .unwrap();
+        server_config
+            .load_priv_key_from_pem_file(&private_key_path)
+            .unwrap();
+        super::apply_provider_quic_transport_settings(&mut server_config);
+        // Issue an early-data-capable ticket: the first handshake uses a
+        // server (and client) with early data enabled so the resumed
+        // Initial can actually offer 0-RTT. The server under test below
+        // uses production settings (disabled) to verify rejection.
+        server_config.set_ticket_key(&TEST_TICKET_KEY).unwrap();
+        server_config.enable_early_data();
+
+        let mut client_config = quiche::Config::new(quiche::PROTOCOL_VERSION).unwrap();
+        client_config
+            .set_application_protos(quiche::h3::APPLICATION_PROTOCOL)
+            .unwrap();
+        client_config.verify_peer(false);
+        super::apply_provider_quic_transport_settings(&mut client_config);
+        client_config.enable_early_data();
+
+        let client_address = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 54321);
+        let server_address = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 4433);
+        let mut packet = [0; 65535];
+
+        // Initial handshake to obtain a session ticket.
+        let client_scid = [0x31; 16];
+        let server_scid = [0x52; 16];
+        let mut client = quiche::connect(
+            Some("localhost"),
+            &ConnectionId::from_ref(&client_scid),
+            client_address,
+            server_address,
+            &mut client_config,
+        )
+        .unwrap();
+        let (initial_length, _) = client.send(&mut packet).unwrap();
+        let original_dcid = Header::from_slice(&mut packet[..initial_length], 16)
+            .unwrap()
+            .dcid
+            .as_ref()
+            .to_vec();
+        let mut server = quiche::accept(
+            &ConnectionId::from_ref(&server_scid),
+            Some(&ConnectionId::from_ref(&original_dcid)),
+            server_address,
+            client_address,
+            &mut server_config,
+        )
+        .unwrap();
+        server
+            .recv(
+                &mut packet[..initial_length],
+                RecvInfo {
+                    from: client_address,
+                    to: server_address,
+                },
+            )
+            .unwrap();
+
+        for _ in 0..16 {
+            while let Ok((length, _)) = server.send(&mut packet) {
+                client
+                    .recv(
+                        &mut packet[..length],
+                        RecvInfo {
+                            from: server_address,
+                            to: client_address,
+                        },
+                    )
+                    .unwrap();
+            }
+            while let Ok((length, _)) = client.send(&mut packet) {
+                server
+                    .recv(
+                        &mut packet[..length],
+                        RecvInfo {
+                            from: client_address,
+                            to: server_address,
+                        },
+                    )
+                    .unwrap();
+            }
+            if client.is_established() && server.is_established() && client.session().is_some() {
+                break;
+            }
+        }
+        assert!(client.is_established());
+        assert!(server.is_established());
+        assert!(!client.is_in_early_data());
+        assert!(!server.is_in_early_data());
+
+        let session = client
+            .session()
+            .expect("session ticket after handshake")
+            .to_vec();
+
+        // Resuming client offers 0-RTT; production server must reject it.
+        // Only the server under test uses provider settings (early data
+        // disabled). The resuming client enables early data so the Initial
+        // actually contains a 0-RTT offer.
+        let mut resume_server_config = quiche::Config::new(quiche::PROTOCOL_VERSION).unwrap();
+        resume_server_config
+            .set_application_protos(quiche::h3::APPLICATION_PROTOCOL)
+            .unwrap();
+        resume_server_config
+            .load_cert_chain_from_pem_file(&certificate_path)
+            .unwrap();
+        resume_server_config
+            .load_priv_key_from_pem_file(&private_key_path)
+            .unwrap();
+        super::apply_provider_quic_transport_settings(&mut resume_server_config);
+        resume_server_config
+            .set_ticket_key(&TEST_TICKET_KEY)
+            .unwrap();
+
+        let mut resume_client_config = quiche::Config::new(quiche::PROTOCOL_VERSION).unwrap();
+        resume_client_config
+            .set_application_protos(quiche::h3::APPLICATION_PROTOCOL)
+            .unwrap();
+        resume_client_config.verify_peer(false);
+        resume_client_config.set_initial_max_data(10_000_000);
+        resume_client_config.set_initial_max_stream_data_bidi_local(1_000_000);
+        resume_client_config.set_initial_max_stream_data_bidi_remote(1_000_000);
+        resume_client_config.set_initial_max_stream_data_uni(1_000_000);
+        resume_client_config.set_initial_max_streams_bidi(100);
+        resume_client_config.set_initial_max_streams_uni(3);
+        resume_client_config.set_max_idle_timeout(60_000);
+        resume_client_config.enable_early_data();
+
+        let resume_client_scid = [0x33; 16];
+        let resume_server_scid = [0x54; 16];
+        let mut resume_client = quiche::connect(
+            Some("localhost"),
+            &ConnectionId::from_ref(&resume_client_scid),
+            client_address,
+            server_address,
+            &mut resume_client_config,
+        )
+        .unwrap();
+        resume_client.set_session(&session).unwrap();
+        let (resume_initial_length, _) = resume_client.send(&mut packet).unwrap();
+        assert!(
+            resume_client.is_in_early_data(),
+            "resuming client must offer 0-RTT so the server can reject it"
+        );
+
+        let resume_dcid = Header::from_slice(&mut packet[..resume_initial_length], 16)
+            .unwrap()
+            .dcid
+            .as_ref()
+            .to_vec();
+        let mut resume_server = quiche::accept(
+            &ConnectionId::from_ref(&resume_server_scid),
+            Some(&ConnectionId::from_ref(&resume_dcid)),
+            server_address,
+            client_address,
+            &mut resume_server_config,
+        )
+        .unwrap();
+        resume_server
+            .recv(
+                &mut packet[..resume_initial_length],
+                RecvInfo {
+                    from: client_address,
+                    to: server_address,
+                },
+            )
+            .unwrap();
+        assert!(
+            !resume_server.is_in_early_data(),
+            "provider server configs must not accept 0-RTT early data"
+        );
+    }
+
+    #[test]
     fn completes_http3_tls_handshake_over_quic_packets() {
         let certificate_path = std::env::var("NET_HTTP_TEST_CERT").unwrap();
         let private_key_path = std::env::var("NET_HTTP_TEST_KEY").unwrap();
@@ -2643,6 +2918,748 @@ mod tests {
         assert!(!server.routes.contains_key(&second_dcid));
     }
 
+    fn stress_server_config() -> quiche::Config {
+        let certificate_path = std::env::var("NET_HTTP_TEST_CERT").unwrap();
+        let private_key_path = std::env::var("NET_HTTP_TEST_KEY").unwrap();
+        let mut server_config = quiche::Config::new(quiche::PROTOCOL_VERSION).unwrap();
+        server_config
+            .set_application_protos(quiche::h3::APPLICATION_PROTOCOL)
+            .unwrap();
+        server_config
+            .load_cert_chain_from_pem_file(&certificate_path)
+            .unwrap();
+        server_config
+            .load_priv_key_from_pem_file(&private_key_path)
+            .unwrap();
+        super::apply_provider_quic_transport_settings(&mut server_config);
+        server_config
+    }
+
+    fn stress_client_config() -> quiche::Config {
+        let mut client_config = quiche::Config::new(quiche::PROTOCOL_VERSION).unwrap();
+        client_config
+            .set_application_protos(quiche::h3::APPLICATION_PROTOCOL)
+            .unwrap();
+        client_config.verify_peer(false);
+        super::apply_provider_quic_transport_settings(&mut client_config);
+        client_config
+    }
+
+    fn collect_client_datagrams(
+        client: &mut quiche::Connection,
+        packet: &mut [u8],
+    ) -> Vec<Vec<u8>> {
+        let mut datagrams = Vec::new();
+        while let Ok((length, _)) = client.send(packet) {
+            datagrams.push(packet[..length].to_vec());
+        }
+        datagrams
+    }
+
+    fn deliver_client_datagram(
+        server: &mut super::QuicServer,
+        datagram: &[u8],
+        local: SocketAddr,
+        remote: SocketAddr,
+    ) {
+        let mut packet = datagram.to_vec();
+        match server.recv_datagram(&mut packet, local, remote) {
+            Ok(()) => {}
+            // Duplicate / out-of-order packets may be ignored by quiche.
+            Err(super::QuicServerError::Quiche(quiche::Error::Done)) => {}
+            Err(error) => panic!("unexpected recv_datagram error: {error:?}"),
+        }
+    }
+
+    fn flush_server_to_client(
+        client: &mut quiche::Connection,
+        server: &mut super::QuicServer,
+        packet: &mut [u8],
+        client_address: SocketAddr,
+    ) {
+        while let Ok(Some((length, info))) = server.send(packet) {
+            let _ = client.recv(
+                &mut packet[..length],
+                RecvInfo {
+                    from: info.from,
+                    to: client_address,
+                },
+            );
+        }
+    }
+
+    fn drive_timeouts(client: &mut quiche::Connection, server: &mut super::QuicServer) {
+        if client.timeout().is_some_and(|timeout| timeout.is_zero()) {
+            client.on_timeout();
+        }
+        if server.timeout().is_some_and(|timeout| timeout.is_zero()) {
+            server.on_timeout();
+        }
+    }
+
+    fn pump_in_memory(
+        client: &mut quiche::Connection,
+        server: &mut super::QuicServer,
+        packet: &mut [u8],
+        local: SocketAddr,
+        remote: SocketAddr,
+        reorder_first_pair: bool,
+        duplicate: bool,
+    ) {
+        drive_timeouts(client, server);
+        let mut datagrams = collect_client_datagrams(client, packet);
+        if reorder_first_pair && datagrams.len() >= 2 {
+            datagrams.swap(0, 1);
+        }
+        for datagram in &datagrams {
+            deliver_client_datagram(server, datagram, local, remote);
+            if duplicate {
+                deliver_client_datagram(server, datagram, local, remote);
+            }
+        }
+        flush_server_to_client(client, server, packet, remote);
+    }
+
+    fn establish_http3_in_memory(
+        client: &mut quiche::Connection,
+        server: &mut super::QuicServer,
+        packet: &mut [u8],
+        local: SocketAddr,
+        remote: SocketAddr,
+        reorder_handshake: bool,
+    ) {
+        // Handshake phase exercises packet-loss recovery: single-datagram
+        // lockstep flights cannot be swapped in-round, and holding one
+        // across rounds deadlocks the handshake, so drop the first server
+        // flight once to force timeout-driven recovery. Real reorder
+        // evidence comes from the 1-RTT large-body swap below.
+        let mut dropped_once = false;
+        for _ in 0..64 {
+            drive_timeouts(client, server);
+            let datagrams = collect_client_datagrams(client, packet);
+            for datagram in &datagrams {
+                deliver_client_datagram(server, datagram, local, remote);
+            }
+            if reorder_handshake {
+                // Drop the first server flight once; timeouts must recover.
+                // Swap in-round when a flight spans several datagrams.
+                let mut cur = Vec::new();
+                while let Ok(Some((length, _))) = server.send(packet) {
+                    cur.push(packet[..length].to_vec());
+                }
+                if !dropped_once && !cur.is_empty() {
+                    dropped_once = true;
+                    // Hold one datagram back to force retransmit timers;
+                    // deliver the rest (if any) out of order.
+                    if cur.len() >= 2 {
+                        cur.swap(0, 1);
+                    }
+                    cur.remove(0);
+                } else if cur.len() >= 2 {
+                    cur.swap(0, 1);
+                }
+                for datagram in &cur {
+                    let mut owned = datagram.clone();
+                    let _ = client.recv(
+                        &mut owned,
+                        RecvInfo {
+                            from: local,
+                            to: remote,
+                        },
+                    );
+                }
+            } else {
+                flush_server_to_client(client, server, packet, remote);
+            }
+            if client.is_established()
+                && server
+                    .connections
+                    .values()
+                    .any(|connection| connection.transport.is_established())
+            {
+                break;
+            }
+            // Loss/reorder recovery is timer-driven; advance when quiche asks.
+            if let Some(timeout) = client.timeout().filter(|timeout| !timeout.is_zero()) {
+                std::thread::sleep(timeout.min(Duration::from_millis(25)));
+            } else if let Some(timeout) = server.timeout().filter(|timeout| !timeout.is_zero()) {
+                std::thread::sleep(timeout.min(Duration::from_millis(25)));
+            }
+        }
+        if reorder_handshake {
+            assert!(
+                dropped_once,
+                "reorder test never dropped a handshake flight"
+            );
+        }
+        assert!(
+            client.is_established(),
+            "client failed to establish under stress"
+        );
+    }
+
+    fn complete_post_request_in_memory(
+        client: &mut quiche::Connection,
+        server: &mut super::QuicServer,
+        packet: &mut [u8],
+        local: SocketAddr,
+        remote: SocketAddr,
+        duplicate_request_datagrams: bool,
+        reorder_request_datagrams: bool,
+    ) -> super::CompletedRequest {
+        let mut client_h3 = quiche::h3::Connection::with_transport(
+            client,
+            &quiche::h3::Config::new().unwrap(),
+        )
+        .unwrap();
+        // Reorder case needs multiple datagrams per round to actually swap;
+        // use a larger body so 1-RTT data spans several QUIC datagrams.
+        let body: Vec<u8> = if reorder_request_datagrams {
+            vec![0x41; 32 * 1024]
+        } else {
+            b"ping".to_vec()
+        };
+        let content_length = body.len().to_string();
+        let request_headers = [
+            quiche::h3::Header::new(b":method", b"POST"),
+            quiche::h3::Header::new(b":scheme", b"https"),
+            quiche::h3::Header::new(b":authority", b"localhost"),
+            quiche::h3::Header::new(b":path", b"/stress"),
+            quiche::h3::Header::new(b"content-length", content_length.as_bytes()),
+        ];
+        let stream_id = client_h3
+            .send_request(client, &request_headers, false)
+            .unwrap();
+        let mut sent = 0;
+        // Send what fits now; remainder is streamed inside the pump loop
+        // as flow control opens (large reorder body would otherwise hit
+        // Done immediately).
+        while sent < body.len() {
+            let end = (sent + 4096).min(body.len());
+            let fin = end == body.len();
+            match client_h3.send_body(client, stream_id, &body[sent..end], fin) {
+                Ok(wrote) => {
+                    sent += wrote;
+                    if wrote == 0 || fin {
+                        break;
+                    }
+                }
+                Err(quiche::h3::Error::Done) => break,
+                Err(e) => panic!("unexpected send_body error: {e:?}"),
+            }
+        }
+
+        let mut swapped = false;
+        let mut carry: Option<Vec<u8>> = None;
+        for _ in 0..64 {
+            drive_timeouts(client, server);
+            // Stream remaining request body as credit allows.
+            while sent < body.len() {
+                let end = (sent + 4096).min(body.len());
+                let fin = end == body.len();
+                match client_h3.send_body(client, stream_id, &body[sent..end], fin)
+                {
+                    Ok(wrote) => {
+                        sent += wrote;
+                        if wrote == 0 {
+                            break;
+                        }
+                        if fin && sent >= body.len() {
+                            break;
+                        }
+                    }
+                    Err(quiche::h3::Error::Done) => break,
+                    Err(e) => panic!("unexpected send_body error: {e:?}"),
+                }
+            }
+            let mut datagrams = collect_client_datagrams(client, packet);
+            if let Some(stashed) = carry.take() {
+                datagrams.insert(0, stashed);
+            }
+            if reorder_request_datagrams {
+                if datagrams.len() >= 2 {
+                    datagrams.swap(0, 1);
+                    swapped = true;
+                } else if datagrams.len() == 1 {
+                    carry = datagrams.pop();
+                }
+            }
+            for datagram in &datagrams {
+                deliver_client_datagram(server, datagram, local, remote);
+                if duplicate_request_datagrams {
+                    deliver_client_datagram(server, datagram, local, remote);
+                }
+            }
+            flush_server_to_client(client, server, packet, remote);
+            while client_h3.poll(client).is_ok() {}
+            if !server.requests.is_empty() {
+                break;
+            }
+            if let Some(timeout) = client.timeout().filter(|timeout| !timeout.is_zero()) {
+                std::thread::sleep(timeout.min(Duration::from_millis(25)));
+            } else if let Some(timeout) = server.timeout().filter(|timeout| !timeout.is_zero()) {
+                std::thread::sleep(timeout.min(Duration::from_millis(25)));
+            }
+        }
+        if let Some(stashed) = carry.take() {
+            deliver_client_datagram(server, &stashed, local, remote);
+            for _ in 0..16 {
+                drive_timeouts(client, server);
+                for datagram in collect_client_datagrams(client, packet) {
+                    deliver_client_datagram(server, &datagram, local, remote);
+                }
+                flush_server_to_client(client, server, packet, remote);
+                if !server.requests.is_empty() {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        }
+        if reorder_request_datagrams {
+            assert!(
+                swapped,
+                "reorder test never swapped 1-RTT datagrams"
+            );
+        }
+
+        server
+            .next_request()
+            .expect("HTTP/3 request should complete under packet stress")
+    }
+
+    #[test]
+    fn tolerates_duplicate_client_datagrams_and_completes_request() {
+        let mut server = super::QuicServer::new(stress_server_config()).unwrap();
+        let local = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 4433);
+        let remote = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 54321);
+        let mut client_config = stress_client_config();
+        let client_scid = [0x71; 16];
+        let mut client = quiche::connect(
+            Some("localhost"),
+            &ConnectionId::from_ref(&client_scid),
+            remote,
+            local,
+            &mut client_config,
+        )
+        .unwrap();
+        let mut packet = [0; 65535];
+
+        establish_http3_in_memory(&mut client, &mut server, &mut packet, local, remote, false);
+        assert!(client.is_established());
+
+        let request = complete_post_request_in_memory(
+            &mut client,
+            &mut server,
+            &mut packet,
+            local,
+            remote,
+            true,
+            false,
+        );
+        assert_eq!(request.method, b"POST");
+        assert_eq!(request.target, b"/stress");
+        assert_eq!(request.body, b"ping");
+        assert!(!server.routes.is_empty());
+        assert_eq!(server.connections.len(), 1);
+    }
+
+    #[test]
+    fn recovers_from_reordered_handshake_datagrams_via_timeouts() {
+        let mut server = super::QuicServer::new(stress_server_config()).unwrap();
+        let local = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 4433);
+        let remote = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 54322);
+        let mut client_config = stress_client_config();
+        let client_scid = [0x72; 16];
+        let mut client = quiche::connect(
+            Some("localhost"),
+            &ConnectionId::from_ref(&client_scid),
+            remote,
+            local,
+            &mut client_config,
+        )
+        .unwrap();
+        let mut packet = [0; 65535];
+
+        // Deliver the first flight normally so the server accepts the connection,
+        // then swap subsequent consecutive client datagrams and let timers recover.
+        pump_in_memory(
+            &mut client,
+            &mut server,
+            &mut packet,
+            local,
+            remote,
+            false,
+            false,
+        );
+        establish_http3_in_memory(&mut client, &mut server, &mut packet, local, remote, true);
+        assert!(client.is_established());
+        assert!(
+            server
+                .connections
+                .values()
+                .any(|connection| connection.transport.is_established())
+        );
+
+        let request = complete_post_request_in_memory(
+            &mut client,
+            &mut server,
+            &mut packet,
+            local,
+            remote,
+            false,
+            true,
+        );
+        assert_eq!(request.body.len(), 32 * 1024);
+        assert!(request.body.iter().all(|b| *b == 0x41));
+    }
+
+    #[test]
+    fn nat_rebinding_continues_or_cleans_cid_routes() {
+        let mut server = super::QuicServer::new(stress_server_config()).unwrap();
+        // Keep idle short so the timeout path finishes quickly when migration fails.
+        server.idle_timeout = Duration::from_millis(150);
+        server.config.set_max_idle_timeout(150);
+        let local = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 4433);
+        let original_remote = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 54323);
+        let rebound_remote = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 54324);
+        let mut client_config = stress_client_config();
+        client_config.set_max_idle_timeout(150);
+        let client_scid = [0x73; 16];
+        let mut client = quiche::connect(
+            Some("localhost"),
+            &ConnectionId::from_ref(&client_scid),
+            original_remote,
+            local,
+            &mut client_config,
+        )
+        .unwrap();
+        let mut packet = [0; 65535];
+
+        establish_http3_in_memory(
+            &mut client,
+            &mut server,
+            &mut packet,
+            local,
+            original_remote,
+            false,
+        );
+        assert_eq!(server.connections.len(), 1);
+        let route_count_before = server.routes.len();
+        assert!(route_count_before > 0);
+
+        // Mid-connection NAT rebinding: same CIDs, new observed UDP source address.
+        let mut continued = false;
+        let mut client_h3 = quiche::h3::Connection::with_transport(
+            &mut client,
+            &quiche::h3::Config::new().unwrap(),
+        )
+        .unwrap();
+        let request_headers = [
+            quiche::h3::Header::new(b":method", b"GET"),
+            quiche::h3::Header::new(b":scheme", b"https"),
+            quiche::h3::Header::new(b":authority", b"localhost"),
+            quiche::h3::Header::new(b":path", b"/rebind"),
+        ];
+        let _ = client_h3
+            .send_request(&mut client, &request_headers, true)
+            .unwrap();
+
+        for _ in 0..48 {
+            drive_timeouts(&mut client, &mut server);
+            let datagrams = collect_client_datagrams(&mut client, &mut packet);
+            for datagram in &datagrams {
+                deliver_client_datagram(&mut server, datagram, local, rebound_remote);
+            }
+            // Only rebound-directed return traffic is usable. Packets still
+            // addressed to the obsolete address are dropped (as a real NAT
+            // would: that path is gone), which lets a non-migrating server
+            // reach the documented timeout/cleanup branch instead of
+            // failing the assertion immediately. Clients see their known
+            // local (original_remote) because a quiche client discards
+            // packets for an unknown local address.
+            let mut server_sent_to_rebound = false;
+            while let Ok(Some((length, info))) = server.send(&mut packet) {
+                if info.to != rebound_remote {
+                    // Obsolete destination: unreachable after rebinding.
+                    continue;
+                }
+                server_sent_to_rebound = true;
+                let _ = client.recv(
+                    &mut packet[..length],
+                    RecvInfo {
+                        from: info.from,
+                        to: original_remote,
+                    },
+                );
+            }
+            while client_h3.poll(&mut client).is_ok() {}
+            if let Some(request) = server.next_request() {
+                assert_eq!(request.target, b"/rebind");
+                assert!(
+                    client.is_established(),
+                    "client must stay established after NAT rebinding"
+                );
+                if !server_sent_to_rebound {
+                    // Server keeps using the pre-rebinding path: this is
+                    // not a usable migration, so skip the response phase
+                    // and let the cleanup assertions run below.
+                    continue;
+                }
+                // Complete an application response on the rebound path.
+                // Requiring response-generated datagrams to the rebound
+                // address (not just ACKs/PATH_CHALLENGE) before declaring
+                // the connection usable.
+                assert!(
+                    server.enqueue_response(
+                        request.id,
+                        200,
+                        Vec::new(),
+                        b"rebound-ok".to_vec()
+                    ),
+                    "server must enqueue rebound response"
+                );
+                let mut response_bytes_to_rebound = 0;
+                let mut got_status_200 = false;
+                let mut response_body = Vec::new();
+                for _ in 0..48 {
+                    drive_timeouts(&mut client, &mut server);
+                    for datagram in collect_client_datagrams(&mut client, &mut packet) {
+                        deliver_client_datagram(&mut server, &datagram, local, rebound_remote);
+                    }
+                    while let Ok(Some((length, info))) = server.send(&mut packet) {
+                        if info.to != rebound_remote {
+                            continue;
+                        }
+                        response_bytes_to_rebound += length;
+                        // Feed the client's known local (see above) so path
+                        // frames are processed and PATH_RESPONSE is emitted.
+                        let _ = client.recv(
+                            &mut packet[..length],
+                            RecvInfo {
+                                from: info.from,
+                                to: original_remote,
+                            },
+                        );
+                    }
+                    // Drain client H3 events, consuming response bytes via
+                    // recv_body: poll() only reports Data readability, so an
+                    // unconsumed body would be reported again on the next
+                    // poll instead of reaching Done.
+                    loop {
+                        match client_h3.poll(&mut client) {
+                            Ok((id, quiche::h3::Event::Headers { list, .. })) => {
+                                for header in list {
+                                    if header.name() == b":status"
+                                        && header.value() == b"200"
+                                    {
+                                        got_status_200 = true;
+                                    }
+                                }
+                            }
+                            Ok((id, quiche::h3::Event::Data)) => {
+                                let mut buf = [0; 1024];
+                                while let Ok(n) =
+                                    client_h3.recv_body(&mut client, id, &mut buf)
+                                {
+                                    response_body.extend_from_slice(&buf[..n]);
+                                }
+                            }
+                            Ok(_) => (),
+                            Err(quiche::h3::Error::Done) => break,
+                            Err(e) => panic!("rebound response poll failed: {e:?}"),
+                        }
+                    }
+                    if got_status_200 && response_body == b"rebound-ok" {
+                        break;
+                    }
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                // Migration is only "continued" when the application
+                // response actually arrived on the rebound path; otherwise
+                // fall through to the cleanup assertions below.
+                if response_bytes_to_rebound > 0
+                    && got_status_200
+                    && response_body == b"rebound-ok"
+                {
+                    continued = true;
+                    break;
+                }
+            }
+            if server.connections.is_empty() {
+                break;
+            }
+            if let Some(timeout) = client.timeout().filter(|timeout| !timeout.is_zero()) {
+                std::thread::sleep(timeout.min(Duration::from_millis(40)));
+            } else if let Some(timeout) = server.timeout().filter(|timeout| !timeout.is_zero()) {
+                std::thread::sleep(timeout.min(Duration::from_millis(40)));
+            } else {
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        }
+
+        if continued {
+            // Path accepted: the rebound request completed and the client
+            // received the response on the rebound path, proving the
+            // connection is routed and usable. The tight 150ms idle budget
+            // in this test may retire the connection right after serving,
+            // so the close handshake below must handle both cases.
+            client.close(true, 0, b"done").ok();
+            for _ in 0..32 {
+                drive_timeouts(&mut client, &mut server);
+                for datagram in collect_client_datagrams(&mut client, &mut packet) {
+                    deliver_client_datagram(&mut server, &datagram, local, rebound_remote);
+                }
+                while let Ok(Some((length, info))) = server.send(&mut packet) {
+                    let _ = client.recv(
+                        &mut packet[..length],
+                        RecvInfo {
+                            from: info.from,
+                            to: rebound_remote,
+                        },
+                    );
+                }
+                if server.connections.is_empty() {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        } else {
+            // No full path migration: idle / loss timers must drop CID routes.
+            for _ in 0..40 {
+                drive_timeouts(&mut client, &mut server);
+                let _ = flush_server_to_client(&mut client, &mut server, &mut packet, original_remote);
+                if server.connections.is_empty() && server.routes.is_empty() {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(25));
+            }
+        }
+
+        assert!(
+            server.connections.is_empty(),
+            "NAT rebinding must not leak connections"
+        );
+        assert!(
+            server.routes.is_empty(),
+            "NAT rebinding must not leak CID routes"
+        );
+        assert!(server.request_routes.is_empty());
+        assert!(server.requests.is_empty());
+    }
+
+    #[test]
+    fn refuses_new_quic_connections_when_transport_memory_budget_is_exhausted() {
+        let certificate_path = std::env::var("NET_HTTP_TEST_CERT").unwrap();
+        let private_key_path = std::env::var("NET_HTTP_TEST_KEY").unwrap();
+        let mut server_config = quiche::Config::new(quiche::PROTOCOL_VERSION).unwrap();
+        server_config
+            .set_application_protos(quiche::h3::APPLICATION_PROTOCOL)
+            .unwrap();
+        server_config
+            .load_cert_chain_from_pem_file(&certificate_path)
+            .unwrap();
+        server_config
+            .load_priv_key_from_pem_file(&private_key_path)
+            .unwrap();
+        let mut server = super::QuicServer::new(server_config).unwrap();
+        // Soft estimate: one connection fills the budget; a second Initial is refused.
+        server.max_transport_memory_bytes = super::ESTIMATED_QUIC_TRANSPORT_BYTES_PER_CONNECTION;
+
+        let local = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 4433);
+        let mut packet = [0; 65535];
+        let mut first_config = quiche::Config::new(quiche::PROTOCOL_VERSION).unwrap();
+        first_config
+            .set_application_protos(quiche::h3::APPLICATION_PROTOCOL)
+            .unwrap();
+        first_config.verify_peer(false);
+        let first_address = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 54421);
+        let first_scid = [0x71; 16];
+        let mut first_client = quiche::connect(
+            Some("localhost"),
+            &ConnectionId::from_ref(&first_scid),
+            first_address,
+            local,
+            &mut first_config,
+        )
+        .unwrap();
+        let (first_length, _) = first_client.send(&mut packet).unwrap();
+        server
+            .recv_datagram(&mut packet[..first_length], local, first_address)
+            .unwrap();
+        assert_eq!(server.connections.len(), 1);
+        assert_eq!(
+            server.estimated_transport_memory_bytes(),
+            super::ESTIMATED_QUIC_TRANSPORT_BYTES_PER_CONNECTION
+        );
+
+        let mut second_config = quiche::Config::new(quiche::PROTOCOL_VERSION).unwrap();
+        second_config
+            .set_application_protos(quiche::h3::APPLICATION_PROTOCOL)
+            .unwrap();
+        second_config.verify_peer(false);
+        let second_address = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 54422);
+        let second_scid = [0x72; 16];
+        let mut second_client = quiche::connect(
+            Some("localhost"),
+            &ConnectionId::from_ref(&second_scid),
+            second_address,
+            local,
+            &mut second_config,
+        )
+        .unwrap();
+        let (second_length, _) = second_client.send(&mut packet).unwrap();
+        let second_dcid = Header::from_slice(&mut packet[..second_length], 16)
+            .unwrap()
+            .dcid
+            .as_ref()
+            .to_vec();
+        assert!(matches!(
+            server.recv_datagram(&mut packet[..second_length], local, second_address),
+            Err(super::QuicServerError::Quiche(quiche::Error::Done))
+        ));
+        assert_eq!(server.connections.len(), 1);
+        assert!(!server.routes.contains_key(&second_dcid));
+        assert_eq!(
+            server.estimated_transport_memory_bytes(),
+            super::ESTIMATED_QUIC_TRANSPORT_BYTES_PER_CONNECTION
+        );
+
+        let keys: Vec<Vec<u8>> = server.connections.keys().cloned().collect();
+        for key in keys {
+            server.force_drop_connection(&key);
+        }
+        assert!(server.connections.is_empty());
+        assert!(server.routes.is_empty());
+        assert!(server.request_routes.is_empty());
+        assert_eq!(server.estimated_transport_memory_bytes(), 0);
+
+        // After close, the budget frees and a new Initial is admitted.
+        let mut retry_config = quiche::Config::new(quiche::PROTOCOL_VERSION).unwrap();
+        retry_config
+            .set_application_protos(quiche::h3::APPLICATION_PROTOCOL)
+            .unwrap();
+        retry_config.verify_peer(false);
+        let retry_address = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 54423);
+        let retry_scid = [0x73; 16];
+        let mut retry_client = quiche::connect(
+            Some("localhost"),
+            &ConnectionId::from_ref(&retry_scid),
+            retry_address,
+            local,
+            &mut retry_config,
+        )
+        .unwrap();
+        let (retry_length, _) = retry_client.send(&mut packet).unwrap();
+        server
+            .recv_datagram(&mut packet[..retry_length], local, retry_address)
+            .unwrap();
+        assert_eq!(server.connections.len(), 1);
+        assert_eq!(
+            server.estimated_transport_memory_bytes(),
+            super::ESTIMATED_QUIC_TRANSPORT_BYTES_PER_CONNECTION
+        );
+    }
+
     #[test]
     fn routes_http3_request_through_mojo_server_handler() {
         use std::collections::HashMap;
@@ -2660,6 +3677,9 @@ mod tests {
                 ".",
                 "tests/http3_server_fixture.mojo",
             ])
+            // This test serves exactly 2 POSTs; the shared fixture defaults
+            // to 5 (aioquic script) and would otherwise wait forever.
+            .env("HTTP3_FIXTURE_EXPECT", "2")
             .stdout(Stdio::piped())
             .stderr(Stdio::inherit())
             .spawn()

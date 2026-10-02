@@ -325,7 +325,8 @@ sections above).
 
 ### Host and procedure
 
-- macOS 27.0.1, Apple M3 Max, `h2load` nghttp2/1.70.0, aioquic 1.3.0.
+- macOS 27.0.1, Apple M3 Max, `h2load` nghttp2/1.70.0, aioquic 1.3.0,
+  hyper-h2 4.4.1 (`h2==4.4.1`, pinned in the `http2` feature).
 - `WARMUP_S=2 MEASURE_S=4 RUNS=2 CONNS="1 16" STREAMS="1 10"`, harness
   default SKIP flags otherwise; `SKIP_SPECIAL=1` for the matrix tables and
   a separate `RUNS=1 CONNS="1" STREAMS="1"` pass for the scenarios.
@@ -372,20 +373,45 @@ All runs: 0 failed, rc=0.
 
 ### Special scenarios
 
+Both HTTP/2 special scenarios run over a **single** HTTP/2 connection
+(`benchmarks/http/http2_scenarios.py`, hyper-h2): the target stream and its
+siblings share one connection, so a server with per-connection
+head-of-line blocking or broken `RST_STREAM` handling cannot pass. The
+earlier `curl --limit-rate` + `h2load` version could not show this, because
+those are separate processes and therefore always separate connections;
+`h2load` still drives the throughput matrix above.
+
 | Proto | Server | Scenario | Verdict | Detail |
 | --- | --- | --- | --- | --- |
-| h2 | Go | slow | pass | sibling req/s 53,787, 0 failed |
-| h2 | Mojo | slow | pass | sibling req/s 35,301, 0 failed |
-| h2 | Go | cancel | pass | sibling HTTP 200 after client abort |
-| h2 | Mojo | cancel | pass | sibling HTTP 200 after client abort |
+| h2 | Go | slow | pass | 1 conn: 8/8 siblings exact 64 B while the upload stream was still open; echo completed after release |
+| h2 | Mojo | slow | not run | see note below |
+| h2 | Go | cancel | pass | 1 conn: 274 cancel cycles (unsent residual > 256 MiB budget); target+8 siblings FC-blocked across RST (65535 B at reset); siblings completed after release; post-reset full echo + GET /fixed OK |
+| h2 | Mojo | cancel | not run | see note below |
 | h2 | Go | loss | skip | pf/dummynet needs root; no-loss reference 49,882 req/s |
 | h2 | Mojo | loss | skip | pf/dummynet needs root; no-loss reference 35,860 req/s |
-| h3 | aioquic | slow | pass | held 262,144 B while 8/8 siblings completed |
-| h3 | Mojo | slow | pass | held 262,144 B while 8/8 siblings completed |
-| h3 | aioquic | cancel | pass | reset target in-flight; 8/8 siblings outstanding across the reset and completed |
-| h3 | Mojo | cancel | pass | reset target in-flight; 8/8 siblings outstanding across the reset and completed |
+| h3 | aioquic | slow | pass | 1 conn incomplete upload: 8/8 siblings exact 64 B while POST /echo was still open; echo completed after finish (`method=incomplete_upload`) |
+| h3 | Mojo | slow | pass † | held 262,144 B while 8/8 siblings completed |
+| h3 | aioquic | cancel | pass | 257 incomplete-reset cycles with peer-ACK'd 256 KiB each (> 64 MiB request-body budget); reset target in-flight; 8/8 siblings outstanding across the reset and completed; post-reset GET /fixed on the same connection OK |
+| h3 | Mojo | cancel | pass † | reset target in-flight; 8/8 siblings completed |
 | h3 | aioquic | loss | pass | 5% client datagram drop, req/s 5,460, 0 failed |
-| h3 | Mojo | loss | pass | 5% client datagram drop, req/s 6,134, 0 failed |
+| h3 | Mojo | loss | pass † | 5% client datagram drop, req/s 6,134, 0 failed |
+
+† Recorded by an earlier revision of the scenario drivers, before the
+incomplete-upload H3 slow criterion, post-reset connection probe, sibling
+body validation and the partial-run rejection were added, and not
+re-measured since: the Mojo servers cannot be built on this host (the Mojo
+build in the `tls-http2` and `tls-http3` environments fails to parse
+`net/http/_encoder.mojo` on `InlineArray`, which is unrelated to this harness
+and reproduces on an unmodified checkout). These rows therefore show the Mojo
+servers were not broken at that revision; they are not evidence under the
+current criteria.
+
+The two `h2 | Mojo` rows are *not run* rather than carried over: the previous
+`pass` entries came from the `curl` + `h2load` version, which cannot exercise
+these properties at all, so re-recording them was not possible even before the
+build problem. Re-run `bash benchmarks/http/run_multiplex_matrix.sh` once the
+Mojo build works to fill the `h2 | Mojo` rows and to bring the `h3 | Mojo` rows
+up to the current criteria.
 
 ### Target check
 
@@ -404,15 +430,41 @@ the aioquic baseline (H3).
 | h3 16 conns × 10 streams | 138.3% | Exceed baseline |
 
 Interpretation: multiplexed HTTP/2 (m=10) reaches or exceeds the Go baseline
-at both connection counts, and latency stays at or below Go except at 16×1
-where Go's single-stream aggregate hides per-request cost. The 16×1 HTTP/2
-shortfall (69%) is consistent with the PR 9 single-stream result and is
-carried forward as profiling follow-up (TLS/HPACK path cost), not a feature
-cut. HTTP/3 exceeds the Python baseline in every cell, with lower median
-latency everywhere and lower p99 in every cell except 1 conn × 10 streams
-(2,023 µs vs 1,961 µs, still within 1.2x). Slow-stream and cancellation
-scenarios pass on both stacks:
-the server keeps serving siblings while a large stream is held (H3) or a
-throttled upload is in flight (H2). Loss via pf/dummynet is skipped on this
-host (no passwordless sudo); the measurable 5% client-side datagram drop
-runs pass on both H3 servers with 0 failed requests.
+at both connection counts, and in both m=10 cells Mojo's p50, p95, and p99
+are at or below Go's. Latency is only claimed per percentile: the target
+metric p99 is at or below Go in every cell (1×1 85 vs 86 µs, 1×10 276 vs
+418 µs, 16×1 591 vs 822 µs, 16×10 5,280 vs 6,220 µs), while p50/p95 do
+regress in the two single-stream cells (1×1 53/64 vs 46/60 µs; 16×1 482/526
+vs 312/526 µs). Those two cells are also the throughput misses, so the p50/p95
+gap tracks the single-stream shortfall rather than a tail-latency problem.
+The 16×1 HTTP/2 shortfall (69%) is consistent with the PR 9 single-stream
+result and is carried forward as profiling follow-up (TLS/HPACK path cost),
+not a feature cut. HTTP/3 exceeds the Python baseline in every cell, with
+lower median latency everywhere and lower p99 in every cell except
+1 conn × 10 streams (2,023 µs vs 1,961 µs, still within 1.2x).
+
+Slow-stream and cancellation pass for every server actually exercised with
+the current harness — HTTPS+H2 against the Go baseline, HTTP/3 against
+aioquic — meaning the server keeps serving siblings while another stream on
+the *same* connection is still open (H2 and H3: an incomplete POST /echo
+upload). The H2 driver also withholds the target's receive credit so it does
+not depend on a rate limit or on wall-clock timing. The H3 slow driver cannot
+withhold QUIC `MAX_STREAM_DATA` through aioquic (credit tracks the highest
+received offset), so it matches H2 on the request side instead: siblings must
+complete while the large upload is still unfinished, then the upload is
+finished and the echo body is checked. Cancellation on both protocols also
+requires a post-reset request on the same connection so a GOAWAY/draining
+server that only finishes already-admitted siblings cannot pass.
+That claim is scoped to the runs above. Mojo's HTTP/2 multiplexing behaviour
+is untested here (`h2 | Mojo` not run), and the `h3 | Mojo` rows predate the
+current criteria (†), so neither is offered as evidence that Mojo multiplexes
+correctly; the H2 throughput matrix in the tables above remains the measured
+Mojo result. Loss via pf/dummynet is skipped on this host (no passwordless
+sudo); the measurable 5% client-side datagram drop passes for aioquic with 0
+failed requests under the current harness, and for Mojo at the earlier
+revision (†). When dummynet is available the harness reads `dnctl pipe list`
+and configures the first unused id (H2 42–61, H3 62–81) rather than a fixed
+one, because `dnctl pipe N config` targets an existing pipe instead of
+allocating a private one; the chosen id is recorded in the scenario detail
+and only that pipe is deleted afterwards, so a run never reconfigures or
+removes shaping that already existed on the host.

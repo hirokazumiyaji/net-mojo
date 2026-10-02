@@ -42,9 +42,7 @@ struct QuicProvider(Movable):
         var library = OwnedDLHandle(self._library_path)
         return QuicServerConfig(library^, config.value())
 
-    def server(
-        mut self, var config: QuicServerConfig
-    ) raises -> QuicServer:
+    def server(mut self, var config: QuicServerConfig) raises -> QuicServer:
         var server = config._library.call[
             "net_quic_create",
             Optional[Pointer[Byte, MutUntrackedOrigin]],
@@ -134,9 +132,12 @@ struct QuicServer(Movable):
             )
 
     def shutdown_complete(self) -> Bool:
-        return self._library.call["net_quic_shutdown_complete", c_int](
-            self._server
-        ) == 1
+        return (
+            self._library.call["net_quic_shutdown_complete", c_int](
+                self._server
+            )
+            == 1
+        )
 
     def set_connection_limit(mut self, limit: Int) raises NetError:
         var result = self._library.call["net_quic_set_connection_limit", c_int](
@@ -149,6 +150,25 @@ struct QuicServer(Movable):
                 None,
                 "QUIC provider could not set the connection limit",
             )
+
+    def set_transport_memory_limit(mut self, limit: Int) raises NetError:
+        var result = self._library.call[
+            "net_quic_set_transport_memory_limit", c_int
+        ](self._server, c_size_t(limit))
+        if result != 1:
+            raise NetError(
+                NetErrorKind.invalid_state(),
+                "set QUIC transport memory limit",
+                None,
+                "QUIC provider could not set the transport memory limit",
+            )
+
+    def transport_memory_bytes(self) -> Int:
+        return Int(
+            self._library.call["net_quic_transport_memory_bytes", c_size_t](
+                self._server
+            )
+        )
 
     def set_request_limits(
         mut self,
@@ -352,9 +372,16 @@ struct QuicUDPEndpoint(Movable):
     var _request_buffer: List[Byte]
     var _pending_length: Int
     var _pending_destination: Optional[SocketAddress]
+    var _send_would_block_once: Bool
 
     def set_connection_limit(mut self, limit: Int) raises NetError:
         self._server.set_connection_limit(limit)
+
+    def set_transport_memory_limit(mut self, limit: Int) raises NetError:
+        self._server.set_transport_memory_limit(limit)
+
+    def transport_memory_bytes(self) -> Int:
+        return self._server.transport_memory_bytes()
 
     def set_request_limits(
         mut self,
@@ -408,9 +435,7 @@ struct QuicUDPEndpoint(Movable):
     def shutdown_complete(self) -> Bool:
         return self._server.shutdown_complete()
 
-    def __init__(
-        out self, var server: QuicServer, var socket: UDPConn
-    ):
+    def __init__(out self, var server: QuicServer, var socket: UDPConn):
         self._server = server^
         self._socket = socket^
         self._receive_buffer = List[Byte](length=65535, fill=0)
@@ -418,6 +443,7 @@ struct QuicUDPEndpoint(Movable):
         self._request_buffer = List[Byte](length=1_200_000, fill=0)
         self._pending_length = 0
         self._pending_destination = None
+        self._send_would_block_once = False
 
     def raw_fd(self) raises NetError -> Int32:
         return self._socket.raw_fd()
@@ -452,6 +478,18 @@ struct QuicUDPEndpoint(Movable):
             )
 
         try:
+            if self._send_would_block_once:
+                # Deterministic test hook: simulate EAGAIN at the socket-send
+                # boundary so both injected and real would-block outcomes
+                # flow through the same timeout handler below (which must
+                # preserve pending and keep write interest armed).
+                self._send_would_block_once = False
+                raise NetError(
+                    NetErrorKind.timeout(),
+                    "send QUIC datagram",
+                    None,
+                    "injected send would-block for test",
+                )
             var written = self._socket.try_send_to(
                 Span(self._send_buffer)[0 : self._pending_length],
                 self._pending_destination.value(),
@@ -473,6 +511,36 @@ struct QuicUDPEndpoint(Movable):
 
     def wants_write(self) -> Bool:
         return self._pending_length > 0
+
+    def inject_send_would_block_once(mut self):
+        """Fail the next `try_send` with would-block, preserving pending.
+
+        Deterministic alternative to filling the kernel UDP send queue
+        (which depends on host routing for TEST-NET and on drain timing).
+        """
+        self._send_would_block_once = True
+
+    def stage_outgoing_datagram[
+        origin: Origin
+    ](
+        mut self, packet: Span[Byte, origin], destination: SocketAddress
+    ) raises NetError:
+        """Retain `packet` as the current pending UDP send.
+
+        Test hook for send-path backpressure: stages bytes the same way
+        `try_send` does after `try_send_datagram` returns a packet.
+        """
+        if len(packet) == 0 or len(packet) > len(self._send_buffer):
+            raise NetError(
+                NetErrorKind.invalid_argument(),
+                "stage QUIC datagram",
+                None,
+                "pending datagram length is out of range",
+            )
+        for i in range(len(packet)):
+            self._send_buffer[i] = packet[i]
+        self._pending_length = len(packet)
+        self._pending_destination = Optional(destination.copy())
 
     def timeout_micros(self) -> UInt64:
         return self._server.timeout_micros()
@@ -510,9 +578,7 @@ struct QuicUDPEndpoint(Movable):
                 None,
                 "HTTP/3 request record exceeds the configured buffer",
             )
-        return _decode_request_record(
-            Span(self._request_buffer)[0:length]
-        )
+        return _decode_request_record(Span(self._request_buffer)[0:length])
 
     def _ensure_request_buffer(
         mut self,
@@ -594,13 +660,17 @@ def _decode_request_record[
     var header_count = Int(_read_request_u32(data, offset))
     var headers = List[QuicRequestHeader]()
     for _ in range(header_count):
-        var name = String(from_utf8_lossy=Span(_read_request_bytes(data, offset)))
+        var name = String(
+            from_utf8_lossy=Span(_read_request_bytes(data, offset))
+        )
         var value = _read_request_bytes(data, offset)
         headers.append(QuicRequestHeader(name=name^, value=value^))
     var trailer_count = Int(_read_request_u32(data, offset))
     var trailers = List[QuicRequestHeader]()
     for _ in range(trailer_count):
-        var name = String(from_utf8_lossy=Span(_read_request_bytes(data, offset)))
+        var name = String(
+            from_utf8_lossy=Span(_read_request_bytes(data, offset))
+        )
         var value = _read_request_bytes(data, offset)
         trailers.append(QuicRequestHeader(name=name^, value=value^))
     var body = _read_request_bytes(data, offset)

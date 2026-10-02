@@ -49,10 +49,14 @@ for artifact in build/tls/libnet_tls build/tls/test-cert.pem build/tls/test-key.
         exit 1
     }
 done
-[ -f build/http2/libnet_hpack ] || {
-    echo "missing build/http2/libnet_hpack; run: pixi run -e tls-http2 hpack-test" >&2
-    exit 1
-}
+if [ "${SKIP_MOJO:-0}" != "1" ]; then
+    for artifact in build/tls/libnet_tls build/http2/libnet_hpack; do
+        [ -f "$artifact" ] || {
+            echo "missing $artifact; run tls-build + hpack-test (or SKIP_MOJO=1 for Go-only)" >&2
+            exit 1
+        }
+    done
+fi
 
 echo "== host =="
 uname -a
@@ -186,7 +190,8 @@ run_h2load() {
     local out="$OUT_DIR/${label}_c${clients}_m${streams}_r${run_idx}.out"
 
     (
-        sleep $((WARMUP_S + MEASURE_S / 2))
+        # WARMUP_S / MEASURE_S accept floats, so avoid Bash integers here.
+        sleep "$(python3 -c 'import sys; print(float(sys.argv[1]) + float(sys.argv[2]) / 2)' "$WARMUP_S" "$MEASURE_S")"
         sample_server "$server_pid" "$sample"
     ) &
     local sampler_pid=$!

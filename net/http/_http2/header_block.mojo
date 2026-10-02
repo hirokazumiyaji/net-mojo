@@ -119,9 +119,7 @@ struct Http2HeaderBlock(Movable):
         if start < 0 or end < start or end > len(payload):
             return False
         var fragment_length = end - start
-        if (
-            fragment_length > self.max_compressed_size - len(self.bytes)
-        ):
+        if fragment_length > self.max_compressed_size - len(self.bytes):
             return False
         for i in range(start, end):
             self.bytes.append(payload[i])

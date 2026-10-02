@@ -131,23 +131,49 @@ struct Http2ConnectionInputResult(Movable):
     def is_error(self) -> Bool:
         return self.kind == 7
 
+    def is_flood(self) -> Bool:
+        return self.kind == 9
+
+    @staticmethod
+    def flood(consumed: Int) -> Self:
+        return Self(
+            kind=9,
+            consumed=consumed,
+            frame_type=Byte(0),
+            flags=Byte(0),
+            stream_id=UInt32(0),
+            value=UInt32(11),
+            output=List[Byte](),
+            payload=List[Byte](),
+        )
+
 
 struct Http2ServerConnectionInput(Movable):
     var _bootstrap: Http2ConnectionBootstrap
     var _reader: Http2FrameReader
     var _dispatcher: Http2FrameDispatcher
     var _failed: Bool
+    var _max_control_frames_per_second: Int
+    var _max_resets_per_second: Int
 
     def __init__(
         out self,
         max_frame_size: Int = 16384,
         max_concurrent_streams: Int = 100,
+        max_control_frames_per_second: Int = 1000,
+        max_resets_per_second: Int = 100,
     ):
         self._bootstrap = Http2ConnectionBootstrap(
             max_frame_size, max_concurrent_streams
         )
         self._reader = Http2FrameReader(max_frame_size)
-        self._dispatcher = Http2FrameDispatcher(self._bootstrap.peer_settings())
+        self._max_control_frames_per_second = max_control_frames_per_second
+        self._max_resets_per_second = max_resets_per_second
+        self._dispatcher = Http2FrameDispatcher(
+            self._bootstrap.peer_settings(),
+            max_control_frames_per_second,
+            max_resets_per_second,
+        )
         self._failed = False
 
     def consume[
@@ -163,7 +189,9 @@ struct Http2ServerConnectionInput(Movable):
                 return Http2ConnectionInputResult.error(bootstrap.consumed)
             if bootstrap.is_ready():
                 self._dispatcher = Http2FrameDispatcher(
-                    self._bootstrap.peer_settings()
+                    self._bootstrap.peer_settings(),
+                    self._max_control_frames_per_second,
+                    self._max_resets_per_second,
                 )
             var consumed = bootstrap.consumed
             if len(bootstrap.output) > 0:
@@ -194,6 +222,9 @@ struct Http2ServerConnectionInput(Movable):
         if dispatched.is_error():
             self._failed = True
             return Http2ConnectionInputResult.error(read.consumed)
+        if dispatched.is_flood():
+            self._failed = True
+            return Http2ConnectionInputResult.flood(consumed)
         if dispatched.is_output():
             var output = dispatched.output.copy()
             return Http2ConnectionInputResult.output_frame(consumed, output^)

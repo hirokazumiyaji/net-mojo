@@ -153,7 +153,7 @@ Constraints (see `docs/design/http-server.md` for the full contract):
   and unsupported features are in [HTTP/2](docs/design/http2-server.md) and
   [HTTP/3](docs/design/http3-server.md).
 - HTTP/3 CI and independent-client coverage run on Linux x86_64 and aarch64;
-  end-to-end HTTP/3 validation on macOS remains outstanding.
+  macOS end-to-end Mojo HTTP/3 validation runs in CI (`http3` on macos-14).
 - No client, no HTTP/1.0, no WebSocket/CONNECT/Upgrade switching, no
   multipart helpers, no body compression, no static file serving.
 

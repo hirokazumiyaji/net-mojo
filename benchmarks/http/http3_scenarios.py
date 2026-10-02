@@ -2,8 +2,12 @@
 """HTTP/3 special scenarios for Issue #42 PR 11 multiplex matrix.
 
 Scenarios (qualitative + limited timing; aioquic client):
-  slow   — one slow stream (delayed DATA consume) alongside N normal GETs
-  cancel — RST one in-flight stream (H3_REQUEST_CANCELLED) while siblings complete
+  slow   — hold one large POST /echo upload open while N GET /fixed siblings
+           run on the same connection, then finish the upload (matches H2;
+           aioquic cannot withhold QUIC MAX_STREAM_DATA for a slow reader)
+  cancel — RST one in-flight stream (H3_REQUEST_CANCELLED) after burning
+           the provider request-body budget with incomplete-reset cycles,
+           while siblings complete, then GET /fixed on the same connection
   loss   — drop a fraction of outbound UDP datagrams (client-side loss emulation)
 
 Usage:
@@ -32,6 +36,32 @@ from aioquic.quic.packet import QuicProtocolVersion
 
 # HTTP/3 request cancelled (RFC 9114)
 H3_REQUEST_CANCELLED = 0x10C
+
+# Aggregate request-body budget across active streams
+# (docs/design/http3-server.md). Cancel burns this with incomplete uploads
+# so a server that ignores RESET_STREAM cleanup fails later admission.
+H3_REQUEST_BODY_BUDGET = 64 * 1024 * 1024
+# Bytes sent before each incomplete reset. Received DATA is what the
+# provider charges against the budget before the stream is cancelled.
+CANCEL_PARTIAL = 256 * 1024
+
+# Expected /fixed response, shared with the main H3 loader
+# (benchmarks/http3_load.py) so every scenario validates payloads alike.
+FIXED_PATH = b"/fixed"
+FIXED_BODY = b"a" * 64
+
+
+def _body_ok(path: bytes, result) -> bool:
+    """True when a response carries the exact expected body for `path`.
+
+    A 200 with a truncated or corrupted body is not a valid measurement, so
+    scenarios count a request only when its payload matches the fixture.
+    """
+    if not isinstance(result, dict):
+        return False
+    if path == FIXED_PATH and bytes(result.get("body", b"")) != FIXED_BODY:
+        return False
+    return True
 
 
 class ScenarioProtocol(QuicConnectionProtocol):
@@ -108,6 +138,25 @@ class ScenarioProtocol(QuicConnectionProtocol):
                 total += len(ev.data)
         return total
 
+    def held_ended(self, stream_id: int) -> bool:
+        """True when a held stream has already been fully received.
+
+        A held stream's future is deliberately never resolved — the staged
+        events are only replayed by release_stream() — so the future cannot
+        report transport completion and `future.done()` is always False for
+        a held stream. The staged events can: once one of them carries
+        stream_ended, the whole response has already arrived, whatever the
+        application has done with it. Note that aioquic cannot supply real
+        receive-window backpressure here: MAX_STREAM_DATA is extended from
+        the receiver's highest offset (bytes that arrived), not from what
+        the application has consumed, so withholding consumption alone
+        never stalls the sender.
+        """
+        return any(
+            getattr(ev, "stream_ended", False)
+            for ev in self._staged.get(stream_id, [])
+        )
+
     def release_stream(self, stream_id: int) -> None:
         """Replay staged events, completing the stream normally."""
         self._held.discard(stream_id)
@@ -117,6 +166,65 @@ class ScenarioProtocol(QuicConnectionProtocol):
             return
         for ev in staged:
             self._consume(pending, ev)
+
+    async def open_upload(
+        self, body_len: int, prefix: bytes, authority: bytes
+    ) -> dict:
+        """Start POST /echo with a deliberately unfinished request body.
+
+        Used for the slow-stream scenario. aioquic extends MAX_STREAM_DATA from
+        the highest received offset, so application-level hold_stream cannot
+        create real receive-window backpressure; leaving the request open does.
+        """
+        assert self.http is not None
+        stream_id = self._quic.get_next_available_stream_id()
+        loop = asyncio.get_running_loop()
+        future = loop.create_future()
+        pending = {
+            "future": future,
+            "body": bytearray(),
+            "status": None,
+            "start": time.perf_counter(),
+            "done_at": None,
+            "stream_id": stream_id,
+            "cancelled": False,
+            "sent": len(prefix),
+        }
+        self._inflight[stream_id] = pending
+        self.http.send_headers(
+            stream_id,
+            [
+                (b":method", b"POST"),
+                (b":scheme", b"https"),
+                (b":authority", authority),
+                (b":path", b"/echo"),
+                (b"content-length", str(body_len).encode()),
+            ],
+            end_stream=False,
+        )
+        if prefix:
+            self.http.send_data(stream_id, prefix, end_stream=False)
+        self.transmit()
+        return pending
+
+    async def finish_upload(
+        self, pending: dict, body: bytes, timeout: float = 30.0
+    ) -> dict:
+        """Send the remainder of an open_upload body and await the response."""
+        assert self.http is not None
+        stream_id = pending["stream_id"]
+        sent = int(pending.get("sent", 0))
+        for off in range(sent, len(body), 16384):
+            self.http.send_data(
+                stream_id,
+                body[off : off + 16384],
+                end_stream=(off + 16384 >= len(body)),
+            )
+        self.transmit()
+        try:
+            return await asyncio.wait_for(pending["future"], timeout=timeout)
+        finally:
+            self._inflight.pop(stream_id, None)
 
     async def post_echo(
         self, body: bytes, authority: bytes, *, hold: bool = False
@@ -259,6 +367,13 @@ async def run_slow(url: str, slow_s: float, siblings: int) -> dict:
     configuration.verify_mode = ssl.CERT_NONE
 
     t0 = time.perf_counter()
+    # Match H2 slow: leave a large POST /echo request unfinished so the
+    # server is still reading that stream while siblings complete. aioquic
+    # cannot withhold QUIC receive credit (MAX_STREAM_DATA tracks the highest
+    # received offset), so a response-side "hold" would not create a slow
+    # reader and must not be published as a pass.
+    slow_body = b"x" * (256 * 1024)
+    prefix_len = 32 * 1024
     async with connect(
         host,
         port,
@@ -268,22 +383,10 @@ async def run_slow(url: str, slow_s: float, siblings: int) -> dict:
         assert isinstance(client, ScenarioProtocol)
         await _wait_alpn(client)
 
-        # Slow stream uses a large echo body (256 KiB) so the response
-        # spans many datagrams: a serializing server would stall siblings
-        # behind it. Consumption is withheld at the H3 event layer until
-        # siblings complete (see hold_stream): transport still flows, but
-        # the application does not observe completion early. Manual
-        # flow-control window backpressure is not exposed by aioquic, so
-        # this exercises application-level multiplexing with a large
-        # response; held_bytes proves bytes arrived while withheld.
-        slow_body = b"x" * (256 * 1024)
-
-        slow_pending = await client.post_echo(slow_body, authority, hold=True)
-        slow_id = slow_pending["stream_id"]
-        # Siblings are dispatched immediately, before the held response can
-        # complete: any await/sleep here would let the server finish the
-        # response first and make the scenario a post-completion sleep.
-        slow_pending_at_sibling_dispatch = not slow_pending["future"].done()
+        slow_pending = await client.open_upload(
+            len(slow_body), slow_body[:prefix_len], authority
+        )
+        target_unfinished_at_dispatch = not slow_pending["future"].done()
         sibling_tasks = [
             asyncio.create_task(client.get(path, authority))
             for _ in range(siblings)
@@ -291,50 +394,61 @@ async def run_slow(url: str, slow_s: float, siblings: int) -> dict:
         sibling_results = await asyncio.gather(
             *sibling_tasks, return_exceptions=True
         )
-        # Siblings must have finished while the slow stream was still
-        # incomplete (its future is resolved only on release).
-        slow_unfinished_during_siblings = not slow_pending["future"].done()
+        target_unfinished_during_siblings = not slow_pending["future"].done()
         if slow_s > 0:
             await asyncio.sleep(slow_s)
-        held = client.held_bytes(slow_id)
-        client.release_stream(slow_id)
-        slow_result = await client.await_pending(slow_pending)
+        target_unfinished_before_finish = not slow_pending["future"].done()
+        slow_result = await client.finish_upload(slow_pending, slow_body)
 
     sibling_ok = sum(
         1
         for r in sibling_results
-        if isinstance(r, dict) and r.get("status") == b"200"
+        if isinstance(r, dict)
+        and r.get("status") == b"200"
+        and _body_ok(path, r)
+    )
+    sibling_body_bad = sum(
+        1
+        for r in sibling_results
+        if isinstance(r, dict)
+        and r.get("status") == b"200"
+        and not _body_ok(path, r)
     )
     sibling_fail = siblings - sibling_ok
     slow_ok = (
         isinstance(slow_result, dict) and slow_result.get("status") == b"200"
     )
-    slow_body_ok = bytes(slow_result.get("body", b"")) == slow_body if isinstance(
-        slow_result, dict
-    ) else False
+    slow_body_ok = (
+        bytes(slow_result.get("body", b"")) == slow_body
+        if isinstance(slow_result, dict)
+        else False
+    )
     elapsed_ms = (time.perf_counter() - t0) * 1000
-    # held > 0 proves response bytes arrived while consumption was
-    # withheld yet siblings still completed: genuine slow-consumer
-    # multiplexing overlap, not a post-completion sleep.
     verdict = (
         "pass"
         if slow_ok
         and slow_body_ok
         and sibling_ok == siblings
-        and held > 0
-        and slow_pending_at_sibling_dispatch
-        and slow_unfinished_during_siblings
+        and target_unfinished_at_dispatch
+        and target_unfinished_during_siblings
+        and target_unfinished_before_finish
         else "fail"
     )
     return {
         "scenario": "slow",
         "verdict": verdict,
+        "conn": "single",
+        "method": "incomplete_upload",
         "slow_ok": int(slow_ok),
         "slow_body_ok": int(slow_body_ok),
         "sibling_ok": sibling_ok,
+        "sibling_body_bad": sibling_body_bad,
         "sibling_fail": sibling_fail,
-        "held_bytes": held,
-        "slow_unfinished_during_siblings": int(slow_unfinished_during_siblings),
+        "target_unfinished_at_dispatch": int(target_unfinished_at_dispatch),
+        "target_unfinished_during_siblings": int(
+            target_unfinished_during_siblings
+        ),
+        "target_unfinished_before_finish": int(target_unfinished_before_finish),
         "elapsed_ms": elapsed_ms,
         "slow_s": slow_s,
         "siblings": siblings,
@@ -357,6 +471,10 @@ async def run_cancel(url: str, siblings: int) -> dict:
     configuration.verify_mode = ssl.CERT_NONE
 
     t0 = time.perf_counter()
+    # Declared larger than CANCEL_PARTIAL so END_STREAM never arrives and
+    # the peer must keep the incomplete request until RESET_STREAM.
+    cancel_declared = CANCEL_PARTIAL * 2
+    cancel_body = b"y" * cancel_declared
     async with connect(
         host,
         port,
@@ -366,13 +484,98 @@ async def run_cancel(url: str, siblings: int) -> dict:
         assert isinstance(client, ScenarioProtocol)
         await _wait_alpn(client)
 
-        # Run cancellation concurrently with siblings so reset and sibling
-        # traffic overlap; the old code awaited the cancelled request to
-        # completion before starting siblings. Use a large echo for the
-        # cancel target so it is still in-flight (not already completed)
-        # when reset fires after 5ms.
-        cancel_body = b"y" * (256 * 1024)
+        async def _wait_stream_acked(stream_id: int, timeout_s: float) -> bool:
+            """True once every byte written on `stream_id` has been ACKed.
 
+            Delivery ACK is the observable proof the peer received the H3
+            HEADERS+DATA we queued; a fixed sleep cannot establish that.
+            """
+            assert isinstance(client, ScenarioProtocol)
+            deadline = time.perf_counter() + timeout_s
+            while time.perf_counter() < deadline:
+                stream = client._quic._streams.get(stream_id)
+                if stream is not None:
+                    sender = stream.sender
+                    # _buffer_start advances only on contiguous ACK from the
+                    # write origin; equality with _buffer_stop means the
+                    # entire incomplete request frame has been delivered.
+                    if (
+                        sender._buffer_stop > 0
+                        and sender._buffer_start >= sender._buffer_stop
+                    ):
+                        return True
+                client.transmit()
+                await asyncio.sleep(0.001)
+            return False
+
+        async def _incomplete_reset() -> int:
+            """Send a partial POST /echo and RESET_STREAM it mid-request.
+
+            Returns CANCEL_PARTIAL only when those request bytes were ACKed
+            by the peer before the reset — the amount a forgetful server
+            would keep charged against the request-body budget. Unacked
+            bytes are not counted: RESET can discard them in flight.
+            """
+            assert isinstance(client, ScenarioProtocol)
+            stream_id = client._quic.get_next_available_stream_id()
+            loop = asyncio.get_running_loop()
+            future = loop.create_future()
+            pending = {
+                "future": future,
+                "body": bytearray(),
+                "status": None,
+                "start": time.perf_counter(),
+                "done_at": None,
+                "stream_id": stream_id,
+                "cancelled": False,
+            }
+            assert client.http is not None
+            client._inflight[stream_id] = pending
+            partial = cancel_body[:CANCEL_PARTIAL]
+            client.http.send_headers(
+                stream_id,
+                [
+                    (b":method", b"POST"),
+                    (b":scheme", b"https"),
+                    (b":authority", authority),
+                    (b":path", b"/echo"),
+                    (b"content-length", str(len(cancel_body)).encode()),
+                ],
+                end_stream=False,
+            )
+            client.http.send_data(stream_id, partial, end_stream=False)
+            client.transmit()
+            delivered = await _wait_stream_acked(stream_id, timeout_s=2.0)
+            was_inflight = not future.done()
+            if was_inflight:
+                client._quic.reset_stream(
+                    stream_id, error_code=H3_REQUEST_CANCELLED
+                )
+                client.transmit()
+            pending["cancelled"] = True
+            pending["was_inflight"] = was_inflight
+            client._inflight.pop(stream_id, None)
+            return CANCEL_PARTIAL if delivered and was_inflight else 0
+
+        # Phase 1: prove the peer processes RESET_STREAM cleanup. A server
+        # that ignores cancel and keeps incomplete request bodies charged
+        # will refuse later work once the documented budget is exceeded.
+        # Burn until the *delivered* residual would exceed the budget —
+        # only ACKed request bytes are counted toward the leak estimate.
+        leaked_estimate = 0
+        cycles_done = 0
+        burn_deadline = time.perf_counter() + 300.0
+        while leaked_estimate <= H3_REQUEST_BODY_BUDGET:
+            if time.perf_counter() >= burn_deadline:
+                break
+            credited = await _incomplete_reset()
+            if credited == 0:
+                break
+            leaked_estimate += credited
+            cycles_done += 1
+
+        # Phase 2: concurrent cancel + siblings so reset overlaps sibling
+        # traffic (siblings remain outstanding across the reset).
         async def _cancel_large() -> dict:
             assert isinstance(client, ScenarioProtocol)
             stream_id = client._quic.get_next_available_stream_id()
@@ -401,7 +604,7 @@ async def run_cancel(url: str, siblings: int) -> dict:
                 end_stream=False,
             )
             client.http.send_data(
-                stream_id, cancel_body[:16384], end_stream=False
+                stream_id, cancel_body[:CANCEL_PARTIAL], end_stream=False
             )
             client.transmit()
             await asyncio.sleep(0.005)
@@ -436,7 +639,7 @@ async def run_cancel(url: str, siblings: int) -> dict:
         # reset fires: 64-byte /fixed responses finish within the 5 ms
         # window on loopback, which would leave nothing to prove the
         # connection survives the reset.
-        sibling_body = b"z" * (256 * 1024)
+        sibling_body = b"z" * CANCEL_PARTIAL
         sibling_tasks = [
             asyncio.create_task(_sibling()) for _ in range(siblings)
         ]
@@ -444,6 +647,20 @@ async def run_cancel(url: str, siblings: int) -> dict:
             cancel_task,
             asyncio.gather(*sibling_tasks, return_exceptions=True),
         )
+        # Match H2 cancel: a server that GOAWAYs / drains on RST can still
+        # finish already-admitted siblings. Probe a fresh GET on the same
+        # connection before claiming it remains reusable — and after the
+        # budget burn, so pinned incomplete bodies would block admission.
+        post_reset_ok = False
+        try:
+            after = await client.get(FIXED_PATH, authority)
+            post_reset_ok = (
+                isinstance(after, dict)
+                and after.get("status") == b"200"
+                and _body_ok(FIXED_PATH, after)
+            )
+        except Exception:
+            post_reset_ok = False
 
     sibling_ok = sum(
         1
@@ -454,25 +671,32 @@ async def run_cancel(url: str, siblings: int) -> dict:
     )
     elapsed_ms = (time.perf_counter() - t0) * 1000
     siblings_outstanding = int(cancelled.get("siblings_outstanding_at_reset", 0))
-    # Pass: target was in-flight when reset fired (not already completed),
-    # at least one sibling was still outstanding across the reset, and all
-    # siblings still succeed (connection reusable).
+    # Pass: budget burn completed, target was in-flight when reset fired,
+    # at least one sibling was still outstanding across the reset, all
+    # siblings still succeed, and a post-reset request on the same
+    # connection succeeds (connection reusable; cancel released capacity).
     verdict = (
         "pass"
-        if cancelled.get("cancelled")
+        if leaked_estimate > H3_REQUEST_BODY_BUDGET
+        and cancelled.get("cancelled")
         and cancelled.get("was_inflight")
         and siblings_outstanding > 0
         and sibling_ok == siblings
+        and post_reset_ok
         else "fail"
     )
     return {
         "scenario": "cancel",
         "verdict": verdict,
+        "reserve_cycles": cycles_done,
+        "leaked_estimate": leaked_estimate,
+        "budget": H3_REQUEST_BODY_BUDGET,
         "cancelled": int(bool(cancelled.get("cancelled"))),
         "was_inflight": int(bool(cancelled.get("was_inflight"))),
         "siblings_outstanding_at_reset": siblings_outstanding,
         "sibling_ok": sibling_ok,
         "sibling_fail": siblings - sibling_ok,
+        "post_reset_ok": int(post_reset_ok),
         "elapsed_ms": elapsed_ms,
         "siblings": siblings,
     }
@@ -534,7 +758,7 @@ async def run_loss(
                             return
                         # Same payload check as the main H3 loader: a 200
                         # with a wrong body is not a valid measurement.
-                        if bytes(result["body"]) != b"a" * 64:
+                        if bytes(result["body"]) != FIXED_BODY:
                             counters["failed"] += 1
                             return
                         counters["ok"] += 1

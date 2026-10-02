@@ -74,7 +74,11 @@ from ._parser import ParseResult, parse_head, parse_one
 from .config import ServerConfig
 from .handler import Handler
 from .headers import Headers
-from .response import ResponseWriter, has_body_for_status
+from .response import (
+    ResponseWriter,
+    has_body_for_status,
+    maybe_inject_alt_svc,
+)
 from .request import HttpVersion, Request, split_path_query
 from net.tls import TLSConnection, TLSContext
 from net.http._http2.hpack import Http2HpackDeflater
@@ -222,6 +226,14 @@ struct Server(Movable):
     def active_connections(self) -> Int:
         return self._active_conns
 
+    def _inject_alt_svc_for_tls(
+        mut self, idx: Int, mut writer: ResponseWriter
+    ) raises:
+        # Opt-in HTTPS advertisement only: plaintext and empty alt_svc skip.
+        if not self._conns[idx].is_tls():
+            return
+        maybe_inject_alt_svc(writer, self.config.alt_svc)
+
     def add_listener(mut self, var listener: TCPListener) raises:
         if self._listener:
             raise NetError(
@@ -241,9 +253,7 @@ struct Server(Movable):
         self.add_listener(listener^)
         self._tls_context = Optional[TLSContext](tls_context^)
 
-    def add_quic_endpoint(
-        mut self, var endpoint: QuicUDPEndpoint
-    ) raises:
+    def add_quic_endpoint(mut self, var endpoint: QuicUDPEndpoint) raises:
         if self._quic_endpoint:
             raise NetError(
                 NetErrorKind.invalid_state(),
@@ -252,6 +262,9 @@ struct Server(Movable):
                 "server already has a QUIC endpoint",
             )
         endpoint.set_connection_limit(self.config.max_connections)
+        endpoint.set_transport_memory_limit(
+            self.config.quic_max_transport_memory_bytes
+        )
         endpoint.set_request_limits(
             self.config.max_body_bytes,
             self.config.max_headers_bytes,
@@ -285,7 +298,11 @@ struct Server(Movable):
         var now = now_ns()
         self._tick_date = current_http_date()
         self._note_shutdown(now)
-        if not self._listener and not self._quic_endpoint and self._active_conns == 0:
+        if (
+            not self._listener
+            and not self._quic_endpoint
+            and self._active_conns == 0
+        ):
             self.control.mark_exited()
             return False
         self._tick_id += 1
@@ -392,7 +409,11 @@ struct Server(Movable):
                 self._arm_deadline(idx)
         self._expire_deadlines(now_ns())
         self._process_detached_messages(now_ns())
-        if not self._listener and not self._quic_endpoint and self._active_conns == 0:
+        if (
+            not self._listener
+            and not self._quic_endpoint
+            and self._active_conns == 0
+        ):
             self.control.mark_exited()
             return False
         return True
@@ -656,9 +677,6 @@ struct Server(Movable):
                     self._close_conn(idx)
                     continue
                 var expired = self._conns[idx].http2_session.value().expire(now)
-                if self._conns[idx].http2_session.value().is_failed():
-                    self._close_conn(idx)
-                    continue
                 if len(expired) > 0:
                     if not self._budget.try_reserve(len(expired)):
                         self._close_conn(idx)
@@ -670,6 +688,12 @@ struct Server(Movable):
                     )
                     self._arm_deadline(idx)
                     self._sync_interests(idx)
+                    continue
+                if (
+                    self._conns[idx].http2_session.value().is_failed()
+                    and self._conns[idx].pending_remaining() == 0
+                ):
+                    self._close_conn(idx)
                     continue
                 self._arm_deadline(idx)
                 continue
@@ -694,7 +718,9 @@ struct Server(Movable):
                         or not self._conns[i].http2_session
                     ):
                         continue
-                    var goaway = self._conns[i].http2_session.value().begin_shutdown()
+                    var goaway = (
+                        self._conns[i].http2_session.value().begin_shutdown()
+                    )
                     if not self._budget.try_reserve(len(goaway)):
                         self._close_conn(i)
                         continue
@@ -703,6 +729,10 @@ struct Server(Movable):
                     self._conns[i].write_at = deadline_from_now(
                         self.config.write_deadline
                     )
+                    # Wake the write path: without this, GOAWAY sits in pending
+                    # until an unrelated read event arrives.
+                    self._sync_interests(i)
+                    self._push_urgent(i)
                 # Idle connections (nothing buffered, nothing queued)
                 # stop waiting out their long keep-alive clock: give
                 # them a short cushion instead. Anything with bytes in
@@ -1072,7 +1102,19 @@ struct Server(Movable):
             self._mark_detached_cancelled(idx)
             self._cleanup_detached_state(idx)
             self._remove_detached_conn(idx)
-        var wire = encode_error(status, True, self._tick_date, is_head=is_head)
+        # TLS error responses also advertise Alt-Svc when configured,
+        # matching the handler path (_inject_alt_svc_for_tls).
+        var wire: List[Byte]
+        if self._conns[idx].is_tls() and self.config.alt_svc.byte_length() > 0:
+            wire = encode_error(
+                status,
+                True,
+                self._tick_date,
+                is_head=is_head,
+                alt_svc=self.config.alt_svc,
+            )
+        else:
+            wire = encode_error(status, True, self._tick_date, is_head=is_head)
         # Error responses use a small fixed body: when even that does not
         # fit the remaining budget, close bare.
         if not self._budget.try_reserve(len(wire)):
@@ -1086,9 +1128,27 @@ struct Server(Movable):
         self._sync_interests(idx)
 
     def _sync_interests(mut self, idx: Int) raises NetError:
+        var want_read = self._conns[idx].wants_read()
+        if (
+            self._conns[idx].protocol == PROTOCOL_HTTP2
+            and self._conns[idx].http2_session
+            and self._conns[idx].http2_session.value().is_failed()
+            and self._conns[idx].pending_remaining() > 0
+        ):
+            # A failed HTTP/2 session is draining its GOAWAY: it never
+            # consumes another byte, so only the flush is left. Ordinary
+            # read interest stays true for STATE_SENDING_HTTP2_CONTROL, and
+            # a level-triggered reactor would keep waking this connection on
+            # attacker-controlled readability while the write is stuck. A
+            # TLS write blocked on WANT_READ still needs a read event to
+            # retry, and wants_write() drops write interest in that case.
+            want_read = (
+                self._conns[idx].tls_write_would_block
+                and self._conns[idx].tls_write_wants_read
+            )
         _ = self._reactor.modify(
             self._conns[idx].token,
-            self._conns[idx].wants_read(),
+            want_read,
             self._conns[idx].wants_write(),
         )
 
@@ -1110,6 +1170,8 @@ struct Server(Movable):
                             self.config.max_trailer_count,
                             self.config.header_deadline,
                             self.config.body_deadline,
+                            self.config.http2_max_control_frames_per_second,
+                            self.config.http2_max_resets_per_second,
                         )
                     )
                 elif protocol != "http/1.1":
@@ -1185,9 +1247,6 @@ struct Server(Movable):
         if self._conns[idx].protocol == PROTOCOL_HTTP2:
             if self._conns[idx].http2_session:
                 var expired = self._conns[idx].http2_session.value().expire(now)
-                if self._conns[idx].http2_session.value().is_failed():
-                    self._close_conn(idx)
-                    return
                 if len(expired) > 0:
                     if not self._budget.try_reserve(len(expired)):
                         self._close_conn(idx)
@@ -1197,12 +1256,34 @@ struct Server(Movable):
                     self._conns[idx].write_at = deadline_from_now(
                         self.config.write_deadline
                     )
-            if self._conns[idx].state == STATE_SENDING_HTTP2_CONTROL:
+            if (
+                self._conns[idx].state == STATE_SENDING_HTTP2_CONTROL
+                or self._conns[idx].pending_remaining() > 0
+            ):
                 self._pump_send(
                     idx, self._conns[idx].write_ready(readable, writable)
                 )
                 if not self._conns[idx].active:
                     return
+            if (
+                self._conns[idx].http2_session
+                and self._conns[idx].http2_session.value().is_failed()
+                and self._conns[idx].pending_remaining() == 0
+            ):
+                self._close_conn(idx)
+                return
+            if (
+                self._conns[idx].http2_session
+                and self._conns[idx].http2_session.value().is_failed()
+            ):
+                # Failed session draining GOAWAY: flush pending output only.
+                # Do not read or parse further bytes; the failed session can
+                # never drain them and they would consume shared budget.
+                # _sync_interests drops ordinary read interest here and keeps
+                # only the readiness the flush needs, including the read
+                # event a TLS write blocked on WANT_READ requires.
+                self._sync_interests(idx)
+                return
             var read_event = (
                 self._conns[idx].read_ready(readable, writable)
                 or self._conns[idx].tls_pending() > 0
@@ -1212,8 +1293,7 @@ struct Server(Movable):
                 return
             var http2_activity = read_event
             while (
-                self._conns[idx].active
-                and self._conns[idx].buffered_len() > 0
+                self._conns[idx].active and self._conns[idx].buffered_len() > 0
             ):
                 if (
                     self._conns[idx].requests_this_tick
@@ -1225,6 +1305,17 @@ struct Server(Movable):
                 self._pump_http2_input(idx, handler)
                 http2_activity = True
                 if not self._conns[idx].active:
+                    return
+                if self._conns[idx].state == STATE_SENDING_HTTP2_CONTROL:
+                    self._pump_send(idx, True)
+                    if not self._conns[idx].active:
+                        return
+                if (
+                    self._conns[idx].http2_session
+                    and self._conns[idx].http2_session.value().is_failed()
+                    and self._conns[idx].pending_remaining() == 0
+                ):
+                    self._close_conn(idx)
                     return
                 if self._conns[idx].buffered_len() >= buffered_before:
                     break
@@ -1332,14 +1423,23 @@ struct Server(Movable):
         while self._conns[idx].active and self._conns[idx].buffered_len() > 0:
             var result: Http2RequestSessionResult
             try:
-                result = self._conns[idx].http2_session.value().consume(
-                    Span(self._conns[idx].buf)
+                result = (
+                    self._conns[idx]
+                    .http2_session.value()
+                    .consume(Span(self._conns[idx].buf))
                 )
             except e:
                 _ = e
                 self._close_conn(idx)
                 return
             if result.is_error():
+                if self._conns[idx].pending_remaining() > 0:
+                    self._conns[idx].state = STATE_SENDING_HTTP2_CONTROL
+                    self._conns[idx].write_at = deadline_from_now(
+                        self.config.write_deadline
+                    )
+                    self._pump_send(idx, True)
+                    return
                 self._close_conn(idx)
                 return
             if result.consumed > 0:
@@ -1393,6 +1493,7 @@ struct Server(Movable):
                 self._conns[idx].write_at = deadline_from_now(
                     self.config.write_deadline
                 )
+                self._pump_send(idx, True)
                 return
             if result.is_pending():
                 self._drain_http2_responses(idx)
@@ -1456,6 +1557,13 @@ struct Server(Movable):
             writer.headers.clear()
             writer.body.clear()
 
+        try:
+            self._inject_alt_svc_for_tls(idx, writer)
+        except e:
+            _ = e
+            self._close_conn(idx)
+            return
+
         if not self._conns[idx].http2_deflater:
             try:
                 var table_size = Int(
@@ -1480,8 +1588,10 @@ struct Server(Movable):
                 .peer_settings()
                 .header_table_size
             )
-            if not self._conns[idx].http2_deflater.value().set_max_table_size(
-                table_size
+            if (
+                not self._conns[idx]
+                .http2_deflater.value()
+                .set_max_table_size(table_size)
             ):
                 self._close_conn(idx)
                 return
@@ -1553,9 +1663,9 @@ struct Server(Movable):
         )
         if batch.released_bytes > 0:
             self._budget.release(batch.released_bytes)
-            self._conns[idx].http2_response_bytes_reserved -= (
-                batch.released_bytes
-            )
+            self._conns[
+                idx
+            ].http2_response_bytes_reserved -= batch.released_bytes
         if len(batch.wire) == 0:
             if self._conns[idx].http2_responses.queued_count() > 0:
                 # Still waiting for WINDOW_UPDATE credit; keep the write
@@ -1889,6 +1999,12 @@ struct Server(Movable):
             return
         # Header count/bytes are enforced inside the encoder, the single
         # authoritative site; its failure below becomes a 500 the same way.
+        try:
+            self._inject_alt_svc_for_tls(idx, writer)
+        except e:
+            _ = e
+            self._send_error(idx, 500)
+            return
         var wire: List[Byte]
         try:
             wire = encode_response(
@@ -2005,6 +2121,16 @@ struct Server(Movable):
                 self._conns[idx].idle_at = deadline_from_now(
                     self.config.idle_timeout
                 )
+            var http2_failed = (
+                self._conns[idx].http2_session
+                and self._conns[idx].http2_session.value().is_failed()
+            )
+            if http2_failed:
+                # Flooded session: the control flush (ACK + ENHANCE_YOUR_CALM
+                # GOAWAY) is all the peer will get. Do not schedule more
+                # application responses; the connection closes once pending
+                # output reaches zero.
+                return
             self._drain_http2_responses(idx)
             return
         if was_100:
@@ -2227,6 +2353,16 @@ struct Server(Movable):
             self._arm_deadline(idx)
             return
 
+        try:
+            self._inject_alt_svc_for_tls(idx, rw)
+        except e:
+            _ = e
+            self._mark_detached_cancelled(idx)
+            self._cleanup_detached_state(idx)
+            self._send_error(idx, 500, is_head=is_head)
+            self._arm_deadline(idx)
+            return
+
         var wire: List[Byte]
         try:
             wire = encode_response(
@@ -2286,6 +2422,16 @@ struct Server(Movable):
         msg.headers = Headers()
         rw.headers = h^
         rw.set_should_close(req_close or (self._shutdown_at != NO_DEADLINE))
+
+        try:
+            self._inject_alt_svc_for_tls(idx, rw)
+        except e:
+            _ = e
+            self._mark_detached_cancelled(idx)
+            self._cleanup_detached_state(idx)
+            self._send_error(idx, 500, is_head=is_head)
+            self._arm_deadline(idx)
+            return
 
         var wire: List[Byte]
         try:

@@ -80,8 +80,15 @@ python = ">=3.10,<3.15"
 [feature.http2.dependencies]
 c-compiler = "*"
 libnghttp2 = ">=1.64,<2"
-mojo = ">=1.0.0,<1.1"
 pkg-config = "*"
+python = ">=3.10,<3.15"
+
+# HTTP/2 scenario driver client (benchmarks/http/http2_scenarios.py).
+# Pinned like aioquic for the H3 baseline: the slow-stream and cancellation
+# scenarios need one connection carrying both the target and the sibling
+# streams, which curl and h2load cannot express across separate processes.
+[feature.http2.pypi-dependencies]
+h2 = "==4.4.1"
 
 [feature.http2.tasks]
 hpack-test = "bash scripts/build_hpack_shim.sh"
@@ -105,7 +112,6 @@ cxx-compiler = "*"
 git = "*"
 libclang = "*"
 make = "*"
-mojo = ">=1.0.0,<1.1"
 python = ">=3.10,<3.15"
 rust = ">=1.88,<2"
 
@@ -165,12 +171,17 @@ example-https-hello = { cmd = "mojo run --Werror -I . examples/https_hello.mojo"
   "tls-build",
 ] }
 
-[dependencies]
-mojo = ">=1.0.0,<2"
+[feature.mojo-1-0.dependencies]
+mojo = ">=1.0.0,<1.1"
+
+[feature.mojo-1-1.dependencies]
+mojo = ">=1.1.0,<1.2"
 
 [environments]
-tls = ["tls"]
-http2 = ["http2"]
-http3 = ["http3"]
-tls-http2 = ["tls", "http2"]
-tls-http3 = ["tls", "http3"]
+default = ["mojo-1-1"]
+mojo-1-0 = ["mojo-1-0"]
+tls = ["tls", "mojo-1-1"]
+http2 = ["http2", "mojo-1-1"]
+http3 = ["http3", "mojo-1-1"]
+tls-http2 = ["tls", "http2", "mojo-1-1"]
+tls-http3 = ["tls", "http3", "mojo-1-1"]

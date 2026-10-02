@@ -41,7 +41,7 @@ Deferred (not required to close #42): HTTP/2 response trailers; full H1↔H2 app
 - Add `ServerConfig` fields (defaults conservative, documented):
   - `http2_max_control_frames_per_second: Int = 1000`
   - `http2_max_resets_per_second: Int = 100`
-  - Sliding 1-second windows counted on the connection session (monotonic clock already used for deadlines).
+  - Tumbling 1-second windows counted on the connection session (monotonic clock already used for deadlines).
 - On exceed: emit `GOAWAY` with `ENHANCE_YOUR_CALM` (or `PROTOCOL_ERROR` if that code is not yet wired) and begin drain; do not process further application DATA/HEADERS on that connection.
 - Count: PING (non-ACK), SETTINGS (non-ACK), WINDOW_UPDATE, PRIORITY if present, and RST_STREAM (separate reset counter).
 
@@ -150,7 +150,7 @@ Depends on PR 4. aioquic/quiche client scripts: reorder application datagrams; r
 ## Success criteria for #42 (non-CI)
 
 - [x] PRs 1–8 implemented on the open stack ([#71](https://github.com/hirokazumiyaji/net-mojo/pull/71)–[#78](https://github.com/hirokazumiyaji/net-mojo/pull/78); sibling branches — code not in this worktree tip).
-- [ ] PRs 9–11 with real numbers in `benchmarks/http/README.md` ([#79](https://github.com/hirokazumiyaji/net-mojo/pull/79)–[#81](https://github.com/hirokazumiyaji/net-mojo/pull/81); this branch stack). Connections × streams, slow, and cancel are measured on both stacks under a labeled shortened procedure. Still outstanding: an HTTP/2 loss measurement (pf/dummynet needs root, and the 5% client-side datagram drop only covers H3), so this criterion stays unchecked until the H2 loss row has real numbers.
+- [ ] PRs 9–11 with real numbers in `benchmarks/http/README.md` ([#79](https://github.com/hirokazumiyaji/net-mojo/pull/79)–[#81](https://github.com/hirokazumiyaji/net-mojo/pull/81); this branch stack). Connections × streams are measured on both stacks under a labeled shortened procedure. Specials pass for Go H2 and aioquic H3 under the current single-connection harness; `h2 | Mojo` specials are not run and `h3 | Mojo` specials predate the current criteria. Still outstanding: re-measure Mojo specials once the build works, and an HTTP/2 loss row (pf/dummynet needs root; the 5% client-side datagram drop only covers H3), so this criterion stays unchecked.
 - [x] PR 12 docs match the intended ops model and record stack status honestly (this PR; no claim that #71–#78 code lives here).
 - [x] Shared handler serves H1/H2/H3; TLS ALPN `h2` and QUIC ALPN `h3` verified by independent clients (already on `main`; extended by #78).
 - [x] Flood bounds, explicit 0-RTT off, Alt-Svc, transport memory story documented and tested (#71–#77 on sibling branches; ops docs here).

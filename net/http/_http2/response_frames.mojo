@@ -47,9 +47,8 @@ def encode_headers_block[
             block[offset : offset + chunk_length],
             max_frame_size,
         )
-        if (
-            not frame.is_complete()
-            or len(frame.wire) > max_output_bytes - len(output)
+        if not frame.is_complete() or len(frame.wire) > max_output_bytes - len(
+            output
         ):
             return FrameEncodeResult.failure()
         _append_wire(output, frame.wire)
@@ -91,9 +90,8 @@ def encode_data_frames[
             body[offset : offset + chunk_length],
             max_frame_size,
         )
-        if (
-            not frame.is_complete()
-            or len(frame.wire) > max_output_bytes - len(output)
+        if not frame.is_complete() or len(frame.wire) > max_output_bytes - len(
+            output
         ):
             return FrameEncodeResult.failure()
         _append_wire(output, frame.wire)
@@ -101,9 +99,8 @@ def encode_data_frames[
     if len(body) == 0 and end_stream:
         var empty = List[Byte]()
         var frame = encode_frame(Byte(0), Byte(1), stream_id, Span(empty))
-        if (
-            not frame.is_complete()
-            or len(frame.wire) > max_output_bytes - len(output)
+        if not frame.is_complete() or len(frame.wire) > max_output_bytes - len(
+            output
         ):
             return FrameEncodeResult.failure()
         _append_wire(output, frame.wire)

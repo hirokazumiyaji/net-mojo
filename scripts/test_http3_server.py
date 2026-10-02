@@ -1,4 +1,5 @@
 import asyncio
+import os
 import ssl
 import subprocess
 import sys
@@ -12,6 +13,20 @@ from aioquic.quic.configuration import QuicConfiguration
 from aioquic.quic.events import ConnectionTerminated, ProtocolNegotiated, StreamReset
 from aioquic.quic.packet import QuicProtocolVersion
 
+# HTTP/3 application error codes (RFC 9114).
+H3_REQUEST_CANCELLED = 0x10C
+H3_REQUEST_REJECTED = 0x10B
+H3_NO_ERROR = 0x100
+
+
+def require_http3_alpn(alpn):
+    """Fail unless QUIC negotiated ALPN h3 — HTTPS-only is not HTTP/3 success."""
+    if alpn != "h3":
+        raise RuntimeError(
+            f"HTTP/3 requires negotiated ALPN 'h3'; got {alpn!r}. "
+            "HTTPS-only (http/1.1 or h2 without h3) must not count as HTTP/3 success."
+        )
+
 
 class Http3ClientProtocol(QuicConnectionProtocol):
     def __init__(self, *args, **kwargs):
@@ -22,16 +37,42 @@ class Http3ClientProtocol(QuicConnectionProtocol):
         self.terminated = self._loop.create_future()
         self.alpn = None
         self.dropped_datagrams = 0
+        self.reordered_datagram_batches = 0
+        self._held_datagrams = []
+        self._ping_id = 1
 
-    def transmit(self, drop_next_datagram=False):
+    def transmit(self, drop_next_datagram=False, reorder_datagrams=False):
+        """Flush queued datagrams; returns the number actually sent."""
         self._transmit_task = None
+        datagrams = list(self._quic.datagrams_to_send(now=self._loop.time()))
+        sent = 0
+
+        if reorder_datagrams:
+            if self._held_datagrams:
+                # A newer datagram must exist before the held one can be
+                # released ahead of it; otherwise pacing/cwnd left nothing
+                # new and sending alone is not a reorder.
+                if datagrams:
+                    datagrams = list(datagrams) + self._held_datagrams
+                    self._held_datagrams = []
+                    self.reordered_datagram_batches += 1
+                # else: keep holding until a real packet precedes it.
+            elif len(datagrams) >= 2:
+                datagrams[0], datagrams[1] = datagrams[1], datagrams[0]
+                self.reordered_datagram_batches += 1
+            elif len(datagrams) == 1:
+                # Best-effort: hold until the next transmit supplies a peer packet.
+                self._held_datagrams = datagrams
+                datagrams = []
+
         dropped = False
-        for data, address in self._quic.datagrams_to_send(now=self._loop.time()):
+        for data, address in datagrams:
             if drop_next_datagram and not dropped:
                 self.dropped_datagrams += 1
                 dropped = True
                 continue
             self._transport.sendto(data, address)
+            sent += 1
 
         timer_at = self._quic.get_timer()
         if self._timer is not None and self._timer_at != timer_at:
@@ -40,6 +81,7 @@ class Http3ClientProtocol(QuicConnectionProtocol):
         if self._timer is None and timer_at is not None:
             self._timer = self._loop.call_at(timer_at, self._handle_timer)
         self._timer_at = timer_at
+        return sent
 
     def quic_event_received(self, event):
         if isinstance(event, ProtocolNegotiated):
@@ -59,7 +101,7 @@ class Http3ClientProtocol(QuicConnectionProtocol):
             if http_event.stream_ended:
                 response["future"].set_result(response)
 
-    async def post(self, body, trailers, drop_first_datagram=False):
+    def _start_post(self, body, trailers, end_stream_data=None):
         stream_id = self._quic.get_next_available_stream_id()
         future = self._loop.create_future()
         response = {"future": future, "headers": [], "body": bytearray()}
@@ -75,14 +117,47 @@ class Http3ClientProtocol(QuicConnectionProtocol):
             ],
             end_stream=False,
         )
-        self.http.send_data(stream_id, body, end_stream=not trailers)
+        data_end = end_stream_data if end_stream_data is not None else not trailers
+        self.http.send_data(stream_id, body, end_stream=data_end)
         if trailers:
             self.http.send_headers(
                 stream_id, [(b"x-check", b"done")], end_stream=True
             )
-        self.transmit(drop_next_datagram=drop_first_datagram)
+        return stream_id, response
+
+    async def post(
+        self,
+        body,
+        trailers,
+        drop_first_datagram=False,
+        reorder_datagrams=False,
+    ):
+        stream_id, response = self._start_post(body, trailers)
+        self.transmit(
+            drop_next_datagram=drop_first_datagram,
+            reorder_datagrams=reorder_datagrams,
+        )
+        if reorder_datagrams and self._held_datagrams:
+            # Single application datagram: emit PINGs until a newer datagram
+            # is actually produced, so the held one is sent after it. Sending
+            # must be observed (aioquic may pace or find no cwnd room), and an
+            # empty transmit leaves nothing to reorder.
+            deadline = self._loop.time() + 2.0
+            while self._held_datagrams and self._loop.time() < deadline:
+                self._quic.send_ping(self._ping_id)
+                self._ping_id += 1
+                self.transmit(reorder_datagrams=True)
+                # Yield to the loop: pacing timers and ACKs from the server
+                # need real time to free congestion window before another
+                # datagram can be produced.
+                await asyncio.sleep(0.05)
+            if self._held_datagrams or self.reordered_datagram_batches < 1:
+                raise RuntimeError(
+                    "reorder transmit never produced a newer datagram ahead of "
+                    "the held one"
+                )
         try:
-            result = await asyncio.wait_for(future, timeout=10)
+            result = await asyncio.wait_for(response["future"], timeout=10)
             result["stream_id"] = stream_id
             return result
         finally:
@@ -103,9 +178,79 @@ class Http3ClientProtocol(QuicConnectionProtocol):
         )
         self.http.send_data(stream_id, b"da", end_stream=False)
         self.transmit()
-        self._quic.reset_stream(stream_id, error_code=0x10C)
+        self._quic.reset_stream(stream_id, error_code=H3_REQUEST_CANCELLED)
         self.transmit()
         await asyncio.sleep(0.05)
+
+    async def reset_storm_with_siblings(self):
+        """Storm repeated resets on one stream while siblings complete.
+
+        The same already-reset `storm_id` receives three RESET_STREAM
+        frames, each in a distinct QUIC packet (distinct packet numbers):
+        pinned aioquic's `reset_stream()` is a no-op past the first call
+        and re-sending identical datagram bytes would reuse packet numbers
+        (discarded as duplicates), so the test re-arms the stream sender's
+        pending reset before each transmit. This catches server mishandling
+        of repeated resets for an already-reset request while proving
+        sibling streams still complete on the same connection.
+        """
+        sibling_a_id, sibling_a = self._start_post(b"data", trailers=False)
+        sibling_b_id, sibling_b = self._start_post(b"data", trailers=False)
+
+        storm_id = self._quic.get_next_available_stream_id()
+        self.http.send_headers(
+            storm_id,
+            [
+                (b":method", b"POST"),
+                (b":scheme", b"https"),
+                (b":authority", b"localhost"),
+                (b":path", b"/echo?source=quic"),
+                (b"content-length", b"4"),
+            ],
+            end_stream=False,
+        )
+        self.http.send_data(storm_id, b"da", end_stream=False)
+        self.transmit()
+        self._quic.reset_stream(storm_id, error_code=H3_REQUEST_CANCELLED)
+        sender = self._quic._get_or_create_stream_for_send(storm_id).sender
+        reset_packets = 0
+        deadline = self._loop.time() + 3.0
+        # Re-arm so each transmit emits a fresh RESET_STREAM frame for the
+        # already-reset stream. Yield between attempts: aioquic's pacer or
+        # congestion window may suppress a packet, and without yielding no
+        # ACK can arrive to free capacity.
+        while reset_packets < 3 and self._loop.time() < deadline:
+            sender.reset_pending = True
+            self.transmit()
+            # get_reset_frame() clears reset_pending only when the frame is
+            # actually written, so this counts reset-bearing datagrams
+            # rather than any datagram (ACK-only) this transmit emitted.
+            if not sender.reset_pending:
+                reset_packets += 1
+                continue
+            await asyncio.sleep(0.05)
+        if reset_packets < 3:
+            raise RuntimeError(
+                f"expected 3 distinct reset packets, emitted {reset_packets}"
+            )
+
+        try:
+            for stream_id, response, label in (
+                (sibling_a_id, sibling_a, "sibling-a"),
+                (sibling_b_id, sibling_b, "sibling-b"),
+            ):
+                result = await asyncio.wait_for(response["future"], timeout=10)
+                if (b":status", b"200") not in result["headers"]:
+                    raise RuntimeError(
+                        f"reset-storm {label} unexpected headers: {result}"
+                    )
+                if bytes(result["body"]) != b"handled:data":
+                    raise RuntimeError(
+                        f"reset-storm {label} unexpected body: {result}"
+                    )
+        finally:
+            self.responses.pop(sibling_a_id, None)
+            self.responses.pop(sibling_b_id, None)
 
     async def post_after_goaway(self):
         stream_id = self._quic.get_next_available_stream_id()
@@ -162,9 +307,24 @@ async def run_client(address):
         configuration=configuration,
         create_protocol=Http3ClientProtocol,
     ) as client:
-        if client.alpn != "h3":
-            raise RuntimeError(f"unexpected negotiated ALPN: {client.alpn!r}")
+        require_http3_alpn(client.alpn)
+
         await client.cancel_partial_post()
+
+        reordered = await client.post(
+            b"data", trailers=False, reorder_datagrams=True
+        )
+        if client.reordered_datagram_batches < 1:
+            raise RuntimeError(
+                "expected at least one reordered application datagram batch"
+            )
+        if (b":status", b"200") not in reordered["headers"]:
+            raise RuntimeError(f"unexpected reordered response headers: {reordered}")
+        if bytes(reordered["body"]) != b"handled:data":
+            raise RuntimeError(f"unexpected reordered response body: {reordered}")
+
+        await client.reset_storm_with_siblings()
+
         first = await client.post(
             b"data", trailers=True, drop_first_datagram=True
         )
@@ -181,6 +341,10 @@ async def run_client(address):
                 raise RuntimeError(f"unexpected HTTP/3 response headers: {response}")
             if bytes(response["body"]) != expected_body:
                 raise RuntimeError(f"unexpected HTTP/3 response body: {response}")
+
+        # Re-check after traffic: still must be h3, never HTTPS-only.
+        require_http3_alpn(client.alpn)
+
         await asyncio.wait_for(client.http.wait_for_goaways(2), timeout=5)
         expected_goaways = [(1 << 62) - 4, second["stream_id"] + 4]
         if client.http.goaways != expected_goaways:
@@ -188,20 +352,26 @@ async def run_client(address):
                 f"unexpected HTTP/3 GOAWAY IDs: {client.http.goaways}"
             )
         reset_code = await client.post_after_goaway()
-        if reset_code != 0x10B:
+        if reset_code != H3_REQUEST_REJECTED:
             raise RuntimeError(
                 f"expected H3_REQUEST_REJECTED after GOAWAY, got {reset_code}"
             )
         close_code = await asyncio.wait_for(client.terminated, timeout=5)
-        if close_code != 0x100:
+        if close_code != H3_NO_ERROR:
             raise RuntimeError(f"expected H3_NO_ERROR close, got {close_code}")
 
 
+fixture_env = dict(os.environ)
+# This flow completes 5 requests (reordered POST, two reset-storm
+# siblings, trailers POST, final POST); the shared fixture defaults to
+# the same count, set explicitly so the Rust test's "2" cannot leak in.
+fixture_env["HTTP3_FIXTURE_EXPECT"] = "5"
 process = subprocess.Popen(
     ["mojo", "run", "--Werror", "-I", ".", "tests/http3_server_fixture.mojo"],
     stdout=subprocess.PIPE,
     stderr=subprocess.PIPE,
     text=True,
+    env=fixture_env,
 )
 
 try:
@@ -213,7 +383,10 @@ try:
     process.wait(timeout=5)
     if process.returncode != 0:
         raise RuntimeError(f"HTTP/3 fixture exited with {process.returncode}")
-    print("Independent aioquic HTTP/3 client roundtrips succeeded")
+    print(
+        "Independent aioquic HTTP/3 client roundtrips succeeded "
+        "(reorder + reset-storm siblings + ALPN h3)"
+    )
 finally:
     if process.poll() is None:
         process.terminate()

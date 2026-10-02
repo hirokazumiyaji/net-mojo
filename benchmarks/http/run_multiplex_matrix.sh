@@ -35,8 +35,9 @@ MOJO_H2_BIN="${MOJO_H2_BIN:-$OUT_DIR/http2_tls_server}"
 MOJO_H3_BIN="${MOJO_H3_BIN:-$OUT_DIR/http3_server}"
 PIXI_ENV_H2="${PIXI_ENV_H2:-tls-http2}"
 PIXI_ENV_H3="${PIXI_ENV_H3:-tls-http3}"
-# Resolved lazily inside the H3 branch so H2-only/Go-only runs
-# (SKIP_H3=1) never require pixi or the tls-http3 env at startup.
+# Resolved lazily inside each protocol branch so an H2-only or H3-only run
+# (SKIP_H2=1 / SKIP_H3=1) never requires the other pixi env at startup.
+PIXI_PYTHON_H2="${PIXI_PYTHON_H2:-}"
 PIXI_PYTHON_H3="${PIXI_PYTHON_H3:-}"
 MATRIX_FAILURES=0
 
@@ -47,6 +48,17 @@ h3_python() {
     fi
     PIXI_PYTHON_H3="$(cd "$ROOT" && pixi run -e "$PIXI_ENV_H3" python -c 'import sys; print(sys.executable)')"
     printf '%s' "$PIXI_PYTHON_H3"
+}
+
+# Same lazy resolution for the H2 side: the H3-only path (SKIP_H2=1) must
+# never need the tls-http2 environment at startup.
+h2_python() {
+    if [ -n "${PIXI_PYTHON_H2:-}" ]; then
+        printf '%s' "$PIXI_PYTHON_H2"
+        return 0
+    fi
+    PIXI_PYTHON_H2="$(cd "$ROOT" && pixi run -e "$PIXI_ENV_H2" python -c 'import sys; print(sys.executable)')"
+    printf '%s' "$PIXI_PYTHON_H2"
 }
 
 mkdir -p "$OUT_DIR" "$OUT_DIR/h2" "$OUT_DIR/h3" "$OUT_DIR/special"
@@ -79,6 +91,17 @@ sample_server() {
         fds="?"
     fi
     printf 'cpu_pct=%s rss_kb=%s fd_count=%s\n' "$cpu" "$rss" "$fds" >"$file"
+}
+
+# Mid-run sample point: warmup plus half the measure window. WARMUP_S and
+# MEASURE_S are durations that both clients accept as fractions, and Bash
+# arithmetic expansion is integer-only, so `$((...))` would abort this
+# subshell (leaving a stale .sample file or a post-load fallback sample)
+# for a value like MEASURE_S=0.5. Compute the delay with float arithmetic,
+# as run_http2_bench.sh and run_http3_bench.sh do.
+sampler_delay() {
+    python3 -c 'import sys; print(float(sys.argv[1]) + float(sys.argv[2]) / 2)' \
+        "$WARMUP_S" "$MEASURE_S"
 }
 
 to_us() {
@@ -167,6 +190,223 @@ wait_udp() {
     done
 }
 
+# Remove only the dummynet pipe this harness created.
+# `dnctl flush` is not a scoped operation: `flush` is a global dummynet
+# state reset, and dnctl's own argument parser rejects it (it prints the
+# usage summary and exits 0), so `dnctl -q flush pipe N` would either
+# clear unrelated host shaping rules or silently leave pipe N configured.
+# Numbered removal is `dnctl -q pipe N delete` per dnctl(8).
+# The flowset/queue pair that `config plr` allocates is deliberately left
+# orphaned: with no rule referencing the pipe it is inert, and its ID is
+# not known here, so deleting it could remove another process's shaping.
+dnctl_delete_pipe() {
+    local pipe_id="$1"
+    local log="${2:-/dev/null}"
+    sudo -n dnctl -q pipe "$pipe_id" delete 2>>"$log" || true
+}
+
+# Interprocess lock for dummynet pipe allocate/config/teardown. Without this,
+# two harnesses can pick the same free id between list and config.
+# Uses an atomic mkdir lock (portable where the flock(1) utility is absent).
+DNCTL_LOCK_DIR="${DNCTL_LOCK_DIR:-/tmp/net_mojo_dnctl_pipes.lock.d}"
+
+dnctl_lock_acquire() {
+    local log="${1:-/dev/null}"
+    local i
+    for i in $(seq 1 600); do
+        if mkdir "$DNCTL_LOCK_DIR" 2>/dev/null; then
+            printf '%s\n' "$$" >"$DNCTL_LOCK_DIR/pid"
+            return 0
+        fi
+        sleep 0.1
+    done
+    echo "dnctl lock timeout waiting for ${DNCTL_LOCK_DIR}" >>"$log"
+    return 1
+}
+
+dnctl_lock_release() {
+    rm -f "$DNCTL_LOCK_DIR/pid" 2>/dev/null || true
+    rmdir "$DNCTL_LOCK_DIR" 2>/dev/null || true
+}
+
+# Print the first dummynet pipe id in [first,last] that is not already
+# configured, and fail when no such id exists or the state is unknown.
+#
+# `dnctl pipe N config` targets an existing pipe rather than allocating a
+# private one, so a fixed id would reconfigure whatever owns that pipe and
+# the matching delete would then remove it. dnctl lists configured pipes as
+# "%05d: <params>" (list_pipes() in sbin/ipfw/dummynet.c), and an empty
+# listing means no pipes exist. dummynet_list() reports no error for a
+# missing pipe, so the listing is the only usable occupancy check; when the
+# output is non-empty but unparseable the caller is told skip rather than
+# left to guess at an id.
+#
+# Callers that will configure the pipe must use dnctl_claim_pipe under
+# dnctl_lock_acquire instead: a bare free-id scan does not reserve the id.
+dnctl_free_pipe() {
+    local first="$1"
+    local last="$2"
+    local log="${3:-/dev/null}"
+    local listing used n
+    if ! listing="$(sudo -n dnctl pipe list 2>>"$log")"; then
+        return 1
+    fi
+    used=""
+    if [ -n "$listing" ]; then
+        used="$(printf '%s\n' "$listing" | awk '
+            /^[0-9]+:/ {
+                id = $1
+                sub(/:$/, "", id)
+                if (id != "") printf "%s ", id + 0
+            }
+        ')"
+        [ -n "$used" ] || return 1
+    fi
+    for n in $(seq "$first" "$last"); do
+        case " $used " in
+            *" $n "*) continue ;;
+        esac
+        printf '%s' "$n"
+        return 0
+    done
+    return 1
+}
+
+# Atomically reserve a free pipe: list → config plr → re-list verify.
+# Requires dnctl_lock_acquire so concurrent harnesses cannot race the same id.
+# Hold the lock until dnctl_delete_pipe + dnctl_lock_release after teardown.
+dnctl_claim_pipe() {
+    local first="$1"
+    local last="$2"
+    local plr="$3"
+    local log="${4:-/dev/null}"
+    local n listing
+    n="$(dnctl_free_pipe "$first" "$last" "$log")" || return 1
+    if ! sudo -n dnctl pipe "$n" config plr "$plr" 2>>"$log"; then
+        return 1
+    fi
+    if ! listing="$(sudo -n dnctl pipe list 2>>"$log")"; then
+        sudo -n dnctl -q pipe "$n" delete 2>>"$log" || true
+        return 1
+    fi
+    if ! printf '%s\n' "$listing" | awk -v id="$n" '
+        BEGIN { found = 0 }
+        /^[0-9]+:/ {
+            x = $1
+            sub(/:$/, "", x)
+            if ((x + 0) == (id + 0)) found = 1
+        }
+        END { exit !found }
+    '; then
+        sudo -n dnctl -q pipe "$n" delete 2>>"$log" || true
+        return 1
+    fi
+    printf '%s' "$n"
+    return 0
+}
+
+# True when the packet filter is enabled. Loading rules into an anchor can
+# succeed while PF is still Disabled; those rules do not impair traffic
+# until something enables PF (pfctl -e / -E).
+pf_is_enabled() {
+    local log="${1:-/dev/null}"
+    local info
+    if ! info="$(sudo -n pfctl -s info 2>>"$log")"; then
+        return 1
+    fi
+    printf '%s\n' "$info" | grep -qiE 'Status:[[:space:]]*Enabled'
+}
+
+# Allocate a unique, empty dummynet anchor under an evaluated parent.
+# `pfctl -a NAME -f -` alone only fills a named ruleset; those rules run only
+# when a parent `dummynet-anchor` directive reaches them (pf.conf(5)). On
+# macOS the default /etc/pf.conf has `dummynet-anchor "com.apple/*"`, so a
+# nested `com.apple/<unique>` is live. Never reuse a nonempty leaf: `-f`
+# replaces and later `-F all` would destroy host rules in that anchor.
+# Prints the anchor path on success; returns 1 when PF is off, no parent
+# exists, or the chosen path is already occupied.
+pf_alloc_dummynet_anchor() {
+    local leaf_prefix="$1"
+    local log="${2:-/dev/null}"
+    local rules unique anchor existing
+    if ! pf_is_enabled "$log"; then
+        return 1
+    fi
+    if ! rules="$(sudo -n pfctl -sr 2>>"$log")"; then
+        return 1
+    fi
+    unique="${leaf_prefix}_$$_${RANDOM}"
+    if printf '%s\n' "$rules" | grep -qE 'dummynet-anchor[[:space:]]+"com\.apple/\*"'; then
+        anchor="com.apple/${unique}"
+    elif printf '%s\n' "$rules" | grep -qE "dummynet-anchor[[:space:]]+\"${leaf_prefix}\""; then
+        # Exact leaf only — and only when empty (checked below).
+        anchor="$leaf_prefix"
+    else
+        return 1
+    fi
+    existing="$(sudo -n pfctl -a "$anchor" -s rules 2>>"$log" || true)"
+    if [ -n "$(printf '%s' "$existing" | tr -d '[:space:]')" ]; then
+        echo "pf anchor ${anchor} is nonempty; refusing to replace" >>"$log"
+        return 1
+    fi
+    printf '%s' "$anchor"
+    return 0
+}
+
+# True when the named anchor currently holds at least one dummynet rule.
+pf_anchor_has_dummynet() {
+    local anchor="$1"
+    local log="${2:-/dev/null}"
+    local rules
+    if ! rules="$(sudo -n pfctl -a "$anchor" -s rules 2>>"$log")"; then
+        return 1
+    fi
+    printf '%s\n' "$rules" | grep -q dummynet
+}
+
+# Sum packets observed on a dummynet pipe. Zero means the classifier never
+# steered traffic into the pipe — impairment was inert.
+#
+# `dnctl pipe show` prints a flow table whose heading is literally
+# `Tot_pkt/bytes` (and `Pkt/Byte`, `Drp`): those are column titles, not a
+# single `packets/bytes` token. Queue rows then use separate whitespace-
+# delimited integers — Tot_pkt, Tot_bytes, ..., Drp — after the src/dst
+# address fields (see ipfw(8) / dummynet list output).
+dnctl_pipe_packet_count() {
+    local pipe_id="$1"
+    local log="${2:-/dev/null}"
+    local out
+    if ! out="$(sudo -n dnctl pipe show "$pipe_id" 2>>"$log")"; then
+        printf '0'
+        return 1
+    fi
+    printf '%s\n' "$out" | awk '
+        BEGIN { n = 0; in_flows = 0 }
+        /Tot_pkt\/bytes/ { in_flows = 1; next }
+        # A new pipe/queue banner ends the previous flow table.
+        /^[0-9]+:/ { in_flows = 0; next }
+        !in_flows { next }
+        {
+            # After the last address-like field (contains "/"), the next
+            # integer is Tot_pkt; the final integer is Drp when present.
+            last_addr = 0
+            for (i = 1; i <= NF; i++) {
+                if (index($i, "/") > 0) last_addr = i
+            }
+            if (last_addr == 0) next
+            pkts_f = last_addr + 1
+            if (pkts_f <= NF && $(pkts_f) ~ /^[0-9]+$/) {
+                n += $(pkts_f) + 0
+            }
+            # Drp is the last column (BKT ... Tot_pkt Tot_bytes Pkt Byte Drp).
+            if (NF >= pkts_f + 4 && $NF ~ /^[0-9]+$/) {
+                n += $NF + 0
+            }
+        }
+        END { print n + 0 }
+    '
+}
+
 # --- HTTP/2 matrix cell via h2load ---
 run_h2load_cell() {
     local label="$1"
@@ -178,8 +418,11 @@ run_h2load_cell() {
     local out="$OUT_DIR/h2/${label}_c${clients}_m${streams}_r${run_idx}.out"
     local sample="$OUT_DIR/h2/${label}_c${clients}_m${streams}_r${run_idx}.sample"
 
+    # Drop any sample from an earlier run: if the sampler never fires, the
+    # fallback below would otherwise publish a stale .sample file.
+    rm -f "$sample"
     (
-        sleep $((WARMUP_S + MEASURE_S / 2))
+        sleep "$(sampler_delay)"
         sample_server "$server_pid" "$sample"
     ) &
     local sampler_pid=$!
@@ -227,9 +470,14 @@ run_h2load_cell() {
     if [ -n "${failed:-}" ] && [ "${failed}" != "0" ]; then cell_failed=1; fi
     if [ -n "${errored:-}" ] && [ "${errored}" != "0" ]; then cell_failed=1; fi
     if [ -n "${timedout:-}" ] && [ "${timedout}" != "0" ]; then cell_failed=1; fi
+    # h2load can exit 0 with an unusable summary (unsupported format or
+    # zero-work duration). Require a parsed positive throughput and success
+    # count before accepting the cell, matching the H3 req_s gate.
+    if [ -z "${req_s:-}" ] || [ "${req_s%%.*}" = "0" ]; then cell_failed=1; fi
+    if [ -z "${success:-}" ] || [ "${success}" = "0" ]; then cell_failed=1; fi
     if [ "$cell_failed" -ne 0 ]; then
         MATRIX_FAILURES=$((MATRIX_FAILURES + 1))
-        echo "matrix cell failed: h2 $label c=$clients m=$streams run=$run_idx rc=$rc failed=${failed:-?} errored=${errored:-?} timeout=${timedout:-?}" >&2
+        echo "matrix cell failed: h2 $label c=$clients m=$streams run=$run_idx rc=$rc req_s=${req_s:-?} succeeded=${success:-?} failed=${failed:-?} errored=${errored:-?} timeout=${timedout:-?}" >&2
     fi
 }
 
@@ -244,14 +492,25 @@ run_h3_cell() {
     local sample="$OUT_DIR/h3/${label}_c${clients}_m${streams}_r${run_idx}.sample"
     local err="$OUT_DIR/h3/${label}_c${clients}_m${streams}_r${run_idx}.err"
 
+    # Resolve the interpreter in this shell *before* the sampler starts.
+    # `$(h3_python)` would run the helper in a subshell, discard its cache
+    # assignment, and re-run `pixi` after the sampler is already sleeping —
+    # shifting the CPU/RSS/FD sample earlier than warmup+half-measure.
+    if [ -z "${PIXI_PYTHON_H3:-}" ]; then
+        PIXI_PYTHON_H3="$(cd "$ROOT" && pixi run -e "$PIXI_ENV_H3" python -c 'import sys; print(sys.executable)')"
+    fi
+
+    # Drop any sample from an earlier run: if the sampler never fires, the
+    # fallback below would otherwise publish a stale .sample file.
+    rm -f "$sample"
     (
-        sleep $((WARMUP_S + MEASURE_S / 2))
+        sleep "$(sampler_delay)"
         sample_server "$server_pid" "$sample"
     ) &
     local sampler_pid=$!
 
     set +e
-    $(h3_python) benchmarks/http3_load.py \
+    "$PIXI_PYTHON_H3" benchmarks/http3_load.py \
         --url "$url" \
         --clients "$clients" \
         --streams "$streams" \
@@ -291,7 +550,14 @@ run_h3_cell() {
     fi
 }
 
-# --- H2 special scenarios (qualitative + limited timing) ---
+# --- H2 special scenarios (single connection) ---
+# The slow and cancel cases must put the target stream and its siblings on
+# one HTTP/2 connection: a server with per-connection head-of-line blocking
+# or with broken RST_STREAM handling passes if the streams are split across
+# connections. curl and h2load are separate processes and always use
+# separate connections, so these two scenarios run through
+# benchmarks/http/http2_scenarios.py (single connection, hyper-h2) instead.
+# h2load still drives the throughput matrix above.
 run_h2_special() {
     local label="$1"   # go|mojo
     local addr="$2"
@@ -302,101 +568,35 @@ run_h2_special() {
 
     echo "== H2 special scenarios ($label @ $addr) ==" | tee -a "$special_log"
 
-    # 1 MiB body reused by the slow-upload and cancel scenarios.
-    local body_file="$OUT_DIR/special/upload_body_1m.bin"
-    dd if=/dev/zero of="$body_file" bs=1024 count=1024 status=none 2>/dev/null
-
-    # Slow-client tolerance (server-wide health, not same-connection HoL):
-    # curl --limit-rate runs in its own H2 connection while sibling GETs via
-    # h2load use separate connections. This proves the server stays healthy
-    # under a slow client; it cannot detect connection-level head-of-line
-    # blocking, which requires all streams multiplexed on one measured
-    # connection (future single-client work).
-    local slow_out="$OUT_DIR/special/h2_${label}_slow.out"
-    local slow_t0
-    slow_t0="$(python3 -c 'import time; print(time.time())')"
-    set +e
-    # /json is 1 KiB, so a 2 KiB/s cap finishes in well under a second.
-    # POST /echo instead: rate-limiting the request body keeps the stream
-    # open for the whole concurrent-load window, so the slow client is
-    # genuinely active while siblings run.
-    curl -k --http2 --limit-rate 8k --max-time 30 \
-        -X POST --data-binary @"$body_file" \
-        -o /dev/null -s -w 'slow_http_code=%{http_code} slow_time=%{time_total}\n' \
-        "${url}/echo" >"$OUT_DIR/special/h2_${label}_slow_curl.txt" 2>&1 &
-    local slow_pid=$!
-    # Brief concurrent load (no warmup; short measure)
-    h2load --alpn-list=h2 -c 4 -m 4 -t 1 -D 3s "${url}/fixed" \
-        >"$slow_out" 2>&1
-    local h2load_rc=$?
-    wait "$slow_pid" 2>/dev/null
-    local slow_rc=$?
-    set -e
-    local slow_elapsed
-    slow_elapsed="$(python3 -c "import time; print(f'{time.time()-float('$slow_t0'):.3f}')")"
-    local sibling_req
-    sibling_req="$(rg -o 'finished in [^,]+, ([0-9.]+) req/s' -r '$1' "$slow_out" | head -1 || true)"
-    local sibling_fail
-    sibling_fail="$(rg -o 'requests: .* ([0-9]+) failed' -r '$1' "$slow_out" | head -1 || true)"
-    local slow_verdict=fail
-    if [ "${sibling_fail:-1}" = "0" ] && [ -n "$sibling_req" ] && kill -0 "$server_pid" 2>/dev/null; then
-        slow_verdict=pass
-    fi
-    printf 'proto=h2 label=%s scenario=slow verdict=%s sibling_req_s=%s sibling_failed=%s elapsed_s=%s h2load_rc=%s curl_rc=%s\n' \
-        "$label" "$slow_verdict" "${sibling_req:-?}" "${sibling_fail:-?}" \
-        "$slow_elapsed" "$h2load_rc" "$slow_rc" \
-        | tee -a "$OUT_DIR/special/summary.tsv" | tee -a "$special_log"
-    cat "$OUT_DIR/special/h2_${label}_slow_curl.txt" >>"$special_log" || true
-    if [ "$slow_verdict" = "fail" ]; then
-        MATRIX_FAILURES=$((MATRIX_FAILURES + 1))
-        echo "H2 special scenario failed: $label slow" >&2
-    fi
-
-    # Cancel: start a slow large POST, abort the client mid-transfer, then
-    # verify the server process still accepts a new connection. Note: the
-    # sibling uses a fresh TLS/H2 connection (killing curl closes the
-    # original), so this proves process health after abort, not same-
-    # connection sibling-stream survival (which needs one connection with
-    # concurrent streams).
-    set +e
-    curl -k --http2 --limit-rate 8k --max-time 30 \
-        -X POST --data-binary @"$body_file" \
-        -o /dev/null -s -w 'cancel_http_code=%{http_code} cancel_time=%{time_total}\n' \
-        "${url}/echo" >"$OUT_DIR/special/h2_${label}_cancel_curl.txt" 2>&1 &
-    local cancel_pid=$!
-    sleep 0.3
-    # The upload must still be in flight; otherwise no abort was exercised.
-    local cancel_running=false
-    if kill -0 "$cancel_pid" 2>/dev/null; then
-        cancel_running=true
-        kill "$cancel_pid" 2>/dev/null
-    fi
-    wait "$cancel_pid" 2>/dev/null
-    local cancel_curl_rc=$?
-    # Sibling must still work after abort.
-    local cancel_sib
-    cancel_sib="$(curl -k --http2 -s -o /dev/null -w '%{http_code}' --max-time 5 "${url}/fixed")"
-    local cancel_sib_rc=$?
-    set -e
-    local cancel_verdict=fail
-    # Pass only when an in-flight upload was aborted, the sibling got 200,
-    # and the server is still up.
-    if [ "$cancel_running" = "true" ] && [ "$cancel_sib" = "200" ] \
-        && kill -0 "$server_pid" 2>/dev/null; then
-        cancel_verdict=pass
-    fi
-    if [ "$cancel_running" != "true" ]; then
-        cancel_verdict=skip
-    fi
-    printf 'proto=h2 label=%s scenario=cancel verdict=%s target_was_running=%s sibling_http=%s curl_rc=%s sib_rc=%s\n' \
-        "$label" "$cancel_verdict" "$cancel_running" "$cancel_sib" \
-        "$cancel_curl_rc" "$cancel_sib_rc" \
-        | tee -a "$OUT_DIR/special/summary.tsv" | tee -a "$special_log"
-    cat "$OUT_DIR/special/h2_${label}_cancel_curl.txt" >>"$special_log" || true
-    if [ "$cancel_verdict" = "fail" ]; then
-        MATRIX_FAILURES=$((MATRIX_FAILURES + 1))
-        echo "H2 special scenario failed: $label cancel" >&2
-    fi
+    local scenario line
+    for scenario in slow cancel; do
+        set +e
+        line="$($(h2_python) benchmarks/http/http2_scenarios.py \
+            --url "https://${addr}/fixed" --scenario "$scenario" --siblings 8 \
+            2>>"$special_log")"
+        local scenario_rc=$?
+        set -e
+        # A driver failure must not be recorded as a pass, and a missing
+        # result line must not be recorded as a verdict at all.
+        if [ -z "$line" ]; then
+            line="scenario=${scenario} verdict=fail conn=single error=no-result rc=${scenario_rc}"
+        fi
+        echo "$line" | tee -a "$special_log"
+        printf 'proto=h2 label=%s %s rc=%s\n' \
+            "$label" "$line" "$scenario_rc" \
+            | tee -a "$OUT_DIR/special/summary.tsv"
+        case "$line" in
+            *"verdict=pass"*) ;;
+            *)
+                MATRIX_FAILURES=$((MATRIX_FAILURES + 1))
+                echo "H2 special scenario failed: $label $scenario" >&2
+                ;;
+        esac
+        if ! kill -0 "$server_pid" 2>/dev/null; then
+            MATRIX_FAILURES=$((MATRIX_FAILURES + 1))
+            echo "H2 server exited during $label $scenario" >&2
+        fi
+    done
 
     # Loss: attempt pf/dummynet; document if unavailable (no passwordless sudo).
     local loss_note="$OUT_DIR/special/h2_${label}_loss.txt"
@@ -407,57 +607,123 @@ run_h2_special() {
         # Verify impairment was actually configured; otherwise a clean run
         # must not be reported as an impaired pass.
         local port="${addr##*:}"
-        set +e
-        sudo -n dnctl pipe 42 config plr 0.05 2>"$loss_note"
-        local dnctl_rc=$?
-        echo "dummynet in proto tcp from any to 127.0.0.1 port ${port} pipe 42" \
-            | sudo -n pfctl -a bench_matrix -f - 2>>"$loss_note"
-        local pfctl_rc=$?
-        if [ "$dnctl_rc" -ne 0 ] || [ "$pfctl_rc" -ne 0 ] \
-            || ! command -v dnctl >/dev/null; then
+        # Claim a free pipe under an interprocess lock (list+config+verify)
+        # so overlapping harnesses cannot reconfigure each other's pipe.
+        local loss_pipe=""
+        local dnctl_locked=0
+        if dnctl_lock_acquire "$loss_note"; then
+            dnctl_locked=1
+            loss_pipe="$(dnctl_claim_pipe 42 61 0.05 "$loss_note" || true)"
+        fi
+        if [ -z "$loss_pipe" ]; then
             loss_verdict=skip
-            loss_detail="loss impairment not configured (dnctl_rc=$dnctl_rc pfctl_rc=$pfctl_rc); no impaired run attempted"
-            sudo -n pfctl -a bench_matrix -F all 2>>"$loss_note" || true
-            sudo -n dnctl -q flush pipe 42 2>>"$loss_note" || true
-            set -e
+            loss_detail="no free dummynet pipe id in 42-61 (or lock/claim failed); no impaired run attempted"
+            if [ "$dnctl_locked" -eq 1 ]; then dnctl_lock_release; fi
         else
-            h2load --alpn-list=h2 -c 8 -m 4 -t 1 -D 5s "${url}/fixed" \
-                >"$OUT_DIR/special/h2_${label}_loss_h2load.out" 2>&1
-            local loss_rc=$?
-            sudo -n pfctl -a bench_matrix -F all 2>>"$loss_note" || true
-            sudo -n dnctl -q flush pipe 42 2>>"$loss_note" || true
-            set -e
-            local loss_req loss_fail
-            loss_req="$(rg -o 'finished in [^,]+, ([0-9.]+) req/s' -r '$1' \
-                "$OUT_DIR/special/h2_${label}_loss_h2load.out" | head -1 || true)"
-            loss_fail="$(rg -o 'requests: .* ([0-9]+) failed' -r '$1' \
-                "$OUT_DIR/special/h2_${label}_loss_h2load.out" | head -1 || true)"
-            local loss_errored loss_timeout
-            loss_errored="$(rg -o 'requests: .* ([0-9]+) errored' -r '$1' \
-                "$OUT_DIR/special/h2_${label}_loss_h2load.out" | head -1 || true)"
-            loss_timeout="$(rg -o 'requests: .* ([0-9]+) timeout' -r '$1' \
-                "$OUT_DIR/special/h2_${label}_loss_h2load.out" | head -1 || true)"
-            # A loss run that lost every request (req_s 0.00), reported
-            # failures, or exited nonzero is not a valid measurement.
-            local loss_ok=true
-            if [ "$loss_rc" -ne 0 ]; then loss_ok=false; fi
-            if [ "${loss_fail:-0}" != "0" ]; then loss_ok=false; fi
-            if [ -n "${loss_errored:-}" ] && [ "$loss_errored" != "0" ]; then
-                loss_ok=false
-            fi
-            if [ -n "${loss_timeout:-}" ] && [ "$loss_timeout" != "0" ]; then
-                loss_ok=false
-            fi
-            if [ -z "$loss_req" ] || [ "${loss_req%%.*}" = "0" ]; then
-                loss_ok=false
-            fi
-            if ! kill -0 "$server_pid" 2>/dev/null; then loss_ok=false; fi
-            if [ "$loss_ok" = "true" ]; then
-                loss_verdict=pass
-                loss_detail="dnctl plr=0.05 req_s=${loss_req} failed=${loss_fail:-?} rc=${loss_rc}"
+            # Pipe+lock are live immediately after claim. Install cleanup
+            # before anchor work so SIGINT/SIGTERM cannot leave a configured
+            # pipe or a held DNCTL_LOCK_DIR. Extend with PF once the rule is
+            # installed below.
+            # shellcheck disable=SC2064
+            trap "sudo -n dnctl -q pipe ${loss_pipe} delete 2>/dev/null || true; rm -f ${DNCTL_LOCK_DIR}/pid 2>/dev/null || true; rmdir ${DNCTL_LOCK_DIR} 2>/dev/null || true; kill_pid \"\${GO_PID:-}\"; kill_pid \"\${MOJO_H2_PID:-}\"; kill_pid \"\${BASE_PID:-}\"; kill_pid \"\${MOJO_H3_PID:-}\"" EXIT
+            # shellcheck disable=SC2064
+            trap "sudo -n dnctl -q pipe ${loss_pipe} delete 2>/dev/null || true; rm -f ${DNCTL_LOCK_DIR}/pid 2>/dev/null || true; rmdir ${DNCTL_LOCK_DIR} 2>/dev/null || true" RETURN
+            trap 'exit 130' INT
+            trap 'exit 143' TERM
+            # Allocate a unique empty child under an evaluated parent.
+            # Reusing a fixed leaf would let -f/-F destroy host rules there.
+            local loss_anchor
+            loss_anchor="$(pf_alloc_dummynet_anchor net_mojo_bench_h2 "$loss_note" || true)"
+            if [ -z "$loss_anchor" ]; then
+                loss_verdict=skip
+                loss_detail="no usable dummynet anchor (PF disabled, no parent, or nonempty leaf); no impaired run attempted"
+                dnctl_delete_pipe "$loss_pipe" "$loss_note"
+                dnctl_lock_release
+                trap 'kill_pid "${GO_PID:-}"; kill_pid "${MOJO_H2_PID:-}"; kill_pid "${BASE_PID:-}"; kill_pid "${MOJO_H3_PID:-}"' EXIT
+                trap - RETURN INT TERM
             else
-                loss_verdict=fail
-                loss_detail="dnctl configured but load invalid rc=${loss_rc} req_s=${loss_req:-?} failed=${loss_fail:-?} errored=${loss_errored:-?} timeout=${loss_timeout:-?}"
+            set +e
+            echo "dummynet in proto tcp from any to 127.0.0.1 port ${port} pipe ${loss_pipe}" \
+                | sudo -n pfctl -a "$loss_anchor" -f - 2>>"$loss_note"
+            local pfctl_rc=$?
+            local anchor_live=0
+            if pf_is_enabled "$loss_note" \
+                && pf_anchor_has_dummynet "$loss_anchor" "$loss_note"; then
+                anchor_live=1
+            fi
+            if [ "$pfctl_rc" -ne 0 ] \
+                || [ "$anchor_live" -ne 1 ] \
+                || ! command -v dnctl >/dev/null; then
+                loss_verdict=skip
+                loss_detail="loss impairment not configured (pfctl_rc=$pfctl_rc anchor=${loss_anchor} live=${anchor_live}); no impaired run attempted"
+                sudo -n pfctl -a "$loss_anchor" -F all 2>>"$loss_note" || true
+                dnctl_delete_pipe "$loss_pipe" "$loss_note"
+                dnctl_lock_release
+                trap 'kill_pid "${GO_PID:-}"; kill_pid "${MOJO_H2_PID:-}"; kill_pid "${BASE_PID:-}"; kill_pid "${MOJO_H3_PID:-}"' EXIT
+                trap - RETURN INT TERM
+                set -e
+            else
+                # Extend cleanup with the live PF anchor.
+                # shellcheck disable=SC2064
+                trap "sudo -n pfctl -a ${loss_anchor} -F all 2>/dev/null || true; sudo -n dnctl -q pipe ${loss_pipe} delete 2>/dev/null || true; rm -f ${DNCTL_LOCK_DIR}/pid 2>/dev/null || true; rmdir ${DNCTL_LOCK_DIR} 2>/dev/null || true; kill_pid \"\${GO_PID:-}\"; kill_pid \"\${MOJO_H2_PID:-}\"; kill_pid \"\${BASE_PID:-}\"; kill_pid \"\${MOJO_H3_PID:-}\"" EXIT
+                # shellcheck disable=SC2064
+                trap "sudo -n pfctl -a ${loss_anchor} -F all 2>/dev/null || true; sudo -n dnctl -q pipe ${loss_pipe} delete 2>/dev/null || true; rm -f ${DNCTL_LOCK_DIR}/pid 2>/dev/null || true; rmdir ${DNCTL_LOCK_DIR} 2>/dev/null || true" RETURN
+                h2load --alpn-list=h2 -c 8 -m 4 -t 1 -D 5s "${url}/fixed" \
+                    >"$OUT_DIR/special/h2_${label}_loss_h2load.out" 2>&1
+                local loss_rc=$?
+                local pipe_pkts
+                pipe_pkts="$(dnctl_pipe_packet_count "$loss_pipe" "$loss_note" || true)"
+                sudo -n pfctl -a "$loss_anchor" -F all 2>>"$loss_note" || true
+                dnctl_delete_pipe "$loss_pipe" "$loss_note"
+                dnctl_lock_release
+                trap 'kill_pid "${GO_PID:-}"; kill_pid "${MOJO_H2_PID:-}"; kill_pid "${BASE_PID:-}"; kill_pid "${MOJO_H3_PID:-}"' EXIT
+                trap - RETURN INT TERM
+                set -e
+                local loss_req loss_fail loss_success
+                loss_req="$(rg -o 'finished in [^,]+, ([0-9.]+) req/s' -r '$1' \
+                    "$OUT_DIR/special/h2_${label}_loss_h2load.out" | head -1 || true)"
+                loss_fail="$(rg -o 'requests: .* ([0-9]+) failed' -r '$1' \
+                    "$OUT_DIR/special/h2_${label}_loss_h2load.out" | head -1 || true)"
+                loss_success="$(rg -o 'requests: .* ([0-9]+) succeeded' -r '$1' \
+                    "$OUT_DIR/special/h2_${label}_loss_h2load.out" | head -1 || true)"
+                local loss_errored loss_timeout
+                loss_errored="$(rg -o 'requests: .* ([0-9]+) errored' -r '$1' \
+                    "$OUT_DIR/special/h2_${label}_loss_h2load.out" | head -1 || true)"
+                loss_timeout="$(rg -o 'requests: .* ([0-9]+) timeout' -r '$1' \
+                    "$OUT_DIR/special/h2_${label}_loss_h2load.out" | head -1 || true)"
+                # A loss run that lost every request (req_s 0.00), reported
+                # failures, or exited nonzero is not a valid measurement.
+                # Also reject runs where the pipe saw no packets: that means
+                # the PF anchor never classified traffic despite setup rc=0.
+                # Match the H2 matrix gate: require a parsed positive success
+                # count so a partial/changed h2load summary cannot pass.
+                # Zero pipe packets after an Enabled PF + live anchor is a
+                # hard fail; PF-disabled hosts are skipped earlier above.
+                local loss_ok=true
+                if [ "$loss_rc" -ne 0 ]; then loss_ok=false; fi
+                if [ "${loss_fail:-0}" != "0" ]; then loss_ok=false; fi
+                if [ -n "${loss_errored:-}" ] && [ "$loss_errored" != "0" ]; then
+                    loss_ok=false
+                fi
+                if [ -n "${loss_timeout:-}" ] && [ "$loss_timeout" != "0" ]; then
+                    loss_ok=false
+                fi
+                if [ -z "$loss_req" ] || [ "${loss_req%%.*}" = "0" ]; then
+                    loss_ok=false
+                fi
+                if [ -z "${loss_success:-}" ] || [ "$loss_success" = "0" ]; then
+                    loss_ok=false
+                fi
+                if [ "${pipe_pkts:-0}" = "0" ]; then loss_ok=false; fi
+                if ! kill -0 "$server_pid" 2>/dev/null; then loss_ok=false; fi
+                if [ "$loss_ok" = "true" ]; then
+                    loss_verdict=pass
+                    loss_detail="dnctl plr=0.05 anchor=${loss_anchor} pipe=${loss_pipe} pipe_pkts=${pipe_pkts} req_s=${loss_req} succeeded=${loss_success} failed=${loss_fail:-?} rc=${loss_rc}"
+                else
+                    loss_verdict=fail
+                    loss_detail="dnctl configured but load invalid anchor=${loss_anchor} pipe=${loss_pipe} pipe_pkts=${pipe_pkts:-?} rc=${loss_rc} req_s=${loss_req:-?} succeeded=${loss_success:-?} failed=${loss_fail:-?} errored=${loss_errored:-?} timeout=${loss_timeout:-?}"
+                fi
+            fi
             fi
         fi
     else
@@ -487,37 +753,111 @@ run_h3_special() {
     : >"$special_log"
     echo "== H3 special scenarios ($label @ $addr) ==" | tee -a "$special_log"
 
-    local line
-    line="$($(h3_python) benchmarks/http/http3_scenarios.py \
-        --url "$url" --scenario slow --slow-s 0.25 --siblings 8 \
-        2>>"$special_log")"
-    echo "$line" | tee -a "$special_log"
-    printf 'proto=h3 label=%s %s\n' "$label" "$line" \
-        | tee -a "$OUT_DIR/special/summary.tsv"
-
-    line="$($(h3_python) benchmarks/http/http3_scenarios.py \
-        --url "$url" --scenario cancel --siblings 8 \
-        2>>"$special_log")"
-    echo "$line" | tee -a "$special_log"
-    printf 'proto=h3 label=%s %s\n' "$label" "$line" \
-        | tee -a "$OUT_DIR/special/summary.tsv"
+    # Capture status under set +e so a legitimate scenario failure records
+    # and continues into cancel/loss and the remaining server matrix,
+    # matching the H2 special-scenario handling.
+    local scenario line scenario_rc
+    for scenario in slow cancel; do
+        set +e
+        case "$scenario" in
+            slow)
+                line="$($(h3_python) benchmarks/http/http3_scenarios.py \
+                    --url "$url" --scenario slow --slow-s 0.25 --siblings 8 \
+                    2>>"$special_log")"
+                ;;
+            cancel)
+                line="$($(h3_python) benchmarks/http/http3_scenarios.py \
+                    --url "$url" --scenario cancel --siblings 8 \
+                    2>>"$special_log")"
+                ;;
+        esac
+        scenario_rc=$?
+        set -e
+        if [ -z "$line" ]; then
+            line="scenario=${scenario} verdict=fail error=no-result rc=${scenario_rc}"
+        fi
+        echo "$line" | tee -a "$special_log"
+        printf 'proto=h3 label=%s %s rc=%s\n' \
+            "$label" "$line" "$scenario_rc" \
+            | tee -a "$OUT_DIR/special/summary.tsv"
+        case "$line" in
+            *"verdict=pass"*) ;;
+            *)
+                MATRIX_FAILURES=$((MATRIX_FAILURES + 1))
+                echo "H3 special scenario failed: $label $scenario" >&2
+                ;;
+        esac
+    done
 
     # Loss: try pf first; always also run client-side drop (measurable without root).
     local loss_pf_verdict=skip
     local loss_pf_detail="sudo -n unavailable"
+    local loss_pipe=""
     if sudo -n true 2>/dev/null; then
         local port="${addr##*:}"
-        set +e
-        sudo -n dnctl pipe 43 config plr 0.05 \
-            >"$OUT_DIR/special/h3_${label}_pf.txt" 2>&1
-        echo "dummynet in proto udp from any to 127.0.0.1 port ${port} pipe 43" \
-            | sudo -n pfctl -a bench_matrix_h3 -f - \
-            >>"$OUT_DIR/special/h3_${label}_pf.txt" 2>&1
-        set -e
-        loss_pf_verdict=configured
-        loss_pf_detail="dnctl udp plr=0.05 on port ${port}"
-        # shellcheck disable=SC2064
-        trap "sudo -n pfctl -a bench_matrix_h3 -F all 2>/dev/null || true; sudo -n dnctl -q flush pipe 43 2>/dev/null || true" RETURN
+        local pf_note="$OUT_DIR/special/h3_${label}_pf.txt"
+        # Claim under interprocess lock. H2 uses 42–61; H3 uses 62–81.
+        local dnctl_locked=0
+        if dnctl_lock_acquire "$pf_note"; then
+            dnctl_locked=1
+            loss_pipe="$(dnctl_claim_pipe 62 81 0.05 "$pf_note" || true)"
+        fi
+        if [ -z "$loss_pipe" ]; then
+            loss_pf_detail="no free dummynet pipe id in 62-81 (or lock/claim failed)"
+            if [ "$dnctl_locked" -eq 1 ]; then dnctl_lock_release; fi
+        else
+            # Pipe+lock are live immediately after claim — clean them up on
+            # signal/exit before PF work; extend with the anchor once live.
+            # shellcheck disable=SC2064
+            trap "sudo -n dnctl -q pipe ${loss_pipe} delete 2>/dev/null || true; rm -f ${DNCTL_LOCK_DIR}/pid 2>/dev/null || true; rmdir ${DNCTL_LOCK_DIR} 2>/dev/null || true; kill_pid \"\${GO_PID:-}\"; kill_pid \"\${MOJO_H2_PID:-}\"; kill_pid \"\${BASE_PID:-}\"; kill_pid \"\${MOJO_H3_PID:-}\"" EXIT
+            # shellcheck disable=SC2064
+            trap "sudo -n dnctl -q pipe ${loss_pipe} delete 2>/dev/null || true; rm -f ${DNCTL_LOCK_DIR}/pid 2>/dev/null || true; rmdir ${DNCTL_LOCK_DIR} 2>/dev/null || true" RETURN
+            trap 'exit 130' INT
+            trap 'exit 143' TERM
+            local loss_anchor
+            loss_anchor="$(pf_alloc_dummynet_anchor net_mojo_bench_h3 "$pf_note" || true)"
+            if [ -z "$loss_anchor" ]; then
+                loss_pf_detail="no usable dummynet anchor (PF disabled, no parent, or nonempty leaf)"
+                dnctl_delete_pipe "$loss_pipe" "$pf_note"
+                dnctl_lock_release
+                trap 'kill_pid "${GO_PID:-}"; kill_pid "${MOJO_H2_PID:-}"; kill_pid "${BASE_PID:-}"; kill_pid "${MOJO_H3_PID:-}"' EXIT
+                trap - RETURN INT TERM
+                loss_pipe=""
+            else
+            set +e
+            echo "dummynet in proto udp from any to 127.0.0.1 port ${port} pipe ${loss_pipe}" \
+                | sudo -n pfctl -a "$loss_anchor" -f - \
+                >>"$pf_note" 2>&1
+            local pfctl_rc=$?
+            local anchor_live=0
+            if pf_is_enabled "$pf_note" \
+                && pf_anchor_has_dummynet "$loss_anchor" "$pf_note"; then
+                anchor_live=1
+            fi
+            set -e
+            # Do not claim configured when PF is disabled, either step
+            # failed, or the parent anchor is inert; match H2 checks.
+            if [ "$pfctl_rc" -ne 0 ] \
+                || [ "$anchor_live" -ne 1 ]; then
+                loss_pf_verdict=skip
+                loss_pf_detail="loss impairment not configured (pfctl_rc=$pfctl_rc anchor=${loss_anchor} live=${anchor_live})"
+                sudo -n pfctl -a "$loss_anchor" -F all 2>>"$pf_note" || true
+                dnctl_delete_pipe "$loss_pipe" "$pf_note"
+                dnctl_lock_release
+                trap 'kill_pid "${GO_PID:-}"; kill_pid "${MOJO_H2_PID:-}"; kill_pid "${BASE_PID:-}"; kill_pid "${MOJO_H3_PID:-}"' EXIT
+                trap - RETURN INT TERM
+                loss_pipe=""
+            else
+                loss_pf_verdict=configured
+                loss_pf_detail="dnctl udp plr=0.05 on port ${port} pipe ${loss_pipe} anchor=${loss_anchor}"
+                # Extend cleanup with the live PF anchor.
+                # shellcheck disable=SC2064
+                trap "sudo -n pfctl -a ${loss_anchor} -F all 2>/dev/null || true; sudo -n dnctl -q pipe ${loss_pipe} delete 2>/dev/null || true; rm -f ${DNCTL_LOCK_DIR}/pid 2>/dev/null || true; rmdir ${DNCTL_LOCK_DIR} 2>/dev/null || true; kill_pid \"\${GO_PID:-}\"; kill_pid \"\${MOJO_H2_PID:-}\"; kill_pid \"\${BASE_PID:-}\"; kill_pid \"\${MOJO_H3_PID:-}\"" EXIT
+                # shellcheck disable=SC2064
+                trap "sudo -n pfctl -a ${loss_anchor} -F all 2>/dev/null || true; sudo -n dnctl -q pipe ${loss_pipe} delete 2>/dev/null || true; rm -f ${DNCTL_LOCK_DIR}/pid 2>/dev/null || true; rmdir ${DNCTL_LOCK_DIR} 2>/dev/null || true" RETURN
+            fi
+            fi
+        fi
     fi
     printf 'proto=h3 label=%s scenario=loss_pf verdict=%s detail=%s\n' \
         "$label" "$loss_pf_verdict" "$loss_pf_detail" \
@@ -527,19 +867,35 @@ run_h3_special() {
     # method=client_datagram_drop measures standalone 5% client loss,
     # not combined kernel + client loss.
     if [ "$loss_pf_verdict" = "configured" ]; then
-        sudo -n pfctl -a bench_matrix_h3 -F all 2>/dev/null || true
-        sudo -n dnctl -q flush pipe 43 2>/dev/null || true
-        trap - RETURN
+        sudo -n pfctl -a "$loss_anchor" -F all 2>/dev/null || true
+        dnctl_delete_pipe "$loss_pipe" /dev/null
+        dnctl_lock_release
+        trap 'kill_pid "${GO_PID:-}"; kill_pid "${MOJO_H2_PID:-}"; kill_pid "${BASE_PID:-}"; kill_pid "${MOJO_H3_PID:-}"' EXIT
+        trap - RETURN INT TERM
         loss_pf_verdict=cleaned
     fi
 
+    set +e
     line="$($(h3_python) benchmarks/http/http3_scenarios.py \
         --url "$url" --scenario loss --drop-rate 0.05 \
         --clients 4 --streams 4 --duration 5 \
         2>>"$special_log")"
+    scenario_rc=$?
+    set -e
+    if [ -z "$line" ]; then
+        line="scenario=loss verdict=fail error=no-result rc=${scenario_rc}"
+    fi
     echo "$line" | tee -a "$special_log"
-    printf 'proto=h3 label=%s %s method=client_datagram_drop\n' "$label" "$line" \
+    printf 'proto=h3 label=%s %s method=client_datagram_drop rc=%s\n' \
+        "$label" "$line" "$scenario_rc" \
         | tee -a "$OUT_DIR/special/summary.tsv"
+    case "$line" in
+        *"verdict=pass"*) ;;
+        *)
+            MATRIX_FAILURES=$((MATRIX_FAILURES + 1))
+            echo "H3 special scenario failed: $label loss" >&2
+            ;;
+    esac
 }
 
 # ========== HTTP/2 matrix ==========

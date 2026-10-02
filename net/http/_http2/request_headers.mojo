@@ -131,9 +131,7 @@ def _is_token_byte(byte: Byte) -> Bool:
     )
 
 
-def _valid_value[
-    origin: Origin
-](value: Span[Byte, origin]) -> Bool:
+def _valid_value[origin: Origin](value: Span[Byte, origin]) -> Bool:
     for i in range(len(value)):
         var byte = value[i]
         if (
@@ -147,14 +145,10 @@ def _valid_value[
     return True
 
 
-def _is_te_trailers[
-    origin: Origin
-](value: Span[Byte, origin]) -> Bool:
+def _is_te_trailers[origin: Origin](value: Span[Byte, origin]) -> Bool:
     var start = 0
     var end = len(value)
-    while start < end and (
-        value[start] == Byte(32) or value[start] == Byte(9)
-    ):
+    while start < end and (value[start] == Byte(32) or value[start] == Byte(9)):
         start += 1
     while end > start and (
         value[end - 1] == Byte(32) or value[end - 1] == Byte(9)
@@ -172,9 +166,7 @@ def _is_te_trailers[
     return True
 
 
-def _valid_scheme[
-    origin: Origin
-](scheme: Span[Byte, origin]) -> Bool:
+def _valid_scheme[origin: Origin](scheme: Span[Byte, origin]) -> Bool:
     if len(scheme) == 0:
         return False
     for i in range(len(scheme)):
@@ -197,28 +189,30 @@ def _valid_scheme[
     return True
 
 
-def _valid_authority[
-    origin: Origin
-](authority: Span[Byte, origin]) -> Bool:
+def _valid_authority[origin: Origin](authority: Span[Byte, origin]) -> Bool:
     return _host_is_valid(String(from_utf8_lossy=authority))
 
 
-def _valid_path[
-    origin: Origin
-](path: Span[Byte, origin]) -> Bool:
+def _valid_path[origin: Origin](path: Span[Byte, origin]) -> Bool:
     if len(path) == 0:
         return False
     if path[0] != Byte(ord("/")) and not _bytes_equal(path, "*"):
         return False
     for i in range(len(path)):
-        if path[i] <= Byte(32) or path[i] >= Byte(127) or path[i] == Byte(ord("#")):
+        if (
+            path[i] <= Byte(32)
+            or path[i] >= Byte(127)
+            or path[i] == Byte(ord("#"))
+        ):
             return False
     return True
 
 
 def decode_http2_request_headers[
     origin: Origin
-](encoded: Span[Byte, origin], expected_fields: Int) raises -> Http2RequestHeadResult:
+](
+    encoded: Span[Byte, origin], expected_fields: Int
+) raises -> Http2RequestHeadResult:
     if expected_fields < 0:
         return Http2RequestHeadResult.error()
 
@@ -301,8 +295,7 @@ def decode_http2_request_headers[
             regular_seen = True
             for i in range(len(name)):
                 if name[i] >= Byte(127) or (
-                    name[i] >= Byte(ord("A"))
-                    and name[i] <= Byte(ord("Z"))
+                    name[i] >= Byte(ord("A")) and name[i] <= Byte(ord("Z"))
                 ):
                     return Http2RequestHeadResult.error()
                 if not _is_token_byte(name[i]):
@@ -352,7 +345,9 @@ def decode_http2_request_headers[
 
 def decode_http2_trailers[
     origin: Origin
-](encoded: Span[Byte, origin], expected_fields: Int) raises -> Http2TrailersResult:
+](
+    encoded: Span[Byte, origin], expected_fields: Int
+) raises -> Http2TrailersResult:
     if expected_fields < 0:
         return Http2TrailersResult.error()
 
@@ -392,9 +387,11 @@ def decode_http2_trailers[
         if not _valid_value(value):
             return Http2TrailersResult.error()
         for i in range(len(name)):
-            if name[i] >= Byte(127) or (
-                name[i] >= Byte(ord("A")) and name[i] <= Byte(ord("Z"))
-            ) or not _is_token_byte(name[i]):
+            if (
+                name[i] >= Byte(127)
+                or (name[i] >= Byte(ord("A")) and name[i] <= Byte(ord("Z")))
+                or not _is_token_byte(name[i])
+            ):
                 return Http2TrailersResult.error()
         var name_string = String(from_utf8_lossy=name)
         if (
