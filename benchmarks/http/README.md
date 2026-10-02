@@ -389,21 +389,22 @@ those are separate processes and therefore always separate connections;
 | h2 | Mojo | cancel | not run | see note below |
 | h2 | Go | loss | skip | pf/dummynet needs root; no-loss reference 49,882 req/s |
 | h2 | Mojo | loss | skip | pf/dummynet needs root; no-loss reference 35,860 req/s |
-| h3 | aioquic | slow | pass | held 262,144 B, response unfinished when the 8/8 siblings completed |
+| h3 | aioquic | slow | pass | 1 conn incomplete upload: 8/8 siblings exact 64 B while POST /echo was still open; echo completed after finish (`method=incomplete_upload`) |
 | h3 | Mojo | slow | pass † | held 262,144 B while 8/8 siblings completed |
-| h3 | aioquic | cancel | pass | reset target in-flight; 8/8 siblings outstanding across the reset and completed |
+| h3 | aioquic | cancel | pass | reset target in-flight; 8/8 siblings outstanding across the reset and completed; post-reset GET /fixed on the same connection OK |
 | h3 | Mojo | cancel | pass † | reset target in-flight; 8/8 siblings completed |
 | h3 | aioquic | loss | pass | 5% client datagram drop, req/s 5,460, 0 failed |
 | h3 | Mojo | loss | pass † | 5% client datagram drop, req/s 6,134, 0 failed |
 
 † Recorded by an earlier revision of the scenario drivers, before the
-transport-level completion check, the sibling body validation and the
-partial-run rejection were added, and not re-measured since: the Mojo
-servers cannot be built on this host (the Mojo build in the `tls-http2` and
-`tls-http3` environments fails to parse `net/http/_encoder.mojo` on
-`InlineArray`, which is unrelated to this harness and reproduces on an
-unmodified checkout). These rows therefore show the Mojo servers were not
-broken at that revision; they are not evidence under the current criteria.
+incomplete-upload H3 slow criterion, post-reset connection probe, sibling
+body validation and the partial-run rejection were added, and not
+re-measured since: the Mojo servers cannot be built on this host (the Mojo
+build in the `tls-http2` and `tls-http3` environments fails to parse
+`net/http/_encoder.mojo` on `InlineArray`, which is unrelated to this harness
+and reproduces on an unmodified checkout). These rows therefore show the Mojo
+servers were not broken at that revision; they are not evidence under the
+current criteria.
 
 The two `h2 | Mojo` rows are *not run* rather than carried over: the previous
 `pass` entries came from the `curl` + `h2load` version, which cannot exercise
@@ -445,19 +446,15 @@ lower median latency everywhere and lower p99 in every cell except
 Slow-stream and cancellation pass for every server actually exercised with
 the current harness — HTTPS+H2 against the Go baseline, HTTP/3 against
 aioquic — meaning the server keeps serving siblings while another stream on
-the *same* connection is still open (H2: an incomplete 1 MiB POST /echo
-upload; H3: a held 256 KiB echo response). The H2 driver holds the request
-side open deterministically and also withholds the target's receive credit,
-so it does not depend on a rate limit or on wall-clock timing. The H3 slow
-pass is recorded at the transport level, not just at the application: bytes
-of the 256 KiB echo response were staged while consumption was withheld, and
-the response still had no `stream_ended` event when the siblings finished.
-Because the held stream's future is deliberately never resolved, that second
-condition is what distinguishes a multiplexed server from one that serializes
-the whole echo ahead of the siblings — a server that serves the echo first
-and the siblings afterwards now reports `verdict=fail` with
-`slow_ended_during_siblings=1`.
-
+the *same* connection is still open (H2 and H3: an incomplete POST /echo
+upload). The H2 driver also withholds the target's receive credit so it does
+not depend on a rate limit or on wall-clock timing. The H3 slow driver cannot
+withhold QUIC `MAX_STREAM_DATA` through aioquic (credit tracks the highest
+received offset), so it matches H2 on the request side instead: siblings must
+complete while the large upload is still unfinished, then the upload is
+finished and the echo body is checked. Cancellation on both protocols also
+requires a post-reset request on the same connection so a GOAWAY/draining
+server that only finishes already-admitted siblings cannot pass.
 That claim is scoped to the runs above. Mojo's HTTP/2 multiplexing behaviour
 is untested here (`h2 | Mojo` not run), and the `h3 | Mojo` rows predate the
 current criteria (†), so neither is offered as evidence that Mojo multiplexes
