@@ -205,6 +205,106 @@ dnctl_delete_pipe() {
     sudo -n dnctl -q pipe "$pipe_id" delete 2>>"$log" || true
 }
 
+# Interprocess lock for dummynet pipe allocate/config/teardown. Without this,
+# two harnesses can pick the same free id between list and config.
+# Uses an atomic mkdir lock (portable where the flock(1) utility is absent).
+DNCTL_LOCK_DIR="${DNCTL_LOCK_DIR:-/tmp/net_mojo_dnctl_pipes.lock.d}"
+
+dnctl_lock_acquire() {
+    local log="${1:-/dev/null}"
+    local i
+    for i in $(seq 1 600); do
+        if mkdir "$DNCTL_LOCK_DIR" 2>/dev/null; then
+            printf '%s\n' "$$" >"$DNCTL_LOCK_DIR/pid"
+            return 0
+        fi
+        sleep 0.1
+    done
+    echo "dnctl lock timeout waiting for ${DNCTL_LOCK_DIR}" >>"$log"
+    return 1
+}
+
+dnctl_lock_release() {
+    rm -f "$DNCTL_LOCK_DIR/pid" 2>/dev/null || true
+    rmdir "$DNCTL_LOCK_DIR" 2>/dev/null || true
+}
+
+# Print the first dummynet pipe id in [first,last] that is not already
+# configured, and fail when no such id exists or the state is unknown.
+#
+# `dnctl pipe N config` targets an existing pipe rather than allocating a
+# private one, so a fixed id would reconfigure whatever owns that pipe and
+# the matching delete would then remove it. dnctl lists configured pipes as
+# "%05d: <params>" (list_pipes() in sbin/ipfw/dummynet.c), and an empty
+# listing means no pipes exist. dummynet_list() reports no error for a
+# missing pipe, so the listing is the only usable occupancy check; when the
+# output is non-empty but unparseable the caller is told skip rather than
+# left to guess at an id.
+#
+# Callers that will configure the pipe must use dnctl_claim_pipe under
+# dnctl_lock_acquire instead: a bare free-id scan does not reserve the id.
+dnctl_free_pipe() {
+    local first="$1"
+    local last="$2"
+    local log="${3:-/dev/null}"
+    local listing used n
+    if ! listing="$(sudo -n dnctl pipe list 2>>"$log")"; then
+        return 1
+    fi
+    used=""
+    if [ -n "$listing" ]; then
+        used="$(printf '%s\n' "$listing" | awk '
+            /^[0-9]+:/ {
+                id = $1
+                sub(/:$/, "", id)
+                if (id != "") printf "%s ", id + 0
+            }
+        ')"
+        [ -n "$used" ] || return 1
+    fi
+    for n in $(seq "$first" "$last"); do
+        case " $used " in
+            *" $n "*) continue ;;
+        esac
+        printf '%s' "$n"
+        return 0
+    done
+    return 1
+}
+
+# Atomically reserve a free pipe: list → config plr → re-list verify.
+# Requires dnctl_lock_acquire so concurrent harnesses cannot race the same id.
+# Hold the lock until dnctl_delete_pipe + dnctl_lock_release after teardown.
+dnctl_claim_pipe() {
+    local first="$1"
+    local last="$2"
+    local plr="$3"
+    local log="${4:-/dev/null}"
+    local n listing
+    n="$(dnctl_free_pipe "$first" "$last" "$log")" || return 1
+    if ! sudo -n dnctl pipe "$n" config plr "$plr" 2>>"$log"; then
+        return 1
+    fi
+    if ! listing="$(sudo -n dnctl pipe list 2>>"$log")"; then
+        sudo -n dnctl -q pipe "$n" delete 2>>"$log" || true
+        return 1
+    fi
+    if ! printf '%s\n' "$listing" | awk -v id="$n" '
+        BEGIN { found = 0 }
+        /^[0-9]+:/ {
+            x = $1
+            sub(/:$/, "", x)
+            if ((x + 0) == (id + 0)) found = 1
+        }
+        END { exit !found }
+    '; then
+        sudo -n dnctl -q pipe "$n" delete 2>>"$log" || true
+        return 1
+    fi
+    printf '%s' "$n"
+    return 0
+}
+
 # True when the packet filter is enabled. Loading rules into an anchor can
 # succeed while PF is still Disabled; those rules do not impair traffic
 # until something enables PF (pfctl -e / -E).
@@ -290,46 +390,6 @@ dnctl_pipe_packet_count() {
         }
         END { print n + 0 }
     '
-}
-
-# Print the first dummynet pipe id in [first,last] that is not already
-# configured, and fail when no such id exists or the state is unknown.
-#
-# `dnctl pipe N config` targets an existing pipe rather than allocating a
-# private one, so a fixed id would reconfigure whatever owns that pipe and
-# the matching delete would then remove it. dnctl lists configured pipes as
-# "%05d: <params>" (list_pipes() in sbin/ipfw/dummynet.c), and an empty
-# listing means no pipes exist. dummynet_list() reports no error for a
-# missing pipe, so the listing is the only usable occupancy check; when the
-# output is non-empty but unparseable the caller is told skip rather than
-# left to guess at an id.
-dnctl_free_pipe() {
-    local first="$1"
-    local last="$2"
-    local log="${3:-/dev/null}"
-    local listing used n
-    if ! listing="$(sudo -n dnctl pipe list 2>>"$log")"; then
-        return 1
-    fi
-    used=""
-    if [ -n "$listing" ]; then
-        used="$(printf '%s\n' "$listing" | awk '
-            /^[0-9]+:/ {
-                id = $1
-                sub(/:$/, "", id)
-                if (id != "") printf "%s ", id + 0
-            }
-        ')"
-        [ -n "$used" ] || return 1
-    fi
-    for n in $(seq "$first" "$last"); do
-        case " $used " in
-            *" $n "*) continue ;;
-        esac
-        printf '%s' "$n"
-        return 0
-    done
-    return 1
 }
 
 # --- HTTP/2 matrix cell via h2load ---
@@ -532,13 +592,18 @@ run_h2_special() {
         # Verify impairment was actually configured; otherwise a clean run
         # must not be reported as an impaired pass.
         local port="${addr##*:}"
-        # Take an unused pipe id so this run cannot reconfigure or delete a
-        # pipe that already belongs to another workload.
-        local loss_pipe
-        loss_pipe="$(dnctl_free_pipe 42 61 "$loss_note" || true)"
+        # Claim a free pipe under an interprocess lock (list+config+verify)
+        # so overlapping harnesses cannot reconfigure each other's pipe.
+        local loss_pipe=""
+        local dnctl_locked=0
+        if dnctl_lock_acquire "$loss_note"; then
+            dnctl_locked=1
+            loss_pipe="$(dnctl_claim_pipe 42 61 0.05 "$loss_note" || true)"
+        fi
         if [ -z "$loss_pipe" ]; then
             loss_verdict=skip
-            loss_detail="no free dummynet pipe id in 42-61; no impaired run attempted"
+            loss_detail="no free dummynet pipe id in 42-61 (or lock/claim failed); no impaired run attempted"
+            if [ "$dnctl_locked" -eq 1 ]; then dnctl_lock_release; fi
         else
             # Allocate a unique empty child under an evaluated parent.
             # Reusing a fixed leaf would let -f/-F destroy host rules there.
@@ -548,10 +613,9 @@ run_h2_special() {
                 loss_verdict=skip
                 loss_detail="no usable dummynet anchor (PF disabled, no parent, or nonempty leaf); no impaired run attempted"
                 dnctl_delete_pipe "$loss_pipe" "$loss_note"
+                dnctl_lock_release
             else
             set +e
-            sudo -n dnctl pipe "$loss_pipe" config plr 0.05 2>"$loss_note"
-            local dnctl_rc=$?
             echo "dummynet in proto tcp from any to 127.0.0.1 port ${port} pipe ${loss_pipe}" \
                 | sudo -n pfctl -a "$loss_anchor" -f - 2>>"$loss_note"
             local pfctl_rc=$?
@@ -560,13 +624,14 @@ run_h2_special() {
                 && pf_anchor_has_dummynet "$loss_anchor" "$loss_note"; then
                 anchor_live=1
             fi
-            if [ "$dnctl_rc" -ne 0 ] || [ "$pfctl_rc" -ne 0 ] \
+            if [ "$pfctl_rc" -ne 0 ] \
                 || [ "$anchor_live" -ne 1 ] \
                 || ! command -v dnctl >/dev/null; then
                 loss_verdict=skip
-                loss_detail="loss impairment not configured (dnctl_rc=$dnctl_rc pfctl_rc=$pfctl_rc anchor=${loss_anchor} live=${anchor_live}); no impaired run attempted"
+                loss_detail="loss impairment not configured (pfctl_rc=$pfctl_rc anchor=${loss_anchor} live=${anchor_live}); no impaired run attempted"
                 sudo -n pfctl -a "$loss_anchor" -F all 2>>"$loss_note" || true
                 dnctl_delete_pipe "$loss_pipe" "$loss_note"
+                dnctl_lock_release
                 set -e
             else
                 # Install cleanup as soon as impairment is live. RETURN
@@ -575,10 +640,11 @@ run_h2_special() {
                 # EXIT runs — RETURN alone does not fire on SIGTERM).
                 # Preserve the top-level server kill_pid EXIT handler.
                 # Flush only this unique anchor — never a shared host leaf.
+                # Release the dnctl lock after pipe delete so peers can claim.
                 # shellcheck disable=SC2064
-                trap "sudo -n pfctl -a ${loss_anchor} -F all 2>/dev/null || true; sudo -n dnctl -q pipe ${loss_pipe} delete 2>/dev/null || true; kill_pid \"\${GO_PID:-}\"; kill_pid \"\${MOJO_H2_PID:-}\"; kill_pid \"\${BASE_PID:-}\"; kill_pid \"\${MOJO_H3_PID:-}\"" EXIT
+                trap "sudo -n pfctl -a ${loss_anchor} -F all 2>/dev/null || true; sudo -n dnctl -q pipe ${loss_pipe} delete 2>/dev/null || true; rm -f ${DNCTL_LOCK_DIR}/pid 2>/dev/null || true; rmdir ${DNCTL_LOCK_DIR} 2>/dev/null || true; kill_pid \"\${GO_PID:-}\"; kill_pid \"\${MOJO_H2_PID:-}\"; kill_pid \"\${BASE_PID:-}\"; kill_pid \"\${MOJO_H3_PID:-}\"" EXIT
                 # shellcheck disable=SC2064
-                trap "sudo -n pfctl -a ${loss_anchor} -F all 2>/dev/null || true; sudo -n dnctl -q pipe ${loss_pipe} delete 2>/dev/null || true" RETURN
+                trap "sudo -n pfctl -a ${loss_anchor} -F all 2>/dev/null || true; sudo -n dnctl -q pipe ${loss_pipe} delete 2>/dev/null || true; rm -f ${DNCTL_LOCK_DIR}/pid 2>/dev/null || true; rmdir ${DNCTL_LOCK_DIR} 2>/dev/null || true" RETURN
                 trap 'exit 130' INT
                 trap 'exit 143' TERM
                 h2load --alpn-list=h2 -c 8 -m 4 -t 1 -D 5s "${url}/fixed" \
@@ -588,6 +654,7 @@ run_h2_special() {
                 pipe_pkts="$(dnctl_pipe_packet_count "$loss_pipe" "$loss_note" || true)"
                 sudo -n pfctl -a "$loss_anchor" -F all 2>>"$loss_note" || true
                 dnctl_delete_pipe "$loss_pipe" "$loss_note"
+                dnctl_lock_release
                 trap 'kill_pid "${GO_PID:-}"; kill_pid "${MOJO_H2_PID:-}"; kill_pid "${BASE_PID:-}"; kill_pid "${MOJO_H3_PID:-}"' EXIT
                 trap - RETURN INT TERM
                 set -e
@@ -708,24 +775,25 @@ run_h3_special() {
     if sudo -n true 2>/dev/null; then
         local port="${addr##*:}"
         local pf_note="$OUT_DIR/special/h3_${label}_pf.txt"
-        # Take an unused pipe id so this run cannot reconfigure or delete a
-        # pipe that already belongs to another workload. The H2 range stops
-        # at 61 so a concurrent harness run cannot land on the same id.
-        loss_pipe="$(dnctl_free_pipe 62 81 "$pf_note" || true)"
+        # Claim under interprocess lock. H2 uses 42–61; H3 uses 62–81.
+        local dnctl_locked=0
+        if dnctl_lock_acquire "$pf_note"; then
+            dnctl_locked=1
+            loss_pipe="$(dnctl_claim_pipe 62 81 0.05 "$pf_note" || true)"
+        fi
         if [ -z "$loss_pipe" ]; then
-            loss_pf_detail="no free dummynet pipe id in 62-81"
+            loss_pf_detail="no free dummynet pipe id in 62-81 (or lock/claim failed)"
+            if [ "$dnctl_locked" -eq 1 ]; then dnctl_lock_release; fi
         else
             local loss_anchor
             loss_anchor="$(pf_alloc_dummynet_anchor net_mojo_bench_h3 "$pf_note" || true)"
             if [ -z "$loss_anchor" ]; then
                 loss_pf_detail="no usable dummynet anchor (PF disabled, no parent, or nonempty leaf)"
                 dnctl_delete_pipe "$loss_pipe" "$pf_note"
+                dnctl_lock_release
                 loss_pipe=""
             else
             set +e
-            sudo -n dnctl pipe "$loss_pipe" config plr 0.05 \
-                >"$pf_note" 2>&1
-            local dnctl_rc=$?
             echo "dummynet in proto udp from any to 127.0.0.1 port ${port} pipe ${loss_pipe}" \
                 | sudo -n pfctl -a "$loss_anchor" -f - \
                 >>"$pf_note" 2>&1
@@ -738,12 +806,13 @@ run_h3_special() {
             set -e
             # Do not claim configured when PF is disabled, either step
             # failed, or the parent anchor is inert; match H2 checks.
-            if [ "$dnctl_rc" -ne 0 ] || [ "$pfctl_rc" -ne 0 ] \
+            if [ "$pfctl_rc" -ne 0 ] \
                 || [ "$anchor_live" -ne 1 ]; then
                 loss_pf_verdict=skip
-                loss_pf_detail="loss impairment not configured (dnctl_rc=$dnctl_rc pfctl_rc=$pfctl_rc anchor=${loss_anchor} live=${anchor_live})"
+                loss_pf_detail="loss impairment not configured (pfctl_rc=$pfctl_rc anchor=${loss_anchor} live=${anchor_live})"
                 sudo -n pfctl -a "$loss_anchor" -F all 2>>"$pf_note" || true
                 dnctl_delete_pipe "$loss_pipe" "$pf_note"
+                dnctl_lock_release
                 loss_pipe=""
             else
                 loss_pf_verdict=configured
@@ -751,9 +820,9 @@ run_h3_special() {
                 # RETURN for early return; EXIT+INT/TERM for signal kill.
                 # Flush only this unique anchor — never a shared host leaf.
                 # shellcheck disable=SC2064
-                trap "sudo -n pfctl -a ${loss_anchor} -F all 2>/dev/null || true; sudo -n dnctl -q pipe ${loss_pipe} delete 2>/dev/null || true; kill_pid \"\${GO_PID:-}\"; kill_pid \"\${MOJO_H2_PID:-}\"; kill_pid \"\${BASE_PID:-}\"; kill_pid \"\${MOJO_H3_PID:-}\"" EXIT
+                trap "sudo -n pfctl -a ${loss_anchor} -F all 2>/dev/null || true; sudo -n dnctl -q pipe ${loss_pipe} delete 2>/dev/null || true; rm -f ${DNCTL_LOCK_DIR}/pid 2>/dev/null || true; rmdir ${DNCTL_LOCK_DIR} 2>/dev/null || true; kill_pid \"\${GO_PID:-}\"; kill_pid \"\${MOJO_H2_PID:-}\"; kill_pid \"\${BASE_PID:-}\"; kill_pid \"\${MOJO_H3_PID:-}\"" EXIT
                 # shellcheck disable=SC2064
-                trap "sudo -n pfctl -a ${loss_anchor} -F all 2>/dev/null || true; sudo -n dnctl -q pipe ${loss_pipe} delete 2>/dev/null || true" RETURN
+                trap "sudo -n pfctl -a ${loss_anchor} -F all 2>/dev/null || true; sudo -n dnctl -q pipe ${loss_pipe} delete 2>/dev/null || true; rm -f ${DNCTL_LOCK_DIR}/pid 2>/dev/null || true; rmdir ${DNCTL_LOCK_DIR} 2>/dev/null || true" RETURN
                 trap 'exit 130' INT
                 trap 'exit 143' TERM
             fi
@@ -770,6 +839,7 @@ run_h3_special() {
     if [ "$loss_pf_verdict" = "configured" ]; then
         sudo -n pfctl -a "$loss_anchor" -F all 2>/dev/null || true
         dnctl_delete_pipe "$loss_pipe" /dev/null
+        dnctl_lock_release
         trap 'kill_pid "${GO_PID:-}"; kill_pid "${MOJO_H2_PID:-}"; kill_pid "${BASE_PID:-}"; kill_pid "${MOJO_H3_PID:-}"' EXIT
         trap - RETURN INT TERM
         loss_pf_verdict=cleaned

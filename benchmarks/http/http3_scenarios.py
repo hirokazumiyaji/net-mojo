@@ -2,7 +2,9 @@
 """HTTP/3 special scenarios for Issue #42 PR 11 multiplex matrix.
 
 Scenarios (qualitative + limited timing; aioquic client):
-  slow   — one slow stream (delayed DATA consume) alongside N normal GETs
+  slow   — hold one large POST /echo upload open while N GET /fixed siblings
+           run on the same connection, then finish the upload (matches H2;
+           aioquic cannot withhold QUIC MAX_STREAM_DATA for a slow reader)
   cancel — RST one in-flight stream (H3_REQUEST_CANCELLED) while siblings
            complete, then GET /fixed on the same connection
   loss   — drop a fraction of outbound UDP datagrams (client-side loss emulation)
@@ -156,6 +158,65 @@ class ScenarioProtocol(QuicConnectionProtocol):
         for ev in staged:
             self._consume(pending, ev)
 
+    async def open_upload(
+        self, body_len: int, prefix: bytes, authority: bytes
+    ) -> dict:
+        """Start POST /echo with a deliberately unfinished request body.
+
+        Used for the slow-stream scenario. aioquic extends MAX_STREAM_DATA from
+        the highest received offset, so application-level hold_stream cannot
+        create real receive-window backpressure; leaving the request open does.
+        """
+        assert self.http is not None
+        stream_id = self._quic.get_next_available_stream_id()
+        loop = asyncio.get_running_loop()
+        future = loop.create_future()
+        pending = {
+            "future": future,
+            "body": bytearray(),
+            "status": None,
+            "start": time.perf_counter(),
+            "done_at": None,
+            "stream_id": stream_id,
+            "cancelled": False,
+            "sent": len(prefix),
+        }
+        self._inflight[stream_id] = pending
+        self.http.send_headers(
+            stream_id,
+            [
+                (b":method", b"POST"),
+                (b":scheme", b"https"),
+                (b":authority", authority),
+                (b":path", b"/echo"),
+                (b"content-length", str(body_len).encode()),
+            ],
+            end_stream=False,
+        )
+        if prefix:
+            self.http.send_data(stream_id, prefix, end_stream=False)
+        self.transmit()
+        return pending
+
+    async def finish_upload(
+        self, pending: dict, body: bytes, timeout: float = 30.0
+    ) -> dict:
+        """Send the remainder of an open_upload body and await the response."""
+        assert self.http is not None
+        stream_id = pending["stream_id"]
+        sent = int(pending.get("sent", 0))
+        for off in range(sent, len(body), 16384):
+            self.http.send_data(
+                stream_id,
+                body[off : off + 16384],
+                end_stream=(off + 16384 >= len(body)),
+            )
+        self.transmit()
+        try:
+            return await asyncio.wait_for(pending["future"], timeout=timeout)
+        finally:
+            self._inflight.pop(stream_id, None)
+
     async def post_echo(
         self, body: bytes, authority: bytes, *, hold: bool = False
     ) -> dict:
@@ -297,6 +358,13 @@ async def run_slow(url: str, slow_s: float, siblings: int) -> dict:
     configuration.verify_mode = ssl.CERT_NONE
 
     t0 = time.perf_counter()
+    # Match H2 slow: leave a large POST /echo request unfinished so the
+    # server is still reading that stream while siblings complete. aioquic
+    # cannot withhold QUIC receive credit (MAX_STREAM_DATA tracks the highest
+    # received offset), so a response-side "hold" would not create a slow
+    # reader and must not be published as a pass.
+    slow_body = b"x" * (256 * 1024)
+    prefix_len = 32 * 1024
     async with connect(
         host,
         port,
@@ -306,27 +374,10 @@ async def run_slow(url: str, slow_s: float, siblings: int) -> dict:
         assert isinstance(client, ScenarioProtocol)
         await _wait_alpn(client)
 
-        # Slow stream uses a large echo body (256 KiB) so the response
-        # spans many datagrams: a serializing server would stall siblings
-        # behind it. Consumption is withheld at the H3 event layer until
-        # siblings complete (see hold_stream): transport still flows, but
-        # the application does not observe completion early. Manual
-        # flow-control window backpressure is not exposed by aioquic — it
-        # extends MAX_STREAM_DATA from the receiver's highest offset, not
-        # from what this application consumes — so the verdict instead
-        # proves overlap from the transport side: held_bytes > 0 shows
-        # bytes arrived while withheld, and held_ended() shows the response
-        # had not finished when the siblings ran.
-        slow_body = b"x" * (256 * 1024)
-
-        slow_pending = await client.post_echo(slow_body, authority, hold=True)
-        slow_id = slow_pending["stream_id"]
-        # Siblings are dispatched immediately, before the held response can
-        # complete: any await/sleep here would let the server finish the
-        # response first and make the scenario a post-completion sleep.
-        # Completion is read from the staged events, not from the held
-        # future, which can never resolve before release_stream().
-        slow_ended_at_dispatch = client.held_ended(slow_id)
+        slow_pending = await client.open_upload(
+            len(slow_body), slow_body[:prefix_len], authority
+        )
+        target_unfinished_at_dispatch = not slow_pending["future"].done()
         sibling_tasks = [
             asyncio.create_task(client.get(path, authority))
             for _ in range(siblings)
@@ -334,20 +385,12 @@ async def run_slow(url: str, slow_s: float, siblings: int) -> dict:
         sibling_results = await asyncio.gather(
             *sibling_tasks, return_exceptions=True
         )
-        # Siblings must have been served while the slow stream was still
-        # unfinished at the transport level: a staged stream_ended would
-        # mean the whole echo response had already been received, i.e. the
-        # server serialized the slow stream ahead of the siblings.
-        slow_ended_during_siblings = client.held_ended(slow_id)
-        slow_unfinished_during_siblings = not slow_ended_during_siblings
+        target_unfinished_during_siblings = not slow_pending["future"].done()
         if slow_s > 0:
             await asyncio.sleep(slow_s)
-        held = client.held_bytes(slow_id)
-        client.release_stream(slow_id)
-        slow_result = await client.await_pending(slow_pending)
+        target_unfinished_before_finish = not slow_pending["future"].done()
+        slow_result = await client.finish_upload(slow_pending, slow_body)
 
-    # Siblings must return the exact /fixed payload: a 200 with a truncated
-    # or corrupted body is a multiplexing failure, not a success.
     sibling_ok = sum(
         1
         for r in sibling_results
@@ -372,33 +415,31 @@ async def run_slow(url: str, slow_s: float, siblings: int) -> dict:
         else False
     )
     elapsed_ms = (time.perf_counter() - t0) * 1000
-    # held > 0 proves response bytes arrived while consumption was withheld,
-    # and neither staged stream_ended proves the response had not finished
-    # when the siblings were dispatched or completed: genuine slow-consumer
-    # multiplexing overlap, not a post-completion sleep and not a server
-    # that serialized the whole echo ahead of the siblings.
     verdict = (
         "pass"
         if slow_ok
         and slow_body_ok
         and sibling_ok == siblings
-        and held > 0
-        and not slow_ended_at_dispatch
-        and slow_unfinished_during_siblings
+        and target_unfinished_at_dispatch
+        and target_unfinished_during_siblings
+        and target_unfinished_before_finish
         else "fail"
     )
     return {
         "scenario": "slow",
         "verdict": verdict,
+        "conn": "single",
+        "method": "incomplete_upload",
         "slow_ok": int(slow_ok),
         "slow_body_ok": int(slow_body_ok),
         "sibling_ok": sibling_ok,
         "sibling_body_bad": sibling_body_bad,
         "sibling_fail": sibling_fail,
-        "held_bytes": held,
-        "slow_ended_at_dispatch": int(slow_ended_at_dispatch),
-        "slow_ended_during_siblings": int(slow_ended_during_siblings),
-        "slow_unfinished_during_siblings": int(slow_unfinished_during_siblings),
+        "target_unfinished_at_dispatch": int(target_unfinished_at_dispatch),
+        "target_unfinished_during_siblings": int(
+            target_unfinished_during_siblings
+        ),
+        "target_unfinished_before_finish": int(target_unfinished_before_finish),
         "elapsed_ms": elapsed_ms,
         "slow_s": slow_s,
         "siblings": siblings,
