@@ -21,14 +21,14 @@ def _unique_path(suffix: StringSlice) raises -> String:
 
 def _unlink(path: StringSlice):
     var owned_path = String(path)
-    var c_path = owned_path.as_c_string_slice()
-    _ = external_call["unlink", c_int](c_path.unsafe_ptr())
+    var c_path = owned_path.as_c_string_span()
+    _ = external_call["unlink", c_int](c_path.ptr())
 
 
 def _exists(path: StringSlice) -> Bool:
     var owned_path = String(path)
-    var c_path = owned_path.as_c_string_slice()
-    return external_call["access", c_int](c_path.unsafe_ptr(), c_int(0)) == 0
+    var c_path = owned_path.as_c_string_span()
+    return external_call["access", c_int](c_path.ptr(), c_int(0)) == 0
 
 
 struct _PathCleanup(Movable):

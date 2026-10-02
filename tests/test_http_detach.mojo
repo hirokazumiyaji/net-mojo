@@ -393,9 +393,7 @@ struct _DeferredHandler(Handler):
 
 
 struct _FailingDetachedStreamHandler(Handler):
-    # Explicit initializer: the generated one carries a `deinit move`
-    # argument that Mojo 1.1 requires callers to pass and 1.0 does not
-    # have. Matches `_DropSenderHandler` above.
+    # Explicit no-op initializer; matches `_DropSenderHandler` above.
     def __init__(out self):
         pass
 

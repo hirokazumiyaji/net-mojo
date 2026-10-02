@@ -383,8 +383,8 @@ def _append_hex(mut out: List[Byte], val: Int):
     if val <= 0:
         out.append(Byte(ord("0")))
         return
-    # Emitted most-significant nibble first so no scratch buffer is needed:
-    # `InlineArray` is Mojo 1.0-only and this source must also build on 1.1.
+    # Emitted most-significant nibble first so no scratch buffer is needed.
+    # (`InlineArray` was removed after Mojo 1.0.)
     var digits = 0
     var probe = val
     while probe > 0:

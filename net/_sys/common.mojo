@@ -1143,11 +1143,11 @@ def _parse_backlog_limit(text: StringSlice) -> Optional[Int]:
 
 def _darwin_backlog_limit() -> Optional[Int]:
     var name = String("kern.ipc.somaxconn")
-    var c_name = name.as_c_string_slice()
+    var c_name = name.as_c_string_span()
     var value: Int32 = 0
     var length = UInt64(size_of[Int32]())
     var result = external_call["sysctlbyname", c_int](
-        c_name.unsafe_ptr(),
+        c_name.ptr(),
         Pointer(to=value),
         Pointer(to=length),
         Optional[Pointer[Byte, MutUntrackedOrigin]](None),

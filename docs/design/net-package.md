@@ -7,14 +7,13 @@ decision. Usage instructions are out of scope here.
 ## Goals
 
 - Provide synchronous IPv4/IPv6 addressing, OS name resolution, TCP, UDP, and
-  Unix stream sockets for Mojo 1.1, while retaining core compatibility with
-  Mojo 1.0.
+  Unix stream sockets for Mojo 1.1.
 - Keep core `net` dependent on Mojo `std` and the documented libc/POSIX ABI,
   with no C shim or third-party runtime. Optional protocol features may add
   isolated native dependencies.
 - Make descriptor ownership, timeout semantics, and partial I/O explicit in the
   type signatures rather than in prose.
-- Stay warning-clean under `--Werror` on both supported targets.
+- Stay warning-clean under `--Werror` on the supported Mojo 1.1 targets.
 
 ## Non-goals for the initial release
 

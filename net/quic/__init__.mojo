@@ -26,12 +26,12 @@ struct QuicProvider(Movable):
     def server_config(
         mut self, var certificate_path: String, var private_key_path: String
     ) raises -> QuicServerConfig:
-        var certificate = certificate_path.as_c_string_slice()
-        var private_key = private_key_path.as_c_string_slice()
+        var certificate = certificate_path.as_c_string_span()
+        var private_key = private_key_path.as_c_string_span()
         var config = self._library.call[
             "net_quic_config_new",
             Optional[Pointer[Byte, MutUntrackedOrigin]],
-        ](certificate.unsafe_ptr(), private_key.unsafe_ptr())
+        ](certificate.ptr(), private_key.ptr())
         if config == None:
             raise NetError(
                 NetErrorKind.system_error(),
@@ -246,14 +246,14 @@ struct QuicServer(Movable):
     ) raises NetError -> Bool:
         var local = String(local_address)
         var remote = String(remote_address)
-        var local_c = local.as_c_string_slice()
-        var remote_c = remote.as_c_string_slice()
+        var local_c = local.as_c_string_span()
+        var remote_c = remote.as_c_string_span()
         var result = self._library.call["net_quic_receive", c_int](
             self._server,
             packet.unsafe_ptr(),
             c_size_t(len(packet)),
-            local_c.unsafe_ptr(),
-            remote_c.unsafe_ptr(),
+            local_c.ptr(),
+            remote_c.ptr(),
         )
         if result < 0:
             raise NetError(

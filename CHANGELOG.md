@@ -12,6 +12,12 @@ underscore (see README "Versioning and compatibility"). Anything under
 
 ## [Unreleased]
 
+### Changed
+
+- Require Mojo 1.1 only: drop the `mojo-1-0` Pixi environment and CI job, and
+  migrate `String.as_c_string_slice` / `CStringSpan.unsafe_ptr` to
+  `as_c_string_span` / `ptr`.
+
 ### Added
 
 - HTTP/2 server support over TLS ALPN `h2`, including bounded request streams,

@@ -96,16 +96,16 @@ struct TLSContext(Movable):
         var protocols: String,
     ) raises:
         var library = OwnedDLHandle(library_path)
-        var certificate = certificate_path.as_c_string_slice()
-        var private_key = private_key_path.as_c_string_slice()
-        var alpn = protocols.as_c_string_slice()
+        var certificate = certificate_path.as_c_string_span()
+        var private_key = private_key_path.as_c_string_span()
+        var alpn = protocols.as_c_string_span()
         var context = library.call[
             "net_tls_context_server",
             Optional[Pointer[Byte, MutUntrackedOrigin]],
         ](
-            certificate.unsafe_ptr(),
-            private_key.unsafe_ptr(),
-            alpn.unsafe_ptr(),
+            certificate.ptr(),
+            private_key.ptr(),
+            alpn.ptr(),
         )
         if context == None:
             raise NetError(
