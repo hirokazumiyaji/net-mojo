@@ -566,10 +566,12 @@ run_h2_special() {
                 trap 'kill_pid "${GO_PID:-}"; kill_pid "${MOJO_H2_PID:-}"; kill_pid "${BASE_PID:-}"; kill_pid "${MOJO_H3_PID:-}"' EXIT
                 trap - RETURN INT TERM
                 set -e
-                local loss_req loss_fail
+                local loss_req loss_fail loss_success
                 loss_req="$(rg -o 'finished in [^,]+, ([0-9.]+) req/s' -r '$1' \
                     "$OUT_DIR/special/h2_${label}_loss_h2load.out" | head -1 || true)"
                 loss_fail="$(rg -o 'requests: .* ([0-9]+) failed' -r '$1' \
+                    "$OUT_DIR/special/h2_${label}_loss_h2load.out" | head -1 || true)"
+                loss_success="$(rg -o 'requests: .* ([0-9]+) succeeded' -r '$1' \
                     "$OUT_DIR/special/h2_${label}_loss_h2load.out" | head -1 || true)"
                 local loss_errored loss_timeout
                 loss_errored="$(rg -o 'requests: .* ([0-9]+) errored' -r '$1' \
@@ -580,6 +582,8 @@ run_h2_special() {
                 # failures, or exited nonzero is not a valid measurement.
                 # Also reject runs where the pipe saw no packets: that means
                 # the PF anchor never classified traffic despite setup rc=0.
+                # Match the H2 matrix gate: require a parsed positive success
+                # count so a partial/changed h2load summary cannot pass.
                 local loss_ok=true
                 if [ "$loss_rc" -ne 0 ]; then loss_ok=false; fi
                 if [ "${loss_fail:-0}" != "0" ]; then loss_ok=false; fi
@@ -592,14 +596,17 @@ run_h2_special() {
                 if [ -z "$loss_req" ] || [ "${loss_req%%.*}" = "0" ]; then
                     loss_ok=false
                 fi
+                if [ -z "${loss_success:-}" ] || [ "$loss_success" = "0" ]; then
+                    loss_ok=false
+                fi
                 if [ "${pipe_pkts:-0}" = "0" ]; then loss_ok=false; fi
                 if ! kill -0 "$server_pid" 2>/dev/null; then loss_ok=false; fi
                 if [ "$loss_ok" = "true" ]; then
                     loss_verdict=pass
-                    loss_detail="dnctl plr=0.05 anchor=${loss_anchor} pipe=${loss_pipe} pipe_pkts=${pipe_pkts} req_s=${loss_req} failed=${loss_fail:-?} rc=${loss_rc}"
+                    loss_detail="dnctl plr=0.05 anchor=${loss_anchor} pipe=${loss_pipe} pipe_pkts=${pipe_pkts} req_s=${loss_req} succeeded=${loss_success} failed=${loss_fail:-?} rc=${loss_rc}"
                 else
                     loss_verdict=fail
-                    loss_detail="dnctl configured but load invalid anchor=${loss_anchor} pipe=${loss_pipe} pipe_pkts=${pipe_pkts:-?} rc=${loss_rc} req_s=${loss_req:-?} failed=${loss_fail:-?} errored=${loss_errored:-?} timeout=${loss_timeout:-?}"
+                    loss_detail="dnctl configured but load invalid anchor=${loss_anchor} pipe=${loss_pipe} pipe_pkts=${pipe_pkts:-?} rc=${loss_rc} req_s=${loss_req:-?} succeeded=${loss_success:-?} failed=${loss_fail:-?} errored=${loss_errored:-?} timeout=${loss_timeout:-?}"
                 fi
             fi
             fi
