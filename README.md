@@ -134,17 +134,34 @@ Constraints (see `docs/design/http-server.md` for the full contract):
   them with `pixi run -e tls-http2 tls-suite` plus
   `pixi run -e tls-http2 hpack-mojo-test`, and `pixi run -e tls-http3 quic-suite`
   plus `pixi run -e tls-http3 http3-client-test`.
-- HTTP/3 does not automatically advertise `Alt-Svc`. Set
-  `ServerConfig.alt_svc` (for example `h3=":443"; ma=86400`) when a QUIC
-  endpoint is attached on the same origin; leave it empty so UDP-unavailable
-  environments still serve HTTPS without advertising H3. Protocol behavior,
-  limits, and unsupported features are documented in
-  [HTTP/2](docs/design/http2-server.md) and
+- Same-origin HTTPS + HTTP/3: bind TCP and UDP on the same host:port (see
+  `examples/http3_hello.mojo`), pass the same certificate/key to
+  `TLSContext.server` (`h2,http/1.1`) and `QuicProvider.server_config` (`h3`),
+  and replace `build/tls/test-*.pem` before deployment. UDP-unavailable hosts
+  may serve HTTPS alone.
+- `Alt-Svc` is opt-in and never automatic. The Issue #42 remaining stack
+  ([PR #77](https://github.com/hirokazumiyaji/net-mojo/pull/77)) adds
+  `ServerConfig.alt_svc` (for example `h3=":8443"; ma=86400`) injected on TLS
+  responses when a QUIC endpoint is attached; leave it empty so HTTPS does not
+  advertise H3. A handler-supplied `Alt-Svc` wins; do not advertise when no H3
+  endpoint is listening.
+- Flood / resource limits on the same stack: HTTP/2 control and RST rate caps
+  ([#71](https://github.com/hirokazumiyaji/net-mojo/pull/71)–[#72](https://github.com/hirokazumiyaji/net-mojo/pull/72)),
+  explicit QUIC 0-RTT off ([#73](https://github.com/hirokazumiyaji/net-mojo/pull/73)),
+  soft `quic_max_transport_memory_bytes` admission
+  ([#75](https://github.com/hirokazumiyaji/net-mojo/pull/75)). Protocol behavior
+  and unsupported features are in [HTTP/2](docs/design/http2-server.md) and
   [HTTP/3](docs/design/http3-server.md).
 - HTTP/3 CI and independent-client coverage run on Linux x86_64 and aarch64;
-  end-to-end HTTP/3 validation on macOS remains outstanding.
+  macOS end-to-end Mojo HTTP/3 validation runs in CI (`http3` on macos-14).
 - No client, no HTTP/1.0, no WebSocket/CONNECT/Upgrade switching, no
   multipart helpers, no body compression, no static file serving.
+
+Optional provider pins live in `pixi.toml` (`openssl`, `libnghttp2`) and
+`net/quic/provider/Cargo.toml` (quiche). After bumping a pin, refresh
+`pixi.lock` / the provider `Cargo.lock`, rebuild the `tls-http2` /
+`tls-http3` environments, and re-run the matching suites. Measured H2/H3
+numbers are recorded in `benchmarks/http/README.md`.
 
 ### Response streaming and deferred responses
 
@@ -235,8 +252,7 @@ HTTP examples: `pixi run example-http-hello`, `pixi run example-http-json`, and 
 
 Format source with `pixi run format`.
 CI runs the complete warning-clean suite on all supported runners and keeps separate AddressSanitizer steps defined in `pixi.toml`.
-Mojo marks foundational standard APIs unstable, so CI uses `--Werror` without
-`--warn-on-unstable-apis`.
+Mojo marks foundational standard APIs unstable, so CI uses `--Werror` without `--warn-on-unstable-apis`.
 The local macOS arm64 toolchain may fail to resolve `___asan_*` runtime symbols before sanitizer tests start.
 
 The package excludes asynchronous I/O, a custom DNS client, raw IP and

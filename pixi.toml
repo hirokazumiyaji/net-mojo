@@ -81,6 +81,14 @@ python = ">=3.10,<3.15"
 c-compiler = "*"
 libnghttp2 = ">=1.64,<2"
 pkg-config = "*"
+python = ">=3.10,<3.15"
+
+# HTTP/2 scenario driver client (benchmarks/http/http2_scenarios.py).
+# Pinned like aioquic for the H3 baseline: the slow-stream and cancellation
+# scenarios need one connection carrying both the target and the sibling
+# streams, which curl and h2load cannot express across separate processes.
+[feature.http2.pypi-dependencies]
+h2 = "==4.4.1"
 
 [feature.http2.tasks]
 hpack-test = "bash scripts/build_hpack_shim.sh"
