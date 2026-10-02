@@ -325,7 +325,8 @@ sections above).
 
 ### Host and procedure
 
-- macOS 27.0.1, Apple M3 Max, `h2load` nghttp2/1.70.0, aioquic 1.3.0.
+- macOS 27.0.1, Apple M3 Max, `h2load` nghttp2/1.70.0, aioquic 1.3.0,
+  hyper-h2 4.4.1 (`h2==4.4.1`, pinned in the `http2` feature).
 - `WARMUP_S=2 MEASURE_S=4 RUNS=2 CONNS="1 16" STREAMS="1 10"`, harness
   default SKIP flags otherwise; `SKIP_SPECIAL=1` for the matrix tables and
   a separate `RUNS=1 CONNS="1" STREAMS="1"` pass for the scenarios.
@@ -372,12 +373,20 @@ All runs: 0 failed, rc=0.
 
 ### Special scenarios
 
+Both HTTP/2 special scenarios run over a **single** HTTP/2 connection
+(`benchmarks/http/http2_scenarios.py`, hyper-h2): the target stream and its
+siblings share one connection, so a server with per-connection
+head-of-line blocking or broken `RST_STREAM` handling cannot pass. The
+earlier `curl --limit-rate` + `h2load` version could not show this, because
+those are separate processes and therefore always separate connections;
+`h2load` still drives the throughput matrix above.
+
 | Proto | Server | Scenario | Verdict | Detail |
 | --- | --- | --- | --- | --- |
-| h2 | Go | slow | pass | sibling req/s 53,787, 0 failed |
-| h2 | Mojo | slow | pass | sibling req/s 35,301, 0 failed |
-| h2 | Go | cancel | pass | sibling HTTP 200 after client abort |
-| h2 | Mojo | cancel | pass | sibling HTTP 200 after client abort |
+| h2 | Go | slow | pass | 1 conn: 8/8 siblings exact 64 B while the upload stream was still open; echo completed after release |
+| h2 | Mojo | slow | not run | see note below |
+| h2 | Go | cancel | pass | 1 conn: 8/8 siblings outstanding at RST_STREAM, all completed; post-reset request on the same connection OK |
+| h2 | Mojo | cancel | not run | see note below |
 | h2 | Go | loss | skip | pf/dummynet needs root; no-loss reference 49,882 req/s |
 | h2 | Mojo | loss | skip | pf/dummynet needs root; no-loss reference 35,860 req/s |
 | h3 | aioquic | slow | pass | held 262,144 B, response unfinished when the 8/8 siblings completed |
@@ -386,6 +395,16 @@ All runs: 0 failed, rc=0.
 | h3 | Mojo | cancel | pass | reset target in-flight; 8/8 siblings outstanding across the reset and completed |
 | h3 | aioquic | loss | pass | 5% client datagram drop, req/s 5,460, 0 failed |
 | h3 | Mojo | loss | pass | 5% client datagram drop, req/s 6,134, 0 failed |
+
+The two `h2 | Mojo` special rows are recorded as *not run* rather than
+carried over: the previous `pass` entries came from the `curl` + `h2load`
+version, which cannot exercise these properties, and the Mojo HTTPS+H2
+server could not be rebuilt on this host to re-measure them (the Mojo build
+in the `tls-http2` environment fails to parse
+`net/http/_encoder.mojo` on `InlineArray`, which is unrelated to this
+harness and reproduces on an unmodified checkout). Re-run
+`bash benchmarks/http/run_multiplex_matrix.sh` once that build works to fill
+both rows in.
 
 ### Target check
 
@@ -417,15 +436,18 @@ not a feature cut. HTTP/3 exceeds the Python baseline in every cell, with
 lower median latency everywhere and lower p99 in every cell except
 1 conn × 10 streams (2,023 µs vs 1,961 µs, still within 1.2x). Slow-stream
 and cancellation scenarios pass on both stacks:
-the server keeps serving siblings while a large stream is held (H3) or a
-throttled upload is in flight (H2). The H3 slow pass is recorded at the
-transport level, not just at the application: bytes of the 256 KiB echo
-response were staged while consumption was withheld, and the response still
-had no `stream_ended` event when the siblings finished. Because the held
-stream's future is deliberately never resolved, that second condition is
-what distinguishes a multiplexed server from one that serializes the whole
-echo ahead of the siblings — a server that serves the echo first and the
-siblings afterwards now reports `verdict=fail` with
+the server keeps serving siblings while another stream on the *same*
+connection is still open (H2: an incomplete 1 MiB POST /echo upload; H3: a
+held 256 KiB echo response). The H2 driver holds the request side open
+deterministically and also withholds the target's receive credit, so it does
+not depend on a rate limit or on wall-clock timing. The H3 slow pass is
+recorded at the transport level, not just at the application: bytes of the
+256 KiB echo response were staged while consumption was withheld, and the
+response still had no `stream_ended` event when the siblings finished.
+Because the held stream's future is deliberately never resolved, that second
+condition is what distinguishes a multiplexed server from one that serializes
+the whole echo ahead of the siblings — a server that serves the echo first
+and the siblings afterwards now reports `verdict=fail` with
 `slow_ended_during_siblings=1`. Loss via pf/dummynet is skipped on this
 host (no passwordless sudo); the measurable 5% client-side datagram drop
 runs pass on both H3 servers with 0 failed requests. When dummynet is

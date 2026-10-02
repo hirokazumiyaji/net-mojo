@@ -35,8 +35,9 @@ MOJO_H2_BIN="${MOJO_H2_BIN:-$OUT_DIR/http2_tls_server}"
 MOJO_H3_BIN="${MOJO_H3_BIN:-$OUT_DIR/http3_server}"
 PIXI_ENV_H2="${PIXI_ENV_H2:-tls-http2}"
 PIXI_ENV_H3="${PIXI_ENV_H3:-tls-http3}"
-# Resolved lazily inside the H3 branch so H2-only/Go-only runs
-# (SKIP_H3=1) never require pixi or the tls-http3 env at startup.
+# Resolved lazily inside each protocol branch so an H2-only or H3-only run
+# (SKIP_H2=1 / SKIP_H3=1) never requires the other pixi env at startup.
+PIXI_PYTHON_H2="${PIXI_PYTHON_H2:-}"
 PIXI_PYTHON_H3="${PIXI_PYTHON_H3:-}"
 MATRIX_FAILURES=0
 
@@ -47,6 +48,17 @@ h3_python() {
     fi
     PIXI_PYTHON_H3="$(cd "$ROOT" && pixi run -e "$PIXI_ENV_H3" python -c 'import sys; print(sys.executable)')"
     printf '%s' "$PIXI_PYTHON_H3"
+}
+
+# Same lazy resolution for the H2 side: the H3-only path (SKIP_H2=1) must
+# never need the tls-http2 environment at startup.
+h2_python() {
+    if [ -n "${PIXI_PYTHON_H2:-}" ]; then
+        printf '%s' "$PIXI_PYTHON_H2"
+        return 0
+    fi
+    PIXI_PYTHON_H2="$(cd "$ROOT" && pixi run -e "$PIXI_ENV_H2" python -c 'import sys; print(sys.executable)')"
+    printf '%s' "$PIXI_PYTHON_H2"
 }
 
 mkdir -p "$OUT_DIR" "$OUT_DIR/h2" "$OUT_DIR/h3" "$OUT_DIR/special"
@@ -363,7 +375,14 @@ run_h3_cell() {
     fi
 }
 
-# --- H2 special scenarios (qualitative + limited timing) ---
+# --- H2 special scenarios (single connection) ---
+# The slow and cancel cases must put the target stream and its siblings on
+# one HTTP/2 connection: a server with per-connection head-of-line blocking
+# or with broken RST_STREAM handling passes if the streams are split across
+# connections. curl and h2load are separate processes and always use
+# separate connections, so these two scenarios run through
+# benchmarks/http/http2_scenarios.py (single connection, hyper-h2) instead.
+# h2load still drives the throughput matrix above.
 run_h2_special() {
     local label="$1"   # go|mojo
     local addr="$2"
@@ -374,101 +393,35 @@ run_h2_special() {
 
     echo "== H2 special scenarios ($label @ $addr) ==" | tee -a "$special_log"
 
-    # 1 MiB body reused by the slow-upload and cancel scenarios.
-    local body_file="$OUT_DIR/special/upload_body_1m.bin"
-    dd if=/dev/zero of="$body_file" bs=1024 count=1024 status=none 2>/dev/null
-
-    # Slow-client tolerance (server-wide health, not same-connection HoL):
-    # curl --limit-rate runs in its own H2 connection while sibling GETs via
-    # h2load use separate connections. This proves the server stays healthy
-    # under a slow client; it cannot detect connection-level head-of-line
-    # blocking, which requires all streams multiplexed on one measured
-    # connection (future single-client work).
-    local slow_out="$OUT_DIR/special/h2_${label}_slow.out"
-    local slow_t0
-    slow_t0="$(python3 -c 'import time; print(time.time())')"
-    set +e
-    # /json is 1 KiB, so a 2 KiB/s cap finishes in well under a second.
-    # POST /echo instead: rate-limiting the request body keeps the stream
-    # open for the whole concurrent-load window, so the slow client is
-    # genuinely active while siblings run.
-    curl -k --http2 --limit-rate 8k --max-time 30 \
-        -X POST --data-binary @"$body_file" \
-        -o /dev/null -s -w 'slow_http_code=%{http_code} slow_time=%{time_total}\n' \
-        "${url}/echo" >"$OUT_DIR/special/h2_${label}_slow_curl.txt" 2>&1 &
-    local slow_pid=$!
-    # Brief concurrent load (no warmup; short measure)
-    h2load --alpn-list=h2 -c 4 -m 4 -t 1 -D 3s "${url}/fixed" \
-        >"$slow_out" 2>&1
-    local h2load_rc=$?
-    wait "$slow_pid" 2>/dev/null
-    local slow_rc=$?
-    set -e
-    local slow_elapsed
-    slow_elapsed="$(python3 -c "import time; print(f'{time.time()-float('$slow_t0'):.3f}')")"
-    local sibling_req
-    sibling_req="$(rg -o 'finished in [^,]+, ([0-9.]+) req/s' -r '$1' "$slow_out" | head -1 || true)"
-    local sibling_fail
-    sibling_fail="$(rg -o 'requests: .* ([0-9]+) failed' -r '$1' "$slow_out" | head -1 || true)"
-    local slow_verdict=fail
-    if [ "${sibling_fail:-1}" = "0" ] && [ -n "$sibling_req" ] && kill -0 "$server_pid" 2>/dev/null; then
-        slow_verdict=pass
-    fi
-    printf 'proto=h2 label=%s scenario=slow verdict=%s sibling_req_s=%s sibling_failed=%s elapsed_s=%s h2load_rc=%s curl_rc=%s\n' \
-        "$label" "$slow_verdict" "${sibling_req:-?}" "${sibling_fail:-?}" \
-        "$slow_elapsed" "$h2load_rc" "$slow_rc" \
-        | tee -a "$OUT_DIR/special/summary.tsv" | tee -a "$special_log"
-    cat "$OUT_DIR/special/h2_${label}_slow_curl.txt" >>"$special_log" || true
-    if [ "$slow_verdict" = "fail" ]; then
-        MATRIX_FAILURES=$((MATRIX_FAILURES + 1))
-        echo "H2 special scenario failed: $label slow" >&2
-    fi
-
-    # Cancel: start a slow large POST, abort the client mid-transfer, then
-    # verify the server process still accepts a new connection. Note: the
-    # sibling uses a fresh TLS/H2 connection (killing curl closes the
-    # original), so this proves process health after abort, not same-
-    # connection sibling-stream survival (which needs one connection with
-    # concurrent streams).
-    set +e
-    curl -k --http2 --limit-rate 8k --max-time 30 \
-        -X POST --data-binary @"$body_file" \
-        -o /dev/null -s -w 'cancel_http_code=%{http_code} cancel_time=%{time_total}\n' \
-        "${url}/echo" >"$OUT_DIR/special/h2_${label}_cancel_curl.txt" 2>&1 &
-    local cancel_pid=$!
-    sleep 0.3
-    # The upload must still be in flight; otherwise no abort was exercised.
-    local cancel_running=false
-    if kill -0 "$cancel_pid" 2>/dev/null; then
-        cancel_running=true
-        kill "$cancel_pid" 2>/dev/null
-    fi
-    wait "$cancel_pid" 2>/dev/null
-    local cancel_curl_rc=$?
-    # Sibling must still work after abort.
-    local cancel_sib
-    cancel_sib="$(curl -k --http2 -s -o /dev/null -w '%{http_code}' --max-time 5 "${url}/fixed")"
-    local cancel_sib_rc=$?
-    set -e
-    local cancel_verdict=fail
-    # Pass only when an in-flight upload was aborted, the sibling got 200,
-    # and the server is still up.
-    if [ "$cancel_running" = "true" ] && [ "$cancel_sib" = "200" ] \
-        && kill -0 "$server_pid" 2>/dev/null; then
-        cancel_verdict=pass
-    fi
-    if [ "$cancel_running" != "true" ]; then
-        cancel_verdict=skip
-    fi
-    printf 'proto=h2 label=%s scenario=cancel verdict=%s target_was_running=%s sibling_http=%s curl_rc=%s sib_rc=%s\n' \
-        "$label" "$cancel_verdict" "$cancel_running" "$cancel_sib" \
-        "$cancel_curl_rc" "$cancel_sib_rc" \
-        | tee -a "$OUT_DIR/special/summary.tsv" | tee -a "$special_log"
-    cat "$OUT_DIR/special/h2_${label}_cancel_curl.txt" >>"$special_log" || true
-    if [ "$cancel_verdict" = "fail" ]; then
-        MATRIX_FAILURES=$((MATRIX_FAILURES + 1))
-        echo "H2 special scenario failed: $label cancel" >&2
-    fi
+    local scenario line
+    for scenario in slow cancel; do
+        set +e
+        line="$($(h2_python) benchmarks/http/http2_scenarios.py \
+            --url "https://${addr}/fixed" --scenario "$scenario" --siblings 8 \
+            2>>"$special_log")"
+        local scenario_rc=$?
+        set -e
+        # A driver failure must not be recorded as a pass, and a missing
+        # result line must not be recorded as a verdict at all.
+        if [ -z "$line" ]; then
+            line="scenario=${scenario} verdict=fail conn=single error=no-result rc=${scenario_rc}"
+        fi
+        echo "$line" | tee -a "$special_log"
+        printf 'proto=h2 label=%s %s rc=%s\n' \
+            "$label" "$line" "$scenario_rc" \
+            | tee -a "$OUT_DIR/special/summary.tsv"
+        case "$line" in
+            *"verdict=pass"*) ;;
+            *)
+                MATRIX_FAILURES=$((MATRIX_FAILURES + 1))
+                echo "H2 special scenario failed: $label $scenario" >&2
+                ;;
+        esac
+        if ! kill -0 "$server_pid" 2>/dev/null; then
+            MATRIX_FAILURES=$((MATRIX_FAILURES + 1))
+            echo "H2 server exited during $label $scenario" >&2
+        fi
+    done
 
     # Loss: attempt pf/dummynet; document if unavailable (no passwordless sudo).
     local loss_note="$OUT_DIR/special/h2_${label}_loss.txt"
