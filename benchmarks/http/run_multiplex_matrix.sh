@@ -81,6 +81,17 @@ sample_server() {
     printf 'cpu_pct=%s rss_kb=%s fd_count=%s\n' "$cpu" "$rss" "$fds" >"$file"
 }
 
+# Mid-run sample point: warmup plus half the measure window. WARMUP_S and
+# MEASURE_S are durations that both clients accept as fractions, and Bash
+# arithmetic expansion is integer-only, so `$((...))` would abort this
+# subshell (leaving a stale .sample file or a post-load fallback sample)
+# for a value like MEASURE_S=0.5. Compute the delay with float arithmetic,
+# as run_http2_bench.sh and run_http3_bench.sh do.
+sampler_delay() {
+    python3 -c 'import sys; print(float(sys.argv[1]) + float(sys.argv[2]) / 2)' \
+        "$WARMUP_S" "$MEASURE_S"
+}
+
 to_us() {
     python3 - "$1" <<'PY'
 import sys
@@ -182,6 +193,46 @@ dnctl_delete_pipe() {
     sudo -n dnctl -q pipe "$pipe_id" delete 2>>"$log" || true
 }
 
+# Print the first dummynet pipe id in [first,last] that is not already
+# configured, and fail when no such id exists or the state is unknown.
+#
+# `dnctl pipe N config` targets an existing pipe rather than allocating a
+# private one, so a fixed id would reconfigure whatever owns that pipe and
+# the matching delete would then remove it. dnctl lists configured pipes as
+# "%05d: <params>" (list_pipes() in sbin/ipfw/dummynet.c), and an empty
+# listing means no pipes exist. dummynet_list() reports no error for a
+# missing pipe, so the listing is the only usable occupancy check; when the
+# output is non-empty but unparseable the caller is told skip rather than
+# left to guess at an id.
+dnctl_free_pipe() {
+    local first="$1"
+    local last="$2"
+    local log="${3:-/dev/null}"
+    local listing used n
+    if ! listing="$(sudo -n dnctl pipe list 2>>"$log")"; then
+        return 1
+    fi
+    used=""
+    if [ -n "$listing" ]; then
+        used="$(printf '%s\n' "$listing" | awk '
+            /^[0-9]+:/ {
+                id = $1
+                sub(/:$/, "", id)
+                if (id != "") printf "%s ", id + 0
+            }
+        ')"
+        [ -n "$used" ] || return 1
+    fi
+    for n in $(seq "$first" "$last"); do
+        case " $used " in
+            *" $n "*) continue ;;
+        esac
+        printf '%s' "$n"
+        return 0
+    done
+    return 1
+}
+
 # --- HTTP/2 matrix cell via h2load ---
 run_h2load_cell() {
     local label="$1"
@@ -193,8 +244,11 @@ run_h2load_cell() {
     local out="$OUT_DIR/h2/${label}_c${clients}_m${streams}_r${run_idx}.out"
     local sample="$OUT_DIR/h2/${label}_c${clients}_m${streams}_r${run_idx}.sample"
 
+    # Drop any sample from an earlier run: if the sampler never fires, the
+    # fallback below would otherwise publish a stale .sample file.
+    rm -f "$sample"
     (
-        sleep $((WARMUP_S + MEASURE_S / 2))
+        sleep "$(sampler_delay)"
         sample_server "$server_pid" "$sample"
     ) &
     local sampler_pid=$!
@@ -259,8 +313,11 @@ run_h3_cell() {
     local sample="$OUT_DIR/h3/${label}_c${clients}_m${streams}_r${run_idx}.sample"
     local err="$OUT_DIR/h3/${label}_c${clients}_m${streams}_r${run_idx}.err"
 
+    # Drop any sample from an earlier run: if the sampler never fires, the
+    # fallback below would otherwise publish a stale .sample file.
+    rm -f "$sample"
     (
-        sleep $((WARMUP_S + MEASURE_S / 2))
+        sleep "$(sampler_delay)"
         sample_server "$server_pid" "$sample"
     ) &
     local sampler_pid=$!
@@ -422,57 +479,66 @@ run_h2_special() {
         # Verify impairment was actually configured; otherwise a clean run
         # must not be reported as an impaired pass.
         local port="${addr##*:}"
-        set +e
-        sudo -n dnctl pipe 42 config plr 0.05 2>"$loss_note"
-        local dnctl_rc=$?
-        echo "dummynet in proto tcp from any to 127.0.0.1 port ${port} pipe 42" \
-            | sudo -n pfctl -a bench_matrix -f - 2>>"$loss_note"
-        local pfctl_rc=$?
-        if [ "$dnctl_rc" -ne 0 ] || [ "$pfctl_rc" -ne 0 ] \
-            || ! command -v dnctl >/dev/null; then
+        # Take an unused pipe id so this run cannot reconfigure or delete a
+        # pipe that already belongs to another workload.
+        local loss_pipe
+        loss_pipe="$(dnctl_free_pipe 42 61 "$loss_note" || true)"
+        if [ -z "$loss_pipe" ]; then
             loss_verdict=skip
-            loss_detail="loss impairment not configured (dnctl_rc=$dnctl_rc pfctl_rc=$pfctl_rc); no impaired run attempted"
-            sudo -n pfctl -a bench_matrix -F all 2>>"$loss_note" || true
-            dnctl_delete_pipe 42 "$loss_note"
-            set -e
+            loss_detail="no free dummynet pipe id in 42-61; no impaired run attempted"
         else
-            h2load --alpn-list=h2 -c 8 -m 4 -t 1 -D 5s "${url}/fixed" \
-                >"$OUT_DIR/special/h2_${label}_loss_h2load.out" 2>&1
-            local loss_rc=$?
-            sudo -n pfctl -a bench_matrix -F all 2>>"$loss_note" || true
-            dnctl_delete_pipe 42 "$loss_note"
-            set -e
-            local loss_req loss_fail
-            loss_req="$(rg -o 'finished in [^,]+, ([0-9.]+) req/s' -r '$1' \
-                "$OUT_DIR/special/h2_${label}_loss_h2load.out" | head -1 || true)"
-            loss_fail="$(rg -o 'requests: .* ([0-9]+) failed' -r '$1' \
-                "$OUT_DIR/special/h2_${label}_loss_h2load.out" | head -1 || true)"
-            local loss_errored loss_timeout
-            loss_errored="$(rg -o 'requests: .* ([0-9]+) errored' -r '$1' \
-                "$OUT_DIR/special/h2_${label}_loss_h2load.out" | head -1 || true)"
-            loss_timeout="$(rg -o 'requests: .* ([0-9]+) timeout' -r '$1' \
-                "$OUT_DIR/special/h2_${label}_loss_h2load.out" | head -1 || true)"
-            # A loss run that lost every request (req_s 0.00), reported
-            # failures, or exited nonzero is not a valid measurement.
-            local loss_ok=true
-            if [ "$loss_rc" -ne 0 ]; then loss_ok=false; fi
-            if [ "${loss_fail:-0}" != "0" ]; then loss_ok=false; fi
-            if [ -n "${loss_errored:-}" ] && [ "$loss_errored" != "0" ]; then
-                loss_ok=false
-            fi
-            if [ -n "${loss_timeout:-}" ] && [ "$loss_timeout" != "0" ]; then
-                loss_ok=false
-            fi
-            if [ -z "$loss_req" ] || [ "${loss_req%%.*}" = "0" ]; then
-                loss_ok=false
-            fi
-            if ! kill -0 "$server_pid" 2>/dev/null; then loss_ok=false; fi
-            if [ "$loss_ok" = "true" ]; then
-                loss_verdict=pass
-                loss_detail="dnctl plr=0.05 req_s=${loss_req} failed=${loss_fail:-?} rc=${loss_rc}"
+            set +e
+            sudo -n dnctl pipe "$loss_pipe" config plr 0.05 2>"$loss_note"
+            local dnctl_rc=$?
+            echo "dummynet in proto tcp from any to 127.0.0.1 port ${port} pipe ${loss_pipe}" \
+                | sudo -n pfctl -a bench_matrix -f - 2>>"$loss_note"
+            local pfctl_rc=$?
+            if [ "$dnctl_rc" -ne 0 ] || [ "$pfctl_rc" -ne 0 ] \
+                || ! command -v dnctl >/dev/null; then
+                loss_verdict=skip
+                loss_detail="loss impairment not configured (dnctl_rc=$dnctl_rc pfctl_rc=$pfctl_rc); no impaired run attempted"
+                sudo -n pfctl -a bench_matrix -F all 2>>"$loss_note" || true
+                dnctl_delete_pipe "$loss_pipe" "$loss_note"
+                set -e
             else
-                loss_verdict=fail
-                loss_detail="dnctl configured but load invalid rc=${loss_rc} req_s=${loss_req:-?} failed=${loss_fail:-?} errored=${loss_errored:-?} timeout=${loss_timeout:-?}"
+                h2load --alpn-list=h2 -c 8 -m 4 -t 1 -D 5s "${url}/fixed" \
+                    >"$OUT_DIR/special/h2_${label}_loss_h2load.out" 2>&1
+                local loss_rc=$?
+                sudo -n pfctl -a bench_matrix -F all 2>>"$loss_note" || true
+                dnctl_delete_pipe "$loss_pipe" "$loss_note"
+                set -e
+                local loss_req loss_fail
+                loss_req="$(rg -o 'finished in [^,]+, ([0-9.]+) req/s' -r '$1' \
+                    "$OUT_DIR/special/h2_${label}_loss_h2load.out" | head -1 || true)"
+                loss_fail="$(rg -o 'requests: .* ([0-9]+) failed' -r '$1' \
+                    "$OUT_DIR/special/h2_${label}_loss_h2load.out" | head -1 || true)"
+                local loss_errored loss_timeout
+                loss_errored="$(rg -o 'requests: .* ([0-9]+) errored' -r '$1' \
+                    "$OUT_DIR/special/h2_${label}_loss_h2load.out" | head -1 || true)"
+                loss_timeout="$(rg -o 'requests: .* ([0-9]+) timeout' -r '$1' \
+                    "$OUT_DIR/special/h2_${label}_loss_h2load.out" | head -1 || true)"
+                # A loss run that lost every request (req_s 0.00), reported
+                # failures, or exited nonzero is not a valid measurement.
+                local loss_ok=true
+                if [ "$loss_rc" -ne 0 ]; then loss_ok=false; fi
+                if [ "${loss_fail:-0}" != "0" ]; then loss_ok=false; fi
+                if [ -n "${loss_errored:-}" ] && [ "$loss_errored" != "0" ]; then
+                    loss_ok=false
+                fi
+                if [ -n "${loss_timeout:-}" ] && [ "$loss_timeout" != "0" ]; then
+                    loss_ok=false
+                fi
+                if [ -z "$loss_req" ] || [ "${loss_req%%.*}" = "0" ]; then
+                    loss_ok=false
+                fi
+                if ! kill -0 "$server_pid" 2>/dev/null; then loss_ok=false; fi
+                if [ "$loss_ok" = "true" ]; then
+                    loss_verdict=pass
+                    loss_detail="dnctl plr=0.05 pipe=${loss_pipe} req_s=${loss_req} failed=${loss_fail:-?} rc=${loss_rc}"
+                else
+                    loss_verdict=fail
+                    loss_detail="dnctl configured but load invalid pipe=${loss_pipe} rc=${loss_rc} req_s=${loss_req:-?} failed=${loss_fail:-?} errored=${loss_errored:-?} timeout=${loss_timeout:-?}"
+                fi
             fi
         fi
     else
@@ -520,19 +586,29 @@ run_h3_special() {
     # Loss: try pf first; always also run client-side drop (measurable without root).
     local loss_pf_verdict=skip
     local loss_pf_detail="sudo -n unavailable"
+    local loss_pipe=""
     if sudo -n true 2>/dev/null; then
         local port="${addr##*:}"
-        set +e
-        sudo -n dnctl pipe 43 config plr 0.05 \
-            >"$OUT_DIR/special/h3_${label}_pf.txt" 2>&1
-        echo "dummynet in proto udp from any to 127.0.0.1 port ${port} pipe 43" \
-            | sudo -n pfctl -a bench_matrix_h3 -f - \
-            >>"$OUT_DIR/special/h3_${label}_pf.txt" 2>&1
-        set -e
-        loss_pf_verdict=configured
-        loss_pf_detail="dnctl udp plr=0.05 on port ${port}"
-        # shellcheck disable=SC2064
-        trap "sudo -n pfctl -a bench_matrix_h3 -F all 2>/dev/null || true; sudo -n dnctl -q pipe 43 delete 2>/dev/null || true" RETURN
+        local pf_note="$OUT_DIR/special/h3_${label}_pf.txt"
+        # Take an unused pipe id so this run cannot reconfigure or delete a
+        # pipe that already belongs to another workload. The H2 range stops
+        # at 61 so a concurrent harness run cannot land on the same id.
+        loss_pipe="$(dnctl_free_pipe 62 81 "$pf_note" || true)"
+        if [ -z "$loss_pipe" ]; then
+            loss_pf_detail="no free dummynet pipe id in 62-81"
+        else
+            set +e
+            sudo -n dnctl pipe "$loss_pipe" config plr 0.05 \
+                >"$pf_note" 2>&1
+            echo "dummynet in proto udp from any to 127.0.0.1 port ${port} pipe ${loss_pipe}" \
+                | sudo -n pfctl -a bench_matrix_h3 -f - \
+                >>"$pf_note" 2>&1
+            set -e
+            loss_pf_verdict=configured
+            loss_pf_detail="dnctl udp plr=0.05 on port ${port} pipe ${loss_pipe}"
+            # shellcheck disable=SC2064
+            trap "sudo -n pfctl -a bench_matrix_h3 -F all 2>/dev/null || true; sudo -n dnctl -q pipe ${loss_pipe} delete 2>/dev/null || true" RETURN
+        fi
     fi
     printf 'proto=h3 label=%s scenario=loss_pf verdict=%s detail=%s\n' \
         "$label" "$loss_pf_verdict" "$loss_pf_detail" \
@@ -543,7 +619,7 @@ run_h3_special() {
     # not combined kernel + client loss.
     if [ "$loss_pf_verdict" = "configured" ]; then
         sudo -n pfctl -a bench_matrix_h3 -F all 2>/dev/null || true
-        dnctl_delete_pipe 43 /dev/null
+        dnctl_delete_pipe "$loss_pipe" /dev/null
         trap - RETURN
         loss_pf_verdict=cleaned
     fi

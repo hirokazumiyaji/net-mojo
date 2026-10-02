@@ -428,4 +428,10 @@ echo ahead of the siblings — a server that serves the echo first and the
 siblings afterwards now reports `verdict=fail` with
 `slow_ended_during_siblings=1`. Loss via pf/dummynet is skipped on this
 host (no passwordless sudo); the measurable 5% client-side datagram drop
-runs pass on both H3 servers with 0 failed requests.
+runs pass on both H3 servers with 0 failed requests. When dummynet is
+available the harness reads `dnctl pipe list` and configures the first
+unused id (H2 42–61, H3 62–81) rather than a fixed one, because
+`dnctl pipe N config` targets an existing pipe instead of allocating a
+private one; the chosen id is recorded in the scenario detail and only that
+pipe is deleted afterwards, so a run never reconfigures or removes shaping
+that already existed on the host.
