@@ -390,21 +390,27 @@ those are separate processes and therefore always separate connections;
 | h2 | Go | loss | skip | pf/dummynet needs root; no-loss reference 49,882 req/s |
 | h2 | Mojo | loss | skip | pf/dummynet needs root; no-loss reference 35,860 req/s |
 | h3 | aioquic | slow | pass | held 262,144 B, response unfinished when the 8/8 siblings completed |
-| h3 | Mojo | slow | pass | held 262,144 B, response unfinished when the 8/8 siblings completed |
+| h3 | Mojo | slow | pass † | held 262,144 B while 8/8 siblings completed |
 | h3 | aioquic | cancel | pass | reset target in-flight; 8/8 siblings outstanding across the reset and completed |
-| h3 | Mojo | cancel | pass | reset target in-flight; 8/8 siblings outstanding across the reset and completed |
+| h3 | Mojo | cancel | pass † | reset target in-flight; 8/8 siblings completed |
 | h3 | aioquic | loss | pass | 5% client datagram drop, req/s 5,460, 0 failed |
-| h3 | Mojo | loss | pass | 5% client datagram drop, req/s 6,134, 0 failed |
+| h3 | Mojo | loss | pass † | 5% client datagram drop, req/s 6,134, 0 failed |
 
-The two `h2 | Mojo` special rows are recorded as *not run* rather than
-carried over: the previous `pass` entries came from the `curl` + `h2load`
-version, which cannot exercise these properties, and the Mojo HTTPS+H2
-server could not be rebuilt on this host to re-measure them (the Mojo build
-in the `tls-http2` environment fails to parse
-`net/http/_encoder.mojo` on `InlineArray`, which is unrelated to this
-harness and reproduces on an unmodified checkout). Re-run
-`bash benchmarks/http/run_multiplex_matrix.sh` once that build works to fill
-both rows in.
+† Recorded by an earlier revision of the scenario drivers, before the
+transport-level completion check, the sibling body validation and the
+partial-run rejection were added, and not re-measured since: the Mojo
+servers cannot be built on this host (the Mojo build in the `tls-http2` and
+`tls-http3` environments fails to parse `net/http/_encoder.mojo` on
+`InlineArray`, which is unrelated to this harness and reproduces on an
+unmodified checkout). These rows therefore show the Mojo servers were not
+broken at that revision; they are not evidence under the current criteria.
+
+The two `h2 | Mojo` rows are *not run* rather than carried over: the previous
+`pass` entries came from the `curl` + `h2load` version, which cannot exercise
+these properties at all, so re-recording them was not possible even before the
+build problem. Re-run `bash benchmarks/http/run_multiplex_matrix.sh` once the
+Mojo build works to fill the `h2 | Mojo` rows and to bring the `h3 | Mojo` rows
+up to the current criteria.
 
 ### Target check
 
@@ -434,26 +440,34 @@ The 16×1 HTTP/2 shortfall (69%) is consistent with the PR 9 single-stream
 result and is carried forward as profiling follow-up (TLS/HPACK path cost),
 not a feature cut. HTTP/3 exceeds the Python baseline in every cell, with
 lower median latency everywhere and lower p99 in every cell except
-1 conn × 10 streams (2,023 µs vs 1,961 µs, still within 1.2x). Slow-stream
-and cancellation scenarios pass on both stacks:
-the server keeps serving siblings while another stream on the *same*
-connection is still open (H2: an incomplete 1 MiB POST /echo upload; H3: a
-held 256 KiB echo response). The H2 driver holds the request side open
-deterministically and also withholds the target's receive credit, so it does
-not depend on a rate limit or on wall-clock timing. The H3 slow pass is
-recorded at the transport level, not just at the application: bytes of the
-256 KiB echo response were staged while consumption was withheld, and the
-response still had no `stream_ended` event when the siblings finished.
+1 conn × 10 streams (2,023 µs vs 1,961 µs, still within 1.2x).
+
+Slow-stream and cancellation pass for every server actually exercised with
+the current harness — HTTPS+H2 against the Go baseline, HTTP/3 against
+aioquic — meaning the server keeps serving siblings while another stream on
+the *same* connection is still open (H2: an incomplete 1 MiB POST /echo
+upload; H3: a held 256 KiB echo response). The H2 driver holds the request
+side open deterministically and also withholds the target's receive credit,
+so it does not depend on a rate limit or on wall-clock timing. The H3 slow
+pass is recorded at the transport level, not just at the application: bytes
+of the 256 KiB echo response were staged while consumption was withheld, and
+the response still had no `stream_ended` event when the siblings finished.
 Because the held stream's future is deliberately never resolved, that second
 condition is what distinguishes a multiplexed server from one that serializes
 the whole echo ahead of the siblings — a server that serves the echo first
 and the siblings afterwards now reports `verdict=fail` with
-`slow_ended_during_siblings=1`. Loss via pf/dummynet is skipped on this
-host (no passwordless sudo); the measurable 5% client-side datagram drop
-runs pass on both H3 servers with 0 failed requests. When dummynet is
-available the harness reads `dnctl pipe list` and configures the first
-unused id (H2 42–61, H3 62–81) rather than a fixed one, because
-`dnctl pipe N config` targets an existing pipe instead of allocating a
-private one; the chosen id is recorded in the scenario detail and only that
-pipe is deleted afterwards, so a run never reconfigures or removes shaping
-that already existed on the host.
+`slow_ended_during_siblings=1`.
+
+That claim is scoped to the runs above. Mojo's HTTP/2 multiplexing behaviour
+is untested here (`h2 | Mojo` not run), and the `h3 | Mojo` rows predate the
+current criteria (†), so neither is offered as evidence that Mojo multiplexes
+correctly; the H2 throughput matrix in the tables above remains the measured
+Mojo result. Loss via pf/dummynet is skipped on this host (no passwordless
+sudo); the measurable 5% client-side datagram drop passes for aioquic with 0
+failed requests under the current harness, and for Mojo at the earlier
+revision (†). When dummynet is available the harness reads `dnctl pipe list`
+and configures the first unused id (H2 42–61, H3 62–81) rather than a fixed
+one, because `dnctl pipe N config` targets an existing pipe instead of
+allocating a private one; the chosen id is recorded in the scenario detail
+and only that pipe is deleted afterwards, so a run never reconfigures or
+removes shaping that already existed on the host.
