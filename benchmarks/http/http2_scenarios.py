@@ -80,6 +80,11 @@ CANCEL_TIMEOUT_S = 300.0
 # capacity-release proof. Go has no such budget; the extra cycles are
 # harmless there and still fail a server that pins cancelled reservations.
 H2_TOTAL_BUFFER_BUDGET = 268435456
+# Stay under http2_max_resets_per_second (100): a correct Mojo server
+# GOAWAYs with ENHANCE_YOUR_CALM above this rate
+# (docs/design/http2-server.md).
+H2_MAX_RESETS_PER_SECOND = 100
+RESET_BUDGET_PER_WINDOW = H2_MAX_RESETS_PER_SECOND - 10
 
 # Default SETTINGS_MAX_FRAME_SIZE. Uploads are split into frames of this
 # size so neither scenario depends on a larger negotiated frame size.
@@ -491,8 +496,12 @@ def run_cancel(url: str, siblings: int) -> dict:
         deadline = time.perf_counter() + CANCEL_TIMEOUT_S
         # Phase 1: burn reserved capacity. A server that pins each cancelled
         # response's buffer reservation will refuse later work once the
-        # configured budget is exceeded.
+        # configured budget is exceeded. Pace RST_STREAM below Mojo's
+        # http2_max_resets_per_second so a correct flood defense does not
+        # GOAWAY the connection before the release assertion runs.
         cycles_done = 0
+        reset_window_start = time.perf_counter()
+        resets_in_window = 0
         for _ in range(reserve_cycles):
             tid = client.post_echo(body, deadline, withhold=True)
             if not client.wait_flow_blocked([tid], deadline):
@@ -500,6 +509,13 @@ def run_cancel(url: str, siblings: int) -> dict:
             client.reset(tid)
             client.abandon(tid)
             cycles_done += 1
+            resets_in_window += 1
+            if resets_in_window >= RESET_BUDGET_PER_WINDOW:
+                remaining = 1.0 - (time.perf_counter() - reset_window_start)
+                if remaining > 0:
+                    time.sleep(remaining)
+                reset_window_start = time.perf_counter()
+                resets_in_window = 0
             if client.terminated is not None:
                 break
 
