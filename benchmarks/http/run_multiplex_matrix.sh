@@ -167,6 +167,21 @@ wait_udp() {
     done
 }
 
+# Remove only the dummynet pipe this harness created.
+# `dnctl flush` is not a scoped operation: `flush` is a global dummynet
+# state reset, and dnctl's own argument parser rejects it (it prints the
+# usage summary and exits 0), so `dnctl -q flush pipe N` would either
+# clear unrelated host shaping rules or silently leave pipe N configured.
+# Numbered removal is `dnctl -q pipe N delete` per dnctl(8).
+# The flowset/queue pair that `config plr` allocates is deliberately left
+# orphaned: with no rule referencing the pipe it is inert, and its ID is
+# not known here, so deleting it could remove another process's shaping.
+dnctl_delete_pipe() {
+    local pipe_id="$1"
+    local log="${2:-/dev/null}"
+    sudo -n dnctl -q pipe "$pipe_id" delete 2>>"$log" || true
+}
+
 # --- HTTP/2 matrix cell via h2load ---
 run_h2load_cell() {
     local label="$1"
@@ -418,14 +433,14 @@ run_h2_special() {
             loss_verdict=skip
             loss_detail="loss impairment not configured (dnctl_rc=$dnctl_rc pfctl_rc=$pfctl_rc); no impaired run attempted"
             sudo -n pfctl -a bench_matrix -F all 2>>"$loss_note" || true
-            sudo -n dnctl -q flush pipe 42 2>>"$loss_note" || true
+            dnctl_delete_pipe 42 "$loss_note"
             set -e
         else
             h2load --alpn-list=h2 -c 8 -m 4 -t 1 -D 5s "${url}/fixed" \
                 >"$OUT_DIR/special/h2_${label}_loss_h2load.out" 2>&1
             local loss_rc=$?
             sudo -n pfctl -a bench_matrix -F all 2>>"$loss_note" || true
-            sudo -n dnctl -q flush pipe 42 2>>"$loss_note" || true
+            dnctl_delete_pipe 42 "$loss_note"
             set -e
             local loss_req loss_fail
             loss_req="$(rg -o 'finished in [^,]+, ([0-9.]+) req/s' -r '$1' \
@@ -517,7 +532,7 @@ run_h3_special() {
         loss_pf_verdict=configured
         loss_pf_detail="dnctl udp plr=0.05 on port ${port}"
         # shellcheck disable=SC2064
-        trap "sudo -n pfctl -a bench_matrix_h3 -F all 2>/dev/null || true; sudo -n dnctl -q flush pipe 43 2>/dev/null || true" RETURN
+        trap "sudo -n pfctl -a bench_matrix_h3 -F all 2>/dev/null || true; sudo -n dnctl -q pipe 43 delete 2>/dev/null || true" RETURN
     fi
     printf 'proto=h3 label=%s scenario=loss_pf verdict=%s detail=%s\n' \
         "$label" "$loss_pf_verdict" "$loss_pf_detail" \
@@ -528,7 +543,7 @@ run_h3_special() {
     # not combined kernel + client loss.
     if [ "$loss_pf_verdict" = "configured" ]; then
         sudo -n pfctl -a bench_matrix_h3 -F all 2>/dev/null || true
-        sudo -n dnctl -q flush pipe 43 2>/dev/null || true
+        dnctl_delete_pipe 43 /dev/null
         trap - RETURN
         loss_pf_verdict=cleaned
     fi

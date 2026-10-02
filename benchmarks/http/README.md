@@ -404,14 +404,19 @@ the aioquic baseline (H3).
 | h3 16 conns × 10 streams | 138.3% | Exceed baseline |
 
 Interpretation: multiplexed HTTP/2 (m=10) reaches or exceeds the Go baseline
-at both connection counts, and latency stays at or below Go except at 16×1
-where Go's single-stream aggregate hides per-request cost. The 16×1 HTTP/2
-shortfall (69%) is consistent with the PR 9 single-stream result and is
-carried forward as profiling follow-up (TLS/HPACK path cost), not a feature
-cut. HTTP/3 exceeds the Python baseline in every cell, with lower median
-latency everywhere and lower p99 in every cell except 1 conn × 10 streams
-(2,023 µs vs 1,961 µs, still within 1.2x). Slow-stream and cancellation
-scenarios pass on both stacks:
+at both connection counts, and in both m=10 cells Mojo's p50, p95, and p99
+are at or below Go's. Latency is only claimed per percentile: the target
+metric p99 is at or below Go in every cell (1×1 85 vs 86 µs, 1×10 276 vs
+418 µs, 16×1 591 vs 822 µs, 16×10 5,280 vs 6,220 µs), while p50/p95 do
+regress in the two single-stream cells (1×1 53/64 vs 46/60 µs; 16×1 482/526
+vs 312/526 µs). Those two cells are also the throughput misses, so the p50/p95
+gap tracks the single-stream shortfall rather than a tail-latency problem.
+The 16×1 HTTP/2 shortfall (69%) is consistent with the PR 9 single-stream
+result and is carried forward as profiling follow-up (TLS/HPACK path cost),
+not a feature cut. HTTP/3 exceeds the Python baseline in every cell, with
+lower median latency everywhere and lower p99 in every cell except
+1 conn × 10 streams (2,023 µs vs 1,961 µs, still within 1.2x). Slow-stream
+and cancellation scenarios pass on both stacks:
 the server keeps serving siblings while a large stream is held (H3) or a
 throttled upload is in flight (H2). Loss via pf/dummynet is skipped on this
 host (no passwordless sudo); the measurable 5% client-side datagram drop
