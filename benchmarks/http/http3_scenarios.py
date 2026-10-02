@@ -126,6 +126,25 @@ class ScenarioProtocol(QuicConnectionProtocol):
                 total += len(ev.data)
         return total
 
+    def held_ended(self, stream_id: int) -> bool:
+        """True when a held stream has already been fully received.
+
+        A held stream's future is deliberately never resolved — the staged
+        events are only replayed by release_stream() — so the future cannot
+        report transport completion and `future.done()` is always False for
+        a held stream. The staged events can: once one of them carries
+        stream_ended, the whole response has already arrived, whatever the
+        application has done with it. Note that aioquic cannot supply real
+        receive-window backpressure here: MAX_STREAM_DATA is extended from
+        the receiver's highest offset (bytes that arrived), not from what
+        the application has consumed, so withholding consumption alone
+        never stalls the sender.
+        """
+        return any(
+            getattr(ev, "stream_ended", False)
+            for ev in self._staged.get(stream_id, [])
+        )
+
     def release_stream(self, stream_id: int) -> None:
         """Replay staged events, completing the stream normally."""
         self._held.discard(stream_id)
@@ -291,9 +310,12 @@ async def run_slow(url: str, slow_s: float, siblings: int) -> dict:
         # behind it. Consumption is withheld at the H3 event layer until
         # siblings complete (see hold_stream): transport still flows, but
         # the application does not observe completion early. Manual
-        # flow-control window backpressure is not exposed by aioquic, so
-        # this exercises application-level multiplexing with a large
-        # response; held_bytes proves bytes arrived while withheld.
+        # flow-control window backpressure is not exposed by aioquic — it
+        # extends MAX_STREAM_DATA from the receiver's highest offset, not
+        # from what this application consumes — so the verdict instead
+        # proves overlap from the transport side: held_bytes > 0 shows
+        # bytes arrived while withheld, and held_ended() shows the response
+        # had not finished when the siblings ran.
         slow_body = b"x" * (256 * 1024)
 
         slow_pending = await client.post_echo(slow_body, authority, hold=True)
@@ -301,7 +323,9 @@ async def run_slow(url: str, slow_s: float, siblings: int) -> dict:
         # Siblings are dispatched immediately, before the held response can
         # complete: any await/sleep here would let the server finish the
         # response first and make the scenario a post-completion sleep.
-        slow_pending_at_sibling_dispatch = not slow_pending["future"].done()
+        # Completion is read from the staged events, not from the held
+        # future, which can never resolve before release_stream().
+        slow_ended_at_dispatch = client.held_ended(slow_id)
         sibling_tasks = [
             asyncio.create_task(client.get(path, authority))
             for _ in range(siblings)
@@ -309,9 +333,12 @@ async def run_slow(url: str, slow_s: float, siblings: int) -> dict:
         sibling_results = await asyncio.gather(
             *sibling_tasks, return_exceptions=True
         )
-        # Siblings must have finished while the slow stream was still
-        # incomplete (its future is resolved only on release).
-        slow_unfinished_during_siblings = not slow_pending["future"].done()
+        # Siblings must have been served while the slow stream was still
+        # unfinished at the transport level: a staged stream_ended would
+        # mean the whole echo response had already been received, i.e. the
+        # server serialized the slow stream ahead of the siblings.
+        slow_ended_during_siblings = client.held_ended(slow_id)
+        slow_unfinished_during_siblings = not slow_ended_during_siblings
         if slow_s > 0:
             await asyncio.sleep(slow_s)
         held = client.held_bytes(slow_id)
@@ -344,16 +371,18 @@ async def run_slow(url: str, slow_s: float, siblings: int) -> dict:
         else False
     )
     elapsed_ms = (time.perf_counter() - t0) * 1000
-    # held > 0 proves response bytes arrived while consumption was
-    # withheld yet siblings still completed: genuine slow-consumer
-    # multiplexing overlap, not a post-completion sleep.
+    # held > 0 proves response bytes arrived while consumption was withheld,
+    # and neither staged stream_ended proves the response had not finished
+    # when the siblings were dispatched or completed: genuine slow-consumer
+    # multiplexing overlap, not a post-completion sleep and not a server
+    # that serialized the whole echo ahead of the siblings.
     verdict = (
         "pass"
         if slow_ok
         and slow_body_ok
         and sibling_ok == siblings
         and held > 0
-        and slow_pending_at_sibling_dispatch
+        and not slow_ended_at_dispatch
         and slow_unfinished_during_siblings
         else "fail"
     )
@@ -366,6 +395,8 @@ async def run_slow(url: str, slow_s: float, siblings: int) -> dict:
         "sibling_body_bad": sibling_body_bad,
         "sibling_fail": sibling_fail,
         "held_bytes": held,
+        "slow_ended_at_dispatch": int(slow_ended_at_dispatch),
+        "slow_ended_during_siblings": int(slow_ended_during_siblings),
         "slow_unfinished_during_siblings": int(slow_unfinished_during_siblings),
         "elapsed_ms": elapsed_ms,
         "slow_s": slow_s,
