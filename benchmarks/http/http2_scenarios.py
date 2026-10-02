@@ -12,9 +12,9 @@ this driver covers the multiplexing cases.
 Scenarios:
   slow   — hold one large POST /echo upload open while N GET /fixed siblings
            run on the same connection, then release it
-  cancel — RST_STREAM a held upload while N large POST /echo siblings are
-           mid-response under withheld stream credit, then verify the same
-           connection still serves
+  cancel — RST_STREAM a target whose large POST /echo response is mid-flight
+           under withheld stream credit (queued response), while siblings
+           complete, then verify the connection still admits a full echo
 
 The slow case is a deterministic version of the earlier `--limit-rate`
 upload: the target stream's request body is deliberately left incomplete, so
@@ -261,6 +261,10 @@ class H2ScenarioClient:
         self.withheld.discard(stream_id)
         self._flush()
 
+    def abandon(self, stream_id: int) -> None:
+        """Drop local interest after RST_STREAM without returning window credit."""
+        self.withheld.discard(stream_id)
+
     def get(self, path: bytes = FIXED_PATH) -> int:
         stream_id = self._conn.get_next_available_stream_id()
         self._conn.send_headers(
@@ -476,35 +480,32 @@ def run_cancel(url: str, siblings: int) -> dict:
     with connect_h2(host, port, REQUEST_TIMEOUT_S) as sock:
         client = H2ScenarioClient(sock, authority)
         deadline = time.perf_counter() + REQUEST_TIMEOUT_S
-        # Target: unfinished upload (server still reading). Siblings: finished
-        # large POST /echo with response credit withheld so each response is
-        # demonstrably incomplete when RST_STREAM is processed. open_streams()
-        # alone is not enough — hyper-h2 can still list a stream as open after
-        # the server has already finished a tiny /fixed into the TLS buffer.
-        target = client.open_upload(
-            ECHO_BODY_LEN, body[:ECHO_PREFIX_LEN], deadline
-        )
-        sib_ids = [
-            client.post_echo(body, deadline, withhold=True)
-            for _ in range(siblings)
-        ]
-        blocked = client.wait_flow_blocked(sib_ids, deadline)
-        target_inflight = not client.ended(target)
-        outstanding = sum(
-            1 for sid in sib_ids if client.response_blocked(sid)
-        )
+        # Target must have a queued mid-response when RST_STREAM fires.
+        # An incomplete upload never reaches the response scheduler, so it
+        # cannot exercise "RST_STREAM cancels the corresponding queued
+        # response and releases its buffer reservation"
+        # (docs/design/http2-server.md). Finish the request, withhold stream
+        # credit until some DATA arrives, then reset that stalled response.
+        target = client.post_echo(body, deadline, withhold=True)
+        target_blocked = client.wait_flow_blocked([target], deadline)
+        target_bytes_at_reset = len(client.body(target))
+        # Siblings share the connection while the target response is stalled.
+        sib_ids = [client.get() for _ in range(siblings)]
         reset_sent = False
-        if target_inflight and blocked and outstanding == siblings:
+        if target_blocked and client.response_blocked(target):
             client.reset(target)
+            client.abandon(target)
             reset_sent = True
-        # Hand credit back so sibling echoes can finish after the reset.
-        for sid in sib_ids:
-            client.release(sid)
         siblings_done = client.wait_siblings(sib_ids, deadline)
         # RFC 7540 5.1: the receiver of RST_STREAM may answer with its own
         # RST_STREAM but need not, so this is recorded, not required.
         peer_reset = client.resets.get(target)
-        # Prove the same connection is still usable after the reset.
+        # Prove admission/reservation was released: another full-size echo
+        # must be accepted and completed on the same connection.
+        reuse_id = client.post_echo(body, deadline, withhold=False)
+        reuse_done = client.wait_stream(reuse_id, deadline)
+        reuse_ok = reuse_done and client.echo_ok(reuse_id, body)
+        # And a small GET still works afterwards.
         after_id = client.get()
         after_ok = client.wait_stream(after_id, deadline) and client.fixed_ok(
             after_id
@@ -512,15 +513,15 @@ def run_cancel(url: str, siblings: int) -> dict:
         terminated = client.terminated
     elapsed_ms = (time.perf_counter() - t0) * 1000
 
-    sibling_ok = sum(1 for sid in sib_ids if client.echo_ok(sid, body))
+    sibling_ok = sum(1 for sid in sib_ids if client.fixed_ok(sid))
     verdict = (
         "pass"
-        if target_inflight
-        and blocked
-        and outstanding == siblings
+        if target_blocked
+        and target_bytes_at_reset > 0
         and reset_sent
         and siblings_done
         and sibling_ok == siblings
+        and reuse_ok
         and after_ok
         and terminated is None
         else "fail"
@@ -529,13 +530,13 @@ def run_cancel(url: str, siblings: int) -> dict:
         "scenario": "cancel",
         "verdict": verdict,
         "conn": "single",
-        "target_inflight": int(target_inflight),
-        "siblings_blocked_at_reset": outstanding,
-        "siblings_outstanding_at_reset": outstanding,
+        "target_response_blocked": int(target_blocked),
+        "target_bytes_at_reset": target_bytes_at_reset,
         "reset_sent": int(reset_sent),
         "peer_reset_code": peer_reset,
         "sibling_ok": sibling_ok,
         "sibling_fail": siblings - sibling_ok,
+        "reuse_echo_ok": int(reuse_ok),
         "post_reset_ok": int(after_ok),
         "elapsed_ms": elapsed_ms,
         "siblings": siblings,

@@ -385,7 +385,7 @@ those are separate processes and therefore always separate connections;
 | --- | --- | --- | --- | --- |
 | h2 | Go | slow | pass | 1 conn: 8/8 siblings exact 64 B while the upload stream was still open; echo completed after release |
 | h2 | Mojo | slow | not run | see note below |
-| h2 | Go | cancel | pass | 1 conn: 8/8 siblings outstanding at RST_STREAM, all completed; post-reset request on the same connection OK |
+| h2 | Go | cancel | pass | 1 conn: target echo response stalled at 65535 B when RST_STREAM sent; 8/8 siblings completed; post-reset full echo + GET /fixed OK |
 | h2 | Mojo | cancel | not run | see note below |
 | h2 | Go | loss | skip | pf/dummynet needs root; no-loss reference 49,882 req/s |
 | h2 | Mojo | loss | skip | pf/dummynet needs root; no-loss reference 35,860 req/s |
