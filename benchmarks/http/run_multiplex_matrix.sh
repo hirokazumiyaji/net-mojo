@@ -308,9 +308,14 @@ run_h2load_cell() {
     if [ -n "${failed:-}" ] && [ "${failed}" != "0" ]; then cell_failed=1; fi
     if [ -n "${errored:-}" ] && [ "${errored}" != "0" ]; then cell_failed=1; fi
     if [ -n "${timedout:-}" ] && [ "${timedout}" != "0" ]; then cell_failed=1; fi
+    # h2load can exit 0 with an unusable summary (unsupported format or
+    # zero-work duration). Require a parsed positive throughput and success
+    # count before accepting the cell, matching the H3 req_s gate.
+    if [ -z "${req_s:-}" ] || [ "${req_s%%.*}" = "0" ]; then cell_failed=1; fi
+    if [ -z "${success:-}" ] || [ "${success}" = "0" ]; then cell_failed=1; fi
     if [ "$cell_failed" -ne 0 ]; then
         MATRIX_FAILURES=$((MATRIX_FAILURES + 1))
-        echo "matrix cell failed: h2 $label c=$clients m=$streams run=$run_idx rc=$rc failed=${failed:-?} errored=${errored:-?} timeout=${timedout:-?}" >&2
+        echo "matrix cell failed: h2 $label c=$clients m=$streams run=$run_idx rc=$rc req_s=${req_s:-?} succeeded=${success:-?} failed=${failed:-?} errored=${errored:-?} timeout=${timedout:-?}" >&2
     fi
 }
 
@@ -454,11 +459,16 @@ run_h2_special() {
                 dnctl_delete_pipe "$loss_pipe" "$loss_note"
                 set -e
             else
+                # Install cleanup as soon as impairment is live so an
+                # interrupt or early return cannot leave PF/dummynet active.
+                # shellcheck disable=SC2064
+                trap "sudo -n pfctl -a bench_matrix -F all 2>/dev/null || true; sudo -n dnctl -q pipe ${loss_pipe} delete 2>/dev/null || true" RETURN
                 h2load --alpn-list=h2 -c 8 -m 4 -t 1 -D 5s "${url}/fixed" \
                     >"$OUT_DIR/special/h2_${label}_loss_h2load.out" 2>&1
                 local loss_rc=$?
                 sudo -n pfctl -a bench_matrix -F all 2>>"$loss_note" || true
                 dnctl_delete_pipe "$loss_pipe" "$loss_note"
+                trap - RETURN
                 set -e
                 local loss_req loss_fail
                 loss_req="$(rg -o 'finished in [^,]+, ([0-9.]+) req/s' -r '$1' \
@@ -521,20 +531,41 @@ run_h3_special() {
     : >"$special_log"
     echo "== H3 special scenarios ($label @ $addr) ==" | tee -a "$special_log"
 
-    local line
-    line="$($(h3_python) benchmarks/http/http3_scenarios.py \
-        --url "$url" --scenario slow --slow-s 0.25 --siblings 8 \
-        2>>"$special_log")"
-    echo "$line" | tee -a "$special_log"
-    printf 'proto=h3 label=%s %s\n' "$label" "$line" \
-        | tee -a "$OUT_DIR/special/summary.tsv"
-
-    line="$($(h3_python) benchmarks/http/http3_scenarios.py \
-        --url "$url" --scenario cancel --siblings 8 \
-        2>>"$special_log")"
-    echo "$line" | tee -a "$special_log"
-    printf 'proto=h3 label=%s %s\n' "$label" "$line" \
-        | tee -a "$OUT_DIR/special/summary.tsv"
+    # Capture status under set +e so a legitimate scenario failure records
+    # and continues into cancel/loss and the remaining server matrix,
+    # matching the H2 special-scenario handling.
+    local scenario line scenario_rc
+    for scenario in slow cancel; do
+        set +e
+        case "$scenario" in
+            slow)
+                line="$($(h3_python) benchmarks/http/http3_scenarios.py \
+                    --url "$url" --scenario slow --slow-s 0.25 --siblings 8 \
+                    2>>"$special_log")"
+                ;;
+            cancel)
+                line="$($(h3_python) benchmarks/http/http3_scenarios.py \
+                    --url "$url" --scenario cancel --siblings 8 \
+                    2>>"$special_log")"
+                ;;
+        esac
+        scenario_rc=$?
+        set -e
+        if [ -z "$line" ]; then
+            line="scenario=${scenario} verdict=fail error=no-result rc=${scenario_rc}"
+        fi
+        echo "$line" | tee -a "$special_log"
+        printf 'proto=h3 label=%s %s rc=%s\n' \
+            "$label" "$line" "$scenario_rc" \
+            | tee -a "$OUT_DIR/special/summary.tsv"
+        case "$line" in
+            *"verdict=pass"*) ;;
+            *)
+                MATRIX_FAILURES=$((MATRIX_FAILURES + 1))
+                echo "H3 special scenario failed: $label $scenario" >&2
+                ;;
+        esac
+    done
 
     # Loss: try pf first; always also run client-side drop (measurable without root).
     local loss_pf_verdict=skip
@@ -577,13 +608,27 @@ run_h3_special() {
         loss_pf_verdict=cleaned
     fi
 
+    set +e
     line="$($(h3_python) benchmarks/http/http3_scenarios.py \
         --url "$url" --scenario loss --drop-rate 0.05 \
         --clients 4 --streams 4 --duration 5 \
         2>>"$special_log")"
+    scenario_rc=$?
+    set -e
+    if [ -z "$line" ]; then
+        line="scenario=loss verdict=fail error=no-result rc=${scenario_rc}"
+    fi
     echo "$line" | tee -a "$special_log"
-    printf 'proto=h3 label=%s %s method=client_datagram_drop\n' "$label" "$line" \
+    printf 'proto=h3 label=%s %s method=client_datagram_drop rc=%s\n' \
+        "$label" "$line" "$scenario_rc" \
         | tee -a "$OUT_DIR/special/summary.tsv"
+    case "$line" in
+        *"verdict=pass"*) ;;
+        *)
+            MATRIX_FAILURES=$((MATRIX_FAILURES + 1))
+            echo "H3 special scenario failed: $label loss" >&2
+            ;;
+    esac
 }
 
 # ========== HTTP/2 matrix ==========
