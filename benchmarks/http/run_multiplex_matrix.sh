@@ -205,6 +205,69 @@ dnctl_delete_pipe() {
     sudo -n dnctl -q pipe "$pipe_id" delete 2>>"$log" || true
 }
 
+# Resolve a dummynet anchor the loaded main ruleset will actually evaluate.
+# `pfctl -a NAME -f -` alone only fills a named ruleset; those rules run only
+# when a parent `dummynet-anchor` directive reaches them (pf.conf(5)). On
+# macOS the default /etc/pf.conf has `dummynet-anchor "com.apple/*"`, so a
+# nested `com.apple/<leaf>` is live. A top-level `bench_matrix` is not.
+# Prints the anchor path on success; returns 1 when no active parent exists.
+pf_active_dummynet_anchor() {
+    local leaf="$1"
+    local log="${2:-/dev/null}"
+    local rules
+    if ! rules="$(sudo -n pfctl -sr 2>>"$log")"; then
+        return 1
+    fi
+    if printf '%s\n' "$rules" | grep -qE 'dummynet-anchor[[:space:]]+"com\.apple/\*"'; then
+        printf 'com.apple/%s' "$leaf"
+        return 0
+    fi
+    if printf '%s\n' "$rules" | grep -qE "dummynet-anchor[[:space:]]+\"${leaf}\""; then
+        printf '%s' "$leaf"
+        return 0
+    fi
+    return 1
+}
+
+# True when the named anchor currently holds at least one dummynet rule.
+pf_anchor_has_dummynet() {
+    local anchor="$1"
+    local log="${2:-/dev/null}"
+    local rules
+    if ! rules="$(sudo -n pfctl -a "$anchor" -s rules 2>>"$log")"; then
+        return 1
+    fi
+    printf '%s\n' "$rules" | grep -q dummynet
+}
+
+# Sum packets observed on a dummynet pipe (Tot_pkt and drops). Zero means
+# the classifier never steered traffic into the pipe — impairment was inert.
+dnctl_pipe_packet_count() {
+    local pipe_id="$1"
+    local log="${2:-/dev/null}"
+    local out
+    if ! out="$(sudo -n dnctl pipe show "$pipe_id" 2>>"$log")"; then
+        printf '0'
+        return 1
+    fi
+    printf '%s\n' "$out" | awk '
+        BEGIN { n = 0 }
+        {
+            for (i = 1; i <= NF; i++) {
+                if ($i ~ /^[0-9]+\/[0-9]+$/) {
+                    split($i, a, "/")
+                    n += a[1] + 0
+                } else if ($(i + 1) == "drops" && $i ~ /^[0-9]+$/) {
+                    n += $i + 0
+                } else if ($(i + 1) == "packets" && $i ~ /^[0-9]+$/) {
+                    n += $i + 0
+                }
+            }
+        }
+        END { print n + 0 }
+    '
+}
+
 # Print the first dummynet pipe id in [first,last] that is not already
 # configured, and fail when no such id exists or the state is unknown.
 #
@@ -445,17 +508,32 @@ run_h2_special() {
             loss_verdict=skip
             loss_detail="no free dummynet pipe id in 42-61; no impaired run attempted"
         else
+            # Load into an anchor the main ruleset evaluates. A bare
+            # top-level name (e.g. bench_matrix) can return 0 from pfctl
+            # while never seeing packets.
+            local loss_anchor
+            loss_anchor="$(pf_active_dummynet_anchor net_mojo_bench_h2 "$loss_note" || true)"
+            if [ -z "$loss_anchor" ]; then
+                loss_verdict=skip
+                loss_detail="no active dummynet-anchor parent (need com.apple/* or explicit leaf); no impaired run attempted"
+                dnctl_delete_pipe "$loss_pipe" "$loss_note"
+            else
             set +e
             sudo -n dnctl pipe "$loss_pipe" config plr 0.05 2>"$loss_note"
             local dnctl_rc=$?
             echo "dummynet in proto tcp from any to 127.0.0.1 port ${port} pipe ${loss_pipe}" \
-                | sudo -n pfctl -a bench_matrix -f - 2>>"$loss_note"
+                | sudo -n pfctl -a "$loss_anchor" -f - 2>>"$loss_note"
             local pfctl_rc=$?
+            local anchor_live=0
+            if pf_anchor_has_dummynet "$loss_anchor" "$loss_note"; then
+                anchor_live=1
+            fi
             if [ "$dnctl_rc" -ne 0 ] || [ "$pfctl_rc" -ne 0 ] \
+                || [ "$anchor_live" -ne 1 ] \
                 || ! command -v dnctl >/dev/null; then
                 loss_verdict=skip
-                loss_detail="loss impairment not configured (dnctl_rc=$dnctl_rc pfctl_rc=$pfctl_rc); no impaired run attempted"
-                sudo -n pfctl -a bench_matrix -F all 2>>"$loss_note" || true
+                loss_detail="loss impairment not configured (dnctl_rc=$dnctl_rc pfctl_rc=$pfctl_rc anchor=${loss_anchor} live=${anchor_live}); no impaired run attempted"
+                sudo -n pfctl -a "$loss_anchor" -F all 2>>"$loss_note" || true
                 dnctl_delete_pipe "$loss_pipe" "$loss_note"
                 set -e
             else
@@ -465,15 +543,17 @@ run_h2_special() {
                 # EXIT runs — RETURN alone does not fire on SIGTERM).
                 # Preserve the top-level server kill_pid EXIT handler.
                 # shellcheck disable=SC2064
-                trap "sudo -n pfctl -a bench_matrix -F all 2>/dev/null || true; sudo -n dnctl -q pipe ${loss_pipe} delete 2>/dev/null || true; kill_pid \"\${GO_PID:-}\"; kill_pid \"\${MOJO_H2_PID:-}\"; kill_pid \"\${BASE_PID:-}\"; kill_pid \"\${MOJO_H3_PID:-}\"" EXIT
+                trap "sudo -n pfctl -a ${loss_anchor} -F all 2>/dev/null || true; sudo -n dnctl -q pipe ${loss_pipe} delete 2>/dev/null || true; kill_pid \"\${GO_PID:-}\"; kill_pid \"\${MOJO_H2_PID:-}\"; kill_pid \"\${BASE_PID:-}\"; kill_pid \"\${MOJO_H3_PID:-}\"" EXIT
                 # shellcheck disable=SC2064
-                trap "sudo -n pfctl -a bench_matrix -F all 2>/dev/null || true; sudo -n dnctl -q pipe ${loss_pipe} delete 2>/dev/null || true" RETURN
+                trap "sudo -n pfctl -a ${loss_anchor} -F all 2>/dev/null || true; sudo -n dnctl -q pipe ${loss_pipe} delete 2>/dev/null || true" RETURN
                 trap 'exit 130' INT
                 trap 'exit 143' TERM
                 h2load --alpn-list=h2 -c 8 -m 4 -t 1 -D 5s "${url}/fixed" \
                     >"$OUT_DIR/special/h2_${label}_loss_h2load.out" 2>&1
                 local loss_rc=$?
-                sudo -n pfctl -a bench_matrix -F all 2>>"$loss_note" || true
+                local pipe_pkts
+                pipe_pkts="$(dnctl_pipe_packet_count "$loss_pipe" "$loss_note" || true)"
+                sudo -n pfctl -a "$loss_anchor" -F all 2>>"$loss_note" || true
                 dnctl_delete_pipe "$loss_pipe" "$loss_note"
                 trap 'kill_pid "${GO_PID:-}"; kill_pid "${MOJO_H2_PID:-}"; kill_pid "${BASE_PID:-}"; kill_pid "${MOJO_H3_PID:-}"' EXIT
                 trap - RETURN INT TERM
@@ -490,6 +570,8 @@ run_h2_special() {
                     "$OUT_DIR/special/h2_${label}_loss_h2load.out" | head -1 || true)"
                 # A loss run that lost every request (req_s 0.00), reported
                 # failures, or exited nonzero is not a valid measurement.
+                # Also reject runs where the pipe saw no packets: that means
+                # the PF anchor never classified traffic despite setup rc=0.
                 local loss_ok=true
                 if [ "$loss_rc" -ne 0 ]; then loss_ok=false; fi
                 if [ "${loss_fail:-0}" != "0" ]; then loss_ok=false; fi
@@ -502,14 +584,16 @@ run_h2_special() {
                 if [ -z "$loss_req" ] || [ "${loss_req%%.*}" = "0" ]; then
                     loss_ok=false
                 fi
+                if [ "${pipe_pkts:-0}" = "0" ]; then loss_ok=false; fi
                 if ! kill -0 "$server_pid" 2>/dev/null; then loss_ok=false; fi
                 if [ "$loss_ok" = "true" ]; then
                     loss_verdict=pass
-                    loss_detail="dnctl plr=0.05 pipe=${loss_pipe} req_s=${loss_req} failed=${loss_fail:-?} rc=${loss_rc}"
+                    loss_detail="dnctl plr=0.05 anchor=${loss_anchor} pipe=${loss_pipe} pipe_pkts=${pipe_pkts} req_s=${loss_req} failed=${loss_fail:-?} rc=${loss_rc}"
                 else
                     loss_verdict=fail
-                    loss_detail="dnctl configured but load invalid pipe=${loss_pipe} rc=${loss_rc} req_s=${loss_req:-?} failed=${loss_fail:-?} errored=${loss_errored:-?} timeout=${loss_timeout:-?}"
+                    loss_detail="dnctl configured but load invalid anchor=${loss_anchor} pipe=${loss_pipe} pipe_pkts=${pipe_pkts:-?} rc=${loss_rc} req_s=${loss_req:-?} failed=${loss_fail:-?} errored=${loss_errored:-?} timeout=${loss_timeout:-?}"
                 fi
+            fi
             fi
         fi
     else
@@ -589,33 +673,46 @@ run_h3_special() {
         if [ -z "$loss_pipe" ]; then
             loss_pf_detail="no free dummynet pipe id in 62-81"
         else
+            local loss_anchor
+            loss_anchor="$(pf_active_dummynet_anchor net_mojo_bench_h3 "$pf_note" || true)"
+            if [ -z "$loss_anchor" ]; then
+                loss_pf_detail="no active dummynet-anchor parent (need com.apple/* or explicit leaf)"
+                dnctl_delete_pipe "$loss_pipe" "$pf_note"
+                loss_pipe=""
+            else
             set +e
             sudo -n dnctl pipe "$loss_pipe" config plr 0.05 \
                 >"$pf_note" 2>&1
             local dnctl_rc=$?
             echo "dummynet in proto udp from any to 127.0.0.1 port ${port} pipe ${loss_pipe}" \
-                | sudo -n pfctl -a bench_matrix_h3 -f - \
+                | sudo -n pfctl -a "$loss_anchor" -f - \
                 >>"$pf_note" 2>&1
             local pfctl_rc=$?
+            local anchor_live=0
+            if pf_anchor_has_dummynet "$loss_anchor" "$pf_note"; then
+                anchor_live=1
+            fi
             set -e
             # Do not claim configured when either step failed (e.g. PF
-            # disabled); match the H2 loss path's status checks.
-            if [ "$dnctl_rc" -ne 0 ] || [ "$pfctl_rc" -ne 0 ]; then
+            # disabled) or the parent anchor is inert; match H2 checks.
+            if [ "$dnctl_rc" -ne 0 ] || [ "$pfctl_rc" -ne 0 ] \
+                || [ "$anchor_live" -ne 1 ]; then
                 loss_pf_verdict=skip
-                loss_pf_detail="loss impairment not configured (dnctl_rc=$dnctl_rc pfctl_rc=$pfctl_rc)"
-                sudo -n pfctl -a bench_matrix_h3 -F all 2>>"$pf_note" || true
+                loss_pf_detail="loss impairment not configured (dnctl_rc=$dnctl_rc pfctl_rc=$pfctl_rc anchor=${loss_anchor} live=${anchor_live})"
+                sudo -n pfctl -a "$loss_anchor" -F all 2>>"$pf_note" || true
                 dnctl_delete_pipe "$loss_pipe" "$pf_note"
                 loss_pipe=""
             else
                 loss_pf_verdict=configured
-                loss_pf_detail="dnctl udp plr=0.05 on port ${port} pipe ${loss_pipe}"
+                loss_pf_detail="dnctl udp plr=0.05 on port ${port} pipe ${loss_pipe} anchor=${loss_anchor}"
                 # RETURN for early return; EXIT+INT/TERM for signal kill.
                 # shellcheck disable=SC2064
-                trap "sudo -n pfctl -a bench_matrix_h3 -F all 2>/dev/null || true; sudo -n dnctl -q pipe ${loss_pipe} delete 2>/dev/null || true; kill_pid \"\${GO_PID:-}\"; kill_pid \"\${MOJO_H2_PID:-}\"; kill_pid \"\${BASE_PID:-}\"; kill_pid \"\${MOJO_H3_PID:-}\"" EXIT
+                trap "sudo -n pfctl -a ${loss_anchor} -F all 2>/dev/null || true; sudo -n dnctl -q pipe ${loss_pipe} delete 2>/dev/null || true; kill_pid \"\${GO_PID:-}\"; kill_pid \"\${MOJO_H2_PID:-}\"; kill_pid \"\${BASE_PID:-}\"; kill_pid \"\${MOJO_H3_PID:-}\"" EXIT
                 # shellcheck disable=SC2064
-                trap "sudo -n pfctl -a bench_matrix_h3 -F all 2>/dev/null || true; sudo -n dnctl -q pipe ${loss_pipe} delete 2>/dev/null || true" RETURN
+                trap "sudo -n pfctl -a ${loss_anchor} -F all 2>/dev/null || true; sudo -n dnctl -q pipe ${loss_pipe} delete 2>/dev/null || true" RETURN
                 trap 'exit 130' INT
                 trap 'exit 143' TERM
+            fi
             fi
         fi
     fi
@@ -627,7 +724,7 @@ run_h3_special() {
     # method=client_datagram_drop measures standalone 5% client loss,
     # not combined kernel + client loss.
     if [ "$loss_pf_verdict" = "configured" ]; then
-        sudo -n pfctl -a bench_matrix_h3 -F all 2>/dev/null || true
+        sudo -n pfctl -a "$loss_anchor" -F all 2>/dev/null || true
         dnctl_delete_pipe "$loss_pipe" /dev/null
         trap 'kill_pid "${GO_PID:-}"; kill_pid "${MOJO_H2_PID:-}"; kill_pid "${BASE_PID:-}"; kill_pid "${MOJO_H3_PID:-}"' EXIT
         trap - RETURN INT TERM
