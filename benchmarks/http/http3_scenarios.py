@@ -475,9 +475,6 @@ async def run_cancel(url: str, siblings: int) -> dict:
     # the peer must keep the incomplete request until RESET_STREAM.
     cancel_declared = CANCEL_PARTIAL * 2
     cancel_body = b"y" * cancel_declared
-    # If each incomplete cancel kept its buffered DATA charged, this many
-    # cycles would exhaust the provider request-body budget.
-    reserve_cycles = (H3_REQUEST_BODY_BUDGET // CANCEL_PARTIAL) + 1
     async with connect(
         host,
         port,
@@ -487,11 +484,37 @@ async def run_cancel(url: str, siblings: int) -> dict:
         assert isinstance(client, ScenarioProtocol)
         await _wait_alpn(client)
 
+        async def _wait_stream_acked(stream_id: int, timeout_s: float) -> bool:
+            """True once every byte written on `stream_id` has been ACKed.
+
+            Delivery ACK is the observable proof the peer received the H3
+            HEADERS+DATA we queued; a fixed sleep cannot establish that.
+            """
+            assert isinstance(client, ScenarioProtocol)
+            deadline = time.perf_counter() + timeout_s
+            while time.perf_counter() < deadline:
+                stream = client._quic._streams.get(stream_id)
+                if stream is not None:
+                    sender = stream.sender
+                    # _buffer_start advances only on contiguous ACK from the
+                    # write origin; equality with _buffer_stop means the
+                    # entire incomplete request frame has been delivered.
+                    if (
+                        sender._buffer_stop > 0
+                        and sender._buffer_start >= sender._buffer_stop
+                    ):
+                        return True
+                client.transmit()
+                await asyncio.sleep(0.001)
+            return False
+
         async def _incomplete_reset() -> int:
             """Send a partial POST /echo and RESET_STREAM it mid-request.
 
-            Returns bytes sent before the reset (the amount a forgetful
-            server would keep charged against the request-body budget).
+            Returns CANCEL_PARTIAL only when those request bytes were ACKed
+            by the peer before the reset — the amount a forgetful server
+            would keep charged against the request-body budget. Unacked
+            bytes are not counted: RESET can discard them in flight.
             """
             assert isinstance(client, ScenarioProtocol)
             stream_id = client._quic.get_next_available_stream_id()
@@ -522,8 +545,7 @@ async def run_cancel(url: str, siblings: int) -> dict:
             )
             client.http.send_data(stream_id, partial, end_stream=False)
             client.transmit()
-            # Let the peer buffer the DATA before we cancel.
-            await asyncio.sleep(0.002)
+            delivered = await _wait_stream_acked(stream_id, timeout_s=2.0)
             was_inflight = not future.done()
             if was_inflight:
                 client._quic.reset_stream(
@@ -533,15 +555,23 @@ async def run_cancel(url: str, siblings: int) -> dict:
             pending["cancelled"] = True
             pending["was_inflight"] = was_inflight
             client._inflight.pop(stream_id, None)
-            return len(partial) if was_inflight else 0
+            return CANCEL_PARTIAL if delivered and was_inflight else 0
 
         # Phase 1: prove the peer processes RESET_STREAM cleanup. A server
         # that ignores cancel and keeps incomplete request bodies charged
         # will refuse later work once the documented budget is exceeded.
+        # Burn until the *delivered* residual would exceed the budget —
+        # only ACKed request bytes are counted toward the leak estimate.
         leaked_estimate = 0
         cycles_done = 0
-        for _ in range(reserve_cycles):
-            leaked_estimate += await _incomplete_reset()
+        burn_deadline = time.perf_counter() + 300.0
+        while leaked_estimate <= H3_REQUEST_BODY_BUDGET:
+            if time.perf_counter() >= burn_deadline:
+                break
+            credited = await _incomplete_reset()
+            if credited == 0:
+                break
+            leaked_estimate += credited
             cycles_done += 1
 
         # Phase 2: concurrent cancel + siblings so reset overlaps sibling
@@ -647,8 +677,7 @@ async def run_cancel(url: str, siblings: int) -> dict:
     # connection succeeds (connection reusable; cancel released capacity).
     verdict = (
         "pass"
-        if cycles_done >= reserve_cycles
-        and leaked_estimate > H3_REQUEST_BODY_BUDGET
+        if leaked_estimate > H3_REQUEST_BODY_BUDGET
         and cancelled.get("cancelled")
         and cancelled.get("was_inflight")
         and siblings_outstanding > 0
