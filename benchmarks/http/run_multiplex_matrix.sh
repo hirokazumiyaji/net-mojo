@@ -364,8 +364,14 @@ pf_anchor_has_dummynet() {
     printf '%s\n' "$rules" | grep -q dummynet
 }
 
-# Sum packets observed on a dummynet pipe (Tot_pkt and drops). Zero means
-# the classifier never steered traffic into the pipe — impairment was inert.
+# Sum packets observed on a dummynet pipe. Zero means the classifier never
+# steered traffic into the pipe — impairment was inert.
+#
+# `dnctl pipe show` prints a flow table whose heading is literally
+# `Tot_pkt/bytes` (and `Pkt/Byte`, `Drp`): those are column titles, not a
+# single `packets/bytes` token. Queue rows then use separate whitespace-
+# delimited integers — Tot_pkt, Tot_bytes, ..., Drp — after the src/dst
+# address fields (see ipfw(8) / dummynet list output).
 dnctl_pipe_packet_count() {
     local pipe_id="$1"
     local log="${2:-/dev/null}"
@@ -375,17 +381,26 @@ dnctl_pipe_packet_count() {
         return 1
     fi
     printf '%s\n' "$out" | awk '
-        BEGIN { n = 0 }
+        BEGIN { n = 0; in_flows = 0 }
+        /Tot_pkt\/bytes/ { in_flows = 1; next }
+        # A new pipe/queue banner ends the previous flow table.
+        /^[0-9]+:/ { in_flows = 0; next }
+        !in_flows { next }
         {
+            # After the last address-like field (contains "/"), the next
+            # integer is Tot_pkt; the final integer is Drp when present.
+            last_addr = 0
             for (i = 1; i <= NF; i++) {
-                if ($i ~ /^[0-9]+\/[0-9]+$/) {
-                    split($i, a, "/")
-                    n += a[1] + 0
-                } else if ($(i + 1) == "drops" && $i ~ /^[0-9]+$/) {
-                    n += $i + 0
-                } else if ($(i + 1) == "packets" && $i ~ /^[0-9]+$/) {
-                    n += $i + 0
-                }
+                if (index($i, "/") > 0) last_addr = i
+            }
+            if (last_addr == 0) next
+            pkts_f = last_addr + 1
+            if (pkts_f <= NF && $(pkts_f) ~ /^[0-9]+$/) {
+                n += $(pkts_f) + 0
+            }
+            # Drp is the last column (BKT ... Tot_pkt Tot_bytes Pkt Byte Drp).
+            if (NF >= pkts_f + 4 && $NF ~ /^[0-9]+$/) {
+                n += $NF + 0
             }
         }
         END { print n + 0 }
