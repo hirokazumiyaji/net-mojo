@@ -205,28 +205,52 @@ dnctl_delete_pipe() {
     sudo -n dnctl -q pipe "$pipe_id" delete 2>>"$log" || true
 }
 
-# Resolve a dummynet anchor the loaded main ruleset will actually evaluate.
+# True when the packet filter is enabled. Loading rules into an anchor can
+# succeed while PF is still Disabled; those rules do not impair traffic
+# until something enables PF (pfctl -e / -E).
+pf_is_enabled() {
+    local log="${1:-/dev/null}"
+    local info
+    if ! info="$(sudo -n pfctl -s info 2>>"$log")"; then
+        return 1
+    fi
+    printf '%s\n' "$info" | grep -qiE 'Status:[[:space:]]*Enabled'
+}
+
+# Allocate a unique, empty dummynet anchor under an evaluated parent.
 # `pfctl -a NAME -f -` alone only fills a named ruleset; those rules run only
 # when a parent `dummynet-anchor` directive reaches them (pf.conf(5)). On
 # macOS the default /etc/pf.conf has `dummynet-anchor "com.apple/*"`, so a
-# nested `com.apple/<leaf>` is live. A top-level `bench_matrix` is not.
-# Prints the anchor path on success; returns 1 when no active parent exists.
-pf_active_dummynet_anchor() {
-    local leaf="$1"
+# nested `com.apple/<unique>` is live. Never reuse a nonempty leaf: `-f`
+# replaces and later `-F all` would destroy host rules in that anchor.
+# Prints the anchor path on success; returns 1 when PF is off, no parent
+# exists, or the chosen path is already occupied.
+pf_alloc_dummynet_anchor() {
+    local leaf_prefix="$1"
     local log="${2:-/dev/null}"
-    local rules
+    local rules unique anchor existing
+    if ! pf_is_enabled "$log"; then
+        return 1
+    fi
     if ! rules="$(sudo -n pfctl -sr 2>>"$log")"; then
         return 1
     fi
+    unique="${leaf_prefix}_$$_${RANDOM}"
     if printf '%s\n' "$rules" | grep -qE 'dummynet-anchor[[:space:]]+"com\.apple/\*"'; then
-        printf 'com.apple/%s' "$leaf"
-        return 0
+        anchor="com.apple/${unique}"
+    elif printf '%s\n' "$rules" | grep -qE "dummynet-anchor[[:space:]]+\"${leaf_prefix}\""; then
+        # Exact leaf only — and only when empty (checked below).
+        anchor="$leaf_prefix"
+    else
+        return 1
     fi
-    if printf '%s\n' "$rules" | grep -qE "dummynet-anchor[[:space:]]+\"${leaf}\""; then
-        printf '%s' "$leaf"
-        return 0
+    existing="$(sudo -n pfctl -a "$anchor" -s rules 2>>"$log" || true)"
+    if [ -n "$(printf '%s' "$existing" | tr -d '[:space:]')" ]; then
+        echo "pf anchor ${anchor} is nonempty; refusing to replace" >>"$log"
+        return 1
     fi
-    return 1
+    printf '%s' "$anchor"
+    return 0
 }
 
 # True when the named anchor currently holds at least one dummynet rule.
@@ -516,14 +540,13 @@ run_h2_special() {
             loss_verdict=skip
             loss_detail="no free dummynet pipe id in 42-61; no impaired run attempted"
         else
-            # Load into an anchor the main ruleset evaluates. A bare
-            # top-level name (e.g. bench_matrix) can return 0 from pfctl
-            # while never seeing packets.
+            # Allocate a unique empty child under an evaluated parent.
+            # Reusing a fixed leaf would let -f/-F destroy host rules there.
             local loss_anchor
-            loss_anchor="$(pf_active_dummynet_anchor net_mojo_bench_h2 "$loss_note" || true)"
+            loss_anchor="$(pf_alloc_dummynet_anchor net_mojo_bench_h2 "$loss_note" || true)"
             if [ -z "$loss_anchor" ]; then
                 loss_verdict=skip
-                loss_detail="no active dummynet-anchor parent (need com.apple/* or explicit leaf); no impaired run attempted"
+                loss_detail="no usable dummynet anchor (PF disabled, no parent, or nonempty leaf); no impaired run attempted"
                 dnctl_delete_pipe "$loss_pipe" "$loss_note"
             else
             set +e
@@ -533,7 +556,8 @@ run_h2_special() {
                 | sudo -n pfctl -a "$loss_anchor" -f - 2>>"$loss_note"
             local pfctl_rc=$?
             local anchor_live=0
-            if pf_anchor_has_dummynet "$loss_anchor" "$loss_note"; then
+            if pf_is_enabled "$loss_note" \
+                && pf_anchor_has_dummynet "$loss_anchor" "$loss_note"; then
                 anchor_live=1
             fi
             if [ "$dnctl_rc" -ne 0 ] || [ "$pfctl_rc" -ne 0 ] \
@@ -550,6 +574,7 @@ run_h2_special() {
                 # signal-driven shell exit (INT/TERM re-enter via exit so
                 # EXIT runs — RETURN alone does not fire on SIGTERM).
                 # Preserve the top-level server kill_pid EXIT handler.
+                # Flush only this unique anchor — never a shared host leaf.
                 # shellcheck disable=SC2064
                 trap "sudo -n pfctl -a ${loss_anchor} -F all 2>/dev/null || true; sudo -n dnctl -q pipe ${loss_pipe} delete 2>/dev/null || true; kill_pid \"\${GO_PID:-}\"; kill_pid \"\${MOJO_H2_PID:-}\"; kill_pid \"\${BASE_PID:-}\"; kill_pid \"\${MOJO_H3_PID:-}\"" EXIT
                 # shellcheck disable=SC2064
@@ -584,6 +609,8 @@ run_h2_special() {
                 # the PF anchor never classified traffic despite setup rc=0.
                 # Match the H2 matrix gate: require a parsed positive success
                 # count so a partial/changed h2load summary cannot pass.
+                # Zero pipe packets after an Enabled PF + live anchor is a
+                # hard fail; PF-disabled hosts are skipped earlier above.
                 local loss_ok=true
                 if [ "$loss_rc" -ne 0 ]; then loss_ok=false; fi
                 if [ "${loss_fail:-0}" != "0" ]; then loss_ok=false; fi
@@ -689,9 +716,9 @@ run_h3_special() {
             loss_pf_detail="no free dummynet pipe id in 62-81"
         else
             local loss_anchor
-            loss_anchor="$(pf_active_dummynet_anchor net_mojo_bench_h3 "$pf_note" || true)"
+            loss_anchor="$(pf_alloc_dummynet_anchor net_mojo_bench_h3 "$pf_note" || true)"
             if [ -z "$loss_anchor" ]; then
-                loss_pf_detail="no active dummynet-anchor parent (need com.apple/* or explicit leaf)"
+                loss_pf_detail="no usable dummynet anchor (PF disabled, no parent, or nonempty leaf)"
                 dnctl_delete_pipe "$loss_pipe" "$pf_note"
                 loss_pipe=""
             else
@@ -704,12 +731,13 @@ run_h3_special() {
                 >>"$pf_note" 2>&1
             local pfctl_rc=$?
             local anchor_live=0
-            if pf_anchor_has_dummynet "$loss_anchor" "$pf_note"; then
+            if pf_is_enabled "$pf_note" \
+                && pf_anchor_has_dummynet "$loss_anchor" "$pf_note"; then
                 anchor_live=1
             fi
             set -e
-            # Do not claim configured when either step failed (e.g. PF
-            # disabled) or the parent anchor is inert; match H2 checks.
+            # Do not claim configured when PF is disabled, either step
+            # failed, or the parent anchor is inert; match H2 checks.
             if [ "$dnctl_rc" -ne 0 ] || [ "$pfctl_rc" -ne 0 ] \
                 || [ "$anchor_live" -ne 1 ]; then
                 loss_pf_verdict=skip
@@ -721,6 +749,7 @@ run_h3_special() {
                 loss_pf_verdict=configured
                 loss_pf_detail="dnctl udp plr=0.05 on port ${port} pipe ${loss_pipe} anchor=${loss_anchor}"
                 # RETURN for early return; EXIT+INT/TERM for signal kill.
+                # Flush only this unique anchor — never a shared host leaf.
                 # shellcheck disable=SC2064
                 trap "sudo -n pfctl -a ${loss_anchor} -F all 2>/dev/null || true; sudo -n dnctl -q pipe ${loss_pipe} delete 2>/dev/null || true; kill_pid \"\${GO_PID:-}\"; kill_pid \"\${MOJO_H2_PID:-}\"; kill_pid \"\${BASE_PID:-}\"; kill_pid \"\${MOJO_H3_PID:-}\"" EXIT
                 # shellcheck disable=SC2064
