@@ -293,8 +293,8 @@ def _resolve_zone(zone: StringSlice) raises NetError -> UInt32:
         return value
 
     var name = String(zone)
-    var c_name = name.as_c_string_slice()
-    var index = external_call["if_nametoindex", c_uint](c_name.unsafe_ptr())
+    var c_name = name.as_c_string_span()
+    var index = external_call["if_nametoindex", c_uint](c_name.ptr())
     if index == 0:
         raise _invalid_zone()
     return UInt32(index)
@@ -396,13 +396,13 @@ def _resolve_parsed(
             raise error^
 
     var service = String(port)
-    var c_host = host.as_c_string_slice()
-    var c_service = service.as_c_string_slice()
+    var c_host = host.as_c_string_span()
+    var c_service = service.as_c_string_span()
     var hints = _ResolverHints(socket_type)
     var result: Optional[Pointer[Byte, MutUntrackedOrigin]] = None
     var status = external_call["getaddrinfo", c_int](
-        c_host.unsafe_ptr(),
-        c_service.unsafe_ptr(),
+        c_host.ptr(),
+        c_service.ptr(),
         hints.unsafe_ptr(),
         Pointer(to=result),
     )

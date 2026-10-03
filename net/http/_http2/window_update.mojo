@@ -39,7 +39,7 @@ def parse_window_update_frame[
         not frame.is_complete()
         or frame.frame_type != Byte(8)
         or frame.payload_length != 4
-        or len(payload) != 4
+        or len(payload) < 4
     ):
         return WindowUpdateFrameResult.error()
 

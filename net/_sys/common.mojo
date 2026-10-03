@@ -353,9 +353,9 @@ def _verify_abi_layouts():
     # numbers, SOCK_*/O_* flags, and sockaddr/addrinfo/msghdr layouts in
     # net/_sys/linux.mojo match on either target (only alpha/mips/sparc
     # style ABIs differ), so any 64-bit Linux target is accepted.
-    comptime assert (
-        _DARWIN and CompilationTarget.is_apple_silicon() and is_64bit()
-    ) or (
+    # Prefer `is_arm()` over `is_apple_silicon()`: the latter also requires
+    # AMX, which GitHub's macOS runners do not always report even on arm64.
+    comptime assert (_DARWIN and CompilationTarget.is_arm() and is_64bit()) or (
         _LINUX and is_64bit()
     ), "net supports only macOS arm64 and 64-bit Linux"
     comptime assert size_of[_PollFD]() == 8, "invalid pollfd ABI"
@@ -1143,11 +1143,11 @@ def _parse_backlog_limit(text: StringSlice) -> Optional[Int]:
 
 def _darwin_backlog_limit() -> Optional[Int]:
     var name = String("kern.ipc.somaxconn")
-    var c_name = name.as_c_string_slice()
+    var c_name = name.as_c_string_span()
     var value: Int32 = 0
     var length = UInt64(size_of[Int32]())
     var result = external_call["sysctlbyname", c_int](
-        c_name.unsafe_ptr(),
+        c_name.ptr(),
         Pointer(to=value),
         Pointer(to=length),
         Optional[Pointer[Byte, MutUntrackedOrigin]](None),

@@ -14,29 +14,6 @@ permissions:
   contents: read
 
 jobs:
-  mojo-1-0-compatibility:
-    name: Mojo 1.0 compatibility (${{ matrix.os }})
-    runs-on: ${{ matrix.os }}
-    timeout-minutes: 30
-    strategy:
-      fail-fast: false
-      matrix:
-        os:
-          - macos-14
-          - ubuntu-24.04
-          - ubuntu-24.04-arm
-    steps:
-      - name: Check out repository
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
-      - name: Install pixi
-        uses: prefix-dev/setup-pixi@f00437f565399d418b0acc85936d12c1fb668347
-        with:
-          frozen: true
-      - name: Test core compatibility
-        run: pixi run -e mojo-1-0 test
-      - name: Test packaged artifact compatibility
-        run: pixi run -e mojo-1-0 test-package
-
   http2:
     name: HTTP/2 (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
@@ -115,10 +92,9 @@ jobs:
         run: git diff --exit-code
       - name: Verify test tasks mirror pixi
         run: |
-          # Bracket classes keep this mirror check from matching its own grep pattern.
           diff -u \
             <(grep -oE '^test-[a-z0-9-]+' pixi.toml | sort -u) \
-            <(grep -oE 'pixi run [t]est-[^ ]+' .github/workflows/ci.yml | awk '{print $3}' | sort -u)
+            <(awk '$1 == "run:" && $2 == "pixi" && $3 == "run" && $4 ~ /^test-/ {print $4}' .github/workflows/ci.yml | sort -u)
           for t in $(grep -oE '^test-[a-z0-9-]+' pixi.toml | sort -u); do
             [ "$t" = "test-package" ] && continue
             grep -q "\"$t\"," pixi.toml || { echo "$t missing from 'test' aggregate"; exit 1; }
@@ -150,6 +126,8 @@ jobs:
         run: pixi run test-http-response
       - name: Test HTTP server
         run: pixi run test-http-server
+      - name: Build HPACK shim for HTTP/2 session tests
+        run: pixi run -e http2 hpack-test
       - name: Test HTTP/2 frame parser
         run: pixi run test-http2
       - name: Test TLS and HTTPS
@@ -183,10 +161,9 @@ jobs:
           frozen: true
       - name: Verify sanitize tasks mirror pixi
         run: |
-          # Bracket classes keep this mirror check from matching its own grep pattern.
           diff -u \
             <(grep -oE '^sanitize-[a-z0-9-]+' pixi.toml | sort -u) \
-            <(grep -oE 'pixi run [s]anitize-[^ ]+' .github/workflows/ci.yml | awk '{print $3}' | sort -u)
+            <(awk '$1 == "run:" && $2 == "pixi" && $3 == "run" && $4 ~ /^sanitize-/ {print $4}' .github/workflows/ci.yml | sort -u)
           for t in $(grep -oE '^sanitize-[a-z0-9-]+' pixi.toml | sort -u); do
             grep -q "\"$t\"," pixi.toml || { echo "$t missing from 'sanitize' aggregate"; exit 1; }
           done

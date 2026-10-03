@@ -7,14 +7,20 @@ import sys
 def read_h2_frame(client):
     header = bytearray()
     while len(header) < 9:
-        chunk = client.recv(9 - len(header))
+        try:
+            chunk = client.recv(9 - len(header))
+        except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError) as exc:
+            raise RuntimeError("connection closed before HTTP/2 response") from exc
         if not chunk:
             raise RuntimeError("connection closed before HTTP/2 response")
         header.extend(chunk)
     length = int.from_bytes(header[:3], "big")
     payload = bytearray()
     while len(payload) < length:
-        chunk = client.recv(length - len(payload))
+        try:
+            chunk = client.recv(length - len(payload))
+        except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError) as exc:
+            raise RuntimeError("incomplete HTTP/2 response frame") from exc
         if not chunk:
             raise RuntimeError("incomplete HTTP/2 response frame")
         payload.extend(chunk)
@@ -300,12 +306,19 @@ def test_http2_reset_flood_isolates_connections():
             if error_code != 11:
                 raise RuntimeError(f"expected ENHANCE_YOUR_CALM, got {error_code}")
 
+            # Check the sibling before provoking a TLS error on A: CPython can
+            # leave OpenSSL thread-local errors that poison reads on B.
+            client_b.sendall(_h2_headers_frame(1, flags=0x05))
+            body_b = _read_response_body(client_b, 1)
+            if body_b != b"flood-ok":
+                raise RuntimeError(f"unexpected B body after A flood: {body_b!r}")
+
             # No further request completes on the flooded connection, and the
             # server must close it after flushing GOAWAY (not leave it idle
             # until timeout). A timeout here means the leak is present.
-            client_a.sendall(_h2_headers_frame(5, flags=0x05))
             closed = False
             try:
+                client_a.sendall(_h2_headers_frame(5, flags=0x05))
                 for _ in range(16):
                     frame_type, flags, stream_id, payload = read_h2_frame(
                         client_a
@@ -351,12 +364,6 @@ def test_http2_reset_flood_isolates_connections():
                     "flooded connection stayed open after GOAWAY "
                     "(expected EOF/reset)"
                 )
-
-            # Connection B remains healthy.
-            client_b.sendall(_h2_headers_frame(1, flags=0x05))
-            body_b = _read_response_body(client_b, 1)
-            if body_b != b"flood-ok":
-                raise RuntimeError(f"unexpected B body after A flood: {body_b!r}")
         finally:
             try:
                 client_a.close()

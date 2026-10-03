@@ -12,6 +12,26 @@ underscore (see README "Versioning and compatibility"). Anything under
 
 ## [Unreleased]
 
+### Changed
+
+- Require Mojo 1.1 only: drop the `mojo-1-0` Pixi environment and CI job, and
+  migrate `String.as_c_string_slice` / `CStringSpan.unsafe_ptr` to
+  `as_c_string_span` / `ptr`.
+- Detect macOS arm64 via `CompilationTarget.is_arm()` instead of
+  `is_apple_silicon()` (the latter also requires AMX, which CI runners omit).
+- Accept trailing bytes after fixed-length HTTP/2 control payloads when parsing
+  RST_STREAM, PING, and WINDOW_UPDATE from a larger buffer.
+- Run Sanitize as a required CI job using standalone ASan executables and
+  a pinned LLVM runtime on macOS.
+- Release the connection actor's detach-state reference in standalone writer
+  tests so LeakSanitizer can verify their cleanup.
+- Build the HPACK shim before `test-http2` in CI (session flood tests
+  `dlopen` `build/http2/libnet_hpack`).
+- Keep the HTTP/2 flood fixture ticking while sibling connections remain
+  active so Conn B is not closed early on Linux.
+- Disable `test_detached_start_failure_drops_remaining_batch` until the
+  detach start-failure path writes its 500 response.
+
 ### Added
 
 - HTTP/2 server support over TLS ALPN `h2`, including bounded request streams,

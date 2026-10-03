@@ -18,14 +18,14 @@ def _socket_path() raises -> String:
 
 def _unlink(path: StringSlice):
     var owned_path = String(path)
-    var c_path = owned_path.as_c_string_slice()
-    _ = external_call["unlink", c_int](c_path.unsafe_ptr())
+    var c_path = owned_path.as_c_string_span()
+    _ = external_call["unlink", c_int](c_path.ptr())
 
 
 def _unlink_checked(path: StringSlice) raises:
     var owned_path = String(path)
-    var c_path = owned_path.as_c_string_slice()
-    if external_call["unlink", c_int](c_path.unsafe_ptr()) != 0:
+    var c_path = owned_path.as_c_string_span()
+    if external_call["unlink", c_int](c_path.ptr()) != 0:
         var error_number = get_errno().value
         raise Error(
             String(t"failed to remove Unix socket path (errno {error_number})")

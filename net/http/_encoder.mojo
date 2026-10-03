@@ -383,19 +383,20 @@ def _append_hex(mut out: List[Byte], val: Int):
     if val <= 0:
         out.append(Byte(ord("0")))
         return
-    var buf = InlineArray[Byte, 16](fill=0)
-    var count = 0
-    var v = val
-    while v > 0:
-        var rem = v & 0xF
+    # Emitted most-significant nibble first so no scratch buffer is needed.
+    # (`InlineArray` was removed after Mojo 1.0.)
+    var digits = 0
+    var probe = val
+    while probe > 0:
+        digits += 1
+        probe = probe >> 4
+    for i in range(digits):
+        var shift = (digits - 1 - i) * 4
+        var rem = (val >> shift) & 0xF
         if rem < 10:
-            buf[count] = Byte(ord("0") + rem)
+            out.append(Byte(ord("0") + rem))
         else:
-            buf[count] = Byte(ord("a") + rem - 10)
-        v = v >> 4
-        count += 1
-    for i in range(count - 1, -1, -1):
-        out.append(buf[i])
+            out.append(Byte(ord("a") + rem - 10))
 
 
 def encode_chunked_start(
