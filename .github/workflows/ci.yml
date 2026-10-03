@@ -144,10 +144,6 @@ jobs:
   sanitize:
     name: Sanitize (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
-    # Mojo's JIT currently fails to resolve __asan_* runtime symbols on both
-    # macOS and Linux runners (same as local `pixi run sanitize-*`). Keep the
-    # job for signal, but do not block merges on the broken toolchain link.
-    continue-on-error: true
     timeout-minutes: 30
     strategy:
       fail-fast: false

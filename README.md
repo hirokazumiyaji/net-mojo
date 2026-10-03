@@ -253,7 +253,8 @@ HTTP examples: `pixi run example-http-hello`, `pixi run example-http-json`, and 
 Format source with `pixi run format`.
 CI runs the complete warning-clean suite on all supported runners and keeps separate AddressSanitizer steps defined in `pixi.toml`.
 Mojo marks foundational standard APIs unstable, so CI uses `--Werror` without `--warn-on-unstable-apis`.
-The local macOS arm64 toolchain may fail to resolve `___asan_*` runtime symbols before sanitizer tests start.
+Sanitizer tasks build standalone ASan executables in the dedicated `sanitize` environment.
+macOS uses a pinned upstream LLVM runtime; Linux requires a system C compiler, such as GCC.
 
 The package excludes asynchronous I/O, a custom DNS client, raw IP and
 multicast APIs, Linux abstract Unix sockets, Unix datagram sockets, Happy

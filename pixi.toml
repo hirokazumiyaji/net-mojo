@@ -22,22 +22,24 @@ test-http-server = "mojo run --Werror -I . tests/test_http_server.mojo"
 test-http2 = "mojo run --Werror -I . tests/test_http2.mojo"
 test-http-detach = "mojo run --Werror -I . tests/test_http_detach.mojo"
 test-actor = "mojo run --Werror -I . tests/test_actor.mojo"
-sanitize-sys = "mojo run --sanitize address -I . tests/test_sys.mojo"
-sanitize-tcp = "mojo run --sanitize address -I . tests/test_tcp.mojo"
-sanitize-udp = "mojo run --sanitize address -I . tests/test_udp.mojo"
-sanitize-unix = "mojo run --sanitize address -I . tests/test_unix.mojo"
-sanitize-actor = "mojo run --sanitize address -I . tests/test_actor.mojo"
-sanitize-http2 = "mojo run --sanitize address -I . tests/test_http2.mojo"
-sanitize-http-detach = "mojo run --sanitize address -I . tests/test_http_detach.mojo"
+sanitize-sys = { cmd = "bash scripts/run_sanitized.sh tests/test_sys.mojo", default-environment = "sanitize" }
+sanitize-tcp = { cmd = "bash scripts/run_sanitized.sh tests/test_tcp.mojo", default-environment = "sanitize" }
+sanitize-udp = { cmd = "bash scripts/run_sanitized.sh tests/test_udp.mojo", default-environment = "sanitize" }
+sanitize-unix = { cmd = "bash scripts/run_sanitized.sh tests/test_unix.mojo", default-environment = "sanitize" }
+sanitize-actor = { cmd = "bash scripts/run_sanitized.sh tests/test_actor.mojo", default-environment = "sanitize" }
+sanitize-http2 = { cmd = "bash scripts/run_sanitized.sh tests/test_http2.mojo", default-environment = "sanitize", depends-on = [
+  { task = "hpack-test", environment = "http2" },
+] }
+sanitize-http-detach = { cmd = "bash scripts/run_sanitized.sh tests/test_http_detach.mojo", default-environment = "sanitize" }
 # Note: pixi runs depends-on tasks concurrently. To avoid high memory from parallel ASan runs, invoke individual tasks sequentially.
 sanitize = { depends-on = [
-  "sanitize-sys",
-  "sanitize-tcp",
-  "sanitize-udp",
-  "sanitize-unix",
-  "sanitize-actor",
-  "sanitize-http2",
-  "sanitize-http-detach",
+  { task = "sanitize-sys", environment = "sanitize" },
+  { task = "sanitize-tcp", environment = "sanitize" },
+  { task = "sanitize-udp", environment = "sanitize" },
+  { task = "sanitize-unix", environment = "sanitize" },
+  { task = "sanitize-actor", environment = "sanitize" },
+  { task = "sanitize-http2", environment = "sanitize" },
+  { task = "sanitize-http-detach", environment = "sanitize" },
 ] }
 test = { depends-on = [
   "test-core",
@@ -174,8 +176,13 @@ example-https-hello = { cmd = "mojo run --Werror -I . examples/https_hello.mojo"
 [feature.mojo-1-1.dependencies]
 mojo = ">=1.1.0,<1.2"
 
+[feature.sanitize.target.osx-arm64.dependencies]
+# LLVM 23 supplies the upstream ASan ABI and fixes initialization on recent macOS.
+compiler-rt = "==23.1.2"
+
 [environments]
 default = ["mojo-1-1"]
+sanitize = ["sanitize", "mojo-1-1"]
 tls = ["tls", "mojo-1-1"]
 http2 = ["http2", "mojo-1-1"]
 http3 = ["http3", "mojo-1-1"]

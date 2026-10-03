@@ -389,7 +389,7 @@
 - [x] Fix sanitizer task mirror extraction and verify missing tasks are detected.
 - [x] Run affected integration suites, core tests, formatting and package checks.
 - [x] Review final diff and record verification results.
-- [ ] Commit and push the verified fix to existing PR #88, then check GitHub CI.
+- [x] Commit and push the verified fix to existing PR #88, then check GitHub CI.
 
 Plan reviewed: preserve reset-flood isolation assertions; fix the responsible transport or fixture behavior using process-exit evidence. Keep workflow task checks strict.
 
@@ -401,3 +401,23 @@ Plan reviewed: preserve reset-flood isolation assertions; fix the responsible tr
 - Linux: core 384/384; tls and tls-http2 integration suites; package and package smoke; HTTP/2 provider package smoke and example build all passed. Mojo formatting left all 110 files unchanged.
 - macOS: tls-http2 integration suite passed outside the sandbox. Python syntax and git diff --check passed. Independent review found no actionable issues.
 - The existing nonblocking sanitizer runtime issue reproduces independently: Mojo 1.1 cannot resolve ASan runtime symbols. No sanitizer checks were removed or weakened.
+
+- Commit 8020676 was pushed to PR #88. CI run 37028334913 completed successfully: all nine Test/HTTP2/HTTP3 jobs passed across macOS and both Linux architectures. The three existing nonblocking sanitizer jobs failed on Mojo ASan runtime symbols after their corrected mirror checks passed.
+
+## ASan CI runtime repair (2026-10-04)
+
+- [x] Identify a working ASan runtime invocation on macOS and Linux with pinned Mojo 1.1.
+- [x] Confirm actual memory errors are detected, and diagnose any test hangs.
+- [x] Apply the smallest sanitizer environment/task/workflow change and remove nonblocking status when verified.
+- [x] Run all seven sanitizer suites and required regression checks.
+- [ ] Review, push to PR #88 and confirm all sanitizer matrix jobs pass.
+
+Plan reviewed: use compatible upstream ASan runtime explicitly if needed; test with real instrumentation rather than suppressing errors or skips. Keep core-only dependencies unchanged where possible.
+
+### ASan repair review
+
+- Replace Mojo 1.1 JIT sanitizer execution with standalone instrumented executables. Linux uses the system C compiler; macOS uses compiler-rt 23.1.2 for the upstream ABI and current macOS initialization fix.
+- A dedicated sanitizer environment leaves the core environment unchanged. Restore required sanitizer CI jobs without suppressions, skipped checks or disabled detection.
+- Real use-after-free probes are detected on macOS and Linux. LeakSanitizer exposed five standalone writer tests missing the production connection actor's reference cleanup; release those references in the fixtures.
+- All seven sanitizer suites passed on macOS arm64 and Linux aarch64: 223/223 each. Linux core regression passed 384/384. Formatting left 110 files unchanged; shell syntax, workflow task mirrors, lockfile checks and git diff --check passed.
+- Independent review found no actionable issues. Remote matrix verification is pending.

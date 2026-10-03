@@ -21,8 +21,10 @@ underscore (see README "Versioning and compatibility"). Anything under
   `is_apple_silicon()` (the latter also requires AMX, which CI runners omit).
 - Accept trailing bytes after fixed-length HTTP/2 control payloads when parsing
   RST_STREAM, PING, and WINDOW_UPDATE from a larger buffer.
-- Mark the Sanitize CI job `continue-on-error` until Mojo can link `__asan_*`
-  symbols under `mojo run --sanitize address`.
+- Run Sanitize as a required CI job using standalone ASan executables and
+  a pinned LLVM runtime on macOS.
+- Release the connection actor's detach-state reference in standalone writer
+  tests so LeakSanitizer can verify their cleanup.
 - Build the HPACK shim before `test-http2` in CI (session flood tests
   `dlopen` `build/http2/libnet_hpack`).
 - Keep the HTTP/2 flood fixture ticking while sibling connections remain
