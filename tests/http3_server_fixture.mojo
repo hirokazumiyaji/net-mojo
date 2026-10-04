@@ -1,3 +1,5 @@
+from std.testing import assert_true
+
 from net import Timeout
 from net.http import (
     Handler,
@@ -19,17 +21,19 @@ struct _Http3Handler(Handler):
         self.requests = 0
 
     def handle(mut self, req: Request, mut writer: ResponseWriter) raises:
-        assert req.version == HttpVersion.http3()
-        assert req.method == "POST"
-        assert req.path == "/echo"
-        assert req.query == "source=quic"
-        assert req.authority == "localhost"
-        assert req.scheme == "https"
-        assert len(req.body) == 4
+        assert_true(req.version == HttpVersion.http3())
+        assert_true(req.method == "POST")
+        assert_true(req.path == "/echo")
+        assert_true(req.query == "source=quic")
+        assert_true(req.authority == "localhost")
+        assert_true(req.scheme == "https")
+        assert_true(len(req.body) == 4)
         writer.write_string("handled:")
         writer.write(Span(req.body))
         if len(req.trailers) > 0:
-            assert req.trailers.get_first("x-check") == Optional[String]("done")
+            assert_true(
+                req.trailers.get_first("x-check") == Optional[String]("done")
+            )
             writer.write_string(":done")
         self.requests += 1
 
