@@ -87,6 +87,13 @@ receive errors release already closed transports before propagating the error.
 Closing and draining connections remain owned until quiche reports closure;
 their native draining deadline schedules the final check and cleanup.
 
+CID-route teardown removes the accepted Initial destination alias and native
+server source-ID aliases directly. The Initial destination ID is stored per
+connection because it is distinct from the server's native source ID. This
+provider does not allocate additional source IDs, and quiche retains its last
+source ID across retirement errors and closure; no global CID ownership scan
+or additional ownership map is needed.
+
 Each initial shutdown stage broadcasts to live connections once. Subsequent
 GOAWAY driving uses a bounded deduplicated queue of connections with unfinished
 flags, refreshed by receive, native timeout and local cancellation events.
@@ -122,8 +129,8 @@ request receive side has finished; queued provider responses satisfy that
 completed-request condition. Sibling streams and subsequent requests continue.
 
 Initial shutdown broadcasts still visit every live connection, and actual
-connection teardown still scans route/request ownership. The full server loop
-is not yet proportional only to ready or due work.
+connection teardown still scans request-route/completed-request ownership. The
+full server loop is not yet proportional only to ready or due work.
 
 ### Canceled HTTP/3 request state
 
