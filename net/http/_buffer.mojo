@@ -11,8 +11,10 @@ need separate capacity accounting.
 
 The global counter uses a mutex-protected shared capability. Detached message
 arrays charge their retained capacity through drained-batch destruction. HTTP/1
-detached state reserves its requested malloc payload until final free; payload,
-header and detached wire allocations remain separate.
+detached state reserves its requested malloc payload until final free. Detached
+message bodies retain adopted capacity reservations through their destruction;
+send reserves exact chunk capacity before allocation. Header and detached wire
+allocations remain separate.
 """
 
 from std.memory import ArcPointer

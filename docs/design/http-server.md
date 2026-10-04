@@ -133,12 +133,13 @@ poll 実装は比較用 commit または benchmark 専用とし、最終 product
 buffer の初期確保は小さくし、実確保容量と保持中の再利用容量を全体 budget に計上する。
 全体 counter は mutex で保護した Arc の shared handle を使い、コピー後も同じ予約を計上する。同期 HTTP/1 writer は body の保持容量だけを直接予約し、body を破棄してから自身の予約を返す。standalone writer は body 長の上限を維持する。detached sender は同じ shared handle で mailbox の List 配列の保持容量と旧＋新の成長ピークを予約する。drain は配列と予約を batch に丸ごと移し、配列の破棄後に予約を返す。finish／abort は順序付き terminal state とし、追加のメッセージ領域を割り当てない。
 HTTP/1 の detached shared state は最終型の sizeof を malloc 前に予約し、最後の参照が state を破棄して free した後に返す。キャンセルされた sender が接続／server より長く生きても予約を維持する。予約失敗と malloc の NULL は NetError とし、writer の detach flag／address を確定しない。これは requested malloc payload の計上であり、allocator metadata の上限ではない。shared budget を渡さない standalone と、detach 非対応の HTTP/2／HTTP/3 path はこの state 予約の対象外となる。
+detached respond は渡された本文 List の実容量を採用時に予約する。send は span の長さと同じ容量を割り当て前に予約する。本文と予約は message に保持し、batch／state／server の破棄順序にかかわらず本文の破棄後に予約を返す。event loop の local writer に本文を移す間も、借用中の message が予約を維持する。respond 呼び出し前の caller-owned allocation と header／wire はこの本文予約の対象外となる。
 HTTP 読み取りの一時領域は event loop の stack array を使い、受信先へ移すための一時 List は作らない。
 TLS は budget 計上済みの再試行用 buffer を維持し、読み取り完了分を stack array へコピーする。
 100-continue は静的な byte 列を直接送信し、送信待ちになった残りだけを正確な容量で予約してから確保する。
 HTTP/1 encoder は header の raw value を immutable Span で借用し、値を一時 List に複製しない。
 HTTP/1 error 応答の wire 容量も確保前に予約し、予約できなければ対象接続を閉じる。固定の emergency 容量と String の一時領域の計上は別途必要となる。
-parser／header／String の一時領域、他の encoder、detached payload／header／wire、他の固定 metadata と provider 内部の容量計上は別途必要となる。
+parser／header／String の一時領域、他の encoder、detached header／wire、他の固定 metadata と provider 内部の容量計上は別途必要となる。
 ResponseWriter の拡張前には旧容量と新容量が併存するピークを budget から予約する。budget の不足は handler error として処理し、使用していない予約は解放する。これは List／Arc の実 allocation OOM から復帰する保証ではない。
 一接続の上限だけでなく、同時 body 受信と slow reader が全体 budget を超えないよう admission を制限する。
 budget を予約できない request は受信を継続せず、可能なら 503 と close。エラー応答用に小さい固定容量を確保する。

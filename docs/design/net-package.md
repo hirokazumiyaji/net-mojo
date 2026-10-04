@@ -259,8 +259,11 @@ section records only the package-level boundaries.
   measured and reserved while its writer body remains charged, then
   transferred to the pending queue. HTTP/1 detached state reserves its
   requested malloc bytes through final free, and mailbox arrays retain their
-  capacity reservations through drained-batch destruction. Detached payload,
-  headers and wire remain separate accounting gaps.
+  capacity reservations through drained-batch destruction. Detached `respond`
+  adopts actual body capacity and `send` reserves exact chunk capacity before
+  allocation. Each message keeps its body reservation through queue/batch and
+  borrowed consumer ownership, releasing it after body destruction. Caller-owned
+  allocations before adoption, detached headers and wire remain accounting gaps.
   Raw read scratch uses fixed stack arrays; TLS retains a charged retry buffer.
   Pending 100-continue bytes and HTTP/1 error wire reserve capacity before
   allocation. Header/String/parser scratch, other encoders, native provider
