@@ -58,6 +58,7 @@ struct HttpConnection(Movable):
     var bytes_this_tick: Int
     var requests_this_tick: Int
     var reserved: Int
+    var http1_body_reserved: Int
     var scanned_len: Int
     var more_work: Bool
     var active: Bool
@@ -116,6 +117,7 @@ struct HttpConnection(Movable):
         self.bytes_this_tick = 0
         self.requests_this_tick = 0
         self.reserved = 0
+        self.http1_body_reserved = 0
         self.scanned_len = 0
         self.more_work = False
         self.active = True

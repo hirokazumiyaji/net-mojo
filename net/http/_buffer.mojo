@@ -3,7 +3,9 @@
 Receive and adopted pending buffers charge retained capacity and growth
 peaks. Pending growth also charges its incoming wire allocation. Synchronous
 HTTP/1 buffered response wire is reserved before allocation. Other encoding,
-parser and provider allocations remain separate. Synchronous
+chunked parser and provider allocations remain separate. Content-Length
+HTTP/1 body copies reserve their exact capacity before parsing and remain
+charged through the handler call. Synchronous
 HTTP/1 writer bodies use a reserved workspace; other writer paths and other
 reservations still need separate capacity accounting.
 """

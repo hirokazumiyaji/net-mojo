@@ -12,6 +12,8 @@ Ownership and resources:
   internal table; only raw fd numbers are ever handed to the reactor.
 - One global `BufferBudget` charges receive and adopted pending capacity,
   including growth peaks, and lends synchronous HTTP/1 writer workspace.
+  Content-Length HTTP/1 body copies reserve capacity before parsing and hold
+  that reservation until the borrowed request is dropped after its handler.
   Buffered HTTP/1 wire is reserved before encoding; other encoding remains
   separate.
   Request admission and the `ResponseWriter` cap derive from the remaining
@@ -1048,6 +1050,7 @@ struct Server(Movable):
         )
         self._budget.release(self._conns[idx].reserved)
         self._conns[idx].reserved = 0
+        self._release_http1_body(idx)
         self._budget.release(self._conns[idx].http2_body_reserved)
         self._conns[idx].http2_body_reserved = 0
         self._budget.release(self._conns[idx].http2_response_bytes_reserved)
@@ -1073,6 +1076,7 @@ struct Server(Movable):
     def _send_error(
         mut self, idx: Int, status: Int, is_head: Bool = False
     ) raises NetError:
+        self._release_http1_body(idx)
         if self._conns[idx].detach_state_addr != 0:
             self._mark_detached_cancelled(idx)
             self._cleanup_detached_state(idx)
@@ -1761,6 +1765,11 @@ struct Server(Movable):
                 self._send_error(idx, head_status)
                 return
             var content_length = head.head.content_length
+            if content_length > 0 and self._conns[idx].http1_body_reserved == 0:
+                if not self._budget.try_reserve(content_length):
+                    self._send_error(idx, 503)
+                    return
+                self._conns[idx].http1_body_reserved = content_length
             var outstanding = max(
                 0,
                 head.head.header_end
@@ -1864,6 +1873,10 @@ struct Server(Movable):
         writer._drop_body()
         self._budget.release(charge)
 
+    def _release_http1_body(mut self, idx: Int):
+        self._budget.release(self._conns[idx].http1_body_reserved)
+        self._conns[idx].http1_body_reserved = 0
+
     def _respond[
         H: Handler
     ](
@@ -1898,9 +1911,11 @@ struct Server(Movable):
         if req_close or self._shutdown_at != NO_DEADLINE:
             writer.set_should_close(True)
         try:
-            handler.handle(req^, writer)
+            handler.handle(req, writer)
         except e:
             _ = e
+            _ = req^
+            self._release_http1_body(idx)
             if writer.is_detached():
                 var addr = writer._detach_state_addr
                 if addr != 0:
@@ -1917,6 +1932,8 @@ struct Server(Movable):
             self._send_error(idx, 500)
             return
 
+        _ = req^
+        self._release_http1_body(idx)
         if writer.is_detached():
             self._drop_writer_body(writer, workspace)
             var addr = writer._detach_state_addr

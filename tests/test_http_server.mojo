@@ -194,7 +194,7 @@ def test_pending_capacity_released_on_full_send_error_close_and_reuse() raises:
 
 def test_receive_compaction_consumption_close_and_slot_reuse() raises:
     var config = ServerConfig.default()
-    config.total_buffer_budget = 128
+    config.total_buffer_budget = 256
     var server = Server(config^)
     var listener = listen_tcp("127.0.0.1:0")
     server.add_listener(listener^)
@@ -226,11 +226,13 @@ def test_receive_compaction_consumption_close_and_slot_reuse() raises:
     server._conns[0].append_bytes(head.as_bytes())
     server._pump_parse(0, handler, 0)
     assert_equal(server._conns[0].reserved, 0)
-    assert_equal(server._budget.used, 96)
+    assert_equal(server._conns[0].http1_body_reserved, 40)
+    assert_equal(server._budget.used, 136)
     assert_true(server._budget.try_reserve(7))
     server._conns[0].reserved = 7
     server._close_conn(0)
     assert_equal(server._budget.used, 0)
+    assert_equal(server._conns[0].http1_body_reserved, 0)
     assert_equal(server._conns[0].buf.capacity(), 0)
     client.close()
     var second = dial_tcp(String(address), Timeout.seconds(1))
@@ -287,17 +289,18 @@ struct _BodyCountHandler(Handler):
         writer.write_string(String(len(req.body)))
 
 
-struct _SupportedEchoHandler(Handler):
+struct _BufferedSixKHandler(Handler):
     def __init__(out self):
         pass
 
     def handle(mut self, req: Request, mut writer: ResponseWriter) raises:
-        writer.write(Span(req.body))
+        var body = Array[Byte, 6000](fill=Byte(ord("b")))
+        writer.write(Span(body))
 
 
-def test_echo_admission_needs_combined_body_and_wire_capacity() raises:
+def test_response_needs_combined_body_and_wire_capacity() raises:
     # The body and framed wire must coexist at the 12097-byte boundary.
-    var handler = _SupportedEchoHandler()
+    var handler = _BufferedSixKHandler()
     for limit in [12096, 12097]:
         var config = ServerConfig.default()
         config.total_buffer_budget = limit
@@ -307,12 +310,8 @@ def test_echo_admission_needs_combined_body_and_wire_capacity() raises:
             String("127.0.0.1:") + String(server.local_address().port),
             Timeout.seconds(1),
         )
-        var request = (
-            String(
-                "POST / HTTP/1.1\r\nHost: x\r\nContent-Length:"
-                " 6000\r\nConnection: close\r\n\r\n"
-            )
-            + String("b") * 6000
+        var request = String(
+            "GET / HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n"
         )
         var out = _exchange(server, handler, client, request)
         assert_equal(_status_of(out), 500 if limit == 12096 else 200)
@@ -384,6 +383,77 @@ struct _WorkspaceHandler(Handler):
         if self.action == 3:
             writer.headers.add(String("Content-Length"), String("999"))
         writer.write_string(String("b") * 64)
+
+
+struct _RequestWorkspaceHandler(Handler):
+    var action: Int
+    var workspace: Int
+
+    def __init__(out self):
+        self.action = 0
+        self.workspace = 0
+
+    def handle(mut self, req: Request, mut writer: ResponseWriter) raises:
+        assert_equal(req.body.capacity(), 5)
+        self.workspace = writer._body_budget.value().total
+        writer.write_string("reply")
+        if self.action == 1:
+            raise Error("after borrowed request")
+        if self.action == 2:
+            writer.headers.add(String("Content-Length"), String("999"))
+        if self.action == 3:
+            _ = writer.detach()
+
+
+def test_request_capacity_limits_workspace_and_returns_on_terminal_paths() raises:
+    var config = ServerConfig.default()
+    config.total_buffer_budget = 512
+    var server = Server(config^)
+    server.add_listener(listen_tcp("127.0.0.1:0"))
+    var address = String("127.0.0.1:") + String(server.local_address().port)
+    var handler = _RequestWorkspaceHandler()
+    var waiting = dial_tcp(address, Timeout.seconds(1))
+    waiting.write_all("GET /".as_bytes(), Timeout.seconds(1))
+    _tick_n(server, handler, 2)
+    assert_equal(server._budget.used, 5)
+    for action in range(4):
+        handler.action = action
+        var client = dial_tcp(address, Timeout.seconds(1))
+        var out = _exchange(
+            server,
+            handler,
+            client,
+            (
+                "POST / HTTP/1.1\r\nHost: x\r\nContent-Length: 5\r\nConnection:"
+                " close\r\n\r\nbody!"
+            ),
+        )
+        assert_equal(_status_of(out), 200 if action == 0 else 500)
+        assert_equal(handler.workspace, 502)
+        assert_equal(server._budget.used, 5)
+        client.close()
+    server._close_conn(0)
+    assert_equal(server._budget.used, 0)
+    waiting.close()
+
+
+def test_request_copy_peak_is_rejected_before_receiving_body() raises:
+    var config = ServerConfig.default()
+    config.total_buffer_budget = 8192
+    var server = Server(config^)
+    server.add_listener(listen_tcp("127.0.0.1:0"))
+    var address = String("127.0.0.1:") + String(server.local_address().port)
+    var handler = _BodyCountHandler()
+    var client = dial_tcp(address, Timeout.seconds(1))
+    var out = _exchange(
+        server,
+        handler,
+        client,
+        "POST /echo HTTP/1.1\r\nHost: x\r\nContent-Length: 6000\r\n\r\n",
+    )
+    assert_equal(_status_of(out), 503)
+    assert_equal(server._budget.used, 0)
+    client.close()
 
 
 def test_writer_workspace_returns_on_success_handler_and_encoder_errors() raises:
@@ -1147,7 +1217,7 @@ def test_admitted_body_reservation_blocks_second_client() raises:
     # first body arrives, so completion order cannot free the budget
     # early and flip the outcome.
     var config = ServerConfig.default()
-    config.total_buffer_budget = 8192
+    config.total_buffer_budget = 16384
     var server = Server(config^)
     server.add_listener(listen_tcp("127.0.0.1:0"))
     var port = server.local_address().port
