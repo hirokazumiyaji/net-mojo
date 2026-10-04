@@ -589,10 +589,371 @@ def test_headers_are_case_insensitive_with_duplicates() raises:
     assert_equal(all[1], "charset=x")
 
 
+def _large_capacity_header_name() -> String:
+    var name = String(capacity_bytes=4096)
+    name.resize(7)
+    var bytes = name.unsafe_as_bytes_mut()
+    var token = "X-Probe".as_bytes()
+    for i in range(len(token)):
+        bytes[i] = token[i]
+    return name^
+
+
+def test_writer_header_retains_string_reference_charge_through_move_clear_and_drop() raises:
+    var owner = SharedBufferBudget(16384)
+    var observer = owner.copy()
+    var foreign_admitted = owner.try_reserve(5)
+    var writer = ResponseWriter(1024)
+    writer._set_body_budget(owner.copy())
+    _ = owner^
+    var before = observer.used()
+    var name = _large_capacity_header_name()
+    var original_capacity = name.capacity_bytes()
+    writer.headers.add(name^, String("a"))
+    var retained = observer.used()
+    var known = (
+        writer.headers._names.capacity() * size_of[String]()
+        + writer.headers._lower_names.capacity() * size_of[String]()
+        + writer.headers._values.capacity() * size_of[List[Byte]]()
+        + writer.headers._values[0].capacity()
+    )
+    var stored_capacity = writer.headers._names[0].capacity_bytes()
+    var reference_charge = (
+        stored_capacity
+        + writer.headers._lower_names[0].capacity_bytes()
+        + 2 * String.REF_COUNT_SIZE
+    )
+    var escaped = writer.headers.name_at(0)
+    var moved = writer^
+    var after_move = observer.used()
+    var lowered_matches = moved.headers._lower_names[0] == "x-probe"
+    moved.headers.clear()
+    var after_clear = observer.used()
+    var arrays = (
+        moved.headers._names.capacity() * size_of[String]()
+        + moved.headers._lower_names.capacity() * size_of[String]()
+        + moved.headers._values.capacity() * size_of[List[Byte]]()
+    )
+    _ = moved^
+    var after_drop = observer.used()
+    var escaped_matches = escaped == "X-Probe"
+    var escaped_capacity = escaped.capacity_bytes()
+    _ = escaped^
+    observer.release(5)
+    var after_refund = observer.used()
+
+    assert_true(foreign_admitted)
+    assert_equal(original_capacity, 4096)
+    assert_equal(stored_capacity, original_capacity)
+    assert_true(lowered_matches)
+    assert_equal(retained - before, known + reference_charge)
+    assert_equal(after_move, retained)
+    assert_equal(after_clear, 5 + arrays)
+    assert_equal(after_drop, 5)
+    assert_true(escaped_matches)
+    assert_equal(escaped_capacity, original_capacity)
+    assert_equal(after_refund, 0)
+
+
+def test_preowned_header_adoption_charges_stored_string_references_until_drop() raises:
+    var incoming = _large_capacity_header_name()
+    var caller = incoming.copy()
+    var headers = Headers()
+    headers.add(incoming^, String("a"))
+    var known = (
+        headers._names.capacity() * size_of[String]()
+        + headers._lower_names.capacity() * size_of[String]()
+        + headers._values.capacity() * size_of[List[Byte]]()
+        + headers._values[0].capacity()
+    )
+    var reference_charge = (
+        headers._names[0].capacity_bytes()
+        + headers._lower_names[0].capacity_bytes()
+        + 2 * String.REF_COUNT_SIZE
+    )
+    var owner = SharedBufferBudget(16384)
+    var observer = owner.copy()
+    var foreign_admitted = owner.try_reserve(5)
+    var before = observer.used()
+    var adopted = headers._adopt_capacity_budget(Optional(owner.copy()))
+    var retained = observer.used()
+    var moved = headers^
+    _ = owner^
+    var after_move = observer.used()
+    _ = moved^
+    var after_drop = observer.used()
+    var caller_matches = caller == "X-Probe"
+    var caller_capacity = caller.capacity_bytes()
+    _ = caller^
+    observer.release(5)
+    var after_refund = observer.used()
+
+    assert_true(foreign_admitted)
+    assert_true(adopted)
+    assert_equal(caller_capacity, 4096)
+    assert_equal(retained - before, known + reference_charge)
+    assert_equal(after_move, retained)
+    assert_equal(after_drop, 5)
+    assert_true(caller_matches)
+    assert_equal(after_refund, 0)
+
+
+def test_bound_writer_shared_header_name_keeps_full_reference_charge_until_drop() raises:
+    var owner = SharedBufferBudget(16384)
+    var observer = owner.copy()
+    var foreign_admitted = owner.try_reserve(5)
+    var writer = ResponseWriter(1024)
+    writer._set_body_budget(owner.copy())
+    var incoming = _large_capacity_header_name()
+    var caller = incoming.copy()
+    var before = observer.used()
+    writer.headers.add(incoming^, String("a"))
+    var charged = observer.used() - before
+    var known = (
+        writer.headers._names.capacity() * size_of[String]()
+        + writer.headers._lower_names.capacity() * size_of[String]()
+        + writer.headers._values.capacity() * size_of[List[Byte]]()
+        + writer.headers._values[0].capacity()
+    )
+    var reference_charge = (
+        writer.headers._names[0].capacity_bytes()
+        + writer.headers._lower_names[0].capacity_bytes()
+        + 2 * String.REF_COUNT_SIZE
+    )
+    var moved = writer^
+    _ = owner^
+    var after_move = observer.used()
+    _ = moved^
+    var after_drop = observer.used()
+    var caller_capacity = caller.capacity_bytes()
+    var caller_matches = caller == "X-Probe"
+    _ = caller^
+    observer.release(5)
+    var after_refund = observer.used()
+
+    assert_true(foreign_admitted)
+    assert_equal(charged, known + reference_charge)
+    assert_equal(after_move, 5 + charged)
+    assert_equal(after_drop, 5)
+    assert_equal(caller_capacity, 4096)
+    assert_true(caller_matches)
+    assert_equal(after_refund, 0)
+
+
+def test_bound_writer_shared_name_denial_preserves_old_header_storage() raises:
+    comptime arrays = 2 * size_of[String]() + size_of[List[Byte]]()
+    var first_name = String("X-Keep")
+    var first_references = (
+        first_name.capacity_bytes()
+        + String.INLINE_CAPACITY
+        + 2 * String.REF_COUNT_SIZE
+    )
+    var incoming_references = (
+        4096 + String.INLINE_CAPACITY + 2 * String.REF_COUNT_SIZE
+    )
+    var full_peak = (
+        5 + arrays + 1 + first_references + 2 * arrays + 1 + incoming_references
+    )
+    var owner = SharedBufferBudget(full_peak - 1)
+    var observer = owner.copy()
+    var foreign_admitted = owner.try_reserve(5)
+    var writer = ResponseWriter(1024)
+    writer._set_body_budget(owner.copy())
+    writer.headers.add(first_name^, String("a"))
+    var before = observer.used()
+    var raw_address = Int(writer.headers._values[0].unsafe_ptr())
+    var names_address = Int(writer.headers._names.unsafe_ptr())
+    var incoming = _large_capacity_header_name()
+    var caller = incoming.copy()
+    var denied = False
+    try:
+        writer.headers.add(incoming^, String("b"))
+    except error:
+        denied = error.kind == NetErrorKind.invalid_argument()
+    var after = observer.used()
+    var count = len(writer.headers)
+    var names_capacity = writer.headers._names.capacity()
+    var same_names = Int(writer.headers._names.unsafe_ptr()) == names_address
+    var same_raw = Int(writer.headers._values[0].unsafe_ptr()) == raw_address
+    var old_name_matches = writer.headers._names[0] == "X-Keep"
+    var old_value_matches = writer.headers._values[0][0] == Byte(ord("a"))
+    _ = writer^
+    _ = owner^
+    var after_drop = observer.used()
+    var caller_matches = caller == "X-Probe"
+    _ = caller^
+    observer.release(5)
+    var after_refund = observer.used()
+
+    assert_true(foreign_admitted)
+    assert_true(denied)
+    assert_equal(after, before)
+    assert_equal(count, 1)
+    assert_equal(names_capacity, 1)
+    assert_true(same_names)
+    assert_true(same_raw)
+    assert_true(old_name_matches)
+    assert_true(old_value_matches)
+    assert_equal(after_drop, 5)
+    assert_true(caller_matches)
+    assert_equal(after_refund, 0)
+
+
+def test_header_ascii_lower_capacity_matches_pinned_constructor_boundaries() raises:
+    var lengths = [23, 24, 64, 65]
+    var expected_capacities = [String.INLINE_CAPACITY, 24, 64, 72]
+    for i in range(len(lengths)):
+        var length = lengths[i]
+        var constructor = String(capacity_bytes=length)
+        var constructor_capacity = constructor.capacity_bytes()
+        _ = constructor^
+        var name = String(capacity_bytes=length)
+        name.resize(length, fill_byte=Byte(ord("A")))
+        var original_capacity = name.capacity_bytes()
+        var budget = SharedBufferBudget(4096)
+        var foreign_admitted = budget.try_reserve(5)
+        var headers = Headers()
+        var bound = headers._adopt_capacity_budget(Optional(budget.copy()))
+        headers.add(name^, String("a"))
+        var lowercase_capacity = headers._lower_names[0].capacity_bytes()
+        var lowercase_length = headers._lower_names[0].byte_length()
+        var lowercase_bytes = headers._lower_names[0].as_bytes()
+        var lowercase_matches = True
+        for byte in lowercase_bytes:
+            lowercase_matches = lowercase_matches and byte == Byte(ord("a"))
+        var charged = budget.used()
+        var arrays = (
+            headers._names.capacity() * size_of[String]()
+            + headers._lower_names.capacity() * size_of[String]()
+            + headers._values.capacity() * size_of[List[Byte]]()
+        )
+        var raw_capacity = headers._values[0].capacity()
+        _ = headers^
+        var after_drop = budget.used()
+        budget.release(5)
+        var after_refund = budget.used()
+
+        assert_true(foreign_admitted)
+        assert_true(bound)
+        assert_equal(constructor_capacity, expected_capacities[i])
+        assert_equal(lowercase_capacity, constructor_capacity)
+        assert_equal(lowercase_length, length)
+        assert_true(lowercase_matches)
+        assert_equal(
+            charged,
+            5
+            + arrays
+            + raw_capacity
+            + original_capacity
+            + lowercase_capacity
+            + 2 * String.REF_COUNT_SIZE,
+        )
+        assert_equal(after_drop, 5)
+        assert_equal(after_refund, 0)
+
+
+def test_header_ascii_cache_preserves_every_tchar_and_original_wire_spelling() raises:
+    var original = String(
+        "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789!#$%&'*+-.^_`|~"
+    )
+    var lowercase = String(
+        "abcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwxyz0123456789!#$%&'*+-.^_`|~"
+    )
+    var expected_wire = String("\r\n") + original + String(": a\r\n")
+    var budget = SharedBufferBudget(4096)
+    var foreign_admitted = budget.try_reserve(5)
+    var writer = ResponseWriter(1024)
+    writer._set_body_budget(budget.copy())
+    writer.headers.add(original^, String("a"))
+    var lowered_matches = writer.headers._lower_names[0] == lowercase
+    var lookup = writer.headers.get_first(lowercase)
+    var lookup_matches = Bool(lookup) and lookup.value() == "a"
+    var wire = encode_response(
+        writer, False, "Thu, 01 Jan 1970 00:00:00 GMT", 100, 32768
+    )
+    var text = String(from_utf8_lossy=Span(wire))
+    var wire_matches = text.find(expected_wire) >= 0
+    _ = writer^
+    var after_drop = budget.used()
+    budget.release(5)
+    var after_refund = budget.used()
+
+    assert_true(foreign_admitted)
+    assert_true(lowered_matches)
+    assert_true(lookup_matches)
+    assert_true(wire_matches)
+    assert_equal(after_drop, 5)
+    assert_equal(after_refund, 0)
+
+
+def test_internal_headers_share_name_storage_but_each_retains_full_reference_charge() raises:
+    comptime arrays = 2 * size_of[String]() + size_of[List[Byte]]()
+    comptime retained = arrays + 1 + 4096 + String.INLINE_CAPACITY + 2 * String.REF_COUNT_SIZE
+    for allowance in [5 + 2 * retained, 4 + 2 * retained]:
+        var budget = SharedBufferBudget(allowance)
+        var foreign_admitted = budget.try_reserve(5)
+        var source = Headers()
+        var source_bound = source._adopt_capacity_budget(
+            Optional(budget.copy())
+        )
+        source.add(_large_capacity_header_name(), String("a"))
+        var source_address = Int(source._names[0].unsafe_ptr())
+        var copy = Headers()
+        var copy_bound = copy._adopt_capacity_budget(Optional(budget.copy()))
+        var denied = False
+        try:
+            copy.add_bytes(source.name_at(0), source._value_bytes_span(0))
+        except error:
+            denied = error.kind == NetErrorKind.invalid_argument()
+        var before_drop = budget.used()
+        var same_storage = False
+        var copy_matches = False
+        if not denied:
+            same_storage = Int(copy._names[0].unsafe_ptr()) == source_address
+            copy_matches = copy._names[0] == "X-Probe"
+        var copy_count = len(copy)
+        _ = source^
+        var after_source = budget.used()
+        if not denied:
+            copy_matches = copy_matches and copy._names[0] == "X-Probe"
+        _ = copy^
+        var after_copy = budget.used()
+        budget.release(5)
+        var after_refund = budget.used()
+
+        assert_true(foreign_admitted)
+        assert_true(source_bound)
+        assert_true(copy_bound)
+        assert_equal(denied, allowance != 5 + 2 * retained)
+        assert_equal(after_copy, 5)
+        assert_equal(after_refund, 0)
+        if denied:
+            assert_equal(copy_count, 0)
+            assert_equal(before_drop, 5 + retained)
+            assert_equal(after_source, 5)
+        else:
+            assert_equal(copy_count, 1)
+            assert_true(same_storage)
+            assert_true(copy_matches)
+            assert_equal(before_drop, 5 + 2 * retained)
+            assert_equal(after_source, 5 + retained)
+
+
 def test_header_known_capacity_growth_denial_clear_and_drop() raises:
     comptime arrays = 2 * size_of[String]() + size_of[List[Byte]]()
+    var references = (
+        String("X-One").capacity_bytes()
+        + String.INLINE_CAPACITY
+        + 2 * String.REF_COUNT_SIZE
+    )
+    var next_references = (
+        String("X-Two").capacity_bytes()
+        + String.INLINE_CAPACITY
+        + 2 * String.REF_COUNT_SIZE
+    )
+    var full_peak = 5 + 65 + 3 * arrays + references + next_references
     var raw = Array[Byte, 64](fill=97)
-    for allowance in [5 + 65 + 3 * arrays, 4 + 65 + 3 * arrays]:
+    for allowance in [full_peak, full_peak - 1]:
         var budget = SharedBufferBudget(allowance)
         assert_true(budget.try_reserve(5))
         var headers = Headers()
@@ -606,22 +967,32 @@ def test_header_known_capacity_growth_denial_clear_and_drop() raises:
             assert_equal(error.kind, NetErrorKind.invalid_argument())
             rejected = True
         var retained_arrays = arrays
-        if allowance == 5 + 65 + 3 * arrays:
+        if allowance == full_peak:
             assert_false(rejected)
             assert_equal(len(headers), 2)
-            assert_equal(budget.used(), 5 + 65 + 2 * arrays)
+            assert_equal(
+                budget.used(),
+                5 + 65 + 2 * arrays + references + next_references,
+            )
             assert_equal(headers._names.capacity(), 2)
             retained_arrays = 2 * arrays
         else:
             assert_true(rejected)
             assert_equal(len(headers), 1)
-            assert_equal(budget.used(), 5 + 64 + arrays)
+            assert_equal(budget.used(), 5 + 64 + arrays + references)
             assert_equal(headers._names.capacity(), 1)
         assert_equal(Int(headers._values[0].unsafe_ptr()), original)
         headers.clear()
         assert_equal(budget.used(), 5 + retained_arrays)
         headers.add(String("X-Again"), String("q"))
-        assert_equal(budget.used(), 6 + retained_arrays)
+        assert_equal(
+            budget.used(),
+            6
+            + retained_arrays
+            + String("X-Again").capacity_bytes()
+            + String.INLINE_CAPACITY
+            + 2 * String.REF_COUNT_SIZE,
+        )
         assert_equal(headers._names.capacity(), retained_arrays // arrays)
         _ = headers^
         assert_equal(budget.used(), 5)
@@ -648,7 +1019,14 @@ def test_header_denied_growth_does_not_allocate_arrays_or_raw_value() raises:
 
 
 def test_header_adoption_same_capability_and_cross_budget_failure_preserve_storage() raises:
-    comptime known = 64 + 2 * size_of[String]() + size_of[List[Byte]]()
+    var known = (
+        64
+        + 2 * size_of[String]()
+        + size_of[List[Byte]]()
+        + String("X-One").capacity_bytes()
+        + String.INLINE_CAPACITY
+        + 2 * String.REF_COUNT_SIZE
+    )
     var source = SharedBufferBudget(known + 5)
     assert_true(source.try_reserve(5))
     var target = SharedBufferBudget(known + 5)
@@ -676,7 +1054,14 @@ def test_header_adoption_same_capability_and_cross_budget_failure_preserve_stora
 
 
 def test_reconstructed_headers_hold_independent_known_capacity_and_caller_copy() raises:
-    comptime known = 64 + 2 * size_of[String]() + size_of[List[Byte]]()
+    var known = (
+        64
+        + 2 * size_of[String]()
+        + size_of[List[Byte]]()
+        + String("X-One").capacity_bytes()
+        + String.INLINE_CAPACITY
+        + 2 * String.REF_COUNT_SIZE
+    )
     for allowance in [5 + 2 * known, 4 + 2 * known]:
         var budget = SharedBufferBudget(allowance)
         assert_true(budget.try_reserve(5))

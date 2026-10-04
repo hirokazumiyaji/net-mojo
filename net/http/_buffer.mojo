@@ -19,7 +19,11 @@ exact start/chunk/end capacity before allocation and transfers its charge into
 pending storage, retaining old + incoming + new growth peaks. Response Headers
 charge their three List arrays and raw value capacities through owned tickets;
 grouped growth reserves full new arrays while the old storage stays charged.
-String backing/scratch and request/parser Header admission remain separate.
+Stored name references conservatively charge public String capacity and refcount
+prefix per reference, including inline/static/shared storage. Fresh ASCII lowercase
+names are reserved before construction. Internal references drop before refund;
+escaped caller copies, String scratch and request/parser Header admission remain
+separate.
 """
 
 from std.memory import ArcPointer
