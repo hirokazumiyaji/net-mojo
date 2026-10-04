@@ -3746,6 +3746,53 @@ mod tests {
             assert_eq!(self.server.next_request().unwrap().body, b"complete");
         }
 
+        fn complete_requests(&mut self, cycles: usize) {
+            let mut last_id = 0;
+            for _ in 0..cycles {
+                let id = self
+                    .http3
+                    .send_request(&mut self.client, &Self::headers(&[]), false)
+                    .unwrap();
+                self.http3
+                    .send_body(&mut self.client, id, b"complete", true)
+                    .unwrap();
+                self.pump_until(|server| !server.requests.is_empty());
+                let request = self.server.next_request().unwrap();
+                assert_eq!(request.body, b"complete");
+                assert!(self.server.enqueue_response(
+                    request.id,
+                    200,
+                    Vec::new(),
+                    b"response".to_vec()
+                ));
+                self.pump_until(|server| {
+                    server.connections.values().all(|c| c.responses.is_empty())
+                });
+                let mut body = [0; 8];
+                assert_eq!(self.http3.recv_body(&mut self.client, id, &mut body), Ok(8));
+                assert_eq!(&body, b"response");
+                while self.http3.poll(&mut self.client).is_ok() {}
+                assert_eq!(self.server.buffered_request_bytes, 0);
+                assert_eq!(self.server.buffered_response_bytes, 0);
+                last_id = id;
+            }
+            self.pump_until(|server| {
+                server
+                    .connections
+                    .values()
+                    .all(|c| c.transport.stream_closed(last_id))
+            });
+        }
+
+        fn retained_transport_bytes(&mut self) -> isize {
+            let key = self.server.connections.keys().next().unwrap().clone();
+            let mut connection = self.server.connections.remove(&key).unwrap();
+            drop(connection.http3.take());
+            let before_drop = super::allocation_probe::live();
+            drop(connection.transport);
+            before_drop - super::allocation_probe::live()
+        }
+
         fn retained_engine_bytes(&mut self) -> isize {
             let http3 = self
                 .server
@@ -3760,6 +3807,39 @@ mod tests {
             drop(http3);
             before_drop - super::allocation_probe::live()
         }
+    }
+
+    fn transport_retention_after_churn(cycles: usize, reset: bool) -> isize {
+        let mut fixture = H3ResetFixture::new();
+        if reset {
+            fixture.churn(cycles, 0, Cancellation::PeerReset);
+        } else {
+            fixture.complete_requests(cycles);
+        }
+        fixture.probe();
+        fixture.retained_transport_bytes()
+    }
+
+    fn assert_transport_retention_stable(reset: bool) {
+        let after_10k = transport_retention_after_churn(10_000, reset);
+        let after_50k = transport_retention_after_churn(50_000, reset);
+        eprintln!(
+            "server transport Rust allocations reset={reset}: 10000={after_10k} bytes, 50000={after_50k} bytes"
+        );
+        assert!(
+            after_50k <= after_10k + 64 * 1024,
+            "collected streams retained growing transport allocations: {after_10k} -> {after_50k} bytes"
+        );
+    }
+
+    #[test]
+    fn collected_reset_streams_keep_transport_allocations_stable() {
+        assert_transport_retention_stable(true);
+    }
+
+    #[test]
+    fn collected_completed_streams_keep_transport_allocations_stable() {
+        assert_transport_retention_stable(false);
     }
 
     #[test]

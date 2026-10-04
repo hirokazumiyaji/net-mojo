@@ -20,3 +20,13 @@ NET_HTTP_TEST_KEY="$PWD/build/tls/test-key.pem" \
 cargo test --locked --release \
     --manifest-path "$task_quiche_source/Cargo.toml" \
     --target-dir build/quic/cargo request_cancellation
+
+cargo test --locked --release \
+    --manifest-path "$task_quiche_source/Cargo.toml" \
+    --target-dir build/quic/cargo ranges::tests
+cargo test --locked --release \
+    --manifest-path "$task_quiche_source/Cargo.toml" \
+    --target-dir build/quic/cargo collected_streams
+cargo test --locked --release \
+    --manifest-path "$task_quiche_source/Cargo.toml" \
+    --target-dir build/quic/cargo stream_limit_does_not_collect
