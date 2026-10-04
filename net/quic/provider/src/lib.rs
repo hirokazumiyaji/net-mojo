@@ -818,6 +818,8 @@ pub struct QuicServer {
     goaway_checks: usize,
     #[cfg(test)]
     cid_route_visits: usize,
+    #[cfg(test)]
+    request_route_visits: usize,
     transport_timeouts: BTreeSet<(Instant, Vec<u8>)>,
     request_timeouts: BTreeSet<(Instant, Vec<u8>, u64)>,
     response_timeouts: BTreeSet<(Instant, Vec<u8>, u64)>,
@@ -868,6 +870,7 @@ struct QuicConnection {
     header_deadlines: HashMap<u64, Instant>,
     indexed_request_deadlines: HashMap<u64, Instant>,
     responses: HashMap<u64, PendingResponse>,
+    request_route_ids: HashSet<u64>,
     goaway_sent: bool,
     final_goaway_sent: bool,
     last_request_stream_id: Option<u64>,
@@ -986,6 +989,8 @@ impl QuicServer {
             goaway_checks: 0,
             #[cfg(test)]
             cid_route_visits: 0,
+            #[cfg(test)]
+            request_route_visits: 0,
             transport_timeouts: BTreeSet::new(),
             request_timeouts: BTreeSet::new(),
             response_timeouts: BTreeSet::new(),
@@ -1122,6 +1127,7 @@ impl QuicServer {
                         header_deadlines: HashMap::new(),
                         indexed_request_deadlines: HashMap::new(),
                         responses: HashMap::new(),
+                        request_route_ids: HashSet::new(),
                         goaway_sent: false,
                         final_goaway_sent: false,
                         last_request_stream_id: None,
@@ -1212,7 +1218,7 @@ impl QuicServer {
         for (request_id, stream_id, deadline) in cancelled_requests {
             self.response_timeouts
                 .remove(&(deadline, key.clone(), stream_id));
-            self.request_routes.remove(&request_id);
+            self.remove_request_route(request_id);
         }
         self.refresh_idle_timeout(&key);
         self.refresh_response_ready(&key);
@@ -1242,6 +1248,11 @@ impl QuicServer {
             self.next_request_id = self.next_request_id.wrapping_add(1).max(1);
             self.request_routes
                 .insert(id, (key.clone(), request.stream_id));
+            self.connections
+                .get_mut(&key)
+                .unwrap()
+                .request_route_ids
+                .insert(id);
             self.requests.push_back(CompletedRequest {
                 id,
                 stream_id: request.stream_id,
@@ -1390,15 +1401,14 @@ impl QuicServer {
             }
             self.routes.remove(source_id.as_ref());
         }
-        let request_ids: Vec<u64> = self
-            .request_routes
-            .iter()
-            .filter_map(|(request_id, (owner_key, _))| {
-                (owner_key.as_slice() == connection_key).then_some(*request_id)
-            })
-            .collect();
-        self.request_routes
-            .retain(|_, (owner_key, _)| owner_key.as_slice() != connection_key);
+        let request_ids = connection.request_route_ids;
+        for request_id in &request_ids {
+            #[cfg(test)]
+            {
+                self.request_route_visits += 1;
+            }
+            self.request_routes.remove(request_id);
+        }
         let queued_bytes: usize = self
             .requests
             .iter()
@@ -1780,6 +1790,15 @@ impl QuicServer {
         Ok(completed)
     }
 
+    fn remove_request_route(&mut self, request_id: u64) {
+        let (key, _) = self.request_routes.remove(&request_id).unwrap();
+        self.connections
+            .get_mut(&key)
+            .unwrap()
+            .request_route_ids
+            .remove(&request_id);
+    }
+
     pub fn next_request(&mut self) -> Option<CompletedRequest> {
         let request = self.requests.pop_front()?;
         self.buffered_request_bytes = self
@@ -1820,7 +1839,8 @@ impl QuicServer {
         if !reserve_response_bytes(&mut self.buffered_response_bytes, buffered_bytes) {
             let connection = self.connections.get_mut(&connection_key).unwrap();
             cancel_http3_request(connection, stream_id, H3_EXCESSIVE_LOAD);
-            self.request_routes.remove(&request_id);
+            self.refresh_transport_timeout(&connection_key);
+            self.remove_request_route(request_id);
             self.refresh_response_ready(&connection_key);
             self.refresh_goaway_ready(&connection_key);
             return true;
@@ -1832,7 +1852,8 @@ impl QuicServer {
                 self.buffered_response_bytes -= buffered_bytes;
                 let connection = self.connections.get_mut(&connection_key).unwrap();
                 cancel_http3_request(connection, stream_id, H3_GENERAL_PROTOCOL_ERROR);
-                self.request_routes.remove(&request_id);
+                self.refresh_transport_timeout(&connection_key);
+                self.remove_request_route(request_id);
                 self.refresh_response_ready(&connection_key);
                 self.refresh_goaway_ready(&connection_key);
                 return true;
@@ -1946,7 +1967,7 @@ impl QuicServer {
                     .remove(&stream_id)
                     .unwrap();
                 self.buffered_response_bytes -= response.buffered_bytes;
-                self.request_routes.remove(&request_id);
+                self.remove_request_route(request_id);
                 self.refresh_idle_timeout(&connection_key);
                 if self.connections[&connection_key].responses.is_empty() {
                     self.response_ready.remove(&connection_key);
@@ -2040,10 +2061,10 @@ impl QuicServer {
             let connection = self.connections.get_mut(&key).unwrap();
             let response = connection.responses.remove(&stream_id).unwrap();
             self.buffered_response_bytes -= response.buffered_bytes;
-            self.request_routes.remove(&response.request_id);
             self.send_ready.push(&key);
             cancel_http3_request(connection, stream_id, H3_REQUEST_REJECTED);
             self.refresh_transport_timeout(&key);
+            self.remove_request_route(response.request_id);
             self.refresh_idle_timeout(&key);
             self.refresh_response_ready(&key);
             self.refresh_goaway_ready(&key);
@@ -2331,6 +2352,7 @@ mod tests {
                     header_deadlines: Default::default(),
                     indexed_request_deadlines: Default::default(),
                     responses: Default::default(),
+                    request_route_ids: Default::default(),
                     goaway_sent: false,
                     final_goaway_sent: false,
                     last_request_stream_id: None,
@@ -2921,6 +2943,211 @@ mod tests {
         assert_eq!(server.routes, surviving_routes);
     }
 
+    fn assert_request_route_ownership(server: &super::QuicServer) {
+        let mut total = 0;
+        for (key, connection) in &server.connections {
+            let expected: std::collections::HashSet<_> = server
+                .request_routes
+                .iter()
+                .filter_map(|(id, (owner, _))| (owner == key).then_some(*id))
+                .collect();
+            assert_eq!(connection.request_route_ids, expected);
+            total += connection.request_route_ids.len();
+        }
+        assert_eq!(total, server.request_routes.len());
+    }
+
+    #[test]
+    fn request_ownership_rejections_remove_delivered_request_ids() {
+        for invalid_header in [true, false] {
+            let (mut server, mut client, mut h3, local, remote) = request_timer_peer();
+            let request = completed_ready_request(&mut server, &mut client, &mut h3, local, remote);
+            let key = server.connections.keys().next().unwrap().clone();
+            assert!(
+                server.connections[&key]
+                    .request_route_ids
+                    .contains(&request.id)
+            );
+            assert_request_route_ownership(&server);
+            if invalid_header {
+                assert!(server.enqueue_response(
+                    request.id,
+                    200,
+                    vec![(b"bad name".to_vec(), b"ignored".to_vec())],
+                    Vec::new()
+                ));
+            } else {
+                server.max_response_body_bytes = MAX_HTTP3_BUFFERED_RESPONSE_BYTES;
+                assert!(server.enqueue_response(
+                    request.id,
+                    200,
+                    Vec::new(),
+                    vec![0; MAX_HTTP3_BUFFERED_RESPONSE_BYTES]
+                ));
+            }
+            assert!(server.connections[&key].request_route_ids.is_empty());
+            assert!(server.request_routes.is_empty());
+            assert!(server.connections[&key].responses.is_empty());
+            assert_eq!(server.buffered_response_bytes, 0);
+            assert_request_route_ownership(&server);
+        }
+    }
+
+    #[test]
+    fn request_ownership_cleanup_visits_only_dropped_peer_ids() {
+        let (mut server, mut client, mut h3, local, remote) = request_timer_peer();
+        let delivered = completed_ready_request(&mut server, &mut client, &mut h3, local, remote);
+        let responding = completed_ready_request(&mut server, &mut client, &mut h3, local, remote);
+        let key = server.connections.keys().next().unwrap().clone();
+        let original = server.connections[&key].initial_destination_id.clone();
+        assert_eq!(server.connections[&key].request_route_ids.len(), 2);
+        assert_request_route_ownership(&server);
+        let other: SocketAddr = "127.0.0.1:30407".parse().unwrap();
+        let mut sibling = quiche::connect(
+            Some("localhost"),
+            &ConnectionId::from_ref(&[0x9e; 16]),
+            other,
+            local,
+            &mut stress_client_config(),
+        )
+        .unwrap();
+        establish_http3_in_memory(
+            &mut sibling,
+            &mut server,
+            &mut [0; 65535],
+            local,
+            other,
+            false,
+        );
+        let mut sibling_h3 = quiche::h3::Connection::with_transport(
+            &mut sibling,
+            &quiche::h3::Config::new().unwrap(),
+        )
+        .unwrap();
+        let mut sibling_ids = Vec::new();
+        for _ in 0..64 {
+            let request =
+                completed_ready_request(&mut server, &mut sibling, &mut sibling_h3, local, other);
+            sibling_ids.push((request.id, request.stream_id));
+        }
+        assert!(server.enqueue_response(responding.id, 200, Vec::new(), vec![42; 2_000_000]));
+        server.drive_responses().unwrap();
+        let headers = [
+            quiche::h3::Header::new(b":method", b"POST"),
+            quiche::h3::Header::new(b":scheme", b"https"),
+            quiche::h3::Header::new(b":authority", b"localhost"),
+            quiche::h3::Header::new(b":path", b"/queued"),
+            quiche::h3::Header::new(b"content-length", b"128"),
+        ];
+        let queued_stream = h3.send_request(&mut client, &headers, false).unwrap();
+        assert_eq!(
+            h3.send_body(&mut client, queued_stream, &[42; 128], true)
+                .unwrap(),
+            128
+        );
+        let mut packet = [0; 65535];
+        for packet in collect_client_datagrams(&mut client, &mut packet) {
+            deliver_client_datagram(&mut server, &packet, local, remote);
+        }
+        assert_eq!(server.requests.len(), 1);
+        assert_eq!(server.requests.front().unwrap().stream_id, queued_stream);
+        let queued_id = server.requests.front().unwrap().id;
+        assert_eq!(server.request_routes.len(), 67);
+        assert_eq!(
+            server.buffered_request_bytes,
+            completed_request_retained_bytes(server.requests.front().unwrap())
+        );
+        assert!(server.buffered_response_bytes >= 2_000_000);
+        let unrelated: std::collections::HashMap<_, _> = server
+            .request_routes
+            .iter()
+            .filter(|(_, (owner, _))| owner != &key)
+            .map(|(id, route)| (*id, route.clone()))
+            .collect();
+        assert_eq!(server.connections[&key].request_route_ids.len(), 3);
+        assert_request_route_ownership(&server);
+        server.request_route_visits = 0;
+        server.force_drop_connection(&key);
+        assert_eq!(server.request_route_visits, 3);
+        assert_eq!(server.request_routes, unrelated);
+        assert_request_route_ownership(&server);
+        assert!(!server.request_routes.contains_key(&delivered.id));
+        assert!(!server.request_routes.contains_key(&responding.id));
+        assert!(!server.request_routes.contains_key(&queued_id));
+        assert!(server.requests.is_empty());
+        assert_eq!(server.buffered_request_bytes, 0);
+        assert_eq!(server.buffered_response_bytes, 0);
+        let (sibling_id, sibling_stream) = sibling_ids[0];
+        assert!(server.enqueue_response(sibling_id, 200, Vec::new(), b"survivor".to_vec()));
+        let mut body = Vec::new();
+        let mut finished = false;
+        for _ in 0..32 {
+            pump_in_memory(
+                &mut sibling,
+                &mut server,
+                &mut packet,
+                local,
+                other,
+                false,
+                false,
+            );
+            let (received, ended) = drain_ready_body(&mut sibling, &mut sibling_h3, sibling_stream);
+            body.extend(received);
+            finished |= ended;
+            if finished {
+                break;
+            }
+        }
+        assert!(finished);
+        assert_eq!(body, b"survivor");
+        server.next_request_id = delivered.id;
+        let reused =
+            completed_ready_request(&mut server, &mut sibling, &mut sibling_h3, local, other);
+        assert_eq!(reused.id, delivered.id);
+        assert_request_route_ownership(&server);
+        let routes_before_reuse = server.request_routes.clone();
+        insert_idle_transports(&mut server, 1);
+        let idle_key = 0_u16.to_be_bytes().repeat(8);
+        let mut fresh = server.connections.remove(&idle_key).unwrap();
+        fresh.transport = quiche::accept(
+            &ConnectionId::from_ref(&key),
+            None,
+            local,
+            remote,
+            &mut server.config,
+        )
+        .unwrap();
+        fresh.initial_destination_id = original;
+        server.connections.insert(key.clone(), fresh);
+        server.routes.insert(key.clone(), key.clone());
+        server.request_route_visits = 0;
+        server.force_drop_connection(&key);
+        assert_eq!(server.request_route_visits, 0);
+        assert_eq!(server.request_routes, routes_before_reuse);
+        assert_request_route_ownership(&server);
+        assert!(server.enqueue_response(reused.id, 200, Vec::new(), b"reused".to_vec()));
+        for _ in 0..32 {
+            pump_in_memory(
+                &mut sibling,
+                &mut server,
+                &mut packet,
+                local,
+                other,
+                false,
+                false,
+            );
+            let (body, finished) =
+                drain_ready_body(&mut sibling, &mut sibling_h3, reused.stream_id);
+            if finished {
+                assert_eq!(body, b"reused");
+                assert!(!server.request_routes.contains_key(&reused.id));
+                assert_request_route_ownership(&server);
+                return;
+            }
+        }
+        panic!("reused request ID did not complete on surviving peer");
+    }
+
     #[test]
     fn terminal_checks_skip_idle_connections_without_due_work() {
         let mut server = super::QuicServer::new(stress_server_config()).unwrap();
@@ -3306,6 +3533,7 @@ mod tests {
             assert!(server.response_ready.entries.is_empty());
             assert_eq!(server.buffered_response_bytes, 0);
             assert!(!server.request_routes.contains_key(&request.id));
+            assert_request_route_ownership(&server);
             assert!(server.connections[&key].transport.local_error().is_none());
             for _ in 0..2 {
                 let id = h3.send_request(&mut client, &headers, true).unwrap();
@@ -3482,6 +3710,7 @@ mod tests {
         assert!(server.response_ready.entries.is_empty());
         assert_eq!(server.buffered_response_bytes, 0);
         assert!(!server.request_routes.contains_key(&request.id));
+        assert_request_route_ownership(&server);
         assert_eq!(server.idle_timeouts.first().unwrap().0, now);
         assert_eq!(server.timeout(), Some(Duration::ZERO));
         server.expire_idle_connections();
@@ -3557,6 +3786,7 @@ mod tests {
             assert!(server.response_timeouts.is_empty());
             assert_eq!(server.buffered_response_bytes, 0);
             assert!(!server.request_routes.contains_key(&request.id));
+            assert_request_route_ownership(&server);
         }
     }
 
@@ -3780,6 +4010,16 @@ mod tests {
                 .is_empty()
         );
         assert_eq!(server.buffered_request_bytes, 0);
+        assert!(
+            server
+                .connections
+                .values()
+                .next()
+                .unwrap()
+                .request_route_ids
+                .is_empty()
+        );
+        assert_request_route_ownership(&server);
     }
 
     #[test]
