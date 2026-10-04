@@ -832,7 +832,7 @@ def test_detached_handler_exception_cancels_and_cleans_up() raises:
     assert_equal(_status_of(resp), 500)
     assert_equal(_body_of(resp), "500 Internal Server Error")
     assert_equal(server.active_connections(), 0)
-    assert_equal(server._budget.used, 0)
+    assert_equal(server._budget.used(), 0)
 
     var sender_addr = box[]
     assert_true(sender_addr != 0)
@@ -969,12 +969,12 @@ def test_writer_workspace_returns_when_handler_starts_detached_worker() raises:
         if handler.started:
             break
     assert_true(handler.started)
-    assert_equal(server._budget.used, 0)
+    assert_equal(server._budget.used(), 0)
     var response = _tick_and_read(server, handler, client)
     _join_thread(handler.thread)
     assert_true(context[].done)
     assert_equal(_body_of(response), "threaded-worker-reply")
-    assert_equal(server._budget.used, 0)
+    assert_equal(server._budget.used(), 0)
     client.close()
     external_call["free", NoneType](context)
 

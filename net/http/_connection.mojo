@@ -12,7 +12,7 @@ from net.tls import TLSConnection, TLSIOResult
 from net.http._http2.hpack import Http2HpackDeflater
 from net.http._http2.request_session import Http2RequestSession
 from net.http._http2.response_scheduler import Http2ResponseScheduler
-from net.http._buffer import BufferBudget, _reserve_capacity
+from net.http._buffer import _CapacityBudget, _reserve_capacity
 
 comptime STATE_READING: UInt8 = 0
 comptime STATE_SENDING: UInt8 = 1
@@ -228,39 +228,39 @@ struct HttpConnection(Movable):
         else:
             self.scanned_len = 0
 
-    def _adopt_pending(
-        mut self, var bytes: List[Byte], mut budget: BufferBudget
-    ) -> Bool:
+    def _adopt_pending[
+        B: _CapacityBudget
+    ](mut self, var bytes: List[Byte], mut budget: B) -> Bool:
         if not budget.try_reserve(bytes.capacity()):
             return False
         self._adopt_reserved_pending(bytes^, budget)
         return True
 
-    def _adopt_reserved_pending(
-        mut self, var bytes: List[Byte], mut budget: BufferBudget
-    ):
+    def _adopt_reserved_pending[
+        B: _CapacityBudget
+    ](mut self, var bytes: List[Byte], mut budget: B):
         var old_capacity = self.pending.capacity()
         self.pending = bytes^
         budget.release(old_capacity)
         self.pending_offset = 0
 
-    def _set_reserved_pending(
-        mut self, var bytes: List[Byte], mut budget: BufferBudget
-    ):
+    def _set_reserved_pending[
+        B: _CapacityBudget
+    ](mut self, var bytes: List[Byte], mut budget: B):
         self._adopt_reserved_pending(bytes^, budget)
         self.state = STATE_SENDING
 
-    def set_pending(
-        mut self, var bytes: List[Byte], mut budget: BufferBudget
-    ) -> Bool:
+    def set_pending[
+        B: _CapacityBudget
+    ](mut self, var bytes: List[Byte], mut budget: B) -> Bool:
         if not self._adopt_pending(bytes^, budget):
             return False
         self.state = STATE_SENDING
         return True
 
-    def append_pending(
-        mut self, var bytes: List[Byte], mut budget: BufferBudget
-    ) -> Bool:
+    def append_pending[
+        B: _CapacityBudget
+    ](mut self, var bytes: List[Byte], mut budget: B) -> Bool:
         if self.pending_offset >= len(self.pending):
             return self._adopt_pending(bytes^, budget)
         var incoming_capacity = bytes.capacity()

@@ -36,6 +36,15 @@ struct PthreadMutex(Movable):
 
     def __init__(out self):
         self._storage = Array[UInt64, 8](fill=0)
+        self._initialize()
+
+    @staticmethod
+    def _uninitialized() -> Self:
+        """Delay native initialization until storage reaches its final address.
+        """
+        return Self(_storage=Array[UInt64, 8](fill=0))
+
+    def _initialize(mut self):
         var ptr = Pointer(to=self._storage).unsafe_bitcast[Byte]()
         _ = external_call["pthread_mutex_init", c_int](
             ptr, Optional[Pointer[Byte, MutUntrackedOrigin]](None)

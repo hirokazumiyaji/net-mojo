@@ -131,6 +131,7 @@ poll 実装は比較用 commit または benchmark 専用とし、最終 product
 | 一巡の accept／接続ごとの処理量 | 64 接続／64 KiB または 16 requests |
 
 buffer の初期確保は小さくし、実確保容量と保持中の再利用容量を全体 budget に計上する。
+全体 counter は mutex で保護した Arc の shared handle を使い、コピー後も同じ予約を計上する。同期 writer の local workspace と detached allocation の計上は別のままとする。
 HTTP 読み取りの一時領域は event loop の stack array を使い、受信先へ移すための一時 List は作らない。
 TLS は budget 計上済みの再試行用 buffer を維持し、読み取り完了分を stack array へコピーする。
 100-continue は静的な byte 列を直接送信し、送信待ちになった残りだけを正確な容量で予約してから確保する。

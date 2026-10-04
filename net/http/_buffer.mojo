@@ -8,10 +8,28 @@ HTTP/1 body copies reserve their exact capacity before materialization and remai
 charged through the handler call. Synchronous
 HTTP/1 writer bodies use a reserved workspace; other writer paths and other
 reservations still need separate capacity accounting.
+
+The global counter uses a mutex-protected shared capability; local writer
+workspace counters remain plain. Detached allocation accounting is separate.
 """
 
+from std.memory import ArcPointer
 
-struct BufferBudget(Movable):
+from net._actor import PthreadMutex
+
+
+trait _CapacityBudget(Movable):
+    def remaining(self) -> Int:
+        ...
+
+    def try_reserve(mut self, amount: Int) -> Bool:
+        ...
+
+    def release(mut self, amount: Int):
+        ...
+
+
+struct BufferBudget(_CapacityBudget):
     var total: Int
     var used: Int
 
@@ -36,9 +54,60 @@ struct BufferBudget(Movable):
             self.used = 0
 
 
-def _reserve_capacity(
+struct _BudgetState(Movable):
+    var mutex: PthreadMutex
+    var budget: BufferBudget
+
+    def __init__(out self, total: Int):
+        self.mutex = PthreadMutex._uninitialized()
+        self.budget = BufferBudget(total)
+
+    def __deinit__(deinit self):
+        self.mutex.destroy()
+
+
+struct SharedBufferBudget(Copyable, _CapacityBudget):
+    var _state: ArcPointer[_BudgetState]
+
+    def __init__(out self, total: Int):
+        self._state = ArcPointer(_BudgetState(total))
+        self._state[].mutex._initialize()
+
+    def total(self) -> Int:
+        self._state[].mutex.lock()
+        var total = self._state[].budget.total
+        self._state[].mutex.unlock()
+        return total
+
+    def used(self) -> Int:
+        self._state[].mutex.lock()
+        var used = self._state[].budget.used
+        self._state[].mutex.unlock()
+        return used
+
+    def remaining(self) -> Int:
+        self._state[].mutex.lock()
+        var remaining = self._state[].budget.remaining()
+        self._state[].mutex.unlock()
+        return remaining
+
+    def try_reserve(mut self, amount: Int) -> Bool:
+        self._state[].mutex.lock()
+        var admitted = self._state[].budget.try_reserve(amount)
+        self._state[].mutex.unlock()
+        return admitted
+
+    def release(mut self, amount: Int):
+        self._state[].mutex.lock()
+        self._state[].budget.release(amount)
+        self._state[].mutex.unlock()
+
+
+def _reserve_capacity[
+    B: _CapacityBudget
+](
     mut bytes: List[Byte],
-    mut budget: BufferBudget,
+    mut budget: B,
     needed: Int,
     mut reservation: Int,
 ) -> Bool:

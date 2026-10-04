@@ -42,7 +42,7 @@ from net._reactor import Reactor, ReactorToken
 from net.error import NetError, NetErrorKind
 from net.quic import QuicUDPEndpoint
 
-from ._buffer import BufferBudget, _reserve_capacity
+from ._buffer import SharedBufferBudget, _reserve_capacity
 from ._control import ServerControl
 from ._connection import (
     HttpConnection,
@@ -127,7 +127,7 @@ struct Server(Movable):
     var _conn_free: List[Int]
     var _slot_map: List[Int]
     var _active_conns: Int
-    var _budget: BufferBudget
+    var _budget: SharedBufferBudget
     var _shutdown_at: Int
     var _quic_finish_at: Int
     var _quic_close_at: Int
@@ -161,7 +161,7 @@ struct Server(Movable):
         self._conn_free = List[Int]()
         self._slot_map = List[Int]()
         self._active_conns = 0
-        self._budget = BufferBudget(budget_total)
+        self._budget = SharedBufferBudget(budget_total)
         self._shutdown_at = NO_DEADLINE
         self._quic_finish_at = NO_DEADLINE
         self._quic_close_at = NO_DEADLINE
@@ -1778,10 +1778,10 @@ struct Server(Movable):
                 + content_length
                 - self._conns[idx].buf.capacity(),
             )
-            var unreserved = self._budget.used - self._conns[idx].reserved
+            var unreserved = self._budget.used() - self._conns[idx].reserved
             if (
                 content_length > 0
-                and unreserved + outstanding > self._budget.total
+                and unreserved + outstanding > self._budget.total()
             ):
                 self._send_error(idx, 503)
                 return
