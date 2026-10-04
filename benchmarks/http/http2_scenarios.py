@@ -138,13 +138,18 @@ class H2ScenarioClient:
         if data:
             self._sock.sendall(data)
 
-    def pump(self, deadline: float) -> None:
+    def pump(
+        self, deadline: float, *, credit_for: Optional[tuple[int, int]] = None
+    ) -> None:
         """Process inbound frames until the peer goes idle or time runs out.
 
         The recv timeout is a short poll, not the remaining budget: this must
         return promptly so a caller can react to stream state, and so a
         silent peer cannot hold the scenario open until the server's own
         request-body deadline closes the target stream.
+
+        Upload waits return when the next frame fits, so small receive
+        windows do not add an idle poll to every upload batch.
         """
         while time.perf_counter() < deadline:
             remaining = deadline - time.perf_counter()
@@ -159,6 +164,10 @@ class H2ScenarioClient:
             self.received += len(chunk)
             self._handle(self._conn.receive_data(chunk))
             self._flush()
+            if credit_for is not None:
+                stream_id, size = credit_for
+                if self._conn.local_flow_control_window(stream_id) >= size:
+                    return
 
     def _handle(self, events) -> None:
         for event in events:
@@ -253,8 +262,8 @@ class H2ScenarioClient:
                     raise ScenarioError(
                         f"upload stalled at offset {off}: no WINDOW_UPDATE"
                     )
-                self.pump(deadline)
                 self._flush()
+                self.pump(deadline, credit_for=(stream_id, size))
                 continue
             off += size
         self._flush()
