@@ -67,6 +67,13 @@ sends rotate it after one packet. Idle connections are not probed for every
 send, and terminal cleanup removes their queued keys. Response-stream driving
 and global deadline selection still use scans pending separate scheduler work.
 
+Transport deadlines use an ordered index with at most one absolute entry per
+live connection. Receive, send, transport timeout and close outcomes refresh the
+entry; terminal removal deletes it directly. Only due transport keys are
+visited for quiche timeout dispatch. Application deadline selection/expiration
+and the terminal sweep still scan their state, so overall timeout work is not
+yet proportional only to due connections.
+
 Still deferred: enabling 0-RTT and full path migration. macOS Mojo end-to-end
 HTTP/3 is covered in CI (`http3` job on `macos-14`, `http3-client-test` against
 the Mojo fixture); only packaged-artifact distribution verification remains

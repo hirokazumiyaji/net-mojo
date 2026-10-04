@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use std::ffi::{CStr, c_char};
 use std::fs::File;
 use std::io::{self, Read};
@@ -809,6 +809,7 @@ pub struct QuicServer {
     http3_config: quiche::h3::Config,
     connections: HashMap<Vec<u8>, QuicConnection>,
     send_ready: SendReadyQueue,
+    transport_timeouts: BTreeSet<(Instant, Vec<u8>)>,
     routes: HashMap<Vec<u8>, Vec<u8>>,
     requests: VecDeque<CompletedRequest>,
     request_routes: HashMap<u64, (Vec<u8>, u64)>,
@@ -843,6 +844,7 @@ enum ShutdownState {
 
 struct QuicConnection {
     transport: Connection,
+    transport_deadline_at: Option<Instant>,
     http3: Option<quiche::h3::Connection>,
     requests: HashMap<u64, PendingRequest>,
     /// Deadlines for request streams that have become readable but have not
@@ -957,6 +959,7 @@ impl QuicServer {
             http3_config,
             connections: HashMap::new(),
             send_ready: SendReadyQueue::default(),
+            transport_timeouts: BTreeSet::new(),
             routes: HashMap::new(),
             requests: VecDeque::new(),
             request_routes: HashMap::new(),
@@ -1033,6 +1036,7 @@ impl QuicServer {
         self.drive_final_goaways()?;
         self.shutdown = ShutdownState::Closing;
         let mut first_error = None;
+        let mut timeouts = Vec::new();
         for (connection_key, connection) in self.connections.iter_mut() {
             if connection.transport.is_closed() || connection.transport.is_draining() {
                 continue;
@@ -1041,6 +1045,13 @@ impl QuicServer {
             if let Err(error) = connection.transport.close(true, 0x100, b"") {
                 first_error.get_or_insert(error);
             }
+            timeouts.push((
+                connection_key.clone(),
+                connection.transport.timeout_instant(),
+            ));
+        }
+        for (key, deadline) in timeouts {
+            self.set_transport_timeout(&key, deadline);
         }
         first_error.map_or(Ok(()), |error| Err(error.into()))
     }
@@ -1092,6 +1103,7 @@ impl QuicServer {
                     key.clone(),
                     QuicConnection {
                         transport: connection,
+                        transport_deadline_at: None,
                         http3: None,
                         requests: HashMap::new(),
                         header_deadlines: HashMap::new(),
@@ -1109,15 +1121,17 @@ impl QuicServer {
         };
 
         self.send_ready.push(&key);
+        let received = self.connections.get_mut(&key).unwrap().transport.recv(
+            packet,
+            RecvInfo {
+                from: remote,
+                to: local,
+            },
+        );
+        self.refresh_transport_timeout(&key);
+        received?;
         {
             let connection = self.connections.get_mut(&key).unwrap();
-            connection.transport.recv(
-                packet,
-                RecvInfo {
-                    from: remote,
-                    to: local,
-                },
-            )?;
             connection.idle_deadline_at = Some(Instant::now() + self.idle_timeout);
             if connection.transport.is_established() && connection.http3.is_none() {
                 match quiche::h3::Connection::with_transport(
@@ -1159,6 +1173,7 @@ impl QuicServer {
                 }
             }
         };
+        self.refresh_transport_timeout(&key);
         let Some(completed) = completed else {
             // CONNECTION_CLOSE is queued; keep the connection until send/drain
             // emits it and quiche reports the transport closed.
@@ -1241,6 +1256,10 @@ impl QuicServer {
             return;
         };
         self.send_ready.remove(connection_key);
+        if let Some(deadline) = connection.transport_deadline_at {
+            self.transport_timeouts
+                .remove(&(deadline, connection_key.to_vec()));
+        }
         let in_flight_bytes: usize = connection
             .requests
             .values()
@@ -1824,6 +1843,7 @@ impl QuicServer {
                 .unwrap()
                 .transport
                 .send(packet);
+            self.refresh_transport_timeout(&key);
             match result {
                 Ok((length, info)) => {
                     self.send_ready.push(&key);
@@ -1837,6 +1857,37 @@ impl QuicServer {
             }
         }
         Ok(None)
+    }
+
+    fn set_transport_timeout(&mut self, key: &[u8], deadline: Option<Instant>) {
+        let connection = self.connections.get_mut(key).unwrap();
+        if connection.transport_deadline_at == deadline {
+            return;
+        }
+        if let Some(previous) = connection.transport_deadline_at.take() {
+            self.transport_timeouts.remove(&(previous, key.to_vec()));
+        }
+        connection.transport_deadline_at = deadline;
+        if let Some(deadline) = deadline {
+            self.transport_timeouts.insert((deadline, key.to_vec()));
+        }
+    }
+
+    fn refresh_transport_timeout(&mut self, key: &[u8]) {
+        let deadline = self.connections[key].transport.timeout_instant();
+        self.set_transport_timeout(key, deadline);
+    }
+
+    fn take_due_transport_timeout(&mut self, now: Instant) -> Option<Vec<u8>> {
+        if self.transport_timeouts.first()?.0 > now {
+            return None;
+        }
+        let (_, key) = self.transport_timeouts.pop_first().unwrap();
+        self.connections
+            .get_mut(&key)
+            .unwrap()
+            .transport_deadline_at = None;
+        Some(key)
     }
 
     pub fn timeout(&self) -> Option<Duration> {
@@ -1880,10 +1931,9 @@ impl QuicServer {
             .flatten()
             .min();
         let transport_timeout = self
-            .connections
-            .values()
-            .filter_map(|connection| connection.transport.timeout())
-            .min();
+            .transport_timeouts
+            .first()
+            .map(|(deadline, _)| deadline.saturating_duration_since(now));
         match (stream_timeout, transport_timeout) {
             (Some(left), Some(right)) => Some(left.min(right)),
             (Some(timeout), None) | (None, Some(timeout)) => Some(timeout),
@@ -1896,15 +1946,15 @@ impl QuicServer {
         self.expire_idle_connections();
         let _ = self.drive_responses();
         let mut closed = Vec::new();
-        for (key, connection) in self.connections.iter_mut() {
-            if connection
+        let now = Instant::now();
+        while let Some(key) = self.take_due_transport_timeout(now) {
+            self.connections
+                .get_mut(&key)
+                .unwrap()
                 .transport
-                .timeout()
-                .is_some_and(|timeout| timeout.is_zero())
-            {
-                connection.transport.on_timeout();
-                self.send_ready.push(key);
-            }
+                .on_timeout();
+            self.send_ready.push(&key);
+            self.refresh_transport_timeout(&key);
         }
         for (connection_key, connection) in &self.connections {
             if connection.transport.is_closed() {
@@ -2055,6 +2105,7 @@ mod tests {
                 key,
                 super::QuicConnection {
                     transport,
+                    transport_deadline_at: None,
                     http3: None,
                     requests: Default::default(),
                     header_deadlines: Default::default(),
@@ -2067,6 +2118,89 @@ mod tests {
                 },
             );
         }
+    }
+
+    #[test]
+    fn transport_timer_query_reads_index_and_preserves_application_priority() {
+        let mut server = super::QuicServer::new(stress_server_config()).unwrap();
+        insert_idle_transports(&mut server, 1);
+        let key = [0; 16];
+        let now = std::time::Instant::now();
+        server.set_transport_timeout(&key, Some(now + Duration::from_secs(10)));
+        server
+            .connections
+            .get_mut(&key[..])
+            .unwrap()
+            .idle_deadline_at = Some(now);
+        assert_eq!(server.timeout(), Some(Duration::ZERO));
+        server
+            .connections
+            .get_mut(&key[..])
+            .unwrap()
+            .idle_deadline_at = None;
+        server.set_transport_timeout(&key, Some(now));
+        assert_eq!(server.timeout(), Some(Duration::ZERO));
+        server.set_transport_timeout(&key, None);
+        assert_eq!(server.timeout(), None);
+    }
+
+    #[test]
+    fn transport_timer_rearms_replace_increase_decrease_and_disarm() {
+        let mut server = super::QuicServer::new(stress_server_config()).unwrap();
+        insert_idle_transports(&mut server, 2);
+        let first = [0; 16];
+        let second = 1u16.to_be_bytes().repeat(8);
+        let now = std::time::Instant::now();
+        server.set_transport_timeout(&first, Some(now + Duration::from_secs(4)));
+        server.set_transport_timeout(&second, Some(now + Duration::from_secs(8)));
+        for tick in 0..1000 {
+            server.set_transport_timeout(
+                &first,
+                Some(now + Duration::from_secs(12) + Duration::from_nanos(tick)),
+            );
+        }
+        assert_eq!(server.transport_timeouts.len(), 2);
+        assert_eq!(
+            server.take_due_transport_timeout(now + Duration::from_secs(7)),
+            None
+        );
+        assert_eq!(
+            server.take_due_transport_timeout(now + Duration::from_secs(8)),
+            Some(second)
+        );
+        server.set_transport_timeout(&first, Some(now + Duration::from_secs(2)));
+        assert_eq!(
+            server.take_due_transport_timeout(now + Duration::from_secs(2)),
+            Some(first.to_vec())
+        );
+        assert!(server.transport_timeouts.is_empty());
+        server.set_transport_timeout(&first, Some(now + Duration::from_secs(3)));
+        server.set_transport_timeout(&first, None);
+        assert!(server.transport_timeouts.is_empty());
+        assert_eq!(server.connections[&first[..]].transport_deadline_at, None);
+    }
+
+    #[test]
+    fn terminal_transport_timer_removal_allows_connection_key_reuse() {
+        let mut server = super::QuicServer::new(stress_server_config()).unwrap();
+        insert_idle_transports(&mut server, 1);
+        let key = [0; 16];
+        let now = std::time::Instant::now();
+        server.set_transport_timeout(&key, Some(now + Duration::from_secs(5)));
+        assert_eq!(server.transport_timeouts.len(), 1);
+        server.force_drop_connection(&key);
+        assert!(server.transport_timeouts.is_empty());
+        insert_idle_transports(&mut server, 1);
+        server.set_transport_timeout(&key, Some(now + Duration::from_secs(10)));
+        assert_eq!(
+            server.take_due_transport_timeout(now + Duration::from_secs(5)),
+            None
+        );
+        assert_eq!(
+            server.take_due_transport_timeout(now + Duration::from_secs(10)),
+            Some(key.to_vec())
+        );
+        assert!(server.transport_timeouts.is_empty());
     }
 
     #[test]
