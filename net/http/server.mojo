@@ -1956,7 +1956,7 @@ struct Server(Movable):
                     _release_detach_state(addr, from_sender=False)
                     writer._detach_state_addr = 0
             self._drop_writer_body(writer, workspace)
-            self._send_error(idx, 500)
+            self._send_error(idx, 500, is_head=is_head)
             return
 
         _ = req^
@@ -1965,7 +1965,7 @@ struct Server(Movable):
             self._drop_writer_body(writer, workspace)
             var addr = writer._detach_state_addr
             if addr == 0:
-                self._send_error(idx, 500)
+                self._send_error(idx, 500, is_head=is_head)
                 return
             self._conns[idx].state = STATE_DETACHED
             self._conns[idx].detach_state_addr = addr
@@ -1989,7 +1989,7 @@ struct Server(Movable):
 
         if len(writer.body) > cap or not writer._reconcile_body_budget():
             self._drop_writer_body(writer, workspace)
-            self._send_error(idx, 500)
+            self._send_error(idx, 500, is_head=is_head)
             return
         var writer_charge = writer.body.capacity()
         self._budget.release(workspace - writer_charge)
@@ -2000,7 +2000,7 @@ struct Server(Movable):
         except e:
             _ = e
             self._drop_writer_body(writer, writer_charge)
-            self._send_error(idx, 500)
+            self._send_error(idx, 500, is_head=is_head)
             return
         var wire: List[Byte]
         try:
@@ -2015,7 +2015,7 @@ struct Server(Movable):
         except e:
             _ = e
             self._drop_writer_body(writer, writer_charge)
-            self._send_error(idx, 500)
+            self._send_error(idx, 500, is_head=is_head)
             return
         self._drop_writer_body(writer, writer_charge)
         self._conns[idx]._set_reserved_pending(wire^, self._budget)
@@ -2536,7 +2536,7 @@ struct Server(Movable):
             self._close_conn(idx)
             return
         self._cleanup_detached_state(idx)
-        self._send_error(idx, 500)
+        self._send_error(idx, 500, is_head=self._conns[idx].is_head)
         self._arm_deadline(idx)
 
     def _compute_timeout(
