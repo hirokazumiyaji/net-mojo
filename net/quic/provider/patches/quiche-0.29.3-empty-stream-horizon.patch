@@ -1,0 +1,326 @@
+--- a/src/stream/recv_buf.rs
++++ b/src/stream/recv_buf.rs
+@@ -166,7 +166,12 @@
+             return Ok(());
+         }
+ 
++        // Empty STREAM offsets still advance flow control (RFC 9000 Section 19.8).
+         if !buf.fin() && buf.is_empty() {
++            self.len = cmp::max(self.len, buf.max_off());
++            if self.drain {
++                self.off = self.len;
++            }
+             return Ok(());
+         }
+ 
+@@ -556,10 +561,10 @@
+ 
+         assert_emit_discard(&mut recv, emit, 32, 5, false, None);
+ 
+-        // Don't store non-fin empty buffer.
++        // Don't store non-fin empty buffer, but track its offset.
+         let buf = RangeBuf::from(b"", 10, false);
+         assert!(recv.write(buf).is_ok());
+-        assert_eq!(recv.len, 5);
++        assert_eq!(recv.len, 10);
+         assert_eq!(recv.off, 5);
+         assert_eq!(recv.data.len(), 0);
+ 
+@@ -567,34 +572,45 @@
+         let buf = RangeBuf::from(b"", 16, false);
+         assert_eq!(recv.write(buf), Err(Error::FlowControl));
+ 
+-        // Store fin empty buffer.
++        // A final size below the advanced largest offset is an error
++        // (RFC 9000 Section 4.5).
+         let buf = RangeBuf::from(b"", 5, true);
++        assert_eq!(recv.write(buf), Err(Error::FinalSize));
++
++        // Store fin empty buffer at the largest received offset.
++        let buf = RangeBuf::from(b"", 10, true);
+         assert!(recv.write(buf).is_ok());
+-        assert_eq!(recv.len, 5);
++        assert_eq!(recv.len, 10);
+         assert_eq!(recv.off, 5);
+         assert_eq!(recv.data.len(), 1);
+ 
+         // Don't store additional fin empty buffers.
+-        let buf = RangeBuf::from(b"", 5, true);
++        let buf = RangeBuf::from(b"", 10, true);
+         assert!(recv.write(buf).is_ok());
+-        assert_eq!(recv.len, 5);
++        assert_eq!(recv.len, 10);
+         assert_eq!(recv.off, 5);
+         assert_eq!(recv.data.len(), 1);
+ 
+-        // Don't store additional fin non-empty buffers.
++        // Accept another fin buffer with the same final size.
++        let buf = RangeBuf::from(b"aa", 8, true);
++        assert!(recv.write(buf).is_ok());
++        assert_eq!(recv.len, 10);
++        assert_eq!(recv.off, 5);
++        assert_eq!(recv.data.len(), 1);
++
++        // A fin buffer whose end disagrees with the known final size errors.
+         let buf = RangeBuf::from(b"aa", 3, true);
+-        assert!(recv.write(buf).is_ok());
+-        assert_eq!(recv.len, 5);
+-        assert_eq!(recv.off, 5);
+-        assert_eq!(recv.data.len(), 1);
++        assert_eq!(recv.write(buf), Err(Error::FinalSize));
+ 
+         // Validate final size with fin empty buffers.
+-        let buf = RangeBuf::from(b"", 6, true);
++        let buf = RangeBuf::from(b"", 11, true);
+         assert_eq!(recv.write(buf), Err(Error::FinalSize));
+-        let buf = RangeBuf::from(b"", 4, true);
++        let buf = RangeBuf::from(b"", 9, true);
+         assert_eq!(recv.write(buf), Err(Error::FinalSize));
+ 
+-        assert_emit_discard(&mut recv, emit, 32, 0, true, None);
++        // The range (5..10) was never received, so the stream cannot reach
++        // its fin and nothing further is readable.
++        assert_emit_discard_done(&mut recv, emit);
+     }
+ 
+     #[rstest]
+@@ -689,6 +705,31 @@
+         assert_eq!(recv.data.len(), 0);
+ 
+         assert_emit_discard_done(&mut recv, emit);
++    }
++
++    /// An empty non-fin buffer advances the largest received offset, which the
++    /// connection charges to flow control on arrival, so a draining stream must
++    /// consume it too and a later reset must not credit it again.
++    #[test]
++    fn shutdown_empty_stream_frame() {
++        let mut recv =
++            receiver(u64::MAX, DEFAULT_STREAM_WINDOW, DEFAULT_STREAM_WINDOW);
++
++        assert!(recv.write(RangeBuf::from(b"hello", 0, false)).is_ok());
++        assert_eq!(recv.shutdown(), Ok(5));
++
++        assert!(recv.write(RangeBuf::from(b"", 10, false)).is_ok());
++        assert_eq!(recv.len, 10);
++        assert_eq!(recv.off, 10);
++        assert_eq!(recv.data.len(), 0);
++
++        assert_eq!(
++            recv.reset(42, 10),
++            Ok(RecvBufResetReturn {
++                max_data_delta: 0,
++                consumed_flowcontrol: 0,
++            })
++        );
+     }
+ 
+     #[rstest]
+@@ -1382,6 +1423,110 @@
+         for (off, bytes) in [(2, b"cd"), (6, b"gh"), (10, b"kl")] {
+             recv.write(RangeBuf::from(bytes, off, false)).unwrap();
+         }
++    }
++
++    #[test]
++    fn receive_budget_empty_horizon_at_full_quota() {
++        let budget = limited(0, 2);
++        let mut recv = receiver(&budget);
++        let usage = budget.usage();
++        for off in [0, 10, 10, 5] {
++            recv.write(RangeBuf::from(b"", off, false)).unwrap();
++        }
++        assert_eq!(recv.test_receive_budget_state(), (0, 10, None, 0, 0));
++        assert_eq!(budget.usage(), usage);
++        let before = recv.test_receive_budget_state();
++        assert_eq!(
++            recv.write(RangeBuf::from(b"", 101, false)),
++            Err(Error::FlowControl)
++        );
++        assert_eq!(
++            recv.write(RangeBuf::from(b"", 9, true)),
++            Err(Error::FinalSize)
++        );
++        assert_eq!(
++            recv.write(RangeBuf::from(b"x", 10, true)),
++            Err(Error::ReceiveBufferExceeded)
++        );
++        assert_eq!(recv.test_receive_budget_state(), before);
++        assert_eq!(budget.usage(), usage);
++        recv.write(RangeBuf::from(b"", 10, true)).unwrap();
++        assert_eq!(recv.test_receive_budget_state(), (0, 10, Some(10), 1, 0));
++        assert_eq!(budget.usage(), usage);
++        assert_eq!(
++            recv.write(RangeBuf::from(b"", 11, false)),
++            Err(Error::FinalSize)
++        );
++        assert_eq!(
++            recv.reset(42, 10),
++            Ok(RecvBufResetReturn {
++                max_data_delta: 0,
++                consumed_flowcontrol: 10
++            })
++        );
++        assert_eq!(budget.usage(), usage);
++        drop(recv);
++        assert_eq!(budget.usage(), ReceiveUsage::default());
++    }
++
++    #[test]
++    fn receive_budget_empty_horizon_preserves_retained_fragments() {
++        let budget = limited(1, 3);
++        let mut recv = receiver(&budget);
++        recv.write(RangeBuf::from(b"x", 9, false)).unwrap();
++        let usage = budget.usage();
++        for off in [10, 15, 15, 5] {
++            recv.write(RangeBuf::from(b"", off, false)).unwrap();
++        }
++        assert_eq!(recv.test_receive_budget_state(), (0, 15, None, 1, 1));
++        assert_eq!(budget.usage(), usage);
++        let before = recv.test_receive_budget_state();
++        assert_eq!(
++            recv.write(RangeBuf::from(b"y", 15, true)),
++            Err(Error::ReceiveBufferExceeded)
++        );
++        assert_eq!(recv.test_receive_budget_state(), before);
++        assert_eq!(budget.usage(), usage);
++        assert_eq!(
++            recv.reset(42, 15),
++            Ok(RecvBufResetReturn {
++                max_data_delta: 0,
++                consumed_flowcontrol: 15
++            })
++        );
++        assert_eq!(
++            budget.usage().request,
++            ReceiveLimit {
++                backing_bytes: 0,
++                slots: 2
++            }
++        );
++        drop(recv);
++        assert_eq!(budget.usage(), ReceiveUsage::default());
++    }
++
++    #[test]
++    fn receive_budget_drained_empty_horizon_is_consumed_once() {
++        let budget = limited(5, 3);
++        let mut recv = receiver(&budget);
++        recv.write(RangeBuf::from(b"hello", 0, false)).unwrap();
++        assert_eq!(recv.shutdown(), Ok(5));
++        let usage = budget.usage();
++        for off in [10, 10, 3] {
++            recv.write(RangeBuf::from(b"", off, false)).unwrap();
++        }
++        assert_eq!(recv.test_receive_budget_state(), (10, 10, None, 0, 0));
++        assert_eq!(budget.usage(), usage);
++        assert_eq!(
++            recv.reset(42, 15),
++            Ok(RecvBufResetReturn {
++                max_data_delta: 5,
++                consumed_flowcontrol: 5
++            })
++        );
++        assert_eq!(budget.usage(), usage);
++        drop(recv);
++        assert_eq!(budget.usage(), ReceiveUsage::default());
+     }
+ 
+     #[test]
+--- a/src/tests.rs
++++ b/src/tests.rs
+@@ -1551,6 +1551,94 @@
+ 
+     let pkt_type = Type::Short;
+     assert!(pipe.send_pkt_to_server(pkt_type, &frames, &mut buf).is_ok());
++}
++
++#[rstest]
++fn flow_control_empty_stream_frame_not_double_counted(
++    #[values("cubic", "bbr2_gcongestion")] cc_algorithm_name: &str,
++) {
++    let mut buf = [0; 65535];
++
++    let mut pipe = test_utils::Pipe::new(cc_algorithm_name).unwrap();
++    assert_eq!(pipe.handshake(), Ok(()));
++
++    // The connection-level limit is 30 bytes, the stream-level limit 15.
++    assert_eq!(pipe.server.max_rx_data(), 30);
++
++    // The empty frame advances the largest received offset to 15, which is
++    // charged to connection flow control before the data covering 5..15
++    // arrives.
++    let frames = [
++        frame::Frame::Stream {
++            stream_id: 0,
++            data: <RangeBuf>::from(b"aaaaa", 0, false),
++        },
++        frame::Frame::Stream {
++            stream_id: 0,
++            data: <RangeBuf>::from(b"", 15, false),
++        },
++    ];
++
++    let pkt_type = Type::Short;
++    assert!(pipe.send_pkt_to_server(pkt_type, &frames, &mut buf).is_ok());
++    assert_eq!(pipe.server.rx_data, 15);
++
++    // Filling the gap must not be charged again: the remaining 15 bytes of
++    // credit go entirely to the second stream.
++    let frames = [
++        frame::Frame::Stream {
++            stream_id: 0,
++            data: <RangeBuf>::from(b"aaaaaaaaaa", 5, false),
++        },
++        frame::Frame::Stream {
++            stream_id: 4,
++            data: <RangeBuf>::from(b"aaaaaaaaaaaaaaa", 0, false),
++        },
++    ];
++
++    assert!(pipe.send_pkt_to_server(pkt_type, &frames, &mut buf).is_ok());
++    assert_eq!(pipe.server.rx_data, 30);
++}
++
++#[rstest]
++fn flow_control_empty_stream_frame_after_shutdown(
++    #[values("cubic", "bbr2_gcongestion")] cc_algorithm_name: &str,
++) {
++    let mut buf = [0; 65535];
++    let pkt_type = Type::Short;
++
++    let mut pipe = test_utils::Pipe::new(cc_algorithm_name).unwrap();
++    assert_eq!(pipe.handshake(), Ok(()));
++
++    let frames = [frame::Frame::Stream {
++        stream_id: 0,
++        data: <RangeBuf>::from(b"aaaaa", 0, false),
++    }];
++    assert!(pipe.send_pkt_to_server(pkt_type, &frames, &mut buf).is_ok());
++
++    // A draining stream counts incoming data as consumed as it arrives.
++    assert_eq!(pipe.server.stream_shutdown(0, Shutdown::Read, 42), Ok(()));
++    assert_eq!(pipe.server.rx_data, 5);
++    assert_eq!(pipe.server.flow_control.consumed(), 5);
++
++    let frames = [frame::Frame::Stream {
++        stream_id: 0,
++        data: <RangeBuf>::from(b"", 10, false),
++    }];
++    assert!(pipe.send_pkt_to_server(pkt_type, &frames, &mut buf).is_ok());
++    assert_eq!(pipe.server.rx_data, 10);
++    assert_eq!(pipe.server.flow_control.consumed(), 10);
++
++    // The reset charges and consumes only the bytes beyond the largest
++    // received offset; 5..10 was already consumed above.
++    let frames = [frame::Frame::ResetStream {
++        stream_id: 0,
++        error_code: 42,
++        final_size: 15,
++    }];
++    assert!(pipe.send_pkt_to_server(pkt_type, &frames, &mut buf).is_ok());
++    assert_eq!(pipe.server.rx_data, 15);
++    assert_eq!(pipe.server.flow_control.consumed(), 15);
+ }
+ 
+ #[rstest]
