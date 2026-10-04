@@ -431,15 +431,38 @@ def listen_and_serve[H: Handler](
 
 ### borrow 寿命
 
+`Request` は、decode 済みの `String`、`Headers`、`List[Byte]` を所有する。
+`Handler.handle(mut self, req: Request, mut writer: ResponseWriter)` は、この `Request` を immutable borrow し、writer を mutable borrow する。
+handler が保持できるのは、呼び出し中に作った所有値のコピーである。
+`String.as_bytes()`、`Span(req.body)` などから得た view の寿命は、借用元の値に結び付く。
+受信 socket の buffer を直接指す view を `Request` の公開 field として渡す契約にはなっていない。
+
 | 値 | 所有者 | 有効期間 |
 | --- | --- | --- |
-| 受信 buffer と `Request` の各 view | server の connection table | handler 呼び出し中のみ。呼び出し中の移動・拡張・再利用なし。保持はコピーで行う |
-| `ResponseWriter` と `body` | connection（送信完了まで） | handler 終了後に server が送信。handler の短命値を借用して queue に積まない |
+| decode 済みの `Request` | protocol adapter から server に移された request 値 | handler は呼び出し中に借用する。保持する field はコピーする |
+| request field から作った `StringSlice` と `Span` | 元の `String` または `List` | 元の値を借用できる期間。thread に渡すデータには所有値を使う |
+| `Headers` の公開 getter の戻り値 | getter の呼び出し側 | `get_first`、`get_all`、`name_at`、`value_at`、`value_bytes_at` は所有値を返す。元の `Headers.clear()` 後も使える |
+| encoder 内部の `_value_bytes_span` | `Headers` 内部の value storage | immutable borrow 中のみ。元の header を移動、変更、破棄しない |
+| `ResponseWriter.body` | writer | `write` と `write_string` は入力をコピーする。handler 終了後、adapter が wire または provider の送信待ち状態へ変換する |
+| `ResponseSender` | handle が参照する共有 detached state | HTTP/1 の handler 終了後も使える。connection の終了や timeout は state を取消済みにする |
 | `TCPConn` / `TCPListener` | 単一 owner | `raw_fd()` は借用。登録解除から close まで owner を生存させる。thread 間は fd 番号のみを渡す |
 | `ServerControl` | 共有 control state（wakeup 資源と終了状態の寿命を管理） | server より長生き可。終了後の要求は no-op。冪等。通知と wakeup fd 破棄を同期し、close 済み fd に書かない |
 
-初版は bounded buffered のみ。request body 全体を上限付きで受信してから handler を呼ぶ。
-request streaming、response streaming、`Flush`、router、middleware は含めない。
+header の値は raw bytes として保持する。
+`get_first`、`get_all`、`value_at` の `String` 化は UTF-8 の不正列を置換するため、wire と同じ octet 列を使う場合は `value_bytes_at` を使う。
+
+request body は、protocol ごとの上限と終端を検証してから handler に渡す。
+HTTP/1 は parser の結果、HTTP/2 は `Http2RequestStream.take_request()`、HTTP/3 は native provider の完了 record を decode した所有値を使う。
+HTTP/3 の record buffer と handler の `Request.body` は同じ借用 storage を共有せず、body は `QuicRequest.take_body()` で移す。
+
+応答を別 thread から送る場合は、HTTP/1 の `ResponseWriter.detach()` が返す `ResponseSender` を移す。
+request の view や mutable writer の借用を handler 終了後まで保持する用途には使わない。
+HTTP/2 と HTTP/3 の共通 handler は bounded buffered response を返す。
+両 protocol での detach は未対応で、現在の HTTP/2 adapter は接続を閉じ、HTTP/3 adapter は sender を取り消して 500 応答にする。
+request streaming、`Flush`、router、middleware は含めない。
+
+所有値へのコピーは `tests/test_http_api.mojo` の `test_response_writer_owns_copies_of_handler_locals` と `test_header_value_span_borrows_storage_and_owned_copy_survives_clear` で検証する。
+HTTP/2 の request 組立ては `tests/test_http2.mojo` の `test_http2_request_stream_combines_headers_body_and_trailers`、HTTP/3 の native record と Mojo decode は `tests/test_quic_provider.mojo` で検証する。
 
 ### エラー契約
 
@@ -476,18 +499,41 @@ transport 失敗は `NetError`、HTTP 失敗は `HttpError(status, should_close)
 
 method・status の意味は RFC 9110 による。Phase 1 で節番号付き table と wire fixture に対応付ける。
 
-### HTTP/2・HTTP/3 を見据えた共通境界（確認済み）
+### HTTP/2 と HTTP/3 の request 変換
 
-- `Request`・`Headers`・`Handler`・`ResponseWriter` は semantics 共有、wire と状態機械は分離。
-  Phase 1 の `_parser`・`_encoder` は HTTP/1.1 専用、H2 は `_http2/`、H3 は `_http3/`。
-- `scheme`・`authority`・`path`・`query`・`trailers` を Phase 0 から表現。
-  H2/H3 pseudo-header（`:method`・`:scheme`・`:authority`・`:path`）は adapter で変換し一般 header に混ぜない。
-- request line・chunked・一接続一 request の制約を共通 handler に持ち込まない。
-- stream 状態と connection 状態を分離、buffer 寿命は stream owner に結合。H1 初版は一接続一 active request。
-- H2/H3 は stream 単位の deadline・cancel・flow control・budget と connection 上限を併用。
-  一 stream の送信待ちで全体読み取りを止めず、制御 frame と他 stream を処理する。
-- H1 の close を一律 connection close に変換しない。stream error・connection error・GOAWAY・drain は adapter ごとに定義。
-- bounded buffered handler を各 protocol で再利用、streaming は別設計。wire 多重化と CPU 並列実行は区別する。
+共通 handler は `Request` の意味と所有値を受け取る。
+HTTP/1 の `_parser` と `_encoder`、HTTP/2 の `_http2/`、HTTP/3 の quiche provider が、それぞれ wire と状態機械を担当する。
+HTTP/3 の実装は `net/quic/provider/src/lib.rs` と `net/quic/__init__.mojo` にあり、`net/http/_http3/` package は存在しない。
+
+| 共通 field | HTTP/1.1 | HTTP/2 と HTTP/3 |
+| --- | --- | --- |
+| `method` | request line の method token | `:method` |
+| `target` | 検証した request target | `:path` |
+| `path` と `query` | origin-form は最初の `?` で分離。absolute-form は scheme と authority を除いた path と query | `:path` の最初の `?` で分離 |
+| `scheme` | 現在の parser は TLS listener でも `http` を設定 | `:scheme` |
+| `authority` | absolute-form の authority、または `Host` | `:authority`。HTTP/2 は省略時に妥当な `Host` を使える。HTTP/3 は必須 |
+| `version` | `HttpVersion.http11()` | `HttpVersion.http2()` または `HttpVersion.http3()` |
+| `headers` | 通常 header。`Host` も保持 | pseudo-header を除いた通常 header |
+| `trailers` | chunked body の trailer | 後続 HEADERS の trailer |
+| `body` | Content-Length または chunked を decode した bytes | DATA を終端まで組み立てた bytes |
+
+`path` と `query` は percent decode しない。
+HTTP/2 と HTTP/3 は pseudo-header の重複、不明な名前、通常 header の後の出現を拒否する。
+`Host` と `:authority` を併記するときは、ASCII の大文字小文字を除いて一致させる。
+CONNECT は未対応で、HTTP/3 の `:protocol` も拒否する。
+通常 header に connection 固有 field を混ぜず、`te` は `trailers` に限る。
+trailers は header と別に検証し、framing や routing を変更させない。
+
+HTTP/1 は一接続一 active request と順序付き pipelining を使う。
+HTTP/2 は stream ごとの request と送信状態を connection session に保持する。
+HTTP/3 は native transport と H3 stream の状態を provider に保持し、完了 record の request ID と stream ID を区別する。
+connection の flow control、stream の flow control、reset、GOAWAY は各 adapter が処理し、共通 handler に request line や chunked の処理を要求しない。
+`ResponseWriter.should_close` は HTTP/1 の接続終了指定で、H2/H3 の reset や GOAWAY を要求する共通 API ではない。
+handler は同じ event loop 上で同期実行するため、wire の多重化は handler の CPU 並列実行を意味しない。
+
+HTTP/2 の変換と拒否条件は `net/http/_http2/request_headers.mojo`、trailer と body の組立ては `net/http/_http2/request_stream.mojo` にある。
+対応する fixture は `tests/test_http2.mojo` の pseudo-header、authority、trailer、stream-state tests である。
+HTTP/3 の検証は provider の HEADERS 処理、Mojo への変換は `Server._dispatch_quic_requests` にあり、native provider、C shim、`tests/test_quic_provider.mojo`、独立 aioquic client が境界を検証する。
 
 ### 計測条件（固定）
 
