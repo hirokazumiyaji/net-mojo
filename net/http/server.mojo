@@ -84,7 +84,7 @@ from ._encoder import (
 from ._parser import ParseResult, parse_head, parse_one, _scan_chunked
 from .config import ServerConfig
 from .handler import Handler
-from .headers import Headers
+from .headers import Headers, _check_value_bytes
 from .response import (
     ResponseWriter,
     has_body_for_status,
@@ -1120,6 +1120,14 @@ struct Server(Movable):
         # matching the handler path (_inject_alt_svc_for_tls).
         var alt_svc = String("")
         if self._conns[idx].is_tls() and self.config.alt_svc.byte_length() > 0:
+            try:
+                _check_value_bytes(
+                    self.config.alt_svc.as_bytes(), "encode error Alt-Svc"
+                )
+            except e:
+                _ = e
+                self._close_conn(idx)
+                return
             alt_svc = self.config.alt_svc.copy()
         var capacity = _measure_error(
             status, True, self._tick_date, is_head, alt_svc
