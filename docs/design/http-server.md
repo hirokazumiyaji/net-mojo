@@ -145,6 +145,10 @@ deadline は単調時計による絶対時刻とし、byte を一つ受信する
 handler の同期実行自体は強制中断できないため、停止期限も handler が制御を返すことを前提とする。
 control handle は server より長く生存できる。共有 control state が wakeup 資源と終了状態の寿命を管理し、終了後の要求は何もせず成功する。
 停止要求は冪等とし、通知と wakeup fd の破棄を同期して、close 済みまたは再利用済みの fd に書き込まない。通知が既に保留なら再通知は不要とする。
+実装は `net/http/_control.mojo` の mutex と参照カウント付き共有状態で、停止専用の socketpair を所有する。
+`ServerControl.copy()` で別 thread 用 handle を作成し、`serve_with_control` は handle を immutable borrow して内部にコピーを保持する。
+通知と socketpair の close は同じ mutex で同期する。serve の成功・例外・server 破棄時は reactor 登録を解除して共有状態を終了済みにし、遅れた停止要求が fd 再利用先に通知されない。
+`pixi run test-http-control` は pthread、reactor wakeup、重複要求、handle の寿命、終了と通知の競合、serve 例外を検証する。
 
 ## 実装計画
 
@@ -396,12 +400,12 @@ struct ServerConfig(Copyable, Movable):
     @staticmethod
     def default() raises -> Self
 
-# net/http/server.mojo
-struct ServerControl(Movable):
-    def __init__(out self)
-    def request_shutdown(mut self)
+# net/http/_control.mojo
+struct ServerControl(Copyable, Movable):
+    def __init__(out self) raises NetError
+    def request_shutdown(self)
     def is_shutdown_requested(self) -> Bool
-    def mark_exited(mut self)
+    def mark_exited(self)
 
 struct Server(Movable):
     def __init__(out self, var config: ServerConfig)

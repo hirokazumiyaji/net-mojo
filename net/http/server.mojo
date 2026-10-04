@@ -20,9 +20,8 @@ Ownership and resources:
 - `ServerControl.request_shutdown` only records the request; the loop
   owner performs every socket operation. Shutdown stops accepting,
   closes idle connections at once, drains in-flight requests within the
-  grace period, then marks the control exited. A cross-thread wakeup fd
-  is future work: `tick` bounds every wait, so a request is noticed on
-  the next tick boundary at the latest.
+  grace period, then marks the shared control exited. A shutdown request
+  wakes the reactor immediately; copied handles may outlive the server.
 - Fairness: each connection moves at most `max_bytes_per_tick` bytes
   and completes at most `max_requests_per_tick` requests per tick, and
   each tick accepts at most `max_accept_per_tick` connections.
@@ -37,6 +36,7 @@ from net.error import NetError, NetErrorKind
 from net.quic import QuicUDPEndpoint
 
 from ._buffer import BufferBudget
+from ._control import ServerControl
 from ._connection import (
     HttpConnection,
     PROTOCOL_HTTP2,
@@ -104,40 +104,10 @@ struct _HeapEntry(Copyable, ImplicitlyCopyable, Movable):
     var idx: Int
 
 
-struct ServerControl(Movable):
-    """Shutdown request handle polled by the loop owner.
-
-    NOT yet safe to share across threads (plain `Bool` fields, no
-    atomics available): today the owner thread calls `request_shutdown`
-    or drives shutdown through `Server`. Cross-thread requests plus a
-    wakeup fd are tracked Phase 4 work; see the module docstring.
-    """
-
-    var _requested: Bool
-    var _exited: Bool
-
-    def __init__(out self):
-        self._requested = False
-        self._exited = False
-
-    def request_shutdown(mut self):
-        """Idempotent shutdown request. Safe to call twice and safe to
-        call after the server has exited (then it is a no-op)."""
-        if self._exited:
-            return
-        self._requested = True
-
-    def is_shutdown_requested(self) -> Bool:
-        return self._requested
-
-    def mark_exited(mut self):
-        self._requested = True
-        self._exited = True
-
-
 struct Server(Movable):
     var config: ServerConfig
     var control: ServerControl
+    var _control_token: ReactorToken
     var _reactor: Reactor
     var _listener: Optional[TCPListener]
     var _tls_context: Optional[TLSContext]
@@ -172,6 +142,7 @@ struct Server(Movable):
         self.config = config^
         self.control = ServerControl()
         self._reactor = Reactor()
+        self._control_token = self._reactor.register(self.control._read_fd())
         self._listener = None
         self._tls_context = None
         self._listener_token = ReactorToken(slot=-1, generation=0)
@@ -201,6 +172,7 @@ struct Server(Movable):
             self._slot_map.append(-1)
 
     def __deinit__(deinit self):
+        self._finish_control()
         for idx in range(len(self._conns)):
             var addr = self._conns[idx].detach_state_addr
             if addr != 0:
@@ -300,7 +272,7 @@ struct Server(Movable):
             and not self._quic_endpoint
             and self._active_conns == 0
         ):
-            self.control.mark_exited()
+            self._finish_control()
             return False
         self._tick_id += 1
         # Capped pipelines from the previous tick re-drive without a kernel
@@ -329,6 +301,11 @@ struct Server(Movable):
             wait_timeout = Timeout.nanoseconds(0)
         var events = self._reactor.wait(wait_timeout)
         now = now_ns()
+        self._note_shutdown(now)
+        for i in range(len(events)):
+            if events[i].token == self._control_token:
+                self.control._drain()
+                break
         self._drive_quic()
         self._dispatch_quic_requests(handler)
         self._finish_quic_shutdown_if_due(now)
@@ -411,7 +388,7 @@ struct Server(Movable):
             and not self._quic_endpoint
             and self._active_conns == 0
         ):
-            self.control.mark_exited()
+            self._finish_control()
             return False
         return True
 
@@ -420,8 +397,12 @@ struct Server(Movable):
     ](mut self, var listener: TCPListener, mut handler: H) raises:
         """Runs the event loop until shutdown completes. Takes listener
         ownership."""
-        self.add_listener(listener^)
-        self._run(handler)
+        try:
+            self.add_listener(listener^)
+            self._run(handler)
+        except error:
+            self._finish_control()
+            raise error
 
     def serve_tls[
         H: Handler
@@ -433,14 +414,22 @@ struct Server(Movable):
     ) raises:
         """Serves HTTP/1.1 over TLS and takes ownership of listener and context.
         """
-        self.add_tls_listener(listener^, tls_context^)
-        self._run(handler)
-        self._tls_context = None
+        try:
+            self.add_tls_listener(listener^, tls_context^)
+            self._run(handler)
+            self._tls_context = None
+        except error:
+            self._finish_control()
+            raise error
 
     def _run[H: Handler](mut self, mut handler: H) raises:
         while True:
             if not self.tick(handler, None):
                 break
+
+    def _finish_control(mut self):
+        _ = self._reactor.remove(self._control_token)
+        self.control.mark_exited()
 
     def serve_with_control[
         H: Handler
@@ -448,28 +437,22 @@ struct Server(Movable):
         mut self,
         var listener: TCPListener,
         mut handler: H,
-        mut control: ServerControl,
+        control: ServerControl,
     ) raises:
-        """Runs the event loop like `serve`, but polls and exits through
-        a caller-held `ServerControl` instead of the owned one.
-
-        The handle is polled, not shared: it is mutably borrowed for the
-        whole call, so the caller cannot use it while this runs, and
-        calling `request_shutdown` from another thread becomes safe only
-        once the control is backed by shared atomic state (tracked Phase 4
-        work). Today this only supports pre-requesting shutdown before
-        entry (then it exits promptly); to stop a running server, drive
-        `add_listener` + `tick` and call `request_shutdown` between ticks.
+        """Serves with a shared handle; callers may keep a copy on another thread.
         """
-        self.add_listener(listener^)
-        while True:
-            if control.is_shutdown_requested():
-                self.control.request_shutdown()
-            if not self.tick(handler, None):
-                break
-            if self.control.is_shutdown_requested():
-                control.request_shutdown()
-        control.mark_exited()
+        try:
+            if self.control._addr != control._addr:
+                self._finish_control()
+                self.control = control.copy()
+                self._control_token = self._reactor.register(
+                    self.control._read_fd()
+                )
+            self.add_listener(listener^)
+            self._run(handler)
+        except error:
+            self._finish_control()
+            raise error
 
     def local_address(self) raises NetError -> SocketAddress:
         """Returns the bound listener address (handy with ephemeral
@@ -2623,11 +2606,13 @@ def listen_and_serve_with_control[
     address: StringSlice,
     var config: ServerConfig,
     mut handler: H,
-    mut control: ServerControl,
+    control: ServerControl,
 ) raises:
-    """Binds `address` and serves like `listen_and_serve`, but through a
-    caller-held shutdown handle. See `serve_with_control` for the
-    polling (not yet cross-thread-safe) contract."""
-    var server = Server(config^)
-    var listener = listen_tcp(address)
-    server.serve_with_control(listener^, handler, control)
+    """Binds `address` and serves using a shared shutdown handle."""
+    try:
+        var server = Server(config^)
+        var listener = listen_tcp(address)
+        server.serve_with_control(listener^, handler, control)
+    except error:
+        control.mark_exited()
+        raise error

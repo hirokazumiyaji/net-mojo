@@ -213,14 +213,16 @@ while server.tick(handler):
         server.request_shutdown()
 ```
 
-A running blocking `serve` cannot currently be stopped from another
-thread or from the same thread: `ServerControl` is not thread-safe and
-`serve_with_control` mutably borrows its `control` for the whole call,
-so the handle cannot be used while `serve_with_control` runs.
-Pre-requesting shutdown on the caller-held control before entry only
-makes it exit promptly. Cross-thread shutdown with a wakeup fd is
-future work. See `tests/test_http_server.mojo`
-(`test_shutdown_drains_in_flight_and_exits`).
+`ServerControl` is copyable and thread-safe. Keep a copy of `server.control`
+before handing the server to its loop thread, or supply a shared control to
+`serve_with_control` / `listen_and_serve_with_control`. Calling
+`control.request_shutdown()` from another thread wakes the reactor immediately.
+The loop owner stops accepting and drains requests; the calling thread never
+operates on server sockets. Repeated requests are harmless, and copies can
+outlive the server: requests after completion, an error, or server destruction
+are successful no-ops. Synchronous handlers must still return before shutdown
+can progress. See `tests/test_http_control.mojo` and
+`test_shutdown_drains_in_flight_and_exits` in `tests/test_http_server.mojo`.
 
 Reproduce the performance comparison with
 `benchmarks/http/README.md` (Go baseline in `benchmarks/http_go`,

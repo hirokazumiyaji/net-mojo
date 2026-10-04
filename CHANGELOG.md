@@ -14,6 +14,9 @@ underscore (see README "Versioning and compatibility"). Anything under
 
 ### Changed
 
+- Make HTTP `ServerControl` copyable and thread-safe, wake the reactor on
+  shutdown requests, and keep surviving handles safe after server exit.
+
 - Require Mojo 1.1 only: drop the `mojo-1-0` Pixi environment and CI job, and
   migrate `String.as_c_string_slice` / `CStringSpan.unsafe_ptr` to
   `as_c_string_span` / `ptr`.
