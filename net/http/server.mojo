@@ -12,7 +12,7 @@ Ownership and resources:
   internal table; only raw fd numbers are ever handed to the reactor.
 - One global `BufferBudget` charges receive and adopted pending capacity,
   including growth peaks, and lends synchronous HTTP/1 writer workspace.
-  Content-Length HTTP/1 body copies reserve capacity before parsing and hold
+  Decoded HTTP/1 body copies reserve capacity before materialization and hold
   that reservation until the borrowed request is dropped after its handler.
   Buffered HTTP/1 wire is reserved before encoding; other encoding remains
   separate.
@@ -76,7 +76,7 @@ from ._encoder import (
     encode_response,
     _encode_response_budgeted,
 )
-from ._parser import ParseResult, parse_head, parse_one
+from ._parser import ParseResult, parse_head, parse_one, _scan_chunked
 from .config import ServerConfig
 from .handler import Handler
 from .headers import Headers
@@ -1801,6 +1801,32 @@ struct Server(Movable):
                 # the short header deadline kill a slow but admitted
                 # upload.
                 self._conns[idx].header_at = NO_DEADLINE
+            if head.head.chunked:
+                var wire = head.head.header_end
+                var meta = 0
+                var decoded = 0
+                var scan = _scan_chunked(
+                    Span(self._conns[idx].buf),
+                    self.config,
+                    wire,
+                    meta,
+                    decoded,
+                )
+                if scan.is_error():
+                    self._send_error(idx, scan.error.status)
+                    return
+                if scan.is_need_more():
+                    if self._conns[idx].read_eof:
+                        self._close_conn(idx)
+                        return
+                    self._conns[idx].scanned_len = self._conns[
+                        idx
+                    ].buffered_len()
+                    break
+                if not self._budget.try_reserve(scan.decoded):
+                    self._send_error(idx, 503)
+                    return
+                self._conns[idx].http1_body_reserved = scan.decoded
             var result = parse_one(Span(self._conns[idx].buf), self.config)
             if result.is_need_more():
                 if self._conns[idx].read_eof:
