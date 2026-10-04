@@ -46,6 +46,8 @@ Verified Phase 0 (loopback, `GOMAXPROCS=1`):
 
 For real TCP/UDP RTT and loss without changing host networking, use the
 [isolated Linux procedure](LINUX_NETWORK.md).
+The [2026-10-04 Linux results](LINUX_RESULTS.md) record real RTT/loss
+validation and distinguish it from the remaining performance procedure.
 
 - Warmup 10 s, measure 30 s, repeat at least 5 times.
 - Record req/s, bytes/s, p50 / p95 / p99, error rate, CPU, RSS, fd count.
