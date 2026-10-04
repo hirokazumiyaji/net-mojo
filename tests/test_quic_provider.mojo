@@ -1,3 +1,5 @@
+from std.testing import assert_true, assert_false
+
 from net._reactor import Reactor
 from net.address import SocketAddress
 from net.quic import QuicProvider, QuicUDPEndpoint
@@ -37,16 +39,16 @@ def test_udp_send_backpressure_preserves_pending_datagram() raises:
     # Deterministic would-block via fault injection (no kernel queue
     # timing or TEST-NET routing dependency).
     _stage_pending_payload(endpoint, destination)
-    assert endpoint.wants_write()
+    assert_true(endpoint.wants_write())
     endpoint.inject_send_would_block_once()
-    assert not endpoint.try_send()
-    assert endpoint.wants_write()
+    assert_false(endpoint.try_send())
+    assert_true(endpoint.wants_write())
     # Immediate retry may succeed once the kernel drains; tolerate both
     # (still-pending with write interest, or delivered without it).
     if endpoint.try_send():
-        assert not endpoint.wants_write()
+        assert_false(endpoint.wants_write())
     else:
-        assert endpoint.wants_write()
+        assert_true(endpoint.wants_write())
         # Wait for real writability and deliver the preserved datagram.
         var reactor = Reactor()
         var token = reactor.register(
@@ -65,27 +67,27 @@ def test_udp_send_backpressure_preserves_pending_datagram() raises:
             if endpoint.try_send():
                 delivered = True
                 break
-            assert endpoint.wants_write()
-        assert delivered
-        assert not endpoint.wants_write()
+            assert_true(endpoint.wants_write())
+        assert_true(delivered)
+        assert_false(endpoint.wants_write())
 
     var received = Array[Byte, 16](fill=0)
     var result = receiver.recv_from(
         Span[mut=True](received), Timeout.seconds(1)
     )
-    assert result.count == 16
+    assert_true(result.count == 16)
     for i in range(16):
-        assert received[i] == Byte(0x40 + i)
+        assert_true(received[i] == Byte(0x40 + i))
 
 
 def main() raises:
     var provider = QuicProvider("build/quic/libnet_quic_provider")
-    assert provider.version() == "0.29.3"
+    assert_true(provider.version() == "0.29.3")
     var config = provider.server_config(
         "build/tls/test-cert.pem", "build/tls/test-key.pem"
     )
     var server = provider.server(config^)
-    assert server.timeout_micros() == UInt64.MAX
+    assert_true(server.timeout_micros() == UInt64.MAX)
     var packet = Array[Byte, 256](fill=0)
     _ = server.try_send_datagram(Span[mut=True](packet))
     server.on_timeout()
@@ -99,13 +101,15 @@ def main() raises:
     var invalid_datagram = Array[Byte, 1](fill=Byte(0))
     _ = client.write(Span(invalid_datagram), Timeout.seconds(1))
     var events = reactor.wait(Timeout.seconds(1))
-    assert len(events) == 1
-    assert events[0].token == token
-    assert not endpoint.try_receive()
-    assert not endpoint.try_send()
-    assert not endpoint.wants_write()
+    assert_true(len(events) == 1)
+    assert_true(events[0].token == token)
+    assert_false(endpoint.try_receive())
+    assert_false(endpoint.try_send())
+    assert_false(endpoint.wants_write())
 
-    var http_server = Server(ServerConfig.default())
+    var http_config = ServerConfig.default()
+    http_config.shutdown_grace = Timeout.milliseconds(20)
+    var http_server = Server(http_config^)
     var server_listener = listen_udp("127.0.0.1:0")
     var server_address = String(server_listener.local_address())
     var config2 = provider.server_config(
@@ -118,9 +122,14 @@ def main() raises:
     var udp_client = dial_udp(server_address)
     _ = udp_client.write(Span(invalid_datagram), Timeout.seconds(1))
     var handler = _NoopHandler()
-    assert http_server.tick(handler, Timeout.seconds(1))
+    assert_true(http_server.tick(handler, Timeout.seconds(1)))
     http_server.request_shutdown()
-    assert not http_server.tick(handler, Timeout.nanoseconds(0))
+    var running = True
+    for _ in range(100):
+        running = http_server.tick(handler, Timeout.milliseconds(5))
+        if not running:
+            break
+    assert_false(running)
 
     test_udp_send_backpressure_preserves_pending_datagram()
     print("QUIC provider Mojo FFI: ok")
