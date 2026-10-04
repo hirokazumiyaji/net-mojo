@@ -1,4 +1,4 @@
-"""Exercise all HTTP ServerConfig receive pools through the Mojo/C boundary."""
+"""Exercise HTTP ServerConfig receive and send pools through the Mojo/C boundary."""
 
 import asyncio
 import os
@@ -55,6 +55,19 @@ async def check(address, mode):
     async with connect(host, int(port), configuration=config,
                        create_protocol=PoolProtocol, wait_connected=False) as client:
         client.transmit()
+        if mode.startswith("send_"):
+            if mode == "send_crypto_slots":
+                try:
+                    await asyncio.wait_for(client.handshake, 0.3)
+                except asyncio.TimeoutError:
+                    assert not client.closed.done(), "preaccept refusal fabricated a close"
+                    return
+                raise AssertionError("zero send CRYPTO slots should refuse Initial")
+            if mode in ("send_request_bytes", "send_request_slots"):
+                await asyncio.wait_for(client.wait_connected(), 0.8)
+                client.get()
+            assert await asyncio.wait_for(client.closed, 0.8) == 0x1
+            return
         if mode in ("crypto_bytes", "crypto_slots"):
             try:
                 await asyncio.wait_for(client.handshake, 0.3)
@@ -77,7 +90,9 @@ async def check(address, mode):
 
 def main():
     for mode in ("default", "request_bytes", "request_slots", "control_bytes",
-                 "control_slots", "crypto_bytes", "crypto_slots"):
+                 "control_slots", "crypto_bytes", "crypto_slots",
+                 "send_request_bytes", "send_request_slots", "send_control_bytes",
+                 "send_control_slots", "send_crypto_bytes", "send_crypto_slots"):
         env = dict(os.environ)
         env["HTTP3_RECEIVE_POOL"] = mode
         process = subprocess.Popen(["mojo", "run", "--Werror", "-I", ".",
@@ -90,8 +105,8 @@ def main():
             asyncio.run(check(ready.removeprefix("READY "), mode))
             out, err = process.communicate(timeout=3)
             assert process.returncode == 0, (mode, out, err)
-            assert out.strip() == ("HANDLED 1" if mode == "default" else "HANDLED 0"), (mode, out)
-            print(f"HTTP receive pool={mode}: pass")
+            assert out.strip() == ("HANDLED 1" if mode in ("default", "send_request_bytes") else "HANDLED 0"), (mode, out)
+            print(f"HTTP native pool={mode}: pass")
         finally:
             if process.poll() is None:
                 process.terminate()

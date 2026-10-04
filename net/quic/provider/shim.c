@@ -39,6 +39,14 @@ int32_t net_quic_set_receive_limits(
         control_bytes, control_slots, crypto_bytes, crypto_slots);
 }
 
+int32_t net_quic_set_send_limits(
+    struct NetQuicServer *server, size_t request_bytes, size_t request_slots,
+    size_t control_bytes, size_t control_slots, size_t crypto_bytes,
+    size_t crypto_slots) {
+    return net_quic_server_set_send_limits(server, request_bytes, request_slots,
+        control_bytes, control_slots, crypto_bytes, crypto_slots);
+}
+
 size_t net_quic_transport_memory_bytes(
     const struct NetQuicServer *server) {
     return net_quic_server_transport_memory_bytes(server);

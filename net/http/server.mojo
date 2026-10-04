@@ -260,6 +260,14 @@ struct Server(Movable):
             self.config.quic_receive_crypto_bytes,
             self.config.quic_receive_crypto_slots,
         )
+        endpoint.set_send_limits(
+            self.config.quic_send_request_bytes,
+            self.config.quic_send_request_slots,
+            self.config.quic_send_control_bytes,
+            self.config.quic_send_control_slots,
+            self.config.quic_send_crypto_bytes,
+            self.config.quic_send_crypto_slots,
+        )
         endpoint.set_request_limits(
             self.config.max_body_bytes,
             self.config.max_headers_bytes,
