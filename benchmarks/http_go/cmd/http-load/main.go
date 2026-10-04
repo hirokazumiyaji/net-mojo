@@ -29,6 +29,7 @@ type config struct {
 	Chunked     bool          `json:"chunked"`
 	KeepAlive   bool          `json:"keepalive"`
 	Timeout     time.Duration `json:"request_timeout_ns"`
+	Rate        int           `json:"rate_requests_per_second"`
 }
 
 type counts struct {
@@ -47,16 +48,18 @@ type latencyStats struct {
 type result struct {
 	Config config `json:"config"`
 	counts
-	WarmupCounts           counts       `json:"warmup_counts"`
-	ElapsedSeconds         float64      `json:"elapsed_seconds"`
-	Samples                uint64       `json:"samples"`
-	RequestBodyBytes       uint64       `json:"request_body_bytes"`
-	ResponseBytes          uint64       `json:"response_bytes"`
-	RequestsPerSecond      float64      `json:"requests_per_second"`
-	ResponseBytesPerSecond float64      `json:"response_bytes_per_second"`
-	LatencyMS              latencyStats `json:"latency_ms"`
-	Valid                  bool         `json:"valid"`
-	FirstError             string       `json:"first_error,omitempty"`
+	WarmupCounts           counts        `json:"warmup_counts"`
+	ElapsedSeconds         float64       `json:"elapsed_seconds"`
+	Samples                uint64        `json:"samples"`
+	RequestBodyBytes       uint64        `json:"request_body_bytes"`
+	ResponseBytes          uint64        `json:"response_bytes"`
+	RequestsPerSecond      float64       `json:"requests_per_second"`
+	ResponseBytesPerSecond float64       `json:"response_bytes_per_second"`
+	LatencyMS              latencyStats  `json:"latency_ms"`
+	Valid                  bool          `json:"valid"`
+	FirstError             string        `json:"first_error,omitempty"`
+	Arrivals               *arrivalStats `json:"arrivals,omitempty"`
+	WarmupArrivals         *arrivalStats `json:"warmup_arrivals,omitempty"`
 }
 
 type workload struct {
@@ -72,6 +75,17 @@ func prepare(c config) (workload, error) {
 	}
 	if c.Connections <= 0 || c.Duration <= 0 || c.Warmup < 0 || c.Timeout <= 0 || c.BodySize < 0 || c.BodySize > 1<<20 {
 		return workload{}, errors.New("connections/duration/timeout must be positive; warmup >= 0; body-size 0..1048576")
+	}
+	if c.Rate < 0 {
+		return workload{}, errors.New("rate must be nonnegative")
+	}
+	if c.Rate > 0 {
+		if _, err := arrivalCount(c.Duration, c.Rate); err != nil {
+			return workload{}, err
+		}
+		if _, err := arrivalCount(c.Warmup, c.Rate); err != nil {
+			return workload{}, err
+		}
 	}
 	w := workload{method: "GET"}
 	switch u.Path {
@@ -129,8 +143,9 @@ func request(ctx context.Context, client *http.Client, c config, w workload) err
 
 type phaseResult struct {
 	counts
-	samples []time.Duration
-	error   string
+	samples  []time.Duration
+	error    string
+	arrivals *arrivalStats
 }
 
 func phase(client *http.Client, c config, w workload, duration time.Duration, sample bool) phaseResult {
@@ -183,14 +198,7 @@ func phase(client *http.Client, c config, w workload, duration time.Duration, sa
 	var total phaseResult
 	for i := 0; i < c.Connections; i++ {
 		r := <-results
-		total.Started += r.Started
-		total.Success += r.Success
-		total.Errors += r.Errors
-		total.Cutoff += r.Cutoff
-		total.samples = append(total.samples, r.samples...)
-		if total.error == "" {
-			total.error = r.error
-		}
+		total.merge(r)
 	}
 	return total
 }
@@ -225,14 +233,16 @@ func run(c config) (result, error) {
 	client := &http.Client{Transport: transport, Timeout: c.Timeout,
 		CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
 	if c.Warmup > 0 {
-		warm := phase(client, c, w, c.Warmup, false)
+		warm := runPhase(client, c, w, c.Warmup, false)
 		r.WarmupCounts, r.FirstError = warm.counts, warm.error
-		if warm.Errors > 0 || warm.Success == 0 {
-			return r, errors.New("warmup failed validation or completed no valid requests")
+		r.WarmupArrivals = warm.arrivals
+		if warm.Errors > 0 || warm.Success == 0 || warm.lostArrivals() {
+			return r, errors.New("warmup failed validation, lost arrivals, or completed no valid requests")
 		}
 	}
-	measured := phase(client, c, w, c.Duration, true)
+	measured := runPhase(client, c, w, c.Duration, true)
 	r.counts, r.FirstError = measured.counts, measured.error
+	r.Arrivals = measured.arrivals
 	r.ElapsedSeconds = c.Duration.Seconds()
 	r.Samples = uint64(len(measured.samples))
 	r.RequestBodyBytes = r.Success * uint64(len(w.body))
@@ -240,9 +250,9 @@ func run(c config) (result, error) {
 	r.RequestsPerSecond = float64(r.Success) / r.ElapsedSeconds
 	r.ResponseBytesPerSecond = float64(r.ResponseBytes) / r.ElapsedSeconds
 	r.LatencyMS = latencies(measured.samples)
-	r.Valid = r.Success > 0 && r.Errors == 0
+	r.Valid = r.Samples > 0 && r.Errors == 0 && !measured.lostArrivals()
 	if !r.Valid {
-		return r, errors.New("measurement failed validation or completed no valid requests")
+		return r, errors.New("measurement failed validation, lost arrivals, or completed no valid requests")
 	}
 	return r, nil
 }
@@ -258,6 +268,7 @@ func main() {
 	flag.BoolVar(&c.Chunked, "chunked", false, "send echo request with chunked framing")
 	flag.BoolVar(&c.KeepAlive, "keepalive", true, "reuse connections")
 	flag.DurationVar(&c.Timeout, "timeout", 5*time.Second, "maximum individual request duration")
+	flag.IntVar(&c.Rate, "rate", 0, "fixed requests/second (0 uses saturated closed loop)")
 	flag.Parse()
 	r, err := run(c)
 	if outputErr := json.NewEncoder(os.Stdout).Encode(r); outputErr != nil {
