@@ -18,6 +18,9 @@ Both build and test scripts stage the public Cargo archive, verify SHA-256
 and apply the explicit ordered patch list before compilation. Cargo's
 same-graph `paths` override keeps the upstream version, dependency graph and lockfile unchanged. The
 archive's license remains in the generated source and `quiche-COPYING`.
+Patch application uses the HTTP/3 feature's existing Git dependency, without
+requiring a separate `patch` executable. Git repository discovery stops at the
+fresh staging directory so an enclosing checkout cannot filter staged paths.
 
 The 10,000-cancellation regression measures live Rust allocations released by
 dropping the server's H3 object, independently of application byte counters.
