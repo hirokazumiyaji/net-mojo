@@ -15,6 +15,57 @@ from net.http._deadline import NO_DEADLINE, now_ns
 from tests.support import _tick_n
 
 
+def test_receive_compaction_consumption_close_and_slot_reuse() raises:
+    var config = ServerConfig.default()
+    config.total_buffer_budget = 128
+    var server = Server(config^)
+    var listener = listen_tcp("127.0.0.1:0")
+    server.add_listener(listener^)
+    var address = String("127.0.0.1:") + String(server.local_address().port)
+    var handler = _HelloHandler()
+    var client = dial_tcp(String(address), Timeout.seconds(1))
+    _tick_n(server, handler, 2)
+    assert_equal(len(server._conns), 1)
+    assert_true(server._charge_read(0, 8))
+    for i in range(8):
+        server._conns[0].buf.append(Byte(i))
+    server._conns[0].scanned_len = 8
+    server._consume_receive(0, 5)
+    assert_equal(server._budget.used, 8)
+    assert_equal(server._conns[0].buf.capacity(), 8)
+    assert_equal(len(server._conns[0].buf), 3)
+    assert_equal(server._conns[0].buf[0], 5)
+    assert_equal(server._conns[0].buf[2], 7)
+    assert_equal(server._conns[0].scanned_len, 3)
+    server._consume_receive(0, 3)
+    assert_equal(server._budget.used, 0)
+    assert_equal(server._conns[0].buf.capacity(), 0)
+    assert_true(server._charge_read(0, 12))
+    assert_equal(server._budget.used, 12)
+    assert_true(server._charge_read(0, 96))
+    var head = String(
+        "POST /echo HTTP/1.1\r\nHost: x\r\nContent-Length: 40\r\n\r\n"
+    )
+    server._conns[0].append_bytes(head.as_bytes())
+    server._pump_parse(0, handler, 0)
+    assert_equal(server._conns[0].reserved, 0)
+    assert_equal(server._budget.used, 96)
+    assert_true(server._budget.try_reserve(7))
+    server._conns[0].reserved = 7
+    server._close_conn(0)
+    assert_equal(server._budget.used, 0)
+    assert_equal(server._conns[0].buf.capacity(), 0)
+    client.close()
+    var second = dial_tcp(String(address), Timeout.seconds(1))
+    _tick_n(server, handler, 2)
+    assert_equal(len(server._conns), 1)
+    assert_true(server._conns[0].active)
+    assert_equal(server._conns[0].reserved, 0)
+    assert_equal(server._conns[0].buf.capacity(), 0)
+    assert_equal(server._budget.used, 0)
+    second.close()
+
+
 struct _HelloHandler(Handler):
     def __init__(out self):
         pass

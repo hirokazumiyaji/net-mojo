@@ -10,8 +10,8 @@ Ownership and resources:
 - `serve` takes listener ownership and runs until shutdown completes or
   the listener and every connection are gone. Connections live in the
   internal table; only raw fd numbers are ever handed to the reactor.
-- One global `BufferBudget` counts wire bytes held in receive buffers
-  and queued responses. Request admission (known body length) and the
+- One global `BufferBudget` charges receive capacity, including growth
+  peaks, and queued response wire lengths. Request admission and the
   `ResponseWriter` cap derive from the remaining budget; a request that
   cannot be admitted gets 503 and close, a handler overrun becomes 500.
 - Deadlines are absolute monotonic timestamps fixed at phase entry:
@@ -35,7 +35,7 @@ from net._reactor import Reactor, ReactorToken
 from net.error import NetError, NetErrorKind
 from net.quic import QuicUDPEndpoint
 
-from ._buffer import BufferBudget
+from ._buffer import BufferBudget, _reserve_capacity
 from ._control import ServerControl
 from ._connection import (
     HttpConnection,
@@ -1039,7 +1039,7 @@ struct Server(Movable):
         # partial-send close until unrelated requests see 503s. Any
         # admission reservation still held is released the same way.
         self._budget.release(
-            self._conns[idx].buffered_len() + len(self._conns[idx].pending)
+            self._conns[idx].buf.capacity() + len(self._conns[idx].pending)
         )
         self._budget.release(self._conns[idx].reserved)
         self._conns[idx].reserved = 0
@@ -1414,8 +1414,7 @@ struct Server(Movable):
                 self._close_conn(idx)
                 return
             if result.consumed > 0:
-                self._conns[idx].drain_prefix(result.consumed)
-                self._budget.release(result.consumed)
+                self._consume_receive(idx, result.consumed)
             if result.reset_stream_id != UInt32(0):
                 var dropped_unsent = self._conns[
                     idx
@@ -1714,20 +1713,17 @@ struct Server(Movable):
                 return
 
     def _charge_read(mut self, idx: Int, count: Int) -> Bool:
-        # Bytes covered by an admission reservation reuse it; only the
-        # remainder draws from the shared budget. The reservation is
-        # decremented only after the extra draw succeeds: on failure the
-        # chunk is discarded and the error path still releases the full
-        # reservation, so decrementing first would leak the covered part
-        # out of the budget forever.
-        var covered = count
-        if covered > self._conns[idx].reserved:
-            covered = self._conns[idx].reserved
-        var rest = count - covered
-        if rest > 0 and not self._budget.try_reserve(rest):
-            return False
-        self._conns[idx].reserved -= covered
-        return True
+        return _reserve_capacity(
+            self._conns[idx].buf,
+            self._budget,
+            self._conns[idx].buffered_len() + count,
+            self._conns[idx].reserved,
+        )
+
+    def _consume_receive(mut self, idx: Int, count: Int):
+        var old_capacity = self._conns[idx].buf.capacity()
+        self._conns[idx].drain_prefix(count)
+        self._budget.release(old_capacity - self._conns[idx].buf.capacity())
 
     def _admit_over_budget(mut self, idx: Int) raises NetError:
         # The kernel still holds the unread bytes; answer from what is
@@ -1761,22 +1757,12 @@ struct Server(Movable):
                 self._send_error(idx, head_status)
                 return
             var content_length = head.head.content_length
-            # Admit only the body bytes still missing: what is already
-            # buffered is counted in the budget, so adding the full
-            # declared length would charge it twice and 503 requests
-            # that actually fit.
-            var buffered_body = (
-                self._conns[idx].buffered_len() - head.head.header_end
+            var outstanding = max(
+                0,
+                head.head.header_end
+                + content_length
+                - self._conns[idx].buf.capacity(),
             )
-            if buffered_body < 0:
-                buffered_body = 0
-            var outstanding = content_length - buffered_body
-            if outstanding < 0:
-                outstanding = 0
-            # The live reservation is part of `used`: subtract it before
-            # adding the outstanding remainder, or every re-parse while
-            # the body is still arriving would charge the same bytes
-            # twice and 503 admitted requests.
             var unreserved = self._budget.used - self._conns[idx].reserved
             if (
                 content_length > 0
@@ -1784,12 +1770,7 @@ struct Server(Movable):
             ):
                 self._send_error(idx, 503)
                 return
-            # Reserve the missing bytes now so concurrent admissions
-            # cannot promise the same capacity twice. Arrivals consume
-            # the reservation via _charge_read; completion and close
-            # release whatever remains. Guarded to reserve once per
-            # request: re-parses while the body is still arriving must
-            # not charge again.
+            # Preserve capacity for admitted bodies before other connections compete.
             if outstanding > 0 and self._conns[idx].reserved == 0:
                 if not self._budget.try_reserve(outstanding):
                     self._send_error(idx, 503)
@@ -1820,8 +1801,7 @@ struct Server(Movable):
                 return
             var req_close = result.should_close
             var consumed = result.consumed
-            self._budget.release(consumed)
-            self._conns[idx].drain_prefix(consumed)
+            self._consume_receive(idx, consumed)
             self._conns[idx].requests_this_tick += 1
             self._respond(idx, result^, req_close, handler)
             if not self._conns[idx].active:
