@@ -811,6 +811,8 @@ pub struct QuicServer {
     connections: HashMap<Vec<u8>, QuicConnection>,
     send_ready: SendReadyQueue,
     response_ready: SendReadyQueue,
+    #[cfg(test)]
+    terminal_checks: usize,
     transport_timeouts: BTreeSet<(Instant, Vec<u8>)>,
     request_timeouts: BTreeSet<(Instant, Vec<u8>, u64)>,
     response_timeouts: BTreeSet<(Instant, Vec<u8>, u64)>,
@@ -971,6 +973,8 @@ impl QuicServer {
             connections: HashMap::new(),
             send_ready: SendReadyQueue::default(),
             response_ready: SendReadyQueue::default(),
+            #[cfg(test)]
+            terminal_checks: 0,
             transport_timeouts: BTreeSet::new(),
             request_timeouts: BTreeSet::new(),
             response_timeouts: BTreeSet::new(),
@@ -1067,6 +1071,7 @@ impl QuicServer {
         }
         for (key, deadline) in timeouts {
             self.set_transport_timeout(&key, deadline);
+            self.reap_closed_connection(&key);
         }
         first_error.map_or(Ok(()), |error| Err(error.into()))
     }
@@ -1150,7 +1155,10 @@ impl QuicServer {
         self.refresh_transport_timeout(&key);
         self.refresh_idle_timeout(&key);
         self.refresh_response_ready(&key);
-        received?;
+        if let Err(error) = received {
+            self.reap_closed_connection(&key);
+            return Err(error.into());
+        }
         let http3_error = {
             let connection = self.connections.get_mut(&key).unwrap();
             connection.idle_deadline_at = Some(Instant::now() + self.idle_timeout);
@@ -1172,6 +1180,7 @@ impl QuicServer {
         };
         self.refresh_idle_timeout(&key);
         if let Some(error) = http3_error {
+            self.reap_closed_connection(&key);
             return Err(error.into());
         }
 
@@ -1219,6 +1228,7 @@ impl QuicServer {
         let Some(completed) = completed else {
             // CONNECTION_CLOSE is queued; keep the connection until send/drain
             // emits it and quiche reports the transport closed.
+            self.reap_closed_connection(&key);
             return Ok(());
         };
         let source_ids: Vec<Vec<u8>> = self
@@ -1280,6 +1290,10 @@ impl QuicServer {
     }
 
     fn reap_closed_connection(&mut self, connection_key: &[u8]) {
+        #[cfg(test)]
+        {
+            self.terminal_checks += 1;
+        }
         if !self
             .connections
             .get(connection_key)
@@ -2103,7 +2117,6 @@ impl QuicServer {
         self.expire_incomplete_requests();
         self.expire_idle_connections();
         let _ = self.drive_responses();
-        let mut closed = Vec::new();
         let now = Instant::now();
         while let Some(key) = self.take_due_transport_timeout(now) {
             self.connections
@@ -2114,14 +2127,7 @@ impl QuicServer {
             self.send_ready.push(&key);
             self.refresh_transport_timeout(&key);
             self.refresh_response_ready(&key);
-        }
-        for (connection_key, connection) in &self.connections {
-            if connection.transport.is_closed() {
-                closed.push(connection_key.clone());
-            }
-        }
-        for connection_key in closed {
-            self.reap_closed_connection(&connection_key);
+            self.reap_closed_connection(&key);
         }
     }
 
@@ -2366,6 +2372,133 @@ mod tests {
             }
         }
         (body, finished)
+    }
+
+    #[test]
+    fn terminal_checks_skip_idle_connections_without_due_work() {
+        let mut server = super::QuicServer::new(stress_server_config()).unwrap();
+        insert_idle_transports(&mut server, 128);
+        server.on_timeout();
+        assert_eq!(server.terminal_checks, 0);
+        assert_eq!(server.connections.len(), 128);
+    }
+
+    #[test]
+    fn terminal_checks_reap_failed_first_initial_without_changing_error() {
+        let mut server = super::QuicServer::new(stress_server_config()).unwrap();
+        let local: SocketAddr = "127.0.0.1:4433".parse().unwrap();
+        let remote: SocketAddr = "127.0.0.1:30402".parse().unwrap();
+        let mut client = quiche::connect(
+            Some("localhost"),
+            &ConnectionId::from_ref(&[0x99; 16]),
+            remote,
+            local,
+            &mut stress_client_config(),
+        )
+        .unwrap();
+        let mut packet = [0; 65535];
+        let (length, _) = client.send(&mut packet).unwrap();
+        let header = Header::from_slice(&mut packet[..length], 16).unwrap();
+        assert!(header.token.unwrap().is_empty());
+        let payload_offset = 8 + header.dcid.len() + header.scid.len();
+        assert_eq!(packet[payload_offset] >> 6, 1);
+        packet[payload_offset] = 0x7f;
+        packet[payload_offset + 1] = 0xff;
+        let result = server.recv_datagram(&mut packet[..length], local, remote);
+        assert!(
+            matches!(
+                result,
+                Err(super::QuicServerError::Quiche(quiche::Error::InvalidPacket))
+            ),
+            "unexpected corrupted Initial result: {result:?}"
+        );
+        assert!(server.connections.is_empty());
+        assert_eq!(server.terminal_checks, 1);
+        assert!(server.routes.is_empty());
+        assert!(server.send_ready.entries.is_empty());
+        assert!(server.send_ready.queued.is_empty());
+        assert!(server.response_ready.entries.is_empty());
+        assert!(server.response_ready.queued.is_empty());
+        assert!(server.transport_timeouts.is_empty());
+        assert!(server.idle_timeouts.is_empty());
+        assert_eq!(server.buffered_request_bytes, 0);
+        assert_eq!(server.buffered_response_bytes, 0);
+    }
+
+    #[test]
+    fn terminal_checks_reap_only_native_due_drain_and_allow_key_reuse() {
+        for peer_closes in [false, true] {
+            let (mut server, mut client, mut h3, local, remote) = request_timer_peer();
+            let request = completed_ready_request(&mut server, &mut client, &mut h3, local, remote);
+            let key = server.connections.keys().next().unwrap().clone();
+            assert!(server.enqueue_response(request.id, 200, Vec::new(), vec![42; 2_000_000]));
+            server.drive_responses().unwrap();
+            let retained = server.buffered_response_bytes;
+            assert!(retained >= 2_000_000);
+            insert_idle_transports(&mut server, 128);
+            if peer_closes {
+                client.close(true, 0x100, b"finished").unwrap();
+                for packet in collect_client_datagrams(&mut client, &mut [0; 65535]) {
+                    deliver_client_datagram(&mut server, &packet, local, remote);
+                }
+            } else {
+                server.finish_shutdown().unwrap();
+                server.close_connections().unwrap();
+                assert_eq!(server.connections.len(), 1);
+                assert!(!server.connections[&key].transport.is_draining());
+                while server.send(&mut [0; 65535]).unwrap().is_some() {}
+            }
+            assert!(server.connections[&key].transport.is_draining());
+            assert!(!server.connections[&key].transport.is_closed());
+            assert_eq!(server.buffered_response_bytes, retained);
+            let deadline = server.connections[&key]
+                .transport
+                .timeout_instant()
+                .unwrap();
+            assert_eq!(
+                server.connections[&key].transport_deadline_at,
+                Some(deadline)
+            );
+            std::thread::sleep(
+                deadline.saturating_duration_since(std::time::Instant::now())
+                    + Duration::from_millis(1),
+            );
+            server.terminal_checks = 0;
+            server.on_timeout();
+            assert_eq!(server.terminal_checks, 1);
+            assert!(!server.connections.contains_key(&key));
+            assert_eq!(server.connections.len(), if peer_closes { 128 } else { 0 });
+            assert!(server.routes.is_empty());
+            assert!(server.request_routes.is_empty());
+            assert!(server.requests.is_empty());
+            assert!(server.transport_timeouts.is_empty());
+            assert!(server.request_timeouts.is_empty());
+            assert!(server.response_timeouts.is_empty());
+            assert!(server.idle_timeouts.is_empty());
+            assert!(server.send_ready.entries.is_empty());
+            assert!(server.send_ready.queued.is_empty());
+            assert!(server.response_ready.entries.is_empty());
+            assert!(server.response_ready.queued.is_empty());
+            assert_eq!(server.buffered_request_bytes, 0);
+            assert_eq!(server.buffered_response_bytes, 0);
+            insert_idle_transports(&mut server, 1);
+            let idle_key = 0_u16.to_be_bytes().repeat(8);
+            let mut fresh = server.connections.remove(&idle_key).unwrap();
+            fresh.transport = quiche::accept(
+                &ConnectionId::from_ref(&key),
+                None,
+                local,
+                remote,
+                &mut server.config,
+            )
+            .unwrap();
+            server.connections.insert(key.clone(), fresh);
+            server.refresh_transport_timeout(&key);
+            server.refresh_response_ready(&key);
+            assert!(server.connections.contains_key(&key));
+            assert!(server.transport_timeouts.is_empty());
+            assert!(server.response_ready.entries.is_empty());
+        }
     }
 
     #[test]
