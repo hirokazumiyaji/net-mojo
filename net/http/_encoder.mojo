@@ -9,6 +9,7 @@ from std.ffi import c_long, external_call
 
 from net.error import NetError, NetErrorKind
 
+from ._buffer import BufferBudget
 from .error import _status_reason
 from .response import ResponseWriter, has_body_for_status
 
@@ -166,19 +167,33 @@ def _has_close_token(value: StringSlice) -> Bool:
     return False
 
 
-def encode_response(
+def _append_response_bytes[
+    measure: Bool, origin: ImmOrigin
+](mut out: List[Byte], data: Span[Byte, origin], mut byte_count: Int):
+    comptime if measure:
+        byte_count += len(data)
+    else:
+        for i in range(len(data)):
+            out.append(data[i])
+
+
+def _append_response_string[
+    measure: Bool
+](mut out: List[Byte], data: StringSlice, mut byte_count: Int):
+    _append_response_bytes[measure](out, data.as_bytes(), byte_count)
+
+
+def _render_response[
+    measure: Bool
+](
     writer: ResponseWriter,
     is_head: Bool,
     date: StringSlice,
     max_headers: Int,
     max_bytes: Int,
-) raises NetError -> List[Byte]:
-    """Renders a buffered response with explicit `Date` (tests pin it;
-    servers pass `current_http_date()`).
-
-    Response header count and bytes are enforced here so every encoder
-    user, not just the server loop, honors the advertised bounds.
-    """
+    mut out: List[Byte],
+    mut byte_count: Int,
+) raises NetError:
     if writer.status < 100 or writer.status > 999:
         raise NetError(
             NetErrorKind.invalid_argument(),
@@ -266,14 +281,14 @@ def encode_response(
                 None,
                 "Content-Length does not match body",
             )
-    var out = List[Byte]()
-    _append_string(
+    _append_response_string[measure](
         out,
         String("HTTP/1.1 ")
         + String(writer.status)
         + String(" ")
         + _status_reason(writer.status)
         + String("\r\n"),
+        byte_count,
     )
     for i in range(len(writer.headers)):
         var name = writer.headers.name_at(i)
@@ -307,17 +322,19 @@ def encode_response(
                     None,
                     "response header contains CR or LF",
                 )
-        _append_string(out, name + String(": "))
-        for k in range(len(value_bytes)):
-            out.append(value_bytes[k])
-        _append_string(out, String("\r\n"))
+        _append_response_string[measure](out, name + String(": "), byte_count)
+        _append_response_bytes[measure](out, value_bytes, byte_count)
+        _append_response_string[measure](out, String("\r\n"), byte_count)
     if not writer.headers.get_first("Date"):
         _reject_response_injection("Date", date)
-        _append_string(out, String("Date: ") + String(date) + String("\r\n"))
+        _append_response_string[measure](
+            out, String("Date: ") + String(date) + String("\r\n"), byte_count
+        )
     if wire_length >= 0:
-        _append_string(
+        _append_response_string[measure](
             out,
             String("Content-Length: ") + String(wire_length) + String("\r\n"),
+            byte_count,
         )
     if writer.should_close:
         var connection = writer.headers.get_first("Connection")
@@ -325,11 +342,78 @@ def encode_response(
         if connection:
             has_close = _has_close_token(connection.value())
         if not has_close:
-            _append_string(out, String("Connection: close\r\n"))
-    _append_string(out, String("\r\n"))
+            _append_response_string[measure](
+                out, String("Connection: close\r\n"), byte_count
+            )
+    _append_response_string[measure](out, String("\r\n"), byte_count)
     if send_body:
-        for i in range(len(writer.body)):
-            out.append(writer.body[i])
+        _append_response_bytes[measure](out, Span(writer.body), byte_count)
+
+
+def encode_response(
+    writer: ResponseWriter,
+    is_head: Bool,
+    date: StringSlice,
+    max_headers: Int,
+    max_bytes: Int,
+) raises NetError -> List[Byte]:
+    """Renders a buffered response with explicit `Date` (tests pin it;
+    servers pass `current_http_date()`).
+
+    Response header count and bytes are enforced here so every encoder
+    user, not just the server loop, honors the advertised bounds.
+    """
+    var out = List[Byte]()
+    var byte_count = 0
+    _render_response[False](
+        writer, is_head, date, max_headers, max_bytes, out, byte_count
+    )
+    return out^
+
+
+def _measure_response(
+    writer: ResponseWriter,
+    is_head: Bool,
+    date: StringSlice,
+    max_headers: Int,
+    max_bytes: Int,
+) raises NetError -> Int:
+    var out = List[Byte]()
+    var byte_count = 0
+    _render_response[True](
+        writer, is_head, date, max_headers, max_bytes, out, byte_count
+    )
+    return byte_count
+
+
+def _encode_response_budgeted(
+    writer: ResponseWriter,
+    is_head: Bool,
+    date: StringSlice,
+    max_headers: Int,
+    max_bytes: Int,
+    mut budget: BufferBudget,
+) raises NetError -> List[Byte]:
+    var capacity = _measure_response(
+        writer, is_head, date, max_headers, max_bytes
+    )
+    if not budget.try_reserve(capacity):
+        raise NetError(
+            NetErrorKind.invalid_argument(),
+            "encode response",
+            None,
+            "response wire capacity exceeds budget",
+        )
+    var out = List[Byte](capacity=capacity)
+    var byte_count = 0
+    try:
+        _render_response[False](
+            writer, is_head, date, max_headers, max_bytes, out, byte_count
+        )
+    except e:
+        _ = out^
+        budget.release(capacity)
+        raise e^
     return out^
 
 

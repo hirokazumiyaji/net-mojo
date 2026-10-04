@@ -12,7 +12,8 @@ Ownership and resources:
   internal table; only raw fd numbers are ever handed to the reactor.
 - One global `BufferBudget` charges receive and adopted pending capacity,
   including growth peaks, and lends synchronous HTTP/1 writer workspace.
-  Encoding before adoption remains separate.
+  Buffered HTTP/1 wire is reserved before encoding; other encoding remains
+  separate.
   Request admission and the `ResponseWriter` cap derive from the remaining
   budget; a request that
   cannot be admitted gets 503 and close, a handler overrun becomes 500.
@@ -71,6 +72,7 @@ from ._encoder import (
     encode_chunked_start,
     encode_error,
     encode_response,
+    _encode_response_budgeted,
 )
 from ._parser import ParseResult, parse_head, parse_one
 from .config import ServerConfig
@@ -1958,12 +1960,13 @@ struct Server(Movable):
             return
         var wire: List[Byte]
         try:
-            wire = encode_response(
+            wire = _encode_response_budgeted(
                 writer,
                 is_head,
                 self._tick_date,
                 self.config.max_response_headers_count,
                 self.config.max_response_headers_bytes,
+                self._budget,
             )
         except e:
             _ = e
@@ -1971,9 +1974,7 @@ struct Server(Movable):
             self._send_error(idx, 500)
             return
         self._drop_writer_body(writer, writer_charge)
-        if not self._conns[idx].set_pending(wire^, self._budget):
-            self._send_error(idx, 500)
-            return
+        self._conns[idx]._set_reserved_pending(wire^, self._budget)
         # A half-closed peer (read_eof) forces close only when nothing
         # is left to answer: pipelined requests already buffered must
         # still be served first. The EOF drain rule in _drive_conn

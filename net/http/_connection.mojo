@@ -231,11 +231,22 @@ struct HttpConnection(Movable):
     ) -> Bool:
         if not budget.try_reserve(bytes.capacity()):
             return False
+        self._adopt_reserved_pending(bytes^, budget)
+        return True
+
+    def _adopt_reserved_pending(
+        mut self, var bytes: List[Byte], mut budget: BufferBudget
+    ):
         var old_capacity = self.pending.capacity()
         self.pending = bytes^
         budget.release(old_capacity)
         self.pending_offset = 0
-        return True
+
+    def _set_reserved_pending(
+        mut self, var bytes: List[Byte], mut budget: BufferBudget
+    ):
+        self._adopt_reserved_pending(bytes^, budget)
+        self.state = STATE_SENDING
 
     def set_pending(
         mut self, var bytes: List[Byte], mut budget: BufferBudget

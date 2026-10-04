@@ -1,8 +1,9 @@
 """Global buffer budget for the HTTP server loop.
 
 Receive and adopted pending buffers charge retained capacity and growth
-peaks. Pending growth also charges its incoming wire allocation. Encoding
-before adoption, parser and provider allocations remain separate. Synchronous
+peaks. Pending growth also charges its incoming wire allocation. Synchronous
+HTTP/1 buffered response wire is reserved before allocation. Other encoding,
+parser and provider allocations remain separate. Synchronous
 HTTP/1 writer bodies use a reserved workspace; other writer paths and other
 reservations still need separate capacity accounting.
 """
