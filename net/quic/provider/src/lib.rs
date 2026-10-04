@@ -1573,7 +1573,12 @@ impl QuicServer {
                         });
                     }
                 }
-                Ok((stream_id, quiche::h3::Event::Reset(_))) => {
+                Ok((stream_id, quiche::h3::Event::Reset(error))) => {
+                    let _ = connection.transport.stream_shutdown(
+                        stream_id,
+                        quiche::Shutdown::Write,
+                        error,
+                    );
                     if let Some(reset) = connection.requests.remove(&stream_id) {
                         release_pending_request_bytes(buffered_request_bytes, &reset);
                     }
@@ -3227,6 +3232,112 @@ mod tests {
             .expect("HTTP/3 request should complete under packet stress")
     }
 
+    #[test]
+    fn cancelled_request_streams_return_bidirectional_credit() {
+        let mut server = super::QuicServer::new(stress_server_config()).unwrap();
+        let local = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 4433);
+        let remote = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 54321);
+        let mut config = stress_client_config();
+        let mut client = quiche::connect(
+            Some("localhost"),
+            &ConnectionId::from_ref(&[0x73; 16]),
+            remote,
+            local,
+            &mut config,
+        )
+        .unwrap();
+        let mut packet = [0; 65535];
+        establish_http3_in_memory(&mut client, &mut server, &mut packet, local, remote, false);
+        let mut h3 = quiche::h3::Connection::with_transport(
+            &mut client,
+            &quiche::h3::Config::new().unwrap(),
+        )
+        .unwrap();
+        let headers = [
+            quiche::h3::Header::new(b":method", b"POST"),
+            quiche::h3::Header::new(b":scheme", b"https"),
+            quiche::h3::Header::new(b":authority", b"localhost"),
+            quiche::h3::Header::new(b":path", b"/echo"),
+            quiche::h3::Header::new(b"content-length", b"8"),
+        ];
+        for _ in 0..105 {
+            let id = h3
+                .send_request(&mut client, &headers, false)
+                .expect("cancelled streams must return credit for new requests");
+            h3.send_body(&mut client, id, b"ping", false).unwrap();
+            for _ in 0..64 {
+                pump_in_memory(
+                    &mut client,
+                    &mut server,
+                    &mut packet,
+                    local,
+                    remote,
+                    false,
+                    false,
+                );
+                while h3.poll(&mut client).is_ok() {}
+                if server
+                    .connections
+                    .values()
+                    .any(|c| c.requests.contains_key(&id))
+                {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(2));
+            }
+            assert!(
+                server
+                    .connections
+                    .values()
+                    .any(|c| c.requests.contains_key(&id))
+            );
+            client
+                .stream_shutdown(id, quiche::Shutdown::Write, 0x10c)
+                .unwrap();
+            for _ in 0..64 {
+                pump_in_memory(
+                    &mut client,
+                    &mut server,
+                    &mut packet,
+                    local,
+                    remote,
+                    false,
+                    false,
+                );
+                while h3.poll(&mut client).is_ok() {}
+                if server
+                    .connections
+                    .values()
+                    .all(|c| !c.requests.contains_key(&id))
+                {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(2));
+            }
+            assert_eq!(server.buffered_request_bytes, 0);
+            assert!(server.requests.is_empty());
+        }
+        let id = h3
+            .send_request(&mut client, &headers, false)
+            .expect("a full request must remain usable after cancellation churn");
+        h3.send_body(&mut client, id, b"complete", true).unwrap();
+        for _ in 0..64 {
+            pump_in_memory(
+                &mut client,
+                &mut server,
+                &mut packet,
+                local,
+                remote,
+                false,
+                false,
+            );
+            if !server.requests.is_empty() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        assert_eq!(server.next_request().unwrap().body, b"complete");
+    }
     #[test]
     fn tolerates_duplicate_client_datagrams_and_completes_request() {
         let mut server = super::QuicServer::new(stress_server_config()).unwrap();

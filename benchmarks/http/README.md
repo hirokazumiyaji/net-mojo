@@ -396,22 +396,62 @@ those are separate processes and therefore always separate connections;
 | h3 | aioquic | loss | pass | 5% client datagram drop, req/s 5,460, 0 failed |
 | h3 | Mojo | loss | pass † | 5% client datagram drop, req/s 6,134, 0 failed |
 
-† Recorded by an earlier revision of the scenario drivers, before the
+† Historical results recorded by an earlier revision of the scenario drivers, before the
 incomplete-upload H3 slow criterion, post-reset connection probe, sibling
 body validation and the partial-run rejection were added, and not
-re-measured since: the Mojo servers cannot be built on this host (the Mojo
+re-measured at that time: the Mojo servers could not be built on that host (the Mojo
 build in the `tls-http2` and `tls-http3` environments fails to parse
 `net/http/_encoder.mojo` on `InlineArray`, which is unrelated to this harness
 and reproduces on an unmodified checkout). These rows therefore show the Mojo
 servers were not broken at that revision; they are not evidence under the
 current criteria.
 
-The two `h2 | Mojo` rows are *not run* rather than carried over: the previous
+### Current HTTP/3 cancellation validation (2026-10-04)
+
+The current driver exposed a transport-credit leak: resetting 100 incomplete
+uploads exhausted the peer's initial bidirectional stream allowance. The
+provider now closes its send direction on a received reset. This returns stream
+credit even for requests that never produced a response.
+
+Recorded on macOS arm64 with Mojo 1.1.0 (8189361e), quiche 0.29.3 and
+aioquic 1.3.0, using main `43938a8` plus this PR's reset-credit fix. The optimized
+Mojo benchmark binary loads the rebuilt provider; no CPU pinning or separate
+load-generator host was used. These are single-run correctness checks, not the
+formal performance comparison or a total-engine-memory stability claim.
+
+```bash
+pixi run -e tls-http3 quic-build
+pixi run -e tls-http3 mojo build --Werror -I . \
+  benchmarks/http3_server.mojo -o /tmp/http3_server
+/tmp/http3_server &
+server_pid=$!
+for scenario in slow cancel loss; do
+  pixi run -e tls-http3 python benchmarks/http/http3_scenarios.py \
+    --url https://127.0.0.1:18453/fixed --scenario "$scenario" \
+    --siblings 8 --duration 30
+done
+kill "$server_pid"
+```
+
+| Scenario | Current result |
+| --- | --- |
+| Slow | Pass: incomplete upload stayed open while 8/8 siblings completed with validated bodies; final echo validated, elapsed 393 ms |
+| Cancel | Pass: 257 ACK-confirmed partial-upload resets (67,371,008 B, beyond the 64 MiB application request budget); 8/8 sibling bodies and post-reset request passed, elapsed 3,154 ms |
+| Loss | Pass: 5% seeded client UDP drop, 30 s, 4 connections × 4 streams; 224,422 successful requests, zero failures, 14,856/300,597 sent datagrams dropped; 7,481 req/s, p50 1,981 µs, p99 4,143 µs |
+
+The provider also has an in-memory regression that cancels 105 requests against
+the 100-stream allowance, verifies pending request-byte release and completes a
+subsequent request. The older dagger-marked H3 rows above remain historical;
+the current checks supply the missing current-criteria H3 evidence. H2 Mojo
+specials, H2 packet-loss measurements, full-duration comparisons and engine
+memory measurements remain separate work.
+
+The two `h2 | Mojo` rows in the earlier table are *not run* rather than carried over: the previous
 `pass` entries came from the `curl` + `h2load` version, which cannot exercise
 these properties at all, so re-recording them was not possible even before the
-build problem. Re-run `bash benchmarks/http/run_multiplex_matrix.sh` once the
-Mojo build works to fill the `h2 | Mojo` rows and to bring the `h3 | Mojo` rows
-up to the current criteria.
+build problem. Mojo 1.1 now builds both servers. The H3 rerun above passes;
+the current H2 cancel driver passes Go but stalls against Mojo, so its diagnosis
+and successful rerun remain separate work before completing the matrix.
 
 ### Target check
 
