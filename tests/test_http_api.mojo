@@ -1329,5 +1329,23 @@ def test_response_writer_detach_api() raises:
     assert_false(sender.is_cancelled())
 
 
+def test_alt_svc_empty_handler_value_still_suppresses_configured_injection() raises:
+    var writer = ResponseWriter(32)
+    writer.headers.add(String("aLt-SvC"), String(""))
+    maybe_inject_alt_svc(writer, String('h3=":8443"; ma=86400'))
+    assert_equal(writer.headers.count("Alt-Svc"), 1)
+    var found = writer.headers.get_first("Alt-Svc")
+    assert_true(Bool(found))
+    assert_equal(found.value(), String(""))
+    var wire = encode_response(writer, False, "date", 100, 32768)
+    assert_equal(
+        String(from_utf8_lossy=Span(wire)),
+        String(
+            "HTTP/1.1 200 OK\r\naLt-SvC: \r\nDate: date\r\nContent-Length:"
+            " 0\r\n\r\n"
+        ),
+    )
+
+
 def main() raises:
     TestSuite.discover_tests[__functions_in_module()]().run()
