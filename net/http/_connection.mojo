@@ -12,6 +12,7 @@ from net.tls import TLSConnection, TLSIOResult
 from net.http._http2.hpack import Http2HpackDeflater
 from net.http._http2.request_session import Http2RequestSession
 from net.http._http2.response_scheduler import Http2ResponseScheduler
+from net.http._buffer import BufferBudget, _reserve_capacity
 
 comptime STATE_READING: UInt8 = 0
 comptime STATE_SENDING: UInt8 = 1
@@ -225,28 +226,51 @@ struct HttpConnection(Movable):
         else:
             self.scanned_len = 0
 
-    def set_pending(mut self, var bytes: List[Byte]):
+    def _adopt_pending(
+        mut self, var bytes: List[Byte], mut budget: BufferBudget
+    ) -> Bool:
+        if not budget.try_reserve(bytes.capacity()):
+            return False
+        var old_capacity = self.pending.capacity()
         self.pending = bytes^
+        budget.release(old_capacity)
         self.pending_offset = 0
-        self.state = STATE_SENDING
+        return True
 
-    def append_pending(mut self, var bytes: List[Byte]):
+    def set_pending(
+        mut self, var bytes: List[Byte], mut budget: BufferBudget
+    ) -> Bool:
+        if not self._adopt_pending(bytes^, budget):
+            return False
+        self.state = STATE_SENDING
+        return True
+
+    def append_pending(
+        mut self, var bytes: List[Byte], mut budget: BufferBudget
+    ) -> Bool:
         if self.pending_offset >= len(self.pending):
-            self.pending = bytes^
+            return self._adopt_pending(bytes^, budget)
+        var incoming_capacity = bytes.capacity()
+        if not budget.try_reserve(incoming_capacity):
+            return False
+        var remaining = self.pending_remaining()
+        var reservation = 0
+        if not _reserve_capacity(
+            self.pending, budget, remaining + len(bytes), reservation
+        ):
+            _ = bytes^
+            budget.release(incoming_capacity)
+            return False
+        if self.pending_offset > 0:
+            for i in range(remaining):
+                self.pending[i] = self.pending[self.pending_offset + i]
+            self.pending.shrink(remaining)
             self.pending_offset = 0
-        elif self.pending_offset > 0:
-            var rest = List[Byte]()
-            rest.reserve(self.pending_remaining() + len(bytes))
-            for i in range(self.pending_offset, len(self.pending)):
-                rest.append(self.pending[i])
-            for i in range(len(bytes)):
-                rest.append(bytes[i])
-            self.pending = rest^
-            self.pending_offset = 0
-        else:
-            self.pending.reserve(len(self.pending) + len(bytes))
-            for i in range(len(bytes)):
-                self.pending.append(bytes[i])
+        for i in range(len(bytes)):
+            self.pending.append(bytes[i])
+        _ = bytes^
+        budget.release(incoming_capacity)
+        return True
 
     def pending_span(self) -> Span[Byte, origin_of(self.pending)]:
         return Span(self.pending)[self.pending_offset :]
@@ -258,7 +282,7 @@ struct HttpConnection(Movable):
         return self.pending_offset >= len(self.pending)
 
     def clear_pending(mut self):
-        self.pending.clear()
+        self.pending = List[Byte]()
         self.pending_offset = 0
         self.tls_write_would_block = False
         self.tls_write_wants_read = False

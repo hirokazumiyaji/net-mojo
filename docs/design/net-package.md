@@ -241,9 +241,9 @@ section records only the package-level boundaries.
   `max_body_bytes`) arrives before the call. `Request` views and
   `ResponseWriter` live only for the call; retaining means copying,
   and the connection owns the queued response until it is sent.
-- One global `BufferBudget` charges retained receive capacity and its
-  old + new growth peak; queued responses still charge wire lengths.
-  Temporary read chunks, parser copies, writer/encoder allocations and
+- One global `BufferBudget` charges retained receive and adopted pending
+  capacity, including old + new growth peaks and incoming pending wire.
+  Temporary read chunks, encoding before adoption, parser copies, writer and
   protocol/provider allocations are not all included yet.
   Admission failures become 503+close, handler
   overruns and raises become 500+close without leaking details, and a
