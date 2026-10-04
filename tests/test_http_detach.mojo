@@ -30,6 +30,7 @@ from net.http._detach import (
     _SharedDetachState,
 )
 from tests.support import _join_thread
+from tests.test_http_server import _drain_head_error_to_eof
 
 
 def _move_sender(var sender: ResponseSender) -> ResponseSender:
@@ -1292,6 +1293,83 @@ struct _MailboxRefillContext:
     var sender_addr: Int
     var sent: Bool
     var failed: Bool
+
+
+def _check_detached_response_wire_boundary(is_head: Bool) raises:
+    comptime state_size = size_of[_SharedDetachState]()
+    comptime element = size_of[DetachMessage]()
+    var wire_size = 97 if is_head else 6097
+    for admitted in [False, True]:
+        var config = ServerConfig.default()
+        config.total_buffer_budget = (
+            state_size + element + 6000 + 5 + wire_size - Int(not admitted)
+        )
+        var server = Server(config^)
+        server.add_listener(listen_tcp("127.0.0.1:0"))
+        var handler = _MailboxHandler()
+        var address = String("127.0.0.1:") + String(server.local_address().port)
+        var client = dial_tcp(address, Timeout.seconds(1))
+        var method = String("HEAD") if is_head else String("GET")
+        client.write_all(
+            (method + " / HTTP/1.1\r\nHost: x\r\n\r\n").as_bytes(),
+            Timeout.seconds(1),
+        )
+        _wait_mailbox_handler(server, handler)
+        assert_true(server._budget.try_reserve(5))
+        var sender = ResponseSender(handler.addr)
+        var body = List[Byte](capacity=6000)
+        for _ in range(6000):
+            body.append(Byte(ord("a")))
+        sender.respond(200, Headers(), body^, should_close=True)
+        assert_equal(server._budget.used(), state_size + element + 6000 + 5)
+        var response = _drain_head_error_to_eof(server, handler, client)
+        assert_equal(server.active_connections(), 0)
+        assert_equal(server._budget.used(), state_size + 5)
+        client.close()
+        _ = sender^
+        assert_equal(server._budget.used(), 5)
+        var status = _status_of(response)
+        var length = _content_length_of(response)
+        var response_body = _body_of(response)
+        handler.addr = 0
+        var sibling = dial_tcp(address, Timeout.seconds(1))
+        sibling.write_all(
+            "GET /next HTTP/1.1\r\nHost: x\r\n\r\n".as_bytes(),
+            Timeout.seconds(1),
+        )
+        _wait_mailbox_handler(server, handler)
+        var next_sender = ResponseSender(handler.addr)
+        next_sender.respond(204, Headers(), List[Byte](), should_close=True)
+        var next_response = _drain_head_error_to_eof(server, handler, sibling)
+        sibling.close()
+        _ = next_sender^
+        assert_equal(_status_of(next_response), 204)
+        assert_equal(_body_of(next_response), "")
+        assert_equal(server._budget.used(), 5)
+        server._budget.release(5)
+        if is_head and not admitted:
+            assert_equal(status, -1)
+            assert_equal(length, -1)
+            assert_equal(len(response), 0)
+        else:
+            assert_equal(status, 200 if admitted else 500)
+            assert_equal(length, 6000 if admitted else 25)
+        if is_head:
+            assert_equal(response_body, "")
+        elif admitted:
+            assert_equal(response_body.byte_length(), 6000)
+            for i in range(len(response_body.as_bytes())):
+                assert_equal(response_body.as_bytes()[i], Byte(ord("a")))
+        else:
+            assert_equal(response_body, "500 Internal Server Error")
+
+
+def test_detached_get_wire_admits_exact_capacity_while_body_remains_charged() raises:
+    _check_detached_response_wire_boundary(False)
+
+
+def test_detached_head_wire_keeps_full_body_charge_but_only_encodes_headers() raises:
+    _check_detached_response_wire_boundary(True)
 
 
 def test_respond_admits_body_capacity_with_foreign_and_array_charges() raises:

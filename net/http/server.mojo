@@ -77,7 +77,6 @@ from ._encoder import (
     encode_chunked_start,
     _encode_error_exact,
     _measure_error,
-    encode_response,
     _encode_response_budgeted,
 )
 from ._parser import ParseResult, parse_head, parse_one, _scan_chunked
@@ -2373,12 +2372,13 @@ struct Server(Movable):
 
         var wire: List[Byte]
         try:
-            wire = encode_response(
+            wire = _encode_response_budgeted(
                 rw,
                 is_head,
                 self._tick_date,
                 self.config.max_response_headers_count,
                 self.config.max_response_headers_bytes,
+                self._budget,
             )
         except e:
             _ = e
@@ -2388,12 +2388,7 @@ struct Server(Movable):
             self._arm_deadline(idx)
             return
 
-        if not self._conns[idx].set_pending(wire^, self._budget):
-            self._mark_detached_cancelled(idx)
-            self._cleanup_detached_state(idx)
-            self._send_error(idx, 500, is_head=is_head)
-            self._arm_deadline(idx)
-            return
+        self._conns[idx]._set_reserved_pending(wire^, self._budget)
 
         self._cleanup_detached_state(idx)
         self._conns[idx].should_close = (
