@@ -30,3 +30,10 @@ cargo test --locked --release \
 cargo test --locked --release \
     --manifest-path "$task_quiche_source/Cargo.toml" \
     --target-dir build/quic/cargo stream_limit_does_not_collect
+
+cargo test --locked --release \
+    --manifest-path "$task_quiche_source/Cargo.toml" \
+    --target-dir build/quic/cargo locally_drained
+cargo test --locked --release \
+    --manifest-path "$task_quiche_source/Cargo.toml" \
+    --target-dir build/quic/cargo unknown_retirement

@@ -45,3 +45,34 @@ protocol states, excluding native TLS allocations and total process RSS. The
 suite also exercises exact membership, out-of-order gaps and stream-limit
 rejection. Dependency updates must retain these contracts or use the released
 upstream fix; quiche 0.30.0 already includes range compression.
+
+The third patch retires locally drained transport streams when FIN or RESET
+final size is already known at Read shutdown, or arrives later. Collection
+follows connection-byte consumption and keeps an unfinished bidi send half
+alive. Ordinary application FIN/reset delivery remains unchanged. H3 removes
+only unknown uni parsing state after a successful Drain shutdown; control and
+both QPACK critical streams retain their fatal close semantics.
+
+Open upstream [PR #2054](https://github.com/cloudflare/quiche/pull/2054), head
+`dc2c024fd69acca9f144e1ccc5b63a54ca023453`, covers terminal state already known
+at Read shutdown. This local paired patch also covers later FIN/RESET and H3
+state retirement; it is not an accepted upstream backport. Preserve all four
+completion orders, exact consumed/final-size and same-type MAX_STREAMS credit,
+pending opposite bidi direction, application delivery and critical streams
+when rebasing it.
+
+Before this patch, a valid control stream plus two unknown streams exhausted
+the three-uni allowance: returned peer uni credit was zero for both FIN and
+natural STOP_SENDING/RESET, while a GET remained usable. Measured H3 Rust
+allocation sizes rose from 620 to 1,200 bytes at zero/two unknown streams;
+the old retention was bounded by exhausted credit, not demonstrated unbounded
+growth. The provider regressions now process 10,000 FIN and 10,000 non-FIN
+unknown streams, verify returned peer credit after every cycle and a valid GET
+after churn, and measure 620 bytes released by dropping the server H3 object.
+These measurements exclude transport, native TLS and total process RSS.
+
+Transport collection and H3 retirement must remain paired: enabling only the
+transport repair restores credit but retained 2,404,680 H3 Rust allocation bytes
+after 10,000 FIN unknown streams in the same fixture. That intermediate case
+fails the allocation regression; it does not describe the old exhausted-credit
+behavior.

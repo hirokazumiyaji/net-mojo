@@ -4344,6 +4344,8 @@ mod tests {
                         let connection = self.server.connections.values_mut().next().unwrap();
                         connection.requests.get_mut(&id).unwrap().body_deadline_at =
                             Some(std::time::Instant::now());
+                        let key = self.server.connections.keys().next().unwrap().clone();
+                        self.server.refresh_request_timeout(&key, id);
                         self.server.expire_incomplete_requests();
                     }
                     _ => {
@@ -4472,6 +4474,130 @@ mod tests {
         assert_transport_retention_stable(false);
     }
 
+    fn unknown_uni_retained_bytes(cycles: usize, fin: bool) -> isize {
+        let mut server =
+            super::QuicServer::new(stress_server_config()).unwrap();
+        let local = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 4433);
+        let remote = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 54321);
+        let mut config = stress_client_config();
+        let mut client = quiche::connect(
+            Some("localhost"),
+            &ConnectionId::from_ref(&[0x73; 16]),
+            remote,
+            local,
+            &mut config,
+        )
+        .unwrap();
+        let mut packet = [0; 65535];
+        establish_http3_in_memory(
+            &mut client,
+            &mut server,
+            &mut packet,
+            local,
+            remote,
+            false,
+        );
+        client.stream_send(2, b"\x00\x04\x00", false).unwrap();
+        for _ in 0..4 {
+            pump_in_memory(
+                &mut client,
+                &mut server,
+                &mut packet,
+                local,
+                remote,
+                false,
+                false,
+            );
+        }
+        assert_eq!(client.peer_streams_left_uni(), 2);
+        for index in 1..=cycles {
+            let id = 2 + (index as u64) * 4;
+            client.stream_send(id, b"\x21hello", fin).unwrap();
+            let mut returned = false;
+            for _ in 0..64 {
+                pump_in_memory(
+                    &mut client,
+                    &mut server,
+                    &mut packet,
+                    local,
+                    remote,
+                    false,
+                    false,
+                );
+                if client.peer_streams_left_uni() == 2 {
+                    returned = true;
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(2));
+            }
+            assert!(
+                returned,
+                "unknown uni {id} failed to return MAX_STREAMS credit"
+            );
+            assert_eq!(server.connections.len(), 1);
+            assert_eq!(server.buffered_request_bytes, 0);
+        }
+        assert_eq!(client.peer_streams_left_uni(), 2);
+        client
+            .stream_send(
+                0,
+                b"\x01\x10\x00\x00\xd1\xd7\xc1\x50\x09localhost",
+                true,
+            )
+            .unwrap();
+        for _ in 0..64 {
+            pump_in_memory(
+                &mut client,
+                &mut server,
+                &mut packet,
+                local,
+                remote,
+                false,
+                false,
+            );
+            if !server.requests.is_empty() {
+                break;
+            }
+        }
+        let request = server
+            .next_request()
+            .expect("valid static-QPACK request must remain usable");
+        assert_eq!(request.method, b"GET");
+        assert_eq!(request.authority, b"localhost");
+        assert_eq!(request.target, b"/");
+        let http3 = server
+            .connections
+            .values_mut()
+            .next()
+            .unwrap()
+            .http3
+            .take()
+            .unwrap();
+        let before = super::allocation_probe::live();
+        drop(http3);
+        let retained = before - super::allocation_probe::live();
+        eprintln!("unknown uni churn={cycles} fin={fin} retained server H3 Rust bytes={retained} remaining_uni_credit=2 valid_GET_after_churn=true");
+        retained
+    }
+
+    #[test]
+    fn unknown_fin_streams_return_credit_and_release_h3_state() {
+        let retained = unknown_uni_retained_bytes(10_000, true);
+        assert!(
+            retained < 64 * 1024,
+            "retained unknown FIN stream state: {retained}"
+        );
+    }
+
+    #[test]
+    fn unknown_reset_streams_return_credit_and_release_h3_state() {
+        let retained = unknown_uni_retained_bytes(10_000, false);
+        assert!(
+            retained < 64 * 1024,
+            "retained unknown reset stream state: {retained}"
+        );
+    }
+
     #[test]
     fn cancelled_request_streams_return_bidirectional_credit() {
         let mut fixture = H3ResetFixture::new();
@@ -4528,6 +4654,8 @@ mod tests {
             connection
                 .header_deadlines
                 .insert(id, std::time::Instant::now());
+            let key = fixture.server.connections.keys().next().unwrap().clone();
+            fixture.server.refresh_request_timeout(&key, id);
             fixture.server.expire_incomplete_requests();
             fixture.pump_until(|server| {
                 server
@@ -4564,17 +4692,19 @@ mod tests {
                     .server
                     .enqueue_response(request.id, 200, Vec::new(), vec![0; 32])
             );
+            let key = fixture.server.connections.keys().next().unwrap().clone();
+            fixture.server.remove_response_timeout(&key, id);
             fixture
                 .server
                 .connections
-                .values_mut()
-                .next()
+                .get_mut(&key)
                 .unwrap()
                 .responses
                 .get_mut(&id)
                 .unwrap()
                 .write_deadline_at = std::time::Instant::now();
-            fixture.server.drive_responses().unwrap();
+            fixture.server.index_response_timeout(&key, id);
+            fixture.server.expire_responses();
             fixture.pump_until(|server| {
                 server
                     .connections

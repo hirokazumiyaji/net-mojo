@@ -141,6 +141,28 @@ credit changes, and no additional GOAWAY/reconnection policy is introduced.
 `quic-suite` runs the upstream membership/type/gap/credit tests and real provider
 10,000/50,000-stream allocation comparisons for normal completion and resets.
 
+### Unknown unidirectional stream retirement
+
+The third explicit source patch returns uni stream credit after unknown H3
+stream types are drained. Transport collection occurs only when the locally
+shut receive direction is terminal and the opposite send direction is complete;
+late FIN/RESET is collected after its final-size and connection-byte accounting.
+Normal application FIN/reset delivery and unfinished bidi responses are kept.
+H3 removes only the unknown stream's Drain parsing entry after successful Read
+shutdown. Control and QPACK encoder/decoder streams still close the connection
+when their critical stream is terminated.
+
+With the previous source, a valid control stream plus two unknown streams
+exhausted the three-uni allowance, retaining 1,200 versus 620 server H3 Rust
+allocation bytes; the third unknown stream could not open. This showed bounded
+retention and missing credit, rather than unlimited old memory growth. The
+paired repair processes 10,000 FIN and 10,000 natural STOP_SENDING/RESET cycles,
+returns peer credit after every cycle, accepts a valid GET afterwards and
+retains 620 measured server H3 Rust allocation bytes. `quic-suite` reproduces
+these fixtures plus all four FIN/RESET arrival orders, exact consumed byte and
+same-type stream credit, pending bidi send state and critical stream errors.
+This is a protocol-state allocation measurement, not a transport or RSS cap.
+
 These patches do not establish an allocator cap. The independent 64 MiB
 request/response counters count logical field/body bytes rather than Vec
 capacity, container entries or allocation overhead. Transport admission still

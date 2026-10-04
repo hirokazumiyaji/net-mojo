@@ -1,0 +1,220 @@
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -6243,6 +6243,8 @@
+         match direction {
+             Shutdown::Read => {
+                 let consumed = stream.recv.shutdown()?;
++                let complete = stream.is_complete();
++                let local = stream.local;
+                 self.flow_control.add_consumed(consumed);
+ 
+                 if !stream.recv.is_fin() {
+@@ -6254,6 +6256,10 @@
+ 
+                 self.stopped_stream_local_count =
+                     self.stopped_stream_local_count.saturating_add(1);
++
++                if complete {
++                    self.streams.collect(stream_id, local);
++                }
+             },
+ 
+             Shutdown::Write => {
+@@ -8374,6 +8380,9 @@
+                     consumed_flowcontrol,
+                 } = stream.recv.reset(error_code, final_size)?;
+ 
++                let complete = stream.recv.is_draining() && stream.is_complete();
++                let local = stream.local;
++
+                 if max_data_delta > max_rx_data_left {
+                     return Err(Error::FlowControl);
+                 }
+@@ -8389,6 +8398,10 @@
+ 
+                 self.reset_stream_remote_count =
+                     self.reset_stream_remote_count.saturating_add(1);
++
++                if complete {
++                    self.streams.collect(stream_id, local);
++                }
+             },
+ 
+             frame::Frame::StopSending {
+@@ -8553,6 +8566,8 @@
+                 let was_draining = stream.recv.is_draining();
+ 
+                 stream.recv.write(data)?;
++                let complete = was_draining && stream.is_complete();
++                let local = stream.local;
+ 
+                 if !was_readable && stream.is_readable() {
+                     self.streams.insert_readable(&priority_key);
+@@ -8566,6 +8581,10 @@
+                     // the received data as consumed, which might trigger a flow
+                     // control update.
+                     self.flow_control.add_consumed(max_off_delta);
++                }
++
++                if complete {
++                    self.streams.collect(stream_id, local);
+                 }
+             },
+ 
+--- a/src/tests.rs
++++ b/src/tests.rs
+@@ -12897,3 +12897,102 @@
+         panic!("expected Qlog event");
+     }
+ }
++
++#[rstest]
++fn locally_drained_stream_returns_credit(
++    #[values(0, 1, 2, 3)] order: u8,
++    #[values(false, true)] bidi: bool,
++) {
++    let mut config = test_utils::Pipe::default_config("cubic").unwrap();
++    config.set_initial_max_data(100);
++    config.set_initial_max_streams_uni(1);
++    config.set_initial_max_streams_bidi(1);
++    let mut pipe = test_utils::Pipe::with_config(&mut config).unwrap();
++    pipe.handshake().unwrap();
++    let id = if bidi { 0 } else { 2 };
++    assert_eq!(pipe.client.stream_send(id, b"hello", order == 0), Ok(5));
++    pipe.advance().unwrap();
++
++    let mut packet = [0; 65535];
++    if order == 1 || order == 3 {
++        assert_eq!(pipe.client.stream_send(id, b"world", false), Ok(5));
++        // Lost in-flight data must still count toward RESET_STREAM final size.
++        assert!(pipe.client.send(&mut packet).is_ok());
++        if order == 1 {
++            pipe.client
++                .stream_shutdown(id, Shutdown::Write, 10)
++                .unwrap();
++            pipe.advance().unwrap();
++        }
++    }
++    pipe.server.stream_shutdown(id, Shutdown::Read, 0).unwrap();
++    if order == 2 {
++        assert_eq!(pipe.client.stream_send(id, b"world", true), Ok(5));
++        pipe.advance().unwrap();
++    } else if order == 3 {
++        pipe.client
++            .stream_shutdown(id, Shutdown::Write, 10)
++            .unwrap();
++        pipe.advance().unwrap();
++    }
++
++    let expected = if order == 0 { 5 } else { 10 };
++    assert_eq!(pipe.server.rx_data, expected);
++    assert_eq!(
++        pipe.server.flow_control.max_data_next()
++            - pipe.server.flow_control.window(),
++        expected
++    );
++    assert!(!pipe.server.readable().any(|stream_id| stream_id == id));
++    if bidi {
++        assert!(pipe.server.streams.get(id).is_some());
++        assert!(!pipe.server.streams.is_collected(id));
++        assert_eq!(pipe.server.streams.max_streams_bidi_next(), 1);
++        assert_eq!(pipe.server.stream_send(id, b"response", true), Ok(8));
++        pipe.advance().unwrap();
++        assert_eq!(pipe.client.stream_recv(id, &mut packet), Ok((8, true)));
++        assert_eq!(&packet[..8], b"response");
++        pipe.advance().unwrap();
++    }
++    assert!(pipe.server.streams.get(id).is_none());
++    assert!(pipe.server.streams.is_collected(id));
++    assert_eq!(
++        pipe.server.streams.max_streams_uni_next(),
++        if bidi { 1 } else { 2 }
++    );
++    assert_eq!(
++        pipe.server.streams.max_streams_bidi_next(),
++        if bidi { 2 } else { 1 }
++    );
++    pipe.advance().unwrap();
++    assert_eq!(pipe.client.peer_streams_left_uni(), 1);
++    assert_eq!(pipe.client.peer_streams_left_bidi(), 1);
++}
++
++#[rstest]
++fn locally_drained_fix_preserves_application_delivery(
++    #[values(false, true)] reset: bool,
++) {
++    let mut pipe = test_utils::Pipe::new("cubic").unwrap();
++    pipe.handshake().unwrap();
++    assert_eq!(pipe.client.stream_send(2, b"hello", !reset), Ok(5));
++    pipe.advance().unwrap();
++    if reset {
++        pipe.client.stream_shutdown(2, Shutdown::Write, 10).unwrap();
++        pipe.advance().unwrap();
++    }
++    assert!(pipe.server.streams.get(2).is_some());
++    assert!(!pipe.server.streams.is_collected(2));
++    assert!(pipe.server.readable().any(|id| id == 2));
++    let mut body = [0; 32];
++    if reset {
++        assert_eq!(
++            pipe.server.stream_recv(2, &mut body),
++            Err(Error::StreamReset(10))
++        );
++    } else {
++        assert_eq!(pipe.server.stream_recv(2, &mut body), Ok((5, true)));
++        assert_eq!(&body[..5], b"hello");
++    }
++    assert!(pipe.server.streams.is_collected(2));
++}
+--- a/src/h3/mod.rs
++++ b/src/h3/mod.rs
+@@ -2956,6 +2956,8 @@
+                         0x100,
+                     )?;
+ 
++                    self.streams.remove(&stream_id);
++
+                     break;
+                 },
+ 
+@@ -5643,6 +5645,40 @@
+     }
+ 
+     #[test]
++    fn unknown_retirement_preserves_critical_stream_errors() {
++        for ty in [0, 2, 3] {
++            for reset in [false, true] {
++                let mut s = Session::new().unwrap();
++                s.handshake().unwrap();
++                let id = match ty {
++                    0 => s.client.control_stream_id.unwrap(),
++                    2 => {
++                        s.client.local_qpack_streams.encoder_stream_id.unwrap()
++                    }
++                    3 => {
++                        s.client.local_qpack_streams.decoder_stream_id.unwrap()
++                    }
++                    _ => unreachable!(),
++                };
++                if reset {
++                    s.pipe
++                        .client
++                        .stream_shutdown(id, crate::Shutdown::Write, 10)
++                        .unwrap();
++                } else {
++                    s.pipe.client.stream_send(id, &[], true).unwrap();
++                }
++                s.advance().ok();
++                assert_eq!(
++                    s.server.poll(&mut s.pipe.server),
++                    Err(Error::ClosedCriticalStream)
++                );
++                assert!(s.server.streams.contains_key(&id));
++            }
++        }
++    }
++
++    #[test]
+     /// Client closes the control stream, which is forbidden.
+     fn close_control_stream_after_type() {
+         let mut s = Session::new().unwrap();
