@@ -141,6 +141,10 @@ http3-client-test = { cmd = "python3 scripts/test_http3_server.py", depends-on =
   "tls-build",
   "quic-build",
 ] }
+http-same-origin-test = { cmd = "python3 scripts/test_http_same_origin.py", depends-on = [
+  "tls-build",
+  "quic-build",
+] }
 http3-package-smoke = { cmd = "mojo run --Werror -I build tests/http3_package_smoke.mojo", depends-on = [
   "package",
   "tls-build",

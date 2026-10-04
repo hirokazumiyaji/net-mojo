@@ -142,10 +142,10 @@ Constraints (see `docs/design/http-server.md` for the full contract):
   and replace `build/tls/test-*.pem` before deployment. UDP-unavailable hosts
   may serve HTTPS alone.
 - `Alt-Svc` is opt-in. Set `ServerConfig.alt_svc` (for example
-  `h3=":8443"; ma=86400`) to inject it on TLS
-  responses when a QUIC endpoint is attached; leave it empty so HTTPS does not
-  advertise H3. A handler-supplied `Alt-Svc` wins; do not advertise when no H3
-  endpoint is listening.
+  `h3=":8443"; ma=86400`) only when the advertised QUIC endpoint is available.
+  The server injects the configured value on TLS responses without probing that
+  endpoint. Leave it empty when providing HTTPS alone. A handler-supplied
+  `Alt-Svc` wins. See the [same-origin operation guide](docs/design/http3-server.md#same-origin-operation).
 - HTTP/2 limits control frames, stream creation and resets. QUIC disables
   0-RTT and uses `quic_max_transport_memory_bytes` as a soft connection
   admission estimate. Receive backing and state entries have separate,
