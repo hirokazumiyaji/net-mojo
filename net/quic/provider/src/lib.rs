@@ -30,15 +30,24 @@ fn disable_quic_early_data(_config: &mut quiche::Config) {
     // Intentionally do not call Config::enable_early_data().
 }
 
+const PROVIDER_PEER_BIDI_STREAMS: u64 = 100;
+const PROVIDER_PEER_UNI_STREAMS: u64 = 3;
+const PROVIDER_MAX_STREAM_WINDOW: u64 = 16 * 1024 * 1024;
+const PROVIDER_CONNECTION_WINDOW: u64 =
+    2 * (PROVIDER_PEER_BIDI_STREAMS + PROVIDER_PEER_UNI_STREAMS)
+        * PROVIDER_MAX_STREAM_WINDOW;
+
 /// Apply shared provider transport settings (including explicit 0-RTT disable).
 fn apply_provider_quic_transport_settings(config: &mut quiche::Config) {
     disable_quic_early_data(config);
-    config.set_initial_max_data(10_000_000);
+    config.set_initial_max_data(PROVIDER_CONNECTION_WINDOW);
+    config.set_max_connection_window(PROVIDER_CONNECTION_WINDOW);
+    config.set_max_stream_window(PROVIDER_MAX_STREAM_WINDOW);
     config.set_initial_max_stream_data_bidi_local(1_000_000);
     config.set_initial_max_stream_data_bidi_remote(1_000_000);
     config.set_initial_max_stream_data_uni(1_000_000);
-    config.set_initial_max_streams_bidi(100);
-    config.set_initial_max_streams_uni(3);
+    config.set_initial_max_streams_bidi(PROVIDER_PEER_BIDI_STREAMS);
+    config.set_initial_max_streams_uni(PROVIDER_PEER_UNI_STREAMS);
     config.set_max_idle_timeout(60_000);
 }
 
