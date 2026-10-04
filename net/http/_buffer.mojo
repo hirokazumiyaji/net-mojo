@@ -1,8 +1,9 @@
 """Global buffer budget for the HTTP server loop.
 
-Receive buffers charge retained capacity and the old + new allocation
-peak during growth. Queued responses and other reservations still charge
-wire lengths; parser, writer and provider allocations remain separate.
+Receive and adopted pending buffers charge retained capacity and growth
+peaks. Pending growth also charges its incoming wire allocation. Encoding
+before adoption, parser, writer and provider allocations remain separate;
+other reservations still charge wire lengths.
 """
 
 

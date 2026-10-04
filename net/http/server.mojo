@@ -10,9 +10,10 @@ Ownership and resources:
 - `serve` takes listener ownership and runs until shutdown completes or
   the listener and every connection are gone. Connections live in the
   internal table; only raw fd numbers are ever handed to the reactor.
-- One global `BufferBudget` charges receive capacity, including growth
-  peaks, and queued response wire lengths. Request admission and the
-  `ResponseWriter` cap derive from the remaining budget; a request that
+- One global `BufferBudget` charges receive and adopted pending capacity,
+  including growth peaks. Encoding before adoption remains separate.
+  Request admission and the `ResponseWriter` cap derive from the remaining
+  budget; a request that
   cannot be admitted gets 503 and close, a handler overrun becomes 500.
 - Deadlines are absolute monotonic timestamps fixed at phase entry:
   the header clock starts on the first byte, never per byte. Expired
@@ -651,10 +652,11 @@ struct Server(Movable):
                     continue
                 var expired = self._conns[idx].http2_session.value().expire(now)
                 if len(expired) > 0:
-                    if not self._budget.try_reserve(len(expired)):
+                    if not self._conns[idx].append_pending(
+                        expired^, self._budget
+                    ):
                         self._close_conn(idx)
                         continue
-                    self._conns[idx].append_pending(expired^)
                     self._conns[idx].state = STATE_SENDING_HTTP2_CONTROL
                     self._conns[idx].write_at = deadline_from_now(
                         self.config.write_deadline
@@ -694,10 +696,9 @@ struct Server(Movable):
                     var goaway = (
                         self._conns[i].http2_session.value().begin_shutdown()
                     )
-                    if not self._budget.try_reserve(len(goaway)):
+                    if not self._conns[i].append_pending(goaway^, self._budget):
                         self._close_conn(i)
                         continue
-                    self._conns[i].append_pending(goaway^)
                     self._conns[i].state = STATE_SENDING_HTTP2_CONTROL
                     self._conns[i].write_at = deadline_from_now(
                         self.config.write_deadline
@@ -1039,7 +1040,8 @@ struct Server(Movable):
         # partial-send close until unrelated requests see 503s. Any
         # admission reservation still held is released the same way.
         self._budget.release(
-            self._conns[idx].buf.capacity() + len(self._conns[idx].pending)
+            self._conns[idx].buf.capacity()
+            + self._conns[idx].pending.capacity()
         )
         self._budget.release(self._conns[idx].reserved)
         self._conns[idx].reserved = 0
@@ -1087,10 +1089,9 @@ struct Server(Movable):
             wire = encode_error(status, True, self._tick_date, is_head=is_head)
         # Error responses use a small fixed body: when even that does not
         # fit the remaining budget, close bare.
-        if not self._budget.try_reserve(len(wire)):
+        if not self._conns[idx].set_pending(wire^, self._budget):
             self._close_conn(idx)
             return
-        self._conns[idx].set_pending(wire^)
         self._conns[idx].should_close = True
         self._conns[idx].write_at = deadline_from_now(
             self.config.write_deadline
@@ -1219,10 +1220,11 @@ struct Server(Movable):
             if self._conns[idx].http2_session:
                 var expired = self._conns[idx].http2_session.value().expire(now)
                 if len(expired) > 0:
-                    if not self._budget.try_reserve(len(expired)):
+                    if not self._conns[idx].append_pending(
+                        expired^, self._budget
+                    ):
                         self._close_conn(idx)
                         return
-                    self._conns[idx].append_pending(expired^)
                     self._conns[idx].state = STATE_SENDING_HTTP2_CONTROL
                     self._conns[idx].write_at = deadline_from_now(
                         self.config.write_deadline
@@ -1455,10 +1457,9 @@ struct Server(Movable):
                 return
             if len(result.output) > 0:
                 var output = result.output.copy()
-                if not self._budget.try_reserve(len(output)):
+                if not self._conns[idx].append_pending(output^, self._budget):
                     self._close_conn(idx)
                     return
-                self._conns[idx].append_pending(output^)
                 self._conns[idx].state = STATE_SENDING_HTTP2_CONTROL
                 self._conns[idx].write_at = deadline_from_now(
                     self.config.write_deadline
@@ -1615,10 +1616,11 @@ struct Server(Movable):
             self.config.write_deadline
         )
         if len(control_output) > 0:
-            if not self._budget.try_reserve(len(control_output)):
+            if not self._conns[idx].append_pending(
+                control_output^, self._budget
+            ):
                 self._close_conn(idx)
                 return
-            self._conns[idx].append_pending(control_output^)
             self._conns[idx].state = STATE_SENDING_HTTP2_CONTROL
         self._drain_http2_responses(idx)
 
@@ -1652,11 +1654,10 @@ struct Server(Movable):
                 self.config.idle_timeout
             )
             return
-        if not self._budget.try_reserve(len(batch.wire)):
+        var output = batch.wire.copy()
+        if not self._conns[idx].append_pending(output^, self._budget):
             self._close_conn(idx)
             return
-        var output = batch.wire.copy()
-        self._conns[idx].append_pending(output^)
         self._conns[idx].state = STATE_SENDING_HTTP2_CONTROL
         # Preserve the deadline armed when the response was enqueued so a
         # peer cannot extend it forever by dribbling credit between batches.
@@ -1831,12 +1832,9 @@ struct Server(Movable):
                 var rest = List[Byte]()
                 for i in range(written, len(cont)):
                     rest.append(cont[i])
-                # Queued bytes join the budget like any pending send so
-                # the later full-length release stays balanced.
-                if not self._budget.try_reserve(len(rest)):
+                if not self._conns[idx].set_pending(rest^, self._budget):
                     self._close_conn(idx)
                     return False
-                self._conns[idx].set_pending(rest^)
                 self._conns[idx].state = STATE_SENDING_100
                 self._conns[idx].write_at = deadline_from_now(
                     self.config.write_deadline
@@ -1845,10 +1843,9 @@ struct Server(Movable):
                 return False
         except e:
             if e.kind == NetErrorKind.timeout():
-                if not self._budget.try_reserve(len(cont)):
+                if not self._conns[idx].set_pending(cont^, self._budget):
                     self._close_conn(idx)
                     return False
-                self._conns[idx].set_pending(cont^)
                 self._conns[idx].state = STATE_SENDING_100
                 self._conns[idx].write_at = deadline_from_now(
                     self.config.write_deadline
@@ -1969,10 +1966,9 @@ struct Server(Movable):
             _ = e
             self._send_error(idx, 500)
             return
-        if not self._budget.try_reserve(len(wire)):
+        if not self._conns[idx].set_pending(wire^, self._budget):
             self._send_error(idx, 500)
             return
-        self._conns[idx].set_pending(wire^)
         # A half-closed peer (read_eof) forces close only when nothing
         # is left to answer: pipelined requests already buffered must
         # still be served first. The EOF drain rule in _drive_conn
@@ -2057,14 +2053,14 @@ struct Server(Movable):
             return
         if self._conns[idx].pending_remaining() > 0:
             return
-        var sent = len(self._conns[idx].pending)
-        self._budget.release(sent)
+        var sent_capacity = self._conns[idx].pending.capacity()
         var was_http2_control = (
             self._conns[idx].state == STATE_SENDING_HTTP2_CONTROL
         )
         var was_100 = self._conns[idx].state == STATE_SENDING_100
         var was_streaming = self._conns[idx].state == STATE_STREAMING
         self._conns[idx].clear_pending()
+        self._budget.release(sent_capacity)
         if was_http2_control:
             self._conns[idx].state = STATE_READING
             if self._conns[idx].http2_responses.queued_count() == 0:
@@ -2331,7 +2327,7 @@ struct Server(Movable):
             self._arm_deadline(idx)
             return
 
-        if not self._budget.try_reserve(len(wire)):
+        if not self._conns[idx].set_pending(wire^, self._budget):
             self._mark_detached_cancelled(idx)
             self._cleanup_detached_state(idx)
             self._send_error(idx, 500, is_head=is_head)
@@ -2339,7 +2335,6 @@ struct Server(Movable):
             return
 
         self._cleanup_detached_state(idx)
-        self._conns[idx].set_pending(wire^)
         self._conns[idx].should_close = (
             rw.should_close
             or (
@@ -2401,7 +2396,7 @@ struct Server(Movable):
             self._arm_deadline(idx)
             return
 
-        if not self._budget.try_reserve(len(wire)):
+        if not self._conns[idx].append_pending(wire^, self._budget):
             self._mark_detached_cancelled(idx)
             self._cleanup_detached_state(idx)
             self._send_error(idx, 500, is_head=is_head)
@@ -2413,7 +2408,6 @@ struct Server(Movable):
         self._conns[idx].stream_has_body = (
             not is_head
         ) and has_body_for_status(msg.status, False)
-        self._conns[idx].append_pending(wire^)
         self._conns[idx].should_close = (
             rw.should_close
             or (
@@ -2444,14 +2438,13 @@ struct Server(Movable):
             return
 
         var wire = encode_chunk(Span(msg.body))
-        if not self._budget.try_reserve(len(wire)):
+        if not self._conns[idx].append_pending(wire^, self._budget):
             self._mark_detached_cancelled(idx)
             self._cleanup_detached_state(idx)
             self._remove_detached_conn(idx)
             self._close_conn(idx)
             return
 
-        self._conns[idx].append_pending(wire^)
         self._conns[idx].write_at = deadline_from_now(
             self.config.write_deadline
         )
@@ -2471,14 +2464,13 @@ struct Server(Movable):
             return
 
         var wire = encode_chunk_end()
-        if not self._budget.try_reserve(len(wire)):
+        if not self._conns[idx].append_pending(wire^, self._budget):
             self._mark_detached_cancelled(idx)
             self._cleanup_detached_state(idx)
             self._remove_detached_conn(idx)
             self._close_conn(idx)
             return
 
-        self._conns[idx].append_pending(wire^)
         self._conns[idx].write_at = deadline_from_now(
             self.config.write_deadline
         )

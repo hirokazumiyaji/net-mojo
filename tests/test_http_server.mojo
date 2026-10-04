@@ -3,6 +3,9 @@ from std.time import perf_counter_ns, sleep
 
 from net import TCPConn, Timeout, dial_tcp, listen_tcp
 from net.error import NetErrorKind
+from net._reactor import ReactorToken
+from net.http._buffer import BufferBudget
+from net.http._connection import HttpConnection
 from net.http import (
     Handler,
     Request,
@@ -13,6 +16,165 @@ from net.http import (
 )
 from net.http._deadline import NO_DEADLINE, now_ns
 from tests.support import _tick_n
+
+
+def _pending_test_connection() raises -> HttpConnection:
+    var listener = listen_tcp("127.0.0.1:0")
+    var client = dial_tcp(
+        String("127.0.0.1:") + String(listener.local_address().port),
+        Timeout.seconds(1),
+    )
+    var accepted = listener.accept(Timeout.seconds(1))
+    client.close()
+    return HttpConnection(
+        ReactorToken(0, 0), Optional[TCPConn](accepted^), None, 0, -1, -1
+    )
+
+
+def test_pending_adoption_and_replacement_charge_capacity() raises:
+    var conn = _pending_test_connection()
+    var budget = BufferBudget(20)
+    var first = List[Byte](capacity=8)
+    first.append(42)
+    assert_true(conn.set_pending(first^, budget))
+    assert_equal(budget.used, 8)
+    var second = List[Byte](capacity=12)
+    second.append(43)
+    assert_true(conn.set_pending(second^, budget))
+    assert_equal(budget.used, 12)
+    assert_equal(conn.pending.capacity(), 12)
+    assert_equal(len(conn.pending), 1)
+    assert_equal(conn.pending[0], 43)
+    conn.advance_pending(1)
+    var third = List[Byte](capacity=8)
+    third.append(44)
+    assert_true(conn.append_pending(third^, budget))
+    assert_equal(budget.used, 8)
+    assert_equal(conn.pending_offset, 0)
+    assert_equal(conn.pending[0], 44)
+
+
+def test_pending_replacement_requires_old_plus_incoming_peak() raises:
+    var conn = _pending_test_connection()
+    var budget = BufferBudget(19)
+    var first = List[Byte](capacity=8)
+    first.append(42)
+    assert_true(conn.set_pending(first^, budget))
+    var second = List[Byte](capacity=12)
+    second.append(43)
+    assert_false(conn.set_pending(second^, budget))
+    assert_equal(budget.used, 8)
+    assert_equal(conn.pending.capacity(), 8)
+    assert_equal(conn.pending[0], 42)
+
+
+def test_pending_append_compacts_and_charges_three_allocation_peak() raises:
+    var conn = _pending_test_connection()
+    var budget = BufferBudget(28)
+    var first = List[Byte](capacity=8)
+    for i in range(8):
+        first.append(Byte(i))
+    assert_true(conn.set_pending(first^, budget))
+    conn.advance_pending(2)
+    var second = List[Byte](length=4, fill=42)
+    assert_true(conn.append_pending(second^, budget))
+    assert_equal(budget.used, 16)
+    assert_equal(conn.pending.capacity(), 16)
+    assert_equal(conn.pending_offset, 0)
+    assert_equal(len(conn.pending), 10)
+    assert_equal(conn.pending[0], 2)
+    assert_equal(conn.pending[5], 7)
+    assert_equal(conn.pending[6], 42)
+    assert_equal(conn.pending[9], 42)
+
+
+def test_pending_failed_append_preserves_unsent_queue_and_budget() raises:
+    var conn = _pending_test_connection()
+    var budget = BufferBudget(21)
+    var first = List[Byte](capacity=8)
+    for i in range(8):
+        first.append(Byte(i))
+    assert_true(conn.set_pending(first^, budget))
+    conn.advance_pending(2)
+    var second = List[Byte](length=4, fill=42)
+    assert_false(conn.append_pending(second^, budget))
+    assert_equal(budget.used, 8)
+    assert_equal(conn.pending.capacity(), 8)
+    assert_equal(conn.pending_offset, 2)
+    assert_equal(len(conn.pending), 8)
+    assert_equal(conn.pending[0], 0)
+    assert_equal(conn.pending[7], 7)
+
+
+def test_pending_append_reuses_capacity_without_duplicate_tail() raises:
+    var conn = _pending_test_connection()
+    var budget = BufferBudget(12)
+    var first = List[Byte](capacity=8)
+    for i in range(8):
+        first.append(Byte(i))
+    assert_true(conn.set_pending(first^, budget))
+    conn.advance_pending(6)
+    var second = List[Byte](length=4, fill=42)
+    assert_true(conn.append_pending(second^, budget))
+    assert_equal(budget.used, 8)
+    assert_equal(conn.pending.capacity(), 8)
+    assert_equal(len(conn.pending), 6)
+    assert_equal(conn.pending[0], 6)
+    assert_equal(conn.pending[1], 7)
+    assert_equal(conn.pending[5], 42)
+
+
+def test_pending_clear_drops_allocation() raises:
+    var conn = _pending_test_connection()
+    var bytes = List[Byte](capacity=8)
+    bytes.append(42)
+    var budget = BufferBudget(8)
+    assert_true(conn.set_pending(bytes^, budget))
+    conn.clear_pending()
+    assert_equal(conn.pending.capacity(), 0)
+    assert_equal(conn.pending_offset, 0)
+
+
+def test_pending_capacity_released_on_full_send_error_close_and_reuse() raises:
+    var config = ServerConfig.default()
+    config.total_buffer_budget = 512
+    config.max_bytes_per_tick = 1
+    var server = Server(config^)
+    server.add_listener(listen_tcp("127.0.0.1:0"))
+    var address = String("127.0.0.1:") + String(server.local_address().port)
+    var handler = _HelloHandler()
+    var client = dial_tcp(address, Timeout.seconds(1))
+    _tick_n(server, handler, 2)
+    var bytes = List[Byte](capacity=8)
+    bytes.extend(String("xyz").as_bytes())
+    assert_true(server._conns[0].set_pending(bytes^, server._budget))
+    server._pump_send(0, True)
+    assert_equal(server._budget.used, 8)
+    assert_equal(server._conns[0].pending_offset, 1)
+    for _ in range(2):
+        server._conns[0].reset_tick()
+        server._pump_send(0, True)
+    assert_equal(server._budget.used, 0)
+    assert_equal(server._conns[0].pending.capacity(), 0)
+    assert_true(server._conns[0].active)
+    server._send_error(0, 503)
+    assert_equal(server._budget.used, server._conns[0].pending.capacity())
+    assert_true(server._budget.used > len(server._conns[0].pending))
+    var out = _drain_until_eof_driven(server, handler, client)
+    assert_true(String(from_utf8_lossy=Span(out)).find("503") >= 0)
+    assert_equal(server._budget.used, 0)
+    assert_equal(server._conns[0].pending.capacity(), 0)
+    client.close()
+    var second = dial_tcp(address, Timeout.seconds(1))
+    _tick_n(server, handler, 2)
+    assert_equal(len(server._conns), 1)
+    var queued = List[Byte](capacity=12)
+    queued.append(42)
+    assert_true(server._conns[0].set_pending(queued^, server._budget))
+    server._close_conn(0)
+    assert_equal(server._budget.used, 0)
+    assert_equal(server._conns[0].pending.capacity(), 0)
+    second.close()
 
 
 def test_receive_compaction_consumption_close_and_slot_reuse() raises:
