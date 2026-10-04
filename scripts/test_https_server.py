@@ -586,9 +586,19 @@ try:
             if client.selected_alpn_protocol() != "http/1.1":
                 raise RuntimeError("server did not negotiate HTTP/1.1")
             client.sendall(
-                b"GET /hello HTTP/1.1\r\nHost: localhost\r\n"
+                b"POST /hello HTTP/1.1\r\nHost: localhost\r\n"
+                b"Content-Length: 3\r\nExpect: 100-continue\r\n"
                 b"Connection: close\r\n\r\n"
             )
+            interim = bytearray()
+            while len(interim) < 25:
+                chunk = client.recv(25 - len(interim))
+                if not chunk:
+                    raise RuntimeError("HTTPS closed before 100 Continue")
+                interim.extend(chunk)
+            if interim != b"HTTP/1.1 100 Continue\r\n\r\n":
+                raise RuntimeError(f"unexpected HTTPS interim response: {interim!r}")
+            client.sendall(b"abc")
             response = bytearray()
             while chunk := client.recv(4096):
                 response.extend(chunk)
@@ -596,7 +606,7 @@ try:
     wire = bytes(response)
     if not wire.startswith(b"HTTP/1.1 200 "):
         raise RuntimeError(f"unexpected HTTPS response: {wire!r}")
-    if not wire.endswith(b"hello over https"):
+    if not wire.endswith(b"hello over httpsabc"):
         raise RuntimeError(f"unexpected HTTPS response body: {wire!r}")
     if b"Alt-Svc:" in wire:
         raise RuntimeError(

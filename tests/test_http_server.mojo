@@ -4,9 +4,9 @@ from std.time import perf_counter_ns, sleep
 from net import TCPConn, Timeout, dial_tcp, listen_tcp
 from net.error import NetErrorKind
 from net._reactor import ReactorToken
-from net._sys.common import _OwnedFD
+from net._sys.common import _OwnedFD, _set_no_sigpipe
 from net.http._buffer import BufferBudget
-from net.http._connection import HttpConnection
+from net.http._connection import HttpConnection, STATE_SENDING_100
 from net.http._deadline import now_ns
 from net.http import (
     Handler,
@@ -18,6 +18,144 @@ from net.http import (
 )
 from net.http._deadline import NO_DEADLINE, now_ns
 from tests.support import _socket_pair, _tick_n
+
+
+def _read_interim(mut client: TCPConn, mut out: List[Byte], wanted: Int) raises:
+    var scratch = Array[Byte, 64](fill=0)
+    var expires = Int(perf_counter_ns()) + 1_000_000_000
+    while len(out) < wanted and Int(perf_counter_ns()) < expires:
+        try:
+            var count = client.try_read(Span(scratch))
+            if count == 0:
+                break
+            out.extend(Span(scratch)[0:count])
+        except e:
+            assert_equal(e.kind, NetErrorKind.timeout())
+    assert_equal(len(out), wanted)
+
+
+def test_interim_static_full_exact_partial_and_denied_tail_preserve_foreign_budget() raises:
+    for limit in [80, 93, 92]:
+        var config = ServerConfig.default()
+        config.total_buffer_budget = limit
+        config.max_bytes_per_tick = 81 if limit != 80 else 128
+        var server = Server(config^)
+        server.add_listener(listen_tcp("127.0.0.1:0"))
+        var address = String("127.0.0.1:") + String(server.local_address().port)
+        var handler = _HelloHandler()
+        var foreign = dial_tcp(address, Timeout.seconds(1))
+        foreign.write_all("GET /".as_bytes(), Timeout.seconds(1))
+        var expires = Int(perf_counter_ns()) + 1_000_000_000
+        while server._budget.used != 5 and Int(perf_counter_ns()) < expires:
+            _ = server.tick(handler, Timeout.nanoseconds(0))
+        assert_equal(server._budget.used, 5)
+        var client = dial_tcp(address, Timeout.seconds(1))
+        while (
+            server.active_connections() != 2
+            and Int(perf_counter_ns()) < expires
+        ):
+            _ = server.tick(handler, Timeout.nanoseconds(0))
+        assert_equal(server.active_connections(), 2)
+        client.write_all(
+            "POST / HTTP/1.1\r\nHost: x\r\nContent-Length: 3\r\nExpect:"
+            " 100-continue\r\n\r\n".as_bytes(),
+            Timeout.seconds(1),
+        )
+        while (
+            server._conns[1].active
+            and server._conns[1].buffered_len() == 0
+            and Int(perf_counter_ns()) < expires
+        ):
+            _ = server.tick(handler, Timeout.nanoseconds(0))
+        var out = List[Byte]()
+        _read_interim(client, out, 25 if limit == 80 else 12)
+        if limit == 92:
+            assert_false(server._conns[1].active)
+            assert_equal(server._budget.used, 5)
+            assert_equal(server._conns[1].pending.capacity(), 0)
+        else:
+            assert_true(server._conns[1].active)
+            if limit == 93:
+                assert_equal(server._conns[1].pending.capacity(), 13)
+                assert_equal(server._conns[1].state, STATE_SENDING_100)
+                assert_equal(server._budget.used, 93)
+                while (
+                    server._conns[1].pending_remaining() > 0
+                    and Int(perf_counter_ns()) < expires
+                ):
+                    _ = server.tick(handler, Timeout.nanoseconds(0))
+                _read_interim(client, out, 25)
+            assert_equal(
+                String(from_utf8_lossy=Span(out)),
+                "HTTP/1.1 100 Continue\r\n\r\n",
+            )
+            assert_true(server._conns[1].sent_100)
+            assert_equal(server._conns[1].pending.capacity(), 0)
+            assert_equal(server._budget.used, 80)
+            server._close_conn(1)
+            assert_equal(server._budget.used, 5)
+        assert_true(server._conns[0].active)
+        client.close()
+        foreign.close()
+        server._close_conn(0)
+        assert_equal(server._budget.used, 0)
+
+
+def _interim_native_pair(mut server: Server) raises -> TCPConn:
+    var pair = _socket_pair()
+    var client = TCPConn(_OwnedFD(pair.first._take()))
+    var accepted = TCPConn(_OwnedFD(pair.second._take()))
+    _set_no_sigpipe(accepted.raw_fd())
+    var token = server._reactor.register(accepted.raw_fd())
+    var idx = len(server._conns)
+    server._conns.append(
+        HttpConnection(token, Optional[TCPConn](accepted^), None, -1, -1, -1)
+    )
+    server._ensure_slot_map(token.slot)
+    server._slot_map[token.slot] = idx
+    server._active_conns += 1
+    server._ensure_conn_arrays(idx)
+    return client^
+
+
+def test_interim_native_would_block_and_write_error_release_only_target() raises:
+    var config = ServerConfig.default()
+    config.total_buffer_budget = 30
+    var server = Server(config^)
+    var foreign = _interim_native_pair(server)
+    assert_true(server._charge_read(0, 5))
+    server._conns[0].append_bytes("GET /".as_bytes())
+    var client = _interim_native_pair(server)
+    server._conns[1].conn.value().set_write_buffer(1024)
+    var filler = Array[Byte, 4096](fill=42)
+    var blocked = False
+    var expires = Int(perf_counter_ns()) + 1_000_000_000
+    while not blocked and Int(perf_counter_ns()) < expires:
+        try:
+            _ = server._conns[1].conn.value().try_write(Span(filler))
+        except e:
+            assert_equal(e.kind, NetErrorKind.timeout())
+            blocked = True
+    assert_true(blocked)
+    assert_false(server._send_100(1))
+    assert_true(server._conns[1].active)
+    assert_equal(server._conns[1].state, STATE_SENDING_100)
+    assert_equal(server._conns[1].pending.capacity(), 25)
+    assert_equal(server._conns[1].bytes_this_tick, 0)
+    assert_equal(server._budget.used, 30)
+    server._close_conn(1)
+    assert_equal(server._budget.used, 5)
+    client.close()
+
+    var failed = _interim_native_pair(server)
+    failed.close()
+    assert_false(server._send_100(2))
+    assert_false(server._conns[2].active)
+    assert_true(server._conns[0].active)
+    assert_equal(server._budget.used, 5)
+    foreign.close()
+    server._close_conn(0)
+    assert_equal(server._budget.used, 0)
 
 
 def test_read_into_native_span_count_would_block_and_eof() raises:
