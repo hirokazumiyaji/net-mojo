@@ -110,10 +110,33 @@ pixi run -e tls-http3 python3 benchmarks/http/http3_scenarios.py --url https://1
 
 The allocation test measures live Rust allocation sizes freed by dropping only
 the server H3 engine, separately from application byte counters. It does not
-bound total allocator or RSS usage: normal QUIC collected-stream IDs still grow
-until connection drop and require separate lifetime/accounting work. A scheduler
+bound total allocator or RSS usage: transport flow windows, reassembly/send
+metadata and active H3 field buffers require separate accounting work. A scheduler
 that indexes transport deadlines must refresh its entry whenever cancellation
 closes a connection outside the receive/send paths.
+
+### Collected transport stream history
+
+The second pinned source patch backports merged quiche
+[PR #2719](https://github.com/cloudflare/quiche/pull/2719). Completed streams
+retain exact per-type sequence ranges instead of one HashSet entry per ID;
+sequential completions share a range, while held active or implicitly opened
+gaps remain distinguishable. No closed-stream tombstone is evicted, no stream
+credit changes, and no additional GOAWAY/reconnection policy is introduced.
+`quic-suite` runs the upstream membership/type/gap/credit tests and real provider
+10,000/50,000-stream allocation comparisons for normal completion and resets.
+
+These patches do not establish an allocator cap. The independent 64 MiB
+request/response counters count logical field/body bytes rather than Vec
+capacity, container entries or allocation overhead. Transport admission still
+uses the soft 256 KiB per-connection estimate; default admission budget is
+2,621,440,000 bytes. Initial receive credit is 10,000,000 connection bytes and
+1,000,000 bytes per stream, with quiche's default autotuned maxima of 24 MiB
+per connection and 16 MiB per stream. Out-of-order fragment metadata, native
+response/retransmission copies and active H3 field buffers are outside those
+application counts. Three peer uni streams permit control/QPACK, but share
+connection MAX_DATA with requests; reserving control byte credit and measuring
+actual allocated capacities remain separate design units.
 
 Still deferred: enabling 0-RTT and full path migration. macOS Mojo end-to-end
 HTTP/3 is covered in CI (`http3` job on `macos-14`, `http3-client-test` against

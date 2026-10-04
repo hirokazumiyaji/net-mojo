@@ -32,8 +32,14 @@ mkdir -p build/quic
 task_quiche_stage=$(mktemp -d "$PWD/build/quic/quiche-stage.XXXXXX")
 trap 'rm -rf "$task_quiche_stage"' EXIT
 tar -xzf "$task_quiche_archive" -C "$task_quiche_stage"
-patch --silent --directory "$task_quiche_stage/quiche-0.29.3" -p1 \
-    < net/quic/provider/patches/quiche-0.29.3-cancel-request.patch
+task_quiche_patches=(
+    quiche-0.29.3-cancel-request.patch
+    quiche-0.29.3-collected-stream-ranges.patch
+)
+for task_quiche_patch in "${task_quiche_patches[@]}"; do
+    patch --silent --directory "$task_quiche_stage/quiche-0.29.3" -p1 \
+        < "net/quic/provider/patches/$task_quiche_patch"
+done
 rm -rf build/quic/quiche-0.29.3
 mv "$task_quiche_stage/quiche-0.29.3" build/quic/quiche-0.29.3
 printf '%s\n' "$PWD/build/quic/quiche-0.29.3"
