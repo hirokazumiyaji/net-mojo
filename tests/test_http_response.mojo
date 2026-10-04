@@ -14,7 +14,126 @@ from net.http._encoder import (
     _measure_response,
     _measure_error,
     _encode_error_exact,
+    encode_chunk,
+    encode_chunk_end,
+    _measure_chunked_start,
+    _encode_chunked_start_budgeted,
+    _encode_chunk_budgeted,
+    _encode_chunk_end_budgeted,
 )
+
+
+def test_stream_wire_exact_capacity_preserves_framing_and_foreign_reservations() raises:
+    for status in [100, 200, 204, 205, 304]:
+        for is_head in [False, True]:
+            var writer = ResponseWriter(32)
+            writer.status = status
+            writer.should_close = True
+            var raw: Array[Byte, 2] = [128, 255]
+            writer.headers.add_bytes(String("X-Bin"), Span(raw))
+            writer.headers.add_bytes(String("X-Bin"), Span(raw))
+            var expected = encode_chunked_start(
+                writer, is_head, "date", 100, 32768
+            )
+            var capacity = _measure_chunked_start(
+                writer, is_head, "date", 100, 32768
+            )
+            assert_equal(capacity, len(expected))
+            var budget = BufferBudget(5 + capacity)
+            assert_true(budget.try_reserve(5))
+            var wire = _encode_chunked_start_budgeted(
+                writer, is_head, "date", 100, 32768, budget
+            )
+            assert_equal(wire.capacity(), capacity)
+            assert_equal(budget.used, 5 + capacity)
+            for i in range(len(expected)):
+                assert_equal(wire[i], expected[i])
+            _ = wire^
+            budget.release(capacity)
+            assert_equal(budget.used, 5)
+
+
+def test_stream_wire_denial_and_validation_leave_foreign_reservation() raises:
+    for invalid in range(4):
+        var writer = ResponseWriter(32)
+        if invalid == 0:
+            writer.headers.add(String("Content-Length"), String("0"))
+        elif invalid == 1:
+            writer.headers.add(String("Transfer-Encoding"), String("chunked"))
+        elif invalid == 2:
+            writer.status = 99
+        var date = String("date\r\n") if invalid == 3 else String("date")
+        var budget = BufferBudget(512)
+        assert_true(budget.try_reserve(5))
+        var rejected = False
+        try:
+            _ = _encode_chunked_start_budgeted(
+                writer, False, date, 100, 32768, budget
+            )
+        except e:
+            assert_equal(e.kind, NetErrorKind.invalid_argument())
+            rejected = True
+        assert_true(rejected)
+        assert_equal(budget.used, 5)
+    var writer = ResponseWriter(32)
+    var capacity = _measure_chunked_start(writer, False, "date", 100, 32768)
+    var budget = BufferBudget(5 + capacity - 1)
+    assert_true(budget.try_reserve(5))
+    var rejected = False
+    try:
+        _ = _encode_chunked_start_budgeted(
+            writer, False, "date", 100, 32768, budget
+        )
+    except:
+        rejected = True
+    assert_true(rejected)
+    assert_equal(budget.used, 5)
+
+
+def test_chunk_and_end_reserve_exact_wire_before_construction() raises:
+    var data = List[Byte](length=256, fill=42)
+    for length in [0, 1, 15, 16, 255, 256]:
+        var expected = encode_chunk(Span(data)[0:length])
+        for admitted in [True, False]:
+            var capacity = len(expected)
+            var budget = BufferBudget(
+                5 + capacity - Int(not admitted and capacity > 0)
+            )
+            assert_true(budget.try_reserve(5))
+            var rejected = False
+            var wire = List[Byte]()
+            try:
+                wire = _encode_chunk_budgeted(Span(data)[0:length], budget)
+            except e:
+                assert_equal(e.kind, NetErrorKind.invalid_argument())
+                rejected = True
+            if not rejected:
+                assert_equal(wire.capacity(), capacity)
+                assert_equal(budget.used, 5 + capacity)
+                for i in range(capacity):
+                    assert_equal(wire[i], expected[i])
+                _ = wire^
+                budget.release(capacity)
+            assert_equal(rejected, not admitted and capacity > 0)
+            assert_equal(budget.used, 5)
+    for admitted in [True, False]:
+        var budget = BufferBudget(10 - Int(not admitted))
+        assert_true(budget.try_reserve(5))
+        var rejected = False
+        var wire = List[Byte]()
+        try:
+            wire = _encode_chunk_end_budgeted(budget)
+        except e:
+            assert_equal(e.kind, NetErrorKind.invalid_argument())
+            rejected = True
+        if not rejected:
+            assert_equal(wire.capacity(), 5)
+            assert_equal(String(from_utf8_lossy=Span(wire)), "0\r\n\r\n")
+            assert_equal(budget.used, 10)
+            _ = wire^
+            budget.release(5)
+        assert_equal(rejected, not admitted)
+        assert_equal(budget.used, 5)
 
 
 def test_encoder_borrowed_duplicate_obs_text_headers_match_exact_wire() raises:

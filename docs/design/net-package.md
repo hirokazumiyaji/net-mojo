@@ -262,9 +262,11 @@ section records only the package-level boundaries.
   capacity reservations through drained-batch destruction. Detached `respond`
   adopts actual body capacity and `send` reserves exact chunk capacity before
   allocation. Each message keeps its body reservation through queue/batch and
-  borrowed consumer ownership, releasing it after body destruction. Caller-owned
-  allocations before adoption, detached headers and streaming wire remain
-  accounting gaps.
+  borrowed consumer ownership, releasing it after body destruction. Streaming start/chunk/end wire reserves exact capacity before allocation;
+  appending to pending storage retains the old + incoming + new growth peak
+  and refunds copied incoming capacity only after storage destruction. HEAD
+  and no-body statuses skip chunk/end allocation. Caller-owned allocations
+  before adoption and detached headers remain accounting gaps.
   Raw read scratch uses fixed stack arrays; TLS retains a charged retry buffer.
   Pending 100-continue bytes and HTTP/1 error wire reserve capacity before
   allocation. Header/String/parser scratch, other encoders, native provider

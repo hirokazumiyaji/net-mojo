@@ -468,6 +468,59 @@ def test_pending_replacement_requires_old_plus_incoming_peak() raises:
     assert_equal(conn.pending[0], 42)
 
 
+def test_precharged_append_preserves_full_peak_and_foreign_charge() raises:
+    for offset in [0, 3]:
+        for admitted in [True, False]:
+            var conn = _pending_test_connection()
+            var target = 12 - offset
+            var budget = BufferBudget(5 + 8 + 4 + target - Int(not admitted))
+            assert_true(budget.try_reserve(5))
+            var old = List[Byte](capacity=8)
+            for i in range(8):
+                old.append(Byte(i))
+            assert_true(conn.set_pending(old^, budget))
+            conn.advance_pending(offset)
+            assert_true(budget.try_reserve(4))
+            var incoming = List[Byte](length=4, fill=42)
+            assert_equal(
+                conn._append_reserved_pending(incoming^, budget), admitted
+            )
+            assert_equal(budget.used, 5 + (target if admitted else 8))
+            assert_equal(conn.pending.capacity(), target if admitted else 8)
+            assert_equal(conn.pending_offset, 0 if admitted else offset)
+            assert_equal(len(conn.pending), target if admitted else 8)
+            assert_equal(conn.pending[0], Byte(offset if admitted else 0))
+            assert_equal(
+                conn.pending[len(conn.pending) - 1], Byte(42 if admitted else 7)
+            )
+            var capacity = conn.pending.capacity()
+            conn.clear_pending()
+            budget.release(capacity)
+            assert_equal(budget.used, 5)
+
+
+def test_precharged_append_adopts_without_double_charge_and_keeps_tls_retry() raises:
+    var conn = _pending_test_connection()
+    var budget = BufferBudget(17)
+    assert_true(budget.try_reserve(5))
+    var old = List[Byte](length=8, fill=42)
+    assert_true(conn.set_pending(old^, budget))
+    conn.advance_pending(8)
+    conn.tls_write_retry_length = 4
+    conn.tls_write_would_block = True
+    conn.tls_write_wants_read = True
+    assert_true(budget.try_reserve(4))
+    var incoming = List[Byte](length=4, fill=43)
+    assert_true(conn._append_reserved_pending(incoming^, budget))
+    assert_equal(budget.used, 9)
+    assert_equal(conn.pending.capacity(), 4)
+    assert_equal(conn.pending_offset, 0)
+    assert_equal(conn.pending[0], 43)
+    assert_equal(conn.tls_write_retry_length, 4)
+    assert_true(conn.tls_write_would_block)
+    assert_true(conn.tls_write_wants_read)
+
+
 def test_pending_append_compacts_and_charges_three_allocation_peak() raises:
     var conn = _pending_test_connection()
     var budget = BufferBudget(28)

@@ -539,22 +539,17 @@ def _append_hex(mut out: List[Byte], val: Int):
             out.append(Byte(ord("a") + rem - 10))
 
 
-def encode_chunked_start(
+def _render_chunked_start[
+    measure: Bool
+](
     writer: ResponseWriter,
     is_head: Bool,
     date: StringSlice,
     max_headers: Int,
     max_bytes: Int,
-) raises NetError -> List[Byte]:
-    """Renders the status line and headers for a chunked response.
-
-    Framing rules:
-    - Status must be a 3-digit code (100-999).
-    - Content-Length is prohibited with chunked transfer coding (RFC 9112 §6.1).
-    - Transfer-Encoding header is managed by this encoder; caller-supplied is rejected.
-    - Status 1xx, 204, 205, 304 omit Transfer-Encoding: chunked.
-    - HEAD advertises Transfer-Encoding: chunked (if status allows body) but omits chunk bodies.
-    """
+    mut out: List[Byte],
+    mut byte_count: Int,
+) raises NetError:
     if writer.status < 100 or writer.status > 999:
         raise NetError(
             NetErrorKind.invalid_argument(),
@@ -605,14 +600,14 @@ def encode_chunked_start(
     ):
         emit_transfer_encoding = False
 
-    var out = List[Byte]()
-    _append_string(
+    _append_response_string[measure](
         out,
         String("HTTP/1.1 ")
         + String(writer.status)
         + String(" ")
         + _status_reason(writer.status)
         + String("\r\n"),
+        byte_count,
     )
     for i in range(len(writer.headers)):
         var name = writer.headers.name_at(i)
@@ -638,17 +633,20 @@ def encode_chunked_start(
                     None,
                     "response header contains CR or LF",
                 )
-        _append_string(out, name + String(": "))
-        for k in range(len(value_bytes)):
-            out.append(value_bytes[k])
-        _append_string(out, String("\r\n"))
+        _append_response_string[measure](out, name + String(": "), byte_count)
+        _append_response_bytes[measure](out, value_bytes, byte_count)
+        _append_response_string[measure](out, "\r\n", byte_count)
 
     if not writer.headers.get_first("Date"):
         _reject_response_injection("Date", date)
-        _append_string(out, String("Date: ") + String(date) + String("\r\n"))
+        _append_response_string[measure](
+            out, String("Date: ") + String(date) + String("\r\n"), byte_count
+        )
 
     if emit_transfer_encoding:
-        _append_string(out, String("Transfer-Encoding: chunked\r\n"))
+        _append_response_string[measure](
+            out, "Transfer-Encoding: chunked\r\n", byte_count
+        )
 
     if writer.should_close:
         var connection = writer.headers.get_first("Connection")
@@ -656,21 +654,107 @@ def encode_chunked_start(
         if connection:
             has_close = _has_close_token(connection.value())
         if not has_close:
-            _append_string(out, String("Connection: close\r\n"))
+            _append_response_string[measure](
+                out, "Connection: close\r\n", byte_count
+            )
 
-    _append_string(out, String("\r\n"))
+    _append_response_string[measure](out, "\r\n", byte_count)
+
+
+def _measure_chunked_start(
+    writer: ResponseWriter,
+    is_head: Bool,
+    date: StringSlice,
+    max_headers: Int,
+    max_bytes: Int,
+) raises NetError -> Int:
+    var scratch = List[Byte]()
+    var byte_count = 0
+    _render_chunked_start[True](
+        writer, is_head, date, max_headers, max_bytes, scratch, byte_count
+    )
+    return byte_count
+
+
+def encode_chunked_start(
+    writer: ResponseWriter,
+    is_head: Bool,
+    date: StringSlice,
+    max_headers: Int,
+    max_bytes: Int,
+) raises NetError -> List[Byte]:
+    """Renders the status line and headers for a chunked response.
+
+    Framing rules:
+    - Status must be a 3-digit code (100-999).
+    - Content-Length is prohibited with chunked transfer coding (RFC 9112 §6.1).
+    - Transfer-Encoding header is managed by this encoder; caller-supplied is rejected.
+    - Status 1xx, 204, 205, 304 omit Transfer-Encoding: chunked.
+    - HEAD advertises Transfer-Encoding: chunked (if status allows body) but omits chunk bodies.
+    """
+    var capacity = _measure_chunked_start(
+        writer, is_head, date, max_headers, max_bytes
+    )
+    var out = List[Byte](capacity=capacity)
+    var byte_count = 0
+    _render_chunked_start[False](
+        writer, is_head, date, max_headers, max_bytes, out, byte_count
+    )
     return out^
+
+
+def _encode_chunked_start_budgeted[
+    B: _CapacityBudget
+](
+    writer: ResponseWriter,
+    is_head: Bool,
+    date: StringSlice,
+    max_headers: Int,
+    max_bytes: Int,
+    mut budget: B,
+) raises NetError -> List[Byte]:
+    var capacity = _measure_chunked_start(
+        writer, is_head, date, max_headers, max_bytes
+    )
+    if not budget.try_reserve(capacity):
+        raise NetError(
+            NetErrorKind.invalid_argument(),
+            "encode chunked start",
+            None,
+            "stream wire capacity exceeds budget",
+        )
+    var out = List[Byte](capacity=capacity)
+    var byte_count = 0
+    try:
+        _render_chunked_start[False](
+            writer, is_head, date, max_headers, max_bytes, out, byte_count
+        )
+    except e:
+        _ = out^
+        budget.release(capacity)
+        raise e^
+    return out^
+
+
+def _chunk_wire_size(length: Int) -> Int:
+    if length == 0:
+        return 0
+    var digits = 1
+    var remaining = length >> 4
+    while remaining > 0:
+        digits += 1
+        remaining >>= 4
+    return digits + 2 + length + 2
 
 
 def encode_chunk[origin: ImmOrigin](data: Span[Byte, origin]) -> List[Byte]:
     """Encodes a single chunk with hex length prefix and CRLF delimiters."""
-    var out = List[Byte]()
+    var out = List[Byte](capacity=_chunk_wire_size(len(data)))
     if len(data) == 0:
         return out^
     _append_hex(out, len(data))
     out.append(Byte(ord("\r")))
     out.append(Byte(ord("\n")))
-    out.reserve(len(out) + len(data) + 2)
     for i in range(len(data)):
         out.append(data[i])
     out.append(Byte(ord("\r")))
@@ -688,3 +772,30 @@ def encode_chunk_end() -> List[Byte]:
     out.append(Byte(ord("\r")))
     out.append(Byte(ord("\n")))
     return out^
+
+
+def _encode_chunk_budgeted[
+    B: _CapacityBudget, origin: ImmOrigin
+](data: Span[Byte, origin], mut budget: B) raises NetError -> List[Byte]:
+    var capacity = _chunk_wire_size(len(data))
+    if not budget.try_reserve(capacity):
+        raise NetError(
+            NetErrorKind.invalid_argument(),
+            "encode chunk",
+            None,
+            "stream wire capacity exceeds budget",
+        )
+    return encode_chunk(data)
+
+
+def _encode_chunk_end_budgeted[
+    B: _CapacityBudget
+](mut budget: B) raises NetError -> List[Byte]:
+    if not budget.try_reserve(5):
+        raise NetError(
+            NetErrorKind.invalid_argument(),
+            "encode chunk end",
+            None,
+            "stream wire capacity exceeds budget",
+        )
+    return encode_chunk_end()

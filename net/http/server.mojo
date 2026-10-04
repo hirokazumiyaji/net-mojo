@@ -72,9 +72,9 @@ from ._detach import (
 )
 from ._encoder import (
     current_http_date,
-    encode_chunk,
-    encode_chunk_end,
-    encode_chunked_start,
+    _encode_chunk_budgeted,
+    _encode_chunk_end_budgeted,
+    _encode_chunked_start_budgeted,
     _encode_error_exact,
     _measure_error,
     _encode_response_budgeted,
@@ -2437,12 +2437,13 @@ struct Server(Movable):
 
         var wire: List[Byte]
         try:
-            wire = encode_chunked_start(
+            wire = _encode_chunked_start_budgeted(
                 rw,
                 is_head,
                 self._tick_date,
                 self.config.max_response_headers_count,
                 self.config.max_response_headers_bytes,
+                self._budget,
             )
         except e:
             _ = e
@@ -2452,7 +2453,7 @@ struct Server(Movable):
             self._arm_deadline(idx)
             return
 
-        if not self._conns[idx].append_pending(wire^, self._budget):
+        if not self._conns[idx]._append_reserved_pending(wire^, self._budget):
             self._mark_detached_cancelled(idx)
             self._cleanup_detached_state(idx)
             self._send_error(idx, 500, is_head=is_head)
@@ -2493,8 +2494,14 @@ struct Server(Movable):
         if not self._conns[idx].stream_has_body:
             return
 
-        var wire = encode_chunk(Span(msg.body))
-        if not self._conns[idx].append_pending(wire^, self._budget):
+        var wire: List[Byte]
+        try:
+            wire = _encode_chunk_budgeted(Span(msg.body), self._budget)
+        except e:
+            _ = e
+            self._handle_detached_abort(idx)
+            return
+        if not self._conns[idx]._append_reserved_pending(wire^, self._budget):
             self._mark_detached_cancelled(idx)
             self._cleanup_detached_state(idx)
             self._remove_detached_conn(idx)
@@ -2519,8 +2526,14 @@ struct Server(Movable):
         if not self._conns[idx].stream_has_body:
             return
 
-        var wire = encode_chunk_end()
-        if not self._conns[idx].append_pending(wire^, self._budget):
+        var wire: List[Byte]
+        try:
+            wire = _encode_chunk_end_budgeted(self._budget)
+        except e:
+            _ = e
+            self._handle_detached_abort(idx)
+            return
+        if not self._conns[idx]._append_reserved_pending(wire^, self._budget):
             self._mark_detached_cancelled(idx)
             self._cleanup_detached_state(idx)
             self._remove_detached_conn(idx)
