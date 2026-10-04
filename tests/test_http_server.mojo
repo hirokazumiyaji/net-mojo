@@ -7,8 +7,12 @@ from net.error import NetErrorKind
 from net._reactor import ReactorToken
 from net._sys.common import _OwnedFD, _set_no_sigpipe
 from net.http._buffer import BufferBudget, SharedBufferBudget
-from net.http._connection import HttpConnection, STATE_SENDING_100
-from net.http._deadline import now_ns
+from net.http._connection import (
+    HttpConnection,
+    STATE_SENDING_100,
+    H1_ERROR_CAPACITY,
+)
+from net.http._deadline import NO_DEADLINE, now_ns
 from net.http import (
     Headers,
     Handler,
@@ -18,7 +22,6 @@ from net.http import (
     ServerConfig,
     ServerControl,
 )
-from net.http._deadline import NO_DEADLINE, now_ns
 from tests.support import _socket_pair, _tick_n
 
 
@@ -108,6 +111,196 @@ def _check_completed_head_error(path: String) raises:
         sibling.close()
 
 
+struct _EmergencySaturationHandler(Handler):
+    var budget: SharedBufferBudget
+    var foreign: Int
+    var admitted: Bool
+    var remaining_after_reserve: Int
+
+    def __init__(out self, var budget: SharedBufferBudget):
+        self.budget = budget^
+        self.foreign = 0
+        self.admitted = False
+        self.remaining_after_reserve = -1
+
+    def handle(mut self, req: Request, mut writer: ResponseWriter) raises:
+        if req.path == "/saturate":
+            self.foreign = self.budget.remaining()
+            self.admitted = self.budget.try_reserve(self.foreign)
+            self.remaining_after_reserve = self.budget.remaining()
+            raise Error("emergency error reserve witness")
+        writer.set_should_close(True)
+        writer.write_string("alive")
+
+
+@fieldwise_init
+struct _EmergencyReadResult(Movable):
+    var wire: List[Byte]
+    var eof: Bool
+    var unexpected_io: Bool
+
+
+def _read_emergency_response[
+    H: Handler
+](
+    mut server: Server,
+    mut handler: H,
+    mut client: TCPConn,
+) -> _EmergencyReadResult:
+    var wire = List[Byte]()
+    var scratch = Array[Byte, 1024](fill=0)
+    var eof = False
+    var unexpected_io = False
+    var expires = Int(perf_counter_ns()) + 2_000_000_000
+    while not eof and Int(perf_counter_ns()) < expires:
+        try:
+            _ = server.tick(handler, Timeout.nanoseconds(0))
+        except:
+            unexpected_io = True
+            break
+        try:
+            var count = client.try_read(Span(scratch))
+            if count == 0:
+                eof = True
+            else:
+                wire.extend(Span(scratch)[0:count])
+        except error:
+            if error.kind != NetErrorKind.timeout():
+                unexpected_io = True
+                break
+    return _EmergencyReadResult(wire^, eof, unexpected_io)
+
+
+@fieldwise_init
+struct _EmergencySaturationResult(Movable):
+    var is_head: Bool
+    var response: _EmergencyReadResult
+    var sibling: _EmergencyReadResult
+    var foreign: Int
+    var admitted: Bool
+    var remaining_after_reserve: Int
+    var held_after_error: Int
+    var after_refund: Int
+    var stopped: Bool
+    var cleanup_failed: Bool
+    var active_after_shutdown: Int
+    var after_owner_drop: Int
+
+
+def test_saturated_foreign_budget_keeps_get_and_head_handler_error_wire() raises:
+    var results = List[_EmergencySaturationResult]()
+    for is_head in [False, True]:
+        var config = ServerConfig.default()
+        config.max_bytes_per_tick = 17
+        var server = Server(config^)
+        server.add_listener(listen_tcp("127.0.0.1:0"))
+        var observer = server._budget.copy()
+        var handler = _EmergencySaturationHandler(observer.copy())
+        var address = String("127.0.0.1:") + String(server.local_address().port)
+        var client = dial_tcp(address, Timeout.seconds(1))
+        var method = String("HEAD") if is_head else String("GET")
+        var request = method + String(" /saturate HTTP/1.1\r\nHost: x\r\n\r\n")
+        client.write_all(request.as_bytes(), Timeout.seconds(1))
+        var response = _read_emergency_response(server, handler, client)
+        client.close()
+        var held_after_error = observer.used()
+        var foreign = handler.foreign
+        var admitted = handler.admitted
+        var remaining_after_reserve = handler.remaining_after_reserve
+        if admitted:
+            observer.release(foreign)
+        handler.foreign = 0
+        var after_refund = observer.used()
+
+        var sibling = dial_tcp(address, Timeout.seconds(1))
+        sibling.write_all(
+            "GET /alive HTTP/1.1\r\nHost: x\r\n\r\n".as_bytes(),
+            Timeout.seconds(1),
+        )
+        var next = _read_emergency_response(server, handler, sibling)
+        sibling.close()
+        server.request_shutdown()
+        var stopped = False
+        var cleanup_failed = False
+        var expires = Int(perf_counter_ns()) + 2_000_000_000
+        while not stopped and Int(perf_counter_ns()) < expires:
+            try:
+                stopped = not server.tick(handler, Timeout.nanoseconds(0))
+            except:
+                cleanup_failed = True
+                break
+        var active = server.active_connections()
+        _ = server^
+        var after_owner_drop = observer.used()
+        _ = handler^
+        print(
+            "emergency saturation",
+            method,
+            "wire_bytes",
+            len(response.wire),
+            "eof",
+            response.eof,
+            "foreign",
+            foreign,
+            "held",
+            held_after_error,
+            "after_refund",
+            after_refund,
+            "after_owner_drop",
+            after_owner_drop,
+        )
+        results.append(
+            _EmergencySaturationResult(
+                is_head,
+                response^,
+                next^,
+                foreign,
+                admitted,
+                remaining_after_reserve,
+                held_after_error,
+                after_refund,
+                stopped,
+                cleanup_failed,
+                active,
+                after_owner_drop,
+            )
+        )
+
+    while len(results) > 0:
+        var result = results.pop(0)
+        assert_true(result.admitted)
+        assert_true(result.foreign > 0)
+        assert_equal(result.remaining_after_reserve, 0)
+        assert_equal(result.held_after_error, result.foreign)
+        assert_equal(result.after_refund, 0)
+        assert_true(result.stopped)
+        assert_false(result.cleanup_failed)
+        assert_equal(result.active_after_shutdown, 0)
+        assert_equal(result.after_owner_drop, 0)
+        assert_true(result.response.eof)
+        assert_false(result.response.unexpected_io)
+        assert_true(result.sibling.eof)
+        assert_false(result.sibling.unexpected_io)
+        var sibling_wire = String(from_utf8_lossy=Span(result.sibling.wire))
+        assert_true(sibling_wire.startswith("HTTP/1.1 200 OK\r\n"))
+        assert_true(sibling_wire.endswith("\r\n\r\nalive"))
+        var wire = String(from_utf8_lossy=Span(result.response.wire))
+        assert_true(wire.startswith("HTTP/1.1 500 Internal Server Error\r\n"))
+        assert_true(wire.find("\r\nContent-Length: 25\r\n") >= 0)
+        assert_true(wire.find("\r\nConnection: close\r\n") >= 0)
+        var header_end = _header_end(result.response.wire)
+        assert_true(header_end >= 4)
+        var body = String(
+            from_utf8_lossy=Span(result.response.wire)[header_end:]
+        )
+        assert_equal(
+            body,
+            String("") if result.is_head else String(
+                "500 Internal Server Error"
+            ),
+        )
+
+
 def test_completed_head_handler_error_closes_without_body_and_keeps_sibling() raises:
     _check_completed_head_error(String("/raise"))
 
@@ -120,16 +313,145 @@ def test_completed_head_detached_abort_closes_without_body_and_keeps_sibling() r
     _check_completed_head_error(String("/abort"))
 
 
-def test_error_wire_exact_peak_denial_partial_close_and_reuse_preserve_foreign() raises:
+def test_emergency_accept_exact_capacity_and_denial_preserve_foreign() raises:
+    for capacity in [H1_ERROR_CAPACITY - 1, H1_ERROR_CAPACITY]:
+        var config = ServerConfig.default()
+        config.total_buffer_budget = capacity + 5
+        var server = Server(config^)
+        var observer = server._budget.copy()
+        assert_true(observer.try_reserve(5))
+        server.add_listener(listen_tcp("127.0.0.1:0"))
+        var client = dial_tcp(
+            String("127.0.0.1:") + String(server.local_address().port),
+            Timeout.seconds(1),
+        )
+        var admitted = capacity == H1_ERROR_CAPACITY
+        var accepted = False
+        var scratch = Array[Byte, 1](fill=42)
+        var expires = Int(perf_counter_ns()) + 2_000_000_000
+        while not accepted and Int(perf_counter_ns()) < expires:
+            server._accept_pending(now_ns())
+            if admitted:
+                accepted = server.active_connections() == 1
+            else:
+                try:
+                    accepted = client.try_read(Span(scratch)) == 0
+                except e:
+                    assert_equal(e.kind, NetErrorKind.timeout())
+        assert_true(accepted)
+        assert_equal(server.active_connections(), 1 if admitted else 0)
+        assert_equal(len(server._conns), 1 if admitted else 0)
+        assert_equal(
+            observer.used(), 5 + (H1_ERROR_CAPACITY if admitted else 0)
+        )
+        if admitted:
+            assert_equal(
+                server._conns[0]._error_wire.capacity(), H1_ERROR_CAPACITY
+            )
+            assert_equal(len(server._conns[0]._error_wire), 0)
+            assert_equal(
+                server._conns[0]._error_ticket.amount, H1_ERROR_CAPACITY
+            )
+            server._close_conn(0)
+            assert_equal(server._conns[0]._error_wire.capacity(), 0)
+            assert_equal(server._conns[0]._error_ticket.amount, 0)
+        client.close()
+        _ = server^
+        assert_equal(observer.used(), 5)
+        observer.release(5)
+        assert_equal(observer.used(), 0)
+
+
+def test_emergency_server_drop_releases_unused_and_transferred_store() raises:
+    for transferred in [False, True]:
+        var server = Server(ServerConfig.default())
+        var observer = server._budget.copy()
+        assert_true(observer.try_reserve(5))
+        var client = _interim_native_pair(server)
+        var address = Int(server._conns[0]._error_wire.unsafe_ptr())
+        assert_true(server._charge_read(0, 7))
+        server._conns[0].append_bytes("partial".as_bytes())
+        if transferred:
+            server._send_error(0, 500)
+            assert_equal(Int(server._conns[0].pending.unsafe_ptr()), address)
+            assert_equal(server._conns[0].try_write_pending_capped(1), 1)
+            assert_equal(server._conns[0].pending.capacity(), H1_ERROR_CAPACITY)
+            assert_equal(server._conns[0]._error_wire.capacity(), 0)
+        assert_equal(observer.used(), 5 + 7 + H1_ERROR_CAPACITY)
+        _ = server^
+        var refunded = observer.used()
+        client.close()
+        observer.release(5)
+        assert_equal(refunded, 5)
+        assert_equal(observer.used(), 0)
+
+
+def test_emergency_body_denial_uses_prepaid_wire_without_foreign_refund() raises:
+    var server = Server(ServerConfig.default())
+    server.add_listener(listen_tcp("127.0.0.1:0"))
+    var observer = server._budget.copy()
+    var handler = _HelloHandler()
+    var client = dial_tcp(
+        String("127.0.0.1:") + String(server.local_address().port),
+        Timeout.seconds(1),
+    )
+    client.write_all(
+        "POST / HTTP/1.1\r\nHost: x\r\nContent-Length: 1\r\nConnection:"
+        " close\r\n\r\n".as_bytes(),
+        Timeout.seconds(1),
+    )
+    var expires = Int(perf_counter_ns()) + 2_000_000_000
+    while (
+        len(server._conns) == 0 or server._conns[0].http1_body_reserved != 1
+    ) and Int(perf_counter_ns()) < expires:
+        _ = server.tick(handler, Timeout.milliseconds(1))
+    assert_equal(server._conns[0].http1_body_reserved, 1)
+    assert_true(server._conns[0].buf.capacity() > 0)
+    var address = Int(server._conns[0]._error_wire.unsafe_ptr())
+    var foreign = observer.remaining()
+    assert_true(observer.try_reserve(foreign))
+    client.write_all("x".as_bytes(), Timeout.seconds(1))
+    while (
+        server._conns[0].pending_remaining() == 0
+        and server._conns[0].active
+        and Int(perf_counter_ns()) < expires
+    ):
+        server._pump_read(0, True, now_ns())
+    assert_true(server._conns[0].active)
+    assert_equal(Int(server._conns[0].pending.unsafe_ptr()), address)
+    assert_equal(server._conns[0].pending.capacity(), H1_ERROR_CAPACITY)
+    assert_equal(server._conns[0].http1_body_reserved, 0)
+    assert_equal(server._conns[0].reserved, 1)
+    assert_equal(
+        observer.used(),
+        foreign + H1_ERROR_CAPACITY + server._conns[0].buf.capacity() + 1,
+    )
+    var response = _read_emergency_response(server, handler, client)
+    var held = observer.used()
+    client.close()
+    observer.release(foreign)
+    _ = server^
+    assert_true(response.eof)
+    assert_false(response.unexpected_io)
+    assert_equal(_status_of(response.wire), 503)
+    _assert_body(response.wire, "503 Service Unavailable")
+    assert_equal(held, foreign)
+    assert_equal(observer.used(), 0)
+
+
+def test_error_wire_transfer_partial_close_and_reuse_preserve_foreign() raises:
     for scenario in range(4):
         var config = ServerConfig.default()
-        config.total_buffer_budget = [166, 165, 176, 175][scenario]
+        config.total_buffer_budget = [166, 165, 176, 175][
+            scenario
+        ] + 2 * H1_ERROR_CAPACITY
         var server = Server(config^)
         server._tick_date = "Sun, 06 Nov 1994 08:49:37 GMT"
         var foreign = _interim_native_pair(server)
         assert_true(server._charge_read(0, 5))
         server._conns[0].append_bytes("GET /".as_bytes())
         var client = _interim_native_pair(server)
+        var address = Int(server._conns[1]._error_wire.unsafe_ptr())
         var reservation = 0
         if scenario >= 2:
             var old = List[Byte](capacity=7)
@@ -138,17 +460,27 @@ def test_error_wire_exact_peak_denial_partial_close_and_reuse_preserve_foreign()
             reservation = 3
             assert_true(server._budget.try_reserve(reservation))
             server._conns[1].reserved = reservation
+        var before = server._budget.used()
         server._send_error(1, 503)
+        assert_equal(server._conns[1].pending.capacity(), H1_ERROR_CAPACITY)
+        assert_equal(Int(server._conns[1].pending.unsafe_ptr()), address)
+        assert_equal(server._conns[1]._error_wire.capacity(), 0)
+        assert_equal(server._conns[1]._error_ticket.amount, 0)
+        assert_equal(
+            server._budget.used(), before - (7 if scenario >= 2 else 0)
+        )
+        assert_equal(
+            server._budget.used(), 5 + 2 * H1_ERROR_CAPACITY + reservation
+        )
+        assert_equal(server._conns[1].reserved, reservation)
+        assert_equal(server._conns[1].try_write_pending_capped(11), 11)
+        assert_equal(server._conns[1].pending.capacity(), H1_ERROR_CAPACITY)
+        assert_equal(
+            server._budget.used(), 5 + 2 * H1_ERROR_CAPACITY + reservation
+        )
+        var out = List[Byte]()
+        _read_interim(client, out, 11)
         if scenario % 2 == 0:
-            assert_true(server._conns[1].active)
-            assert_equal(server._conns[1].pending.capacity(), 161)
-            assert_equal(server._budget.used(), 166 + reservation)
-            assert_equal(server._conns[1].reserved, reservation)
-            assert_equal(server._conns[1].try_write_pending_capped(11), 11)
-            assert_equal(server._conns[1].pending.capacity(), 161)
-            assert_equal(server._budget.used(), 166 + reservation)
-            var out = List[Byte]()
-            _read_interim(client, out, 11)
             server._pump_send(1, True)
             _read_interim(client, out, 161)
             assert_equal(
@@ -161,18 +493,27 @@ def test_error_wire_exact_peak_denial_partial_close_and_reuse_preserve_foreign()
                     "503 Service Unavailable"
                 ),
             )
+        elif scenario == 1:
+            server._conns[1].write_at = now_ns() - 1
+            server._arm_deadline(1)
+            server._expire_deadlines(now_ns())
+        else:
+            client.close()
+            server._pump_send(1, True)
         assert_false(server._conns[1].active)
-        assert_equal(server._budget.used(), 5)
+        assert_equal(server._budget.used(), 5 + H1_ERROR_CAPACITY)
         assert_equal(server._conns[1].pending.capacity(), 0)
         assert_equal(server._conns[1].reserved, 0)
         assert_true(server._conns[0].active)
-        client.close()
+        if scenario != 3:
+            client.close()
         var retry = _interim_native_pair(server)
         server._send_error(2, 503, is_head=True)
-        assert_equal(server._conns[2].pending.capacity(), 138)
-        assert_equal(server._budget.used(), 143)
+        assert_equal(server._conns[2].pending.capacity(), H1_ERROR_CAPACITY)
+        assert_equal(len(server._conns[2].pending), 138)
+        assert_equal(server._budget.used(), 5 + 2 * H1_ERROR_CAPACITY)
         server._close_conn(2)
-        assert_equal(server._budget.used(), 5)
+        assert_equal(server._budget.used(), 5 + H1_ERROR_CAPACITY)
         retry.close()
         foreign.close()
         server._close_conn(0)
@@ -196,7 +537,7 @@ def _read_interim(mut client: TCPConn, mut out: List[Byte], wanted: Int) raises:
 def test_interim_static_full_exact_partial_and_denied_tail_preserve_foreign_budget() raises:
     for limit in [80, 93, 92]:
         var config = ServerConfig.default()
-        config.total_buffer_budget = limit
+        config.total_buffer_budget = limit + 2 * H1_ERROR_CAPACITY
         config.max_bytes_per_tick = 81 if limit != 80 else 128
         var server = Server(config^)
         server.add_listener(listen_tcp("127.0.0.1:0"))
@@ -205,9 +546,12 @@ def test_interim_static_full_exact_partial_and_denied_tail_preserve_foreign_budg
         var foreign = dial_tcp(address, Timeout.seconds(1))
         foreign.write_all("GET /".as_bytes(), Timeout.seconds(1))
         var expires = Int(perf_counter_ns()) + 1_000_000_000
-        while server._budget.used() != 5 and Int(perf_counter_ns()) < expires:
+        while (
+            server._budget.used() != 5 + H1_ERROR_CAPACITY
+            and Int(perf_counter_ns()) < expires
+        ):
             _ = server.tick(handler, Timeout.nanoseconds(0))
-        assert_equal(server._budget.used(), 5)
+        assert_equal(server._budget.used(), 5 + H1_ERROR_CAPACITY)
         var client = dial_tcp(address, Timeout.seconds(1))
         while (
             server.active_connections() != 2
@@ -230,14 +574,14 @@ def test_interim_static_full_exact_partial_and_denied_tail_preserve_foreign_budg
         _read_interim(client, out, 25 if limit == 80 else 12)
         if limit == 92:
             assert_false(server._conns[1].active)
-            assert_equal(server._budget.used(), 5)
+            assert_equal(server._budget.used(), 5 + H1_ERROR_CAPACITY)
             assert_equal(server._conns[1].pending.capacity(), 0)
         else:
             assert_true(server._conns[1].active)
             if limit == 93:
                 assert_equal(server._conns[1].pending.capacity(), 13)
                 assert_equal(server._conns[1].state, STATE_SENDING_100)
-                assert_equal(server._budget.used(), 93)
+                assert_equal(server._budget.used(), 93 + 2 * H1_ERROR_CAPACITY)
                 while (
                     server._conns[1].pending_remaining() > 0
                     and Int(perf_counter_ns()) < expires
@@ -250,9 +594,9 @@ def test_interim_static_full_exact_partial_and_denied_tail_preserve_foreign_budg
             )
             assert_true(server._conns[1].sent_100)
             assert_equal(server._conns[1].pending.capacity(), 0)
-            assert_equal(server._budget.used(), 80)
+            assert_equal(server._budget.used(), 80 + 2 * H1_ERROR_CAPACITY)
             server._close_conn(1)
-            assert_equal(server._budget.used(), 5)
+            assert_equal(server._budget.used(), 5 + H1_ERROR_CAPACITY)
         assert_true(server._conns[0].active)
         client.close()
         foreign.close()
@@ -267,9 +611,17 @@ def _interim_native_pair(mut server: Server) raises -> TCPConn:
     _set_no_sigpipe(accepted.raw_fd())
     var token = server._reactor.register(accepted.raw_fd())
     var idx = len(server._conns)
-    server._conns.append(
-        HttpConnection(token, Optional[TCPConn](accepted^), None, -1, -1, -1)
+    var entry = HttpConnection(
+        token, Optional[TCPConn](accepted^), None, -1, -1, -1
     )
+    assert_true(
+        entry._reserve_error_wire(server._budget.copy(), H1_ERROR_CAPACITY)
+    )
+    var address = Int(entry._error_wire.unsafe_ptr())
+    var used = server._budget.used()
+    server._conns.append(entry^)
+    assert_equal(Int(server._conns[idx]._error_wire.unsafe_ptr()), address)
+    assert_equal(server._budget.used(), used)
     server._ensure_slot_map(token.slot)
     server._slot_map[token.slot] = idx
     server._active_conns += 1
@@ -279,7 +631,7 @@ def _interim_native_pair(mut server: Server) raises -> TCPConn:
 
 def test_interim_native_would_block_and_write_error_release_only_target() raises:
     var config = ServerConfig.default()
-    config.total_buffer_budget = 30
+    config.total_buffer_budget = 30 + 2 * H1_ERROR_CAPACITY
     var server = Server(config^)
     var foreign = _interim_native_pair(server)
     assert_true(server._charge_read(0, 5))
@@ -301,9 +653,9 @@ def test_interim_native_would_block_and_write_error_release_only_target() raises
     assert_equal(server._conns[1].state, STATE_SENDING_100)
     assert_equal(server._conns[1].pending.capacity(), 25)
     assert_equal(server._conns[1].bytes_this_tick, 0)
-    assert_equal(server._budget.used(), 30)
+    assert_equal(server._budget.used(), 30 + 2 * H1_ERROR_CAPACITY)
     server._close_conn(1)
-    assert_equal(server._budget.used(), 5)
+    assert_equal(server._budget.used(), 5 + H1_ERROR_CAPACITY)
     client.close()
 
     var failed = _interim_native_pair(server)
@@ -311,7 +663,7 @@ def test_interim_native_would_block_and_write_error_release_only_target() raises
     assert_false(server._send_100(2))
     assert_false(server._conns[2].active)
     assert_true(server._conns[0].active)
-    assert_equal(server._budget.used(), 5)
+    assert_equal(server._budget.used(), 5 + H1_ERROR_CAPACITY)
     foreign.close()
     server._close_conn(0)
     assert_equal(server._budget.used(), 0)
@@ -344,7 +696,7 @@ def test_read_into_native_span_count_would_block_and_eof() raises:
 
 def test_read_scratch_fits_small_budget_preserves_fairness_and_denied_admission() raises:
     var config = ServerConfig.default()
-    config.total_buffer_budget = 12
+    config.total_buffer_budget = 12 + 2 * H1_ERROR_CAPACITY
     config.max_bytes_per_tick = 7
     var server = Server(config^)
     server.add_listener(listen_tcp("127.0.0.1:0"))
@@ -353,9 +705,12 @@ def test_read_scratch_fits_small_budget_preserves_fairness_and_denied_admission(
     var foreign = dial_tcp(address, Timeout.seconds(1))
     foreign.write_all("GET /".as_bytes(), Timeout.seconds(1))
     var expires = Int(perf_counter_ns()) + 1_000_000_000
-    while server._budget.used() != 5 and Int(perf_counter_ns()) < expires:
+    while (
+        server._budget.used() != 5 + H1_ERROR_CAPACITY
+        and Int(perf_counter_ns()) < expires
+    ):
         _ = server.tick(handler, Timeout.nanoseconds(0))
-    assert_equal(server._budget.used(), 5)
+    assert_equal(server._budget.used(), 5 + H1_ERROR_CAPACITY)
     var client = dial_tcp(address, Timeout.seconds(1))
     while server.active_connections() != 2 and Int(perf_counter_ns()) < expires:
         _ = server.tick(handler, Timeout.nanoseconds(0))
@@ -368,7 +723,7 @@ def test_read_scratch_fits_small_budget_preserves_fairness_and_denied_admission(
         server._pump_read(1, True, now_ns())
     assert_equal(server._conns[1].buf.capacity(), 7)
     assert_equal(server._conns[1].bytes_this_tick, 7)
-    assert_equal(server._budget.used(), 12)
+    assert_equal(server._budget.used(), 12 + 2 * H1_ERROR_CAPACITY)
     assert_equal(String(from_utf8_lossy=Span(server._conns[1].buf)), "GET /ab")
     client.close()
     server._conns[1].bytes_this_tick = 0
@@ -376,7 +731,7 @@ def test_read_scratch_fits_small_budget_preserves_fairness_and_denied_admission(
         server._pump_read(1, True, now_ns())
     assert_true(server._conns[1].read_eof)
     server._close_conn(1)
-    assert_equal(server._budget.used(), 5)
+    assert_equal(server._budget.used(), 5 + H1_ERROR_CAPACITY)
 
     var denied = dial_tcp(address, Timeout.seconds(1))
     while server.active_connections() != 2 and Int(perf_counter_ns()) < expires:
@@ -391,14 +746,14 @@ def test_read_scratch_fits_small_budget_preserves_fairness_and_denied_admission(
     assert_equal(server._conns[1].bytes_this_tick, 7)
     server._pump_read(1, True, now_ns())
     assert_equal(server._conns[1].buffered_len(), 7)
-    assert_equal(server._budget.used(), 12)
+    assert_equal(server._budget.used(), 12 + 2 * H1_ERROR_CAPACITY)
     server._conns[1].bytes_this_tick = 0
     while server._conns[1].active and Int(perf_counter_ns()) < expires:
         server._pump_read(1, True, now_ns())
     assert_false(server._conns[1].active)
     assert_true(server._conns[0].active)
     assert_equal(server._conns[0].buf.capacity(), 5)
-    assert_equal(server._budget.used(), 5)
+    assert_equal(server._budget.used(), 5 + H1_ERROR_CAPACITY)
     denied.close()
     foreign.close()
     server._close_conn(0)
@@ -592,7 +947,7 @@ def test_pending_clear_drops_allocation() raises:
 
 def test_pending_capacity_released_on_full_send_error_close_and_reuse() raises:
     var config = ServerConfig.default()
-    config.total_buffer_budget = 512
+    config.total_buffer_budget = 512 + H1_ERROR_CAPACITY
     config.max_bytes_per_tick = 1
     var server = Server(config^)
     server.add_listener(listen_tcp("127.0.0.1:0"))
@@ -604,19 +959,19 @@ def test_pending_capacity_released_on_full_send_error_close_and_reuse() raises:
     bytes.extend(String("xyz").as_bytes())
     assert_true(server._conns[0].set_pending(bytes^, server._budget))
     server._pump_send(0, True)
-    assert_equal(server._budget.used(), 8)
+    assert_equal(server._budget.used(), 8 + H1_ERROR_CAPACITY)
     assert_equal(server._conns[0].pending_offset, 1)
     for _ in range(2):
         server._conns[0].reset_tick()
         server._pump_send(0, True)
-    assert_equal(server._budget.used(), 0)
+    assert_equal(server._budget.used(), H1_ERROR_CAPACITY)
     assert_equal(server._conns[0].pending.capacity(), 0)
     assert_true(server._conns[0].active)
     server._send_error(0, 503)
     assert_equal(server._conns[0].buf.capacity(), 0)
     assert_equal(server._conns[0].reserved, 0)
     assert_equal(server._budget.used(), server._conns[0].pending.capacity())
-    assert_equal(server._budget.used(), 161)
+    assert_equal(server._budget.used(), H1_ERROR_CAPACITY)
     assert_equal(len(server._conns[0].pending), 161)
     var out = _drain_until_eof_driven(server, handler, client)
     assert_true(String(from_utf8_lossy=Span(out)).find("503") >= 0)
@@ -637,7 +992,7 @@ def test_pending_capacity_released_on_full_send_error_close_and_reuse() raises:
 
 def test_receive_compaction_consumption_close_and_slot_reuse() raises:
     var config = ServerConfig.default()
-    config.total_buffer_budget = 256
+    config.total_buffer_budget = 256 + H1_ERROR_CAPACITY
     var server = Server(config^)
     var listener = listen_tcp("127.0.0.1:0")
     server.add_listener(listener^)
@@ -651,17 +1006,17 @@ def test_receive_compaction_consumption_close_and_slot_reuse() raises:
         server._conns[0].buf.append(Byte(i))
     server._conns[0].scanned_len = 8
     server._consume_receive(0, 5)
-    assert_equal(server._budget.used(), 8)
+    assert_equal(server._budget.used(), 8 + H1_ERROR_CAPACITY)
     assert_equal(server._conns[0].buf.capacity(), 8)
     assert_equal(len(server._conns[0].buf), 3)
     assert_equal(server._conns[0].buf[0], 5)
     assert_equal(server._conns[0].buf[2], 7)
     assert_equal(server._conns[0].scanned_len, 3)
     server._consume_receive(0, 3)
-    assert_equal(server._budget.used(), 0)
+    assert_equal(server._budget.used(), H1_ERROR_CAPACITY)
     assert_equal(server._conns[0].buf.capacity(), 0)
     assert_true(server._charge_read(0, 12))
-    assert_equal(server._budget.used(), 12)
+    assert_equal(server._budget.used(), 12 + H1_ERROR_CAPACITY)
     assert_true(server._charge_read(0, 96))
     var head = String(
         "POST /echo HTTP/1.1\r\nHost: x\r\nContent-Length: 40\r\n\r\n"
@@ -670,7 +1025,7 @@ def test_receive_compaction_consumption_close_and_slot_reuse() raises:
     server._pump_parse(0, handler, 0)
     assert_equal(server._conns[0].reserved, 0)
     assert_equal(server._conns[0].http1_body_reserved, 40)
-    assert_equal(server._budget.used(), 136)
+    assert_equal(server._budget.used(), 136 + H1_ERROR_CAPACITY)
     assert_true(server._budget.try_reserve(7))
     server._conns[0].reserved = 7
     server._close_conn(0)
@@ -684,7 +1039,7 @@ def test_receive_compaction_consumption_close_and_slot_reuse() raises:
     assert_true(server._conns[0].active)
     assert_equal(server._conns[0].reserved, 0)
     assert_equal(server._conns[0].buf.capacity(), 0)
-    assert_equal(server._budget.used(), 0)
+    assert_equal(server._budget.used(), H1_ERROR_CAPACITY)
     second.close()
 
 
@@ -746,7 +1101,7 @@ def test_response_needs_combined_body_and_wire_capacity() raises:
     var handler = _BufferedSixKHandler()
     for limit in [12096, 12097]:
         var config = ServerConfig.default()
-        config.total_buffer_budget = limit
+        config.total_buffer_budget = limit + H1_ERROR_CAPACITY
         var server = Server(config^)
         server.add_listener(listen_tcp("127.0.0.1:0"))
         var client = dial_tcp(
@@ -851,7 +1206,7 @@ struct _SharedBodyHandler(Handler):
 
 def test_handler_writer_charges_only_its_body_and_allows_foreign_admission() raises:
     var config = ServerConfig.default()
-    config.total_buffer_budget = 512
+    config.total_buffer_budget = 512 + H1_ERROR_CAPACITY
     var server = Server(config^)
     server.add_listener(listen_tcp("127.0.0.1:0"))
     var handler = _SharedBodyHandler(server._budget.copy())
@@ -870,7 +1225,7 @@ def test_handler_writer_charges_only_its_body_and_allows_foreign_admission() rai
     _assert_body(out, "body1234")
     assert_equal(handler.available, 512)
     assert_true(handler.foreign_admitted)
-    assert_equal(handler.with_body, 15)
+    assert_equal(handler.with_body, 15 + H1_ERROR_CAPACITY)
     assert_equal(server._budget.used(), 0)
 
 
@@ -1107,7 +1462,7 @@ struct _RequestWorkspaceHandler(Handler):
 
 def _check_request_capacity_workspace(request: String) raises:
     var config = ServerConfig.default()
-    config.total_buffer_budget = 512
+    config.total_buffer_budget = 512 + 2 * H1_ERROR_CAPACITY
     var server = Server(config^)
     server.add_listener(listen_tcp("127.0.0.1:0"))
     var address = String("127.0.0.1:") + String(server.local_address().port)
@@ -1115,9 +1470,12 @@ def _check_request_capacity_workspace(request: String) raises:
     var waiting = dial_tcp(address, Timeout.seconds(1))
     waiting.write_all("GET /".as_bytes(), Timeout.seconds(1))
     var expires = Int(perf_counter_ns()) + 1_000_000_000
-    while server._budget.used() != 5 and Int(perf_counter_ns()) < expires:
+    while (
+        server._budget.used() != 5 + H1_ERROR_CAPACITY
+        and Int(perf_counter_ns()) < expires
+    ):
         _ = server.tick(handler, Timeout.milliseconds(1))
-    assert_equal(server._budget.used(), 5)
+    assert_equal(server._budget.used(), 5 + H1_ERROR_CAPACITY)
     for action in range(4):
         handler.action = action
         var client = dial_tcp(address, Timeout.seconds(1))
@@ -1129,7 +1487,7 @@ def _check_request_capacity_workspace(request: String) raises:
         )
         assert_equal(_status_of(out), 200 if action == 0 else 500)
         assert_equal(handler.workspace, 502)
-        assert_equal(server._budget.used(), 5)
+        assert_equal(server._budget.used(), 5 + H1_ERROR_CAPACITY)
         client.close()
     server._close_conn(0)
     assert_equal(server._budget.used(), 0)
@@ -1153,7 +1511,7 @@ def test_chunked_capacity_limits_workspace_and_returns_on_terminal_paths() raise
 
 def test_chunked_copy_peak_is_rejected_before_handler() raises:
     var config = ServerConfig.default()
-    config.total_buffer_budget = 8192
+    config.total_buffer_budget = 8192 + H1_ERROR_CAPACITY
     var server = Server(config^)
     server.add_listener(listen_tcp("127.0.0.1:0"))
     var handler = _BodyCountHandler()
@@ -1177,7 +1535,7 @@ def test_chunked_copy_peak_is_rejected_before_handler() raises:
 
 def test_partial_chunked_body_does_not_reserve_decoded_allocation() raises:
     var config = ServerConfig.default()
-    config.total_buffer_budget = 512
+    config.total_buffer_budget = 512 + H1_ERROR_CAPACITY
     var server = Server(config^)
     server.add_listener(listen_tcp("127.0.0.1:0"))
     var handler = _EchoHandler()
@@ -1192,7 +1550,10 @@ def test_partial_chunked_body_does_not_reserve_decoded_allocation() raises:
     )
     _tick_n(server, handler, 4)
     assert_equal(server._conns[0].http1_body_reserved, 0)
-    assert_equal(server._budget.used(), server._conns[0].buf.capacity())
+    assert_equal(
+        server._budget.used(),
+        server._conns[0].buf.capacity() + H1_ERROR_CAPACITY,
+    )
     var out = _exchange(server, handler, client, "y!\r\n0\r\n\r\n")
     assert_equal(_status_of(out), 200)
     _assert_body(out, "body!")
@@ -1202,7 +1563,7 @@ def test_partial_chunked_body_does_not_reserve_decoded_allocation() raises:
 
 def test_request_copy_peak_is_rejected_before_receiving_body() raises:
     var config = ServerConfig.default()
-    config.total_buffer_budget = 8192
+    config.total_buffer_budget = 8192 + H1_ERROR_CAPACITY
     var server = Server(config^)
     server.add_listener(listen_tcp("127.0.0.1:0"))
     var address = String("127.0.0.1:") + String(server.local_address().port)
@@ -1221,7 +1582,7 @@ def test_request_copy_peak_is_rejected_before_receiving_body() raises:
 
 def test_writer_workspace_returns_on_success_handler_and_encoder_errors() raises:
     var config = ServerConfig.default()
-    config.total_buffer_budget = 512
+    config.total_buffer_budget = 512 + 2 * H1_ERROR_CAPACITY
     var server = Server(config^)
     server.add_listener(listen_tcp("127.0.0.1:0"))
     var address = String("127.0.0.1:") + String(server.local_address().port)
@@ -1229,7 +1590,7 @@ def test_writer_workspace_returns_on_success_handler_and_encoder_errors() raises
     var waiting = dial_tcp(address, Timeout.seconds(1))
     waiting.write_all("GET /".as_bytes(), Timeout.seconds(1))
     _tick_n(server, handler, 2)
-    assert_equal(server._budget.used(), 5)
+    assert_equal(server._budget.used(), 5 + H1_ERROR_CAPACITY)
     for action in range(4):
         handler.action = action
         var client = dial_tcp(address, Timeout.seconds(1))
@@ -1241,7 +1602,7 @@ def test_writer_workspace_returns_on_success_handler_and_encoder_errors() raises
         )
         assert_equal(_status_of(out), 200 if action == 0 else 500)
         assert_equal(handler.workspace, 507)
-        assert_equal(server._budget.used(), 5)
+        assert_equal(server._budget.used(), 5 + H1_ERROR_CAPACITY)
         client.close()
     server._close_conn(0)
     assert_equal(server._budget.used(), 0)
@@ -1980,7 +2341,7 @@ def test_admitted_body_reservation_blocks_second_client() raises:
     # first body arrives, so completion order cannot free the budget
     # early and flip the outcome.
     var config = ServerConfig.default()
-    config.total_buffer_budget = 16384
+    config.total_buffer_budget = 16384 + 2 * H1_ERROR_CAPACITY
     var server = Server(config^)
     server.add_listener(listen_tcp("127.0.0.1:0"))
     var port = server.local_address().port
@@ -2034,7 +2395,7 @@ def test_admitted_body_reservation_blocks_second_client() raises:
 
 def test_small_budget_rejects_with_503() raises:
     var config = ServerConfig.default()
-    config.total_buffer_budget = 2048
+    config.total_buffer_budget = 2048 + H1_ERROR_CAPACITY
     var server = Server(config^)
     server.add_listener(listen_tcp("127.0.0.1:0"))
     var port = server.local_address().port

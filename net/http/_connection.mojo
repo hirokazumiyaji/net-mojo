@@ -1,7 +1,9 @@
 """Per-connection state for the HTTP server loop.
 
 A connection owns its socket, its unprocessed wire bytes, and at most
-one queued response. All moves are whole values; nothing borrows across
+one queued response. Admitted HTTP/1 connections also own a prepaid error
+wire until it is transferred into pending or dropped. All moves are whole
+values; nothing borrows across
 connections, so the table never shares ownership between threads.
 """
 
@@ -12,7 +14,12 @@ from net.tls import TLSConnection, TLSIOResult
 from net.http._http2.hpack import Http2HpackDeflater
 from net.http._http2.request_session import Http2RequestSession
 from net.http._http2.response_scheduler import Http2ResponseScheduler
-from net.http._buffer import _CapacityBudget, _reserve_capacity
+from net.http._buffer import (
+    _CapacityBudget,
+    _CapacityTicket,
+    SharedBufferBudget,
+    _reserve_capacity,
+)
 
 comptime STATE_READING: UInt8 = 0
 comptime STATE_SENDING: UInt8 = 1
@@ -25,6 +32,7 @@ comptime STATE_SENDING_HTTP2_CONTROL: UInt8 = 7
 comptime PROTOCOL_HTTP11: UInt8 = 1
 comptime PROTOCOL_HTTP2: UInt8 = 2
 comptime READ_BUFFER_SIZE: Int = 8192
+comptime H1_ERROR_CAPACITY: Int = 256
 
 
 struct HttpConnection(Movable):
@@ -76,6 +84,8 @@ struct HttpConnection(Movable):
     var tls_write_closed: Bool
     var tls_write_retry_length: Int
     var tls_read_buffer: List[Byte]
+    var _error_wire: List[Byte]
+    var _error_ticket: _CapacityTicket
 
     def __init__(
         out self,
@@ -134,10 +144,34 @@ struct HttpConnection(Movable):
         self.tls_write_closed = False
         self.tls_write_retry_length = 0
         self.tls_read_buffer = List[Byte]()
+        self._error_wire = List[Byte]()
+        self._error_ticket = _CapacityTicket()
         if self.tls:
             self.state = STATE_HANDSHAKING
             self.tls_handshake_wants_read = True
             self.tls_read_buffer = List[Byte](length=READ_BUFFER_SIZE, fill=0)
+
+    def __deinit__(deinit self):
+        self._drop_error_wire()
+
+    def _reserve_error_wire(
+        mut self, var budget: SharedBufferBudget, capacity: Int
+    ) -> Bool:
+        var ticket = _CapacityTicket(Optional(budget^))
+        if not ticket._try_reserve(capacity):
+            return False
+        self._error_wire = List[Byte](capacity=capacity)
+        self._error_ticket = ticket^
+        return True
+
+    def _take_error_wire(mut self) -> List[Byte]:
+        var wire = self._error_wire^
+        self._error_wire = List[Byte]()
+        return wire^
+
+    def _drop_error_wire(mut self):
+        self._error_wire = List[Byte]()
+        self._error_ticket.release()
 
     def wants_read(self) -> Bool:
         if not self.active or self.read_eof:
@@ -411,6 +445,8 @@ struct HttpConnection(Movable):
         # longer accounts for. Both lists are replaced, not cleared.
         self.buf = List[Byte]()
         self.pending = List[Byte]()
+        self.tls_read_buffer = List[Byte]()
+        self._drop_error_wire()
         self.pending_offset = 0
         self.reserved = 0
         self.detach_state_addr = 0

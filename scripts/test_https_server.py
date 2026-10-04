@@ -201,6 +201,7 @@ def test_https_alt_svc_advertisement():
         if not ready.startswith("READY "):
             raise RuntimeError(f"alt-svc fixture did not start: {ready}")
         port = int(ready.split()[1])
+        advertised = b'h3=":8443"; ma=86400; x="' + b"a" * 300 + b'"'
         context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
         context.check_hostname = False
         context.verify_mode = ssl.CERT_NONE
@@ -216,7 +217,7 @@ def test_https_alt_svc_advertisement():
                 while chunk := client.recv(4096):
                     response.extend(chunk)
         injected = bytes(response)
-        if b'Alt-Svc: h3=":8443"; ma=86400\r\n' not in injected:
+        if b"Alt-Svc: " + advertised + b"\r\n" not in injected:
             raise RuntimeError(
                 f"expected injected Alt-Svc on HTTPS response: {injected!r}"
             )
@@ -252,11 +253,28 @@ def test_https_alt_svc_advertisement():
         header, body = error.split(b"\r\n\r\n", 1)
         if (
             not error.startswith(b"HTTP/1.1 500 Internal Server Error\r\n")
-            or b'Alt-Svc: h3=":8443"; ma=86400\r\n' not in header + b"\r\n"
+            or b"Alt-Svc: " + advertised + b"\r\n" not in header + b"\r\n"
             or b"Content-Length: 25\r\n" not in header + b"\r\n"
             or body != b"500 Internal Server Error"
         ):
             raise RuntimeError(f"unexpected TLS Alt-Svc error response: {error!r}")
+        for method, expect_error in [(b"HEAD", True), (b"GET", False)]:
+            with socket.create_connection(("127.0.0.1", port), timeout=5) as raw:
+                with context.wrap_socket(raw, server_hostname="localhost") as client:
+                    if client.selected_alpn_protocol() != "http/1.1":
+                        raise RuntimeError("error fixture ALPN mismatch")
+                    client.sendall(method + b" /error HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+                    response = bytearray()
+                    while chunk := client.recv(4096):
+                        response.extend(chunk)
+            if expect_error:
+                header, body = bytes(response).split(b"\r\n\r\n", 1)
+                if (not header.startswith(b"HTTP/1.1 500 ") or body
+                        or b"Content-Length: 25\r\n" not in header + b"\r\n"
+                        or b"Alt-Svc: " + advertised + b"\r\n" not in header + b"\r\n"):
+                    raise RuntimeError(f"unexpected prepaid TLS HEAD error: {response!r}")
+            elif response:
+                raise RuntimeError(f"grown Alt-Svc must close before rendering: {response!r}")
         if alt_process.wait(timeout=5) != 0:
             raise RuntimeError(alt_process.stderr.read())
     except Exception:
