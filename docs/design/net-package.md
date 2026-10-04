@@ -245,7 +245,10 @@ section records only the package-level boundaries.
   capacity, including old + new growth peaks and incoming pending wire.
   Synchronous HTTP/1 `write`/`write_string` use globally reserved body
   workspace and check growth peaks; direct body edits are reconciled without
-  a pre-growth guarantee. Temporary read chunks, encoding/header allocations,
+  a pre-growth guarantee. Buffered synchronous HTTP/1 wire capacity is
+  measured and reserved while its writer body remains charged, then
+  transferred to the pending queue. Temporary read chunks, header/String
+  scratch, error/100/chunk/detached/H2/H3 encoding,
   parser copies, other writer paths and
   protocol/provider allocations are not all included yet.
   Admission failures become 503+close, handler

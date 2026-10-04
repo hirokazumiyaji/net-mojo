@@ -54,6 +54,21 @@ def test_pending_adoption_and_replacement_charge_capacity() raises:
     assert_equal(conn.pending[0], 44)
 
 
+def test_precharged_wire_transfer_releases_only_old_pending_capacity() raises:
+    var conn = _pending_test_connection()
+    var budget = BufferBudget(20)
+    var old = List[Byte](capacity=8)
+    old.append(42)
+    assert_true(conn.set_pending(old^, budget))
+    assert_true(budget.try_reserve(12))
+    var wire = List[Byte](capacity=12)
+    wire.append(43)
+    conn._set_reserved_pending(wire^, budget)
+    assert_equal(budget.used, 12)
+    assert_equal(conn.pending.capacity(), 12)
+    assert_equal(conn.pending[0], 43)
+
+
 def test_pending_replacement_requires_old_plus_incoming_peak() raises:
     var conn = _pending_test_connection()
     var budget = BufferBudget(19)
@@ -260,6 +275,52 @@ struct _EchoHandler(Handler):
         else:
             writer.set_status(404)
             writer.write_string("missing")
+
+
+struct _BodyCountHandler(Handler):
+    def __init__(out self):
+        pass
+
+    def handle(mut self, req: Request, mut writer: ResponseWriter) raises:
+        for i in range(len(req.body)):
+            assert_equal(req.body[i], Byte(ord("b")))
+        writer.write_string(String(len(req.body)))
+
+
+struct _SupportedEchoHandler(Handler):
+    def __init__(out self):
+        pass
+
+    def handle(mut self, req: Request, mut writer: ResponseWriter) raises:
+        writer.write(Span(req.body))
+
+
+def test_echo_admission_needs_combined_body_and_wire_capacity() raises:
+    # The body and framed wire must coexist at the 12097-byte boundary.
+    var handler = _SupportedEchoHandler()
+    for limit in [12096, 12097]:
+        var config = ServerConfig.default()
+        config.total_buffer_budget = limit
+        var server = Server(config^)
+        server.add_listener(listen_tcp("127.0.0.1:0"))
+        var client = dial_tcp(
+            String("127.0.0.1:") + String(server.local_address().port),
+            Timeout.seconds(1),
+        )
+        var request = (
+            String(
+                "POST / HTTP/1.1\r\nHost: x\r\nContent-Length:"
+                " 6000\r\nConnection: close\r\n\r\n"
+            )
+            + String("b") * 6000
+        )
+        var out = _exchange(server, handler, client, request)
+        assert_equal(_status_of(out), 500 if limit == 12096 else 200)
+        if limit == 12097:
+            assert_equal(_content_length_of(out), 6000)
+            _assert_body(out, String("b") * 6000)
+        assert_equal(server._budget.used, 0)
+        client.close()
 
 
 struct _JsonHandler(Handler):
@@ -1090,7 +1151,7 @@ def test_admitted_body_reservation_blocks_second_client() raises:
     var server = Server(config^)
     server.add_listener(listen_tcp("127.0.0.1:0"))
     var port = server.local_address().port
-    var handler = _EchoHandler()
+    var handler = _BodyCountHandler()
     var first = dial_tcp(
         String("127.0.0.1:") + String(port), Timeout.seconds(2)
     )
@@ -1132,7 +1193,8 @@ def test_admitted_body_reservation_blocks_second_client() raises:
             _ = e
             continue
     assert_equal(_status_of(first_out), 200)
-    assert_equal(_content_length_of(first_out), 6000)
+    assert_equal(_content_length_of(first_out), 4)
+    _assert_body(first_out, String("6000"))
     first.close()
     second.close()
 

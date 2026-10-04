@@ -1,6 +1,7 @@
 from std.testing import assert_equal, assert_false, assert_true, TestSuite
 
 from net.error import NetErrorKind
+from net.http._buffer import BufferBudget
 from net.http import ResponseWriter, has_body_for_status
 from net.http._encoder import (
     current_http_date,
@@ -8,7 +9,87 @@ from net.http._encoder import (
     encode_error,
     encode_response,
     http_date,
+    _encode_response_budgeted,
+    _measure_response,
 )
+
+
+def test_budgeted_wire_exact_capacity_matches_framing_and_raw_headers() raises:
+    for status in [100, 200, 204, 205, 304]:
+        for is_head in [False, True]:
+            var writer = ResponseWriter(32)
+            writer.status = status
+            writer.should_close = True
+            writer.write_string("hello")
+            writer.headers.add(String("Content-Length"), String("5"))
+            writer.headers.add(String("Date"), String("custom date"))
+            writer.headers.add(
+                String("Connection"), String("keep-alive, close")
+            )
+            var raw: Array[Byte, 2] = [128, 255]
+            writer.headers.add_bytes(String("X-Bin"), Span(raw))
+            var expected = encode_response(
+                writer, is_head, "unused", 100, 32768
+            )
+            var budget = BufferBudget(1024)
+            assert_true(budget.try_reserve(writer.body.capacity()))
+            var wire = _encode_response_budgeted(
+                writer, is_head, "unused", 100, 32768, budget
+            )
+            assert_equal(wire.capacity(), len(expected))
+            assert_equal(len(wire), len(expected))
+            assert_equal(budget.used, writer.body.capacity() + wire.capacity())
+            for i in range(len(wire)):
+                assert_equal(wire[i], expected[i])
+
+
+def test_budgeted_wire_requires_body_and_wire_capacity_together() raises:
+    var writer = ResponseWriter(32)
+    writer.write_string("12345678")
+    var size = _measure_response(writer, False, "date", 100, 32768)
+    var budget = BufferBudget(8 + size - 1)
+    assert_true(budget.try_reserve(8))
+    var rejected = False
+    try:
+        _ = _encode_response_budgeted(writer, False, "date", 100, 32768, budget)
+    except e:
+        assert_equal(e.kind, NetErrorKind.invalid_argument())
+        rejected = True
+    assert_true(rejected)
+    assert_equal(budget.used, 8)
+    assert_equal(writer.body.capacity(), 8)
+    budget.total += 1
+    var wire = _encode_response_budgeted(
+        writer, False, "date", 100, 32768, budget
+    )
+    assert_equal(wire.capacity(), size)
+    assert_equal(budget.used, 8 + size)
+    _ = wire^
+    budget.release(size)
+    assert_equal(budget.used, 8)
+
+
+def test_budgeted_wire_validation_failure_preserves_reservation() raises:
+    for invalid in range(3):
+        var writer = ResponseWriter(32)
+        writer.write_string("hello")
+        if invalid == 0:
+            writer.headers.add(String("Content-Length"), String("999"))
+        if invalid == 2:
+            writer.status = 99
+        var date = String("date\r\n") if invalid == 1 else String("date")
+        var budget = BufferBudget(512)
+        assert_true(budget.try_reserve(5))
+        var rejected = False
+        try:
+            _ = _encode_response_budgeted(
+                writer, False, date, 100, 32768, budget
+            )
+        except e:
+            assert_equal(e.kind, NetErrorKind.invalid_argument())
+            rejected = True
+        assert_true(rejected)
+        assert_equal(budget.used, 5)
 
 
 def _bytes_to_string[origin: Origin](bytes: Span[Byte, origin]) -> String:
