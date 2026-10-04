@@ -4,8 +4,10 @@ from std.time import perf_counter_ns, sleep
 from net import TCPConn, Timeout, dial_tcp, listen_tcp
 from net.error import NetErrorKind
 from net._reactor import ReactorToken
+from net._sys.common import _OwnedFD
 from net.http._buffer import BufferBudget
 from net.http._connection import HttpConnection
+from net.http._deadline import now_ns
 from net.http import (
     Handler,
     Request,
@@ -15,7 +17,95 @@ from net.http import (
     ServerControl,
 )
 from net.http._deadline import NO_DEADLINE, now_ns
-from tests.support import _tick_n
+from tests.support import _socket_pair, _tick_n
+
+
+def test_read_into_native_span_count_would_block_and_eof() raises:
+    var pair = _socket_pair()
+    var client = TCPConn(_OwnedFD(pair.first._take()))
+    var accepted = TCPConn(_OwnedFD(pair.second._take()))
+    var conn = HttpConnection(
+        ReactorToken(0, 0), Optional[TCPConn](accepted^), None, 0, -1, -1
+    )
+    var scratch = Array[Byte, 3](fill=0)
+    var blocked = False
+    try:
+        _ = conn.try_read_into(Span(scratch))
+    except e:
+        assert_equal(e.kind, NetErrorKind.timeout())
+        blocked = True
+    assert_true(blocked)
+    client.write_all("abcdef".as_bytes(), Timeout.seconds(1))
+    assert_equal(conn.try_read_into(Span(scratch)), 3)
+    assert_equal(String(from_utf8_lossy=Span(scratch)), "abc")
+    assert_equal(conn.try_read_into(Span(scratch)), 3)
+    assert_equal(String(from_utf8_lossy=Span(scratch)), "def")
+    client.close()
+    assert_equal(conn.try_read_into(Span(scratch)), 0)
+    conn.close()
+
+
+def test_read_scratch_fits_small_budget_preserves_fairness_and_denied_admission() raises:
+    var config = ServerConfig.default()
+    config.total_buffer_budget = 12
+    config.max_bytes_per_tick = 7
+    var server = Server(config^)
+    server.add_listener(listen_tcp("127.0.0.1:0"))
+    var address = String("127.0.0.1:") + String(server.local_address().port)
+    var handler = _HelloHandler()
+    var foreign = dial_tcp(address, Timeout.seconds(1))
+    foreign.write_all("GET /".as_bytes(), Timeout.seconds(1))
+    var expires = Int(perf_counter_ns()) + 1_000_000_000
+    while server._budget.used != 5 and Int(perf_counter_ns()) < expires:
+        _ = server.tick(handler, Timeout.nanoseconds(0))
+    assert_equal(server._budget.used, 5)
+    var client = dial_tcp(address, Timeout.seconds(1))
+    while server.active_connections() != 2 and Int(perf_counter_ns()) < expires:
+        _ = server.tick(handler, Timeout.nanoseconds(0))
+    assert_equal(server.active_connections(), 2)
+    client.write_all("GET /ab".as_bytes(), Timeout.seconds(1))
+    while (
+        server._conns[1].buffered_len() != 7
+        and Int(perf_counter_ns()) < expires
+    ):
+        server._pump_read(1, True, now_ns())
+    assert_equal(server._conns[1].buf.capacity(), 7)
+    assert_equal(server._conns[1].bytes_this_tick, 7)
+    assert_equal(server._budget.used, 12)
+    assert_equal(String(from_utf8_lossy=Span(server._conns[1].buf)), "GET /ab")
+    client.close()
+    server._conns[1].bytes_this_tick = 0
+    while not server._conns[1].read_eof and Int(perf_counter_ns()) < expires:
+        server._pump_read(1, True, now_ns())
+    assert_true(server._conns[1].read_eof)
+    server._close_conn(1)
+    assert_equal(server._budget.used, 5)
+
+    var denied = dial_tcp(address, Timeout.seconds(1))
+    while server.active_connections() != 2 and Int(perf_counter_ns()) < expires:
+        _ = server.tick(handler, Timeout.nanoseconds(0))
+    assert_equal(server.active_connections(), 2)
+    denied.write_all("GET /abc".as_bytes(), Timeout.seconds(1))
+    while (
+        server._conns[1].buffered_len() != 7
+        and Int(perf_counter_ns()) < expires
+    ):
+        server._pump_read(1, True, now_ns())
+    assert_equal(server._conns[1].bytes_this_tick, 7)
+    server._pump_read(1, True, now_ns())
+    assert_equal(server._conns[1].buffered_len(), 7)
+    assert_equal(server._budget.used, 12)
+    server._conns[1].bytes_this_tick = 0
+    while server._conns[1].active and Int(perf_counter_ns()) < expires:
+        server._pump_read(1, True, now_ns())
+    assert_false(server._conns[1].active)
+    assert_true(server._conns[0].active)
+    assert_equal(server._conns[0].buf.capacity(), 5)
+    assert_equal(server._budget.used, 5)
+    denied.close()
+    foreign.close()
+    server._close_conn(0)
+    assert_equal(server._budget.used, 0)
 
 
 def _pending_test_connection() raises -> HttpConnection:

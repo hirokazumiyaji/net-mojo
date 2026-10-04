@@ -302,11 +302,12 @@ struct HttpConnection(Movable):
         self.tls_write_closed = False
         self.tls_write_retry_length = 0
 
-    def try_read_bytes(mut self, limit: Int) raises NetError -> List[Byte]:
-        """One non-blocking read of up to `limit` bytes. An empty result
+    def try_read_into[
+        origin: MutOrigin
+    ](mut self, output: Span[mut=True, Byte, origin]) raises NetError -> Int:
+        """One non-blocking read into caller scratch. A zero count
         means EOF; a would-block socket raises a timeout `NetError`."""
-        var bound = limit if limit < READ_BUFFER_SIZE else READ_BUFFER_SIZE
-        var out = List[Byte]()
+        var bound = min(len(output), READ_BUFFER_SIZE)
         if self.tls:
             if self.tls_read_retry_length > 0:
                 bound = self.tls_read_retry_length
@@ -330,15 +331,14 @@ struct HttpConnection(Movable):
             self.tls_read_wants_write = False
             self.tls_read_retry_length = 0
             if result.progress.is_closed():
-                return out^
-            out.extend(Span(self.tls_read_buffer)[0 : result.count])
+                return 0
+            for i in range(result.count):
+                output[i] = self.tls_read_buffer[i]
             if self.tls.value().pending() > 0:
                 self.more_work = True
+            return result.count
         else:
-            var tmp = Array[Byte, READ_BUFFER_SIZE](fill=0)
-            var count = self.conn.value().try_read(Span(tmp)[0:bound])
-            out.extend(Span(tmp)[0:count])
-        return out^
+            return self.conn.value().try_read(output[0:bound])
 
     def try_write_pending_capped(mut self, cap: Int) raises NetError -> Int:
         """Writes at most `cap` pending bytes so one connection cannot

@@ -2,8 +2,11 @@ from std.testing import assert_equal, assert_true, TestSuite
 from std.time import sleep
 
 from net import TCPConn, Timeout, dial_tcp, listen_tcp
+from net.error import NetErrorKind
+from net._reactor import ReactorToken
+from net.http._connection import HttpConnection, READ_BUFFER_SIZE
 from net.http import Handler, Request, ResponseWriter, Server, ServerConfig
-from net.tls import TLSContext
+from net.tls import TLSConnection, TLSContext
 from tests.support import _tick_n
 
 
@@ -32,6 +35,38 @@ def _try_read[capacity: Int](mut client: TCPConn) raises -> Optional[Int]:
     except e:
         _ = e
         return None
+
+
+def test_https_read_into_preserves_want_read_buffer_and_retry_length() raises:
+    var listener = listen_tcp("127.0.0.1:0")
+    var client = dial_tcp(
+        String("127.0.0.1:") + String(listener.local_address().port),
+        Timeout.seconds(1),
+    )
+    var accepted = listener.accept(Timeout.seconds(1))
+    var context = _tls_context()
+    var tls = context.accept(accepted^)
+    var conn = HttpConnection(
+        ReactorToken(0, 0), None, Optional[TLSConnection](tls^), 0, -1, -1
+    )
+    var buffer_address = Int(conn.tls_read_buffer.unsafe_ptr())
+    var scratch = Array[Byte, 3](fill=42)
+    for _ in range(2):
+        var blocked = False
+        try:
+            _ = conn.try_read_into(Span(scratch))
+        except e:
+            assert_equal(e.kind, NetErrorKind.timeout())
+            blocked = True
+        assert_true(blocked)
+        assert_true(conn.tls_read_would_block)
+        assert_true(not conn.tls_read_wants_write)
+        assert_equal(conn.tls_read_retry_length, 3)
+        assert_equal(conn.tls_read_buffer.capacity(), READ_BUFFER_SIZE)
+        assert_equal(Int(conn.tls_read_buffer.unsafe_ptr()), buffer_address)
+        assert_equal(scratch[0], 42)
+    conn.close()
+    client.close()
 
 
 def test_https_server_rejects_plaintext_before_http_parsing() raises:
