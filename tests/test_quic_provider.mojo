@@ -214,10 +214,9 @@ def main() raises:
     assert_true(http_server.tick(handler, Timeout.seconds(1)))
     http_server.request_shutdown()
     var running = True
-    for _ in range(100):
+    var shutdown_wait_deadline = Int(perf_counter_ns()) + 1_000_000_000
+    while running and Int(perf_counter_ns()) < shutdown_wait_deadline:
         running = http_server.tick(handler, Timeout.milliseconds(5))
-        if not running:
-            break
     assert_false(running)
 
     test_pacing_delay_conversion_saturates_monotonic_deadline()
