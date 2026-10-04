@@ -87,6 +87,16 @@ receive errors release already closed transports before propagating the error.
 Closing and draining connections remain owned until quiche reports closure;
 their native draining deadline schedules the final check and cleanup.
 
+Each initial shutdown stage broadcasts to live connections once. Subsequent
+GOAWAY driving uses a bounded deduplicated queue of connections with unfinished
+flags, refreshed by receive, native timeout and local cancellation events.
+Blocked control frames wait for actual credit instead of retrying on unrelated
+packet sends; an incomplete handshake resumes after receive processing creates
+HTTP/3 state. The maximum-ID GOAWAY must succeed before the final last+4 ID is
+sent, preserving nonincreasing IDs even when only the smaller final frame fits.
+Unexpected errors retain affected readiness and propagate; terminal removal
+deletes both queue storage and membership.
+
 Request deadlines use one indexed minimum per incomplete stream across header,
 body and request-idle phases. Receive processing refreshes only streams touched
 by readable headers or HTTP/3 events, including errors. Completion, reset,
@@ -111,9 +121,9 @@ stopped transport stream and send errors remove HTTP/3 stream state when the
 request receive side has finished; queued provider responses satisfy that
 completed-request condition. Sibling streams and subsequent requests continue.
 
-GOAWAY drivers still scan during shutdown, and actual connection teardown still
-scans route/request ownership. The full server loop is not yet proportional
-only to ready or due work.
+Initial shutdown broadcasts still visit every live connection, and actual
+connection teardown still scans route/request ownership. The full server loop
+is not yet proportional only to ready or due work.
 
 ### Canceled HTTP/3 request state
 
