@@ -763,3 +763,204 @@ fn provider_send_policy_keeps_generic_h3_critical_done_application_close() {
     drop(server);
     assert_eq!(budget.usage(), quiche::SendUsage::default());
 }
+
+fn public_send_close(
+    server: &mut super::QuicServer,
+    client: &mut quiche::Connection,
+    local: SocketAddr,
+    remote: SocketAddr,
+) {
+    let mut packet = [0; 65_535];
+    let until = std::time::Instant::now() + Duration::from_secs(10);
+    while client.peer_error().is_none() && std::time::Instant::now() < until {
+        for mut datagram in collect_client_datagrams(client, &mut packet) {
+            match server.recv_datagram(&mut datagram, local, remote) {
+                Ok(()) | Err(super::QuicServerError::Quiche(quiche::Error::Done)) => (),
+                Err(error) => panic!("public send limit receive: {error:?}"),
+            }
+        }
+        while let Some((length, info)) = server.send(&mut packet).unwrap() {
+            match client.recv(
+                &mut packet[..length],
+                RecvInfo {
+                    from: info.from,
+                    to: info.to,
+                },
+            ) {
+                Ok(_) | Err(quiche::Error::Done) => (),
+                Err(error) => panic!("public send limit close: {error:?}"),
+            }
+        }
+        drive_timeouts(client, server);
+        std::thread::sleep(Duration::from_millis(2));
+    }
+    assert_eq!(
+        client
+            .peer_error()
+            .map(|error| (error.is_app, error.error_code)),
+        Some((false, 1))
+    );
+}
+
+fn public_send_request_zero(slots: bool) {
+    let mut server = super::QuicServer::new(stress_server_config()).unwrap();
+    let mut limits = super::default_send_limits();
+    if slots {
+        limits.request.slots = 0;
+    } else {
+        limits.request.backing_bytes = 0;
+    }
+    assert!(server.set_send_limits(limits));
+    let mut peer = ReceiveBudgetPeer::new(&mut server, 0xe1);
+    let id = send_pool_get(&mut peer, b"/public-zero");
+    for _ in 0..8 {
+        send_pool_pump(&mut server, std::slice::from_mut(&mut peer));
+    }
+    if slots {
+        assert!(server.next_request().is_none());
+    } else {
+        let request = server.next_request().unwrap();
+        assert_eq!(request.stream_id, id);
+        assert!(server.enqueue_response(request.id, 200, Vec::new(), b"alive".to_vec()));
+        server.drive_responses().unwrap();
+    }
+    public_send_close(
+        &mut server,
+        &mut peer.client,
+        "127.0.0.1:4433".parse().unwrap(),
+        peer.remote,
+    );
+    assert!(!server.set_send_limits(super::default_send_limits()));
+    assert!(!server.set_receive_limits(super::default_receive_limits()));
+}
+
+#[test]
+fn provider_send_public_request_zero_bytes_propagates() {
+    public_send_request_zero(false);
+}
+#[test]
+fn provider_send_public_request_zero_slots_propagates() {
+    public_send_request_zero(true);
+}
+
+fn public_send_control_zero(slots: bool) {
+    let mut server = super::QuicServer::new(stress_server_config()).unwrap();
+    let mut limits = super::default_send_limits();
+    if slots {
+        limits.control.slots = 0;
+    } else {
+        limits.control.backing_bytes = 0;
+    }
+    assert!(server.set_send_limits(limits));
+    let (mut client, local, remote) = current_api_send_raw_peer(0xe3);
+    public_send_close(&mut server, &mut client, local, remote);
+    assert!(
+        server
+            .connections
+            .values()
+            .all(|connection| connection.http3.is_none())
+    );
+    assert!(!server.set_send_limits(super::default_send_limits()));
+}
+#[test]
+fn provider_send_public_control_zero_bytes_propagates() {
+    public_send_control_zero(false);
+}
+#[test]
+fn provider_send_public_control_zero_slots_propagates() {
+    public_send_control_zero(true);
+}
+
+#[test]
+fn provider_send_public_crypto_zero_bytes_closes_and_stays_locked_after_drop() {
+    let mut server = super::QuicServer::new(stress_server_config()).unwrap();
+    let mut limits = super::default_send_limits();
+    limits.crypto.backing_bytes = 0;
+    assert!(server.set_send_limits(limits));
+    let (mut client, local, remote) = current_api_send_raw_peer(0xe5);
+    public_send_close(&mut server, &mut client, local, remote);
+    let key = server.connections.keys().next().unwrap().clone();
+    let until = std::time::Instant::now() + Duration::from_secs(10);
+    while server.connections.contains_key(&key) && std::time::Instant::now() < until {
+        std::thread::sleep(server.timeout().unwrap().min(Duration::from_millis(5)));
+        server.on_timeout();
+    }
+    assert!(server.connections.is_empty());
+    assert_no_owned_provider_state(&server, &key);
+    assert!(!server.set_send_limits(super::default_send_limits()));
+    assert!(!server.set_receive_limits(super::default_receive_limits()));
+}
+
+#[test]
+fn provider_send_public_crypto_zero_slots_restore_original_initial_and_sibling() {
+    let mut server = super::QuicServer::new(stress_server_config()).unwrap();
+    let mut limits = super::default_send_limits();
+    limits.crypto.slots = 0;
+    assert!(server.set_send_limits(limits));
+    let (mut client, local, remote) = current_api_send_raw_peer(0xe6);
+    let original_cid = client.source_id().as_ref().to_vec();
+    let packets = collect_client_datagrams(&mut client, &mut [0; 65_535]);
+    assert!(!packets.is_empty());
+    for mut packet in packets.clone() {
+        assert!(matches!(
+            server.recv_datagram(&mut packet, local, remote),
+            Err(super::QuicServerError::Quiche(quiche::Error::Done))
+        ));
+    }
+    assert!(server.connections.is_empty() && server.routes.is_empty());
+    assert!(server.set_send_limits(super::default_send_limits()));
+    assert!(server.set_receive_limits(super::default_receive_limits()));
+    for mut packet in packets {
+        server.recv_datagram(&mut packet, local, remote).unwrap();
+    }
+    assert_eq!(server.connections.len(), 1);
+    assert!(!server.set_send_limits(super::default_send_limits()));
+    assert!(!server.set_receive_limits(super::default_receive_limits()));
+    establish_http3_in_memory(
+        &mut client,
+        &mut server,
+        &mut [0; 65_535],
+        local,
+        remote,
+        false,
+    );
+    let http3 =
+        quiche::h3::Connection::with_transport(&mut client, &quiche::h3::Config::new().unwrap())
+            .unwrap();
+    let mut original = ReceiveBudgetPeer {
+        client,
+        http3,
+        remote,
+        request_stream: 0,
+    };
+    for _ in 0..8 {
+        send_pool_pump(&mut server, std::slice::from_mut(&mut original));
+    }
+    let sibling = ReceiveBudgetPeer::new(&mut server, 0xe7);
+    let mut peers = [original, sibling];
+    for index in 0..2 {
+        let stream = send_pool_get(&mut peers[index], b"/restored");
+        for _ in 0..8 {
+            send_pool_pump(&mut server, &mut peers);
+        }
+        let request = server.next_request().unwrap();
+        assert_eq!(request.stream_id, stream);
+        assert!(server.enqueue_response(request.id, 200, Vec::new(), b"alive".to_vec()));
+        let mut body = Vec::new();
+        let mut finished = false;
+        for _ in 0..32 {
+            send_pool_pump(&mut server, &mut peers);
+            finished |= send_pool_read(&mut peers[index], stream, &mut body);
+            if finished {
+                break;
+            }
+        }
+        assert!(finished);
+        assert_eq!(body, b"alive");
+        assert!(peers[index].client.peer_error().is_none());
+    }
+    assert_eq!(
+        peers[0].client.source_id().as_ref(),
+        original_cid.as_slice()
+    );
+}
