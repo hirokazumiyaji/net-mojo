@@ -13,12 +13,14 @@ Build optimized: `mojo build -I . benchmarks/http3_server.mojo -o ...`
 """
 
 from benchmarks.http_handler import BenchHandler
+from benchmarks._process_resources import print_fd_limits
 from net.http import Server, ServerConfig
 from net.quic import QuicProvider, QuicUDPEndpoint
 from net.udp import listen_udp
 
 
 def main() raises:
+    print_fd_limits()
     var provider = QuicProvider("build/quic/libnet_quic_provider")
     var listener = listen_udp("127.0.0.1:18453")
     var quic_config = provider.server_config(
