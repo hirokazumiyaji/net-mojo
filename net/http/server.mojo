@@ -1962,6 +1962,7 @@ struct Server(Movable):
                     _release_detach_state(addr, from_sender=False)
                     writer._detach_state_addr = 0
             writer._drop_body()
+            writer._drop_headers()
             self._send_error(idx, 500, is_head=is_head)
             return
 
@@ -1969,6 +1970,7 @@ struct Server(Movable):
         self._release_http1_body(idx)
         if writer.is_detached():
             writer._drop_body()
+            writer._drop_headers()
             var addr = writer._detach_state_addr
             if addr == 0:
                 self._send_error(idx, 500, is_head=is_head)
@@ -1993,8 +1995,15 @@ struct Server(Movable):
             self._sync_interests(idx)
             return
 
-        if len(writer.body) > cap or not writer._reconcile_body_budget():
+        if (
+            len(writer.body) > cap
+            or not writer._reconcile_body_budget()
+            or not writer.headers._adopt_capacity_budget(
+                writer._body_budget.copy()
+            )
+        ):
             writer._drop_body()
+            writer._drop_headers()
             self._send_error(idx, 500, is_head=is_head)
             return
         # Header count/bytes are enforced inside the encoder, the single
@@ -2004,6 +2013,7 @@ struct Server(Movable):
         except e:
             _ = e
             writer._drop_body()
+            writer._drop_headers()
             self._send_error(idx, 500, is_head=is_head)
             return
         var wire: List[Byte]
@@ -2019,6 +2029,7 @@ struct Server(Movable):
         except e:
             _ = e
             writer._drop_body()
+            writer._drop_headers()
             self._send_error(idx, 500, is_head=is_head)
             return
         writer._drop_body()
@@ -2356,6 +2367,7 @@ struct Server(Movable):
         if len(rw.body) > self.config.max_response_body:
             self._mark_detached_cancelled(idx)
             self._cleanup_detached_state(idx)
+            rw._drop_headers()
             self._send_error(idx, 500, is_head=is_head)
             self._arm_deadline(idx)
             return
@@ -2366,6 +2378,7 @@ struct Server(Movable):
             _ = e
             self._mark_detached_cancelled(idx)
             self._cleanup_detached_state(idx)
+            rw._drop_headers()
             self._send_error(idx, 500, is_head=is_head)
             self._arm_deadline(idx)
             return
@@ -2384,6 +2397,7 @@ struct Server(Movable):
             _ = e
             self._mark_detached_cancelled(idx)
             self._cleanup_detached_state(idx)
+            rw._drop_headers()
             self._send_error(idx, 500, is_head=is_head)
             self._arm_deadline(idx)
             return
@@ -2431,6 +2445,7 @@ struct Server(Movable):
             _ = e
             self._mark_detached_cancelled(idx)
             self._cleanup_detached_state(idx)
+            rw._drop_headers()
             self._send_error(idx, 500, is_head=is_head)
             self._arm_deadline(idx)
             return
@@ -2449,6 +2464,7 @@ struct Server(Movable):
             _ = e
             self._mark_detached_cancelled(idx)
             self._cleanup_detached_state(idx)
+            rw._drop_headers()
             self._send_error(idx, 500, is_head=is_head)
             self._arm_deadline(idx)
             return
@@ -2456,6 +2472,7 @@ struct Server(Movable):
         if not self._conns[idx]._append_reserved_pending(wire^, self._budget):
             self._mark_detached_cancelled(idx)
             self._cleanup_detached_state(idx)
+            rw._drop_headers()
             self._send_error(idx, 500, is_head=is_head)
             self._arm_deadline(idx)
             return

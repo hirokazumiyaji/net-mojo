@@ -9,9 +9,32 @@ Values are stored as raw wire bytes and preserved exactly, including
 legal `obs-text` bytes that have no UTF-8 decoding. String accessors
 decode lossily for convenience; framing paths must use the byte
 accessors so an encoded message round-trips byte-identically.
+
+HTTP/1 response ownership charges the three List arrays and raw value capacities.
+Clear retains the arrays' charge; destruction frees storage before refunding.
+Incoming caller storage is admitted after allocation. String backing, lookup
+scratch and request/parser admission remain separate.
 """
 
 from net.error import NetError, NetErrorKind
+from std.sys import size_of
+from ._buffer import SharedBufferBudget, _CapacityTicket, _reserve_capacity
+
+
+def _grow_header_array[
+    T: Movable
+](
+    mut values: List[T],
+    mut ticket: _CapacityTicket,
+    needed: Int,
+    mut reservation: Int,
+):
+    if needed > values.capacity():
+        var old_bytes = values.capacity() * size_of[T]()
+        _ = _reserve_capacity(
+            values, ticket.budget.value(), needed, reservation
+        )
+        ticket.amount -= old_bytes
 
 
 def _is_tchar(byte: Byte) -> Bool:
@@ -99,46 +122,130 @@ struct Headers(Movable, Sized):
     var _names: List[String]
     var _values: List[List[Byte]]
     var _lower_names: List[String]
+    var _capacity_ticket: _CapacityTicket
 
     def __init__(out self):
         self._names = List[String]()
         self._values = List[List[Byte]]()
         self._lower_names = List[String]()
+        self._capacity_ticket = _CapacityTicket()
+
+    def __init__(out self, *, deinit move: Self):
+        self._names = move._names^
+        self._values = move._values^
+        self._lower_names = move._lower_names^
+        self._capacity_ticket = move._capacity_ticket^
+
+    def __deinit__(deinit self):
+        _ = self._names^
+        _ = self._values^
+        _ = self._lower_names^
+        self._capacity_ticket.release()
+
+    def _known_capacity(self) -> Int:
+        var capacity = (
+            self._names.capacity() * size_of[String]()
+            + self._lower_names.capacity() * size_of[String]()
+            + self._values.capacity() * size_of[List[Byte]]()
+        )
+        for value in self._values:
+            capacity += value.capacity()
+        return capacity
+
+    def _adopt_capacity_budget(
+        mut self, var budget: Optional[SharedBufferBudget]
+    ) -> Bool:
+        if not budget:
+            return True
+        if (
+            self._capacity_ticket.budget
+            and self._capacity_ticket.budget.value()._shares_storage(
+                budget.value()
+            )
+        ):
+            return True
+        var capacity = self._known_capacity()
+        if not budget.value().try_reserve(capacity):
+            return False
+        self._capacity_ticket.release()
+        self._capacity_ticket = _CapacityTicket(budget^, capacity)
+        return True
+
+    def _prepare_append(mut self, value_length: Int) raises NetError:
+        if not self._capacity_ticket.budget:
+            return
+        var needed = len(self) + 1
+        var reservation = 0
+        if needed > self._names.capacity():
+            reservation += (
+                max(needed, self._names.capacity() * 2) * size_of[String]()
+            )
+        if needed > self._lower_names.capacity():
+            reservation += (
+                max(needed, self._lower_names.capacity() * 2)
+                * size_of[String]()
+            )
+        if needed > self._values.capacity():
+            reservation += (
+                max(needed, self._values.capacity() * 2) * size_of[List[Byte]]()
+            )
+        var admission = reservation + value_length
+        if not self._capacity_ticket.budget.value().try_reserve(admission):
+            raise NetError(
+                NetErrorKind.invalid_argument(),
+                "add header",
+                None,
+                "header backing capacity exceeds budget",
+            )
+        self._capacity_ticket.amount += admission
+        _grow_header_array(
+            self._names, self._capacity_ticket, needed, reservation
+        )
+        _grow_header_array(
+            self._lower_names, self._capacity_ticket, needed, reservation
+        )
+        _grow_header_array(
+            self._values, self._capacity_ticket, needed, reservation
+        )
 
     def __len__(self) -> Int:
         return len(self._names)
 
-    def _append_validated(mut self, var name: String, var value: List[Byte]):
+    def _append_validated[
+        origin: ImmOrigin
+    ](mut self, var name: String, value: Span[Byte, origin]) raises NetError:
+        self._prepare_append(len(value))
+        var raw = List[Byte](capacity=len(value))
+        for i in range(len(value)):
+            raw.append(value[i])
         var lowered = name.lower()
         self._names.append(name^)
-        self._values.append(value^)
+        self._values.append(raw^)
         self._lower_names.append(lowered^)
 
     def add(mut self, var name: String, var value: String) raises NetError:
         _reject_bad_name(name, "add header")
         _reject_bad_value(value, "add header")
-        var raw = List[Byte]()
         var bytes = value.as_bytes()
-        raw.reserve(len(bytes))
-        for i in range(len(bytes)):
-            raw.append(bytes[i])
-        self._append_validated(name^, raw^)
+        self._append_validated(name^, bytes)
 
     def add_bytes[
         origin: ImmOrigin
     ](mut self, var name: String, value: Span[Byte, origin]) raises NetError:
         _reject_bad_name(name, "add header")
         _check_value_bytes(value, "add header")
-        var raw = List[Byte]()
-        raw.reserve(len(value))
-        for i in range(len(value)):
-            raw.append(value[i])
-        self._append_validated(name^, raw^)
+        self._append_validated(name^, value)
 
     def clear(mut self):
+        var raw_capacity = 0
+        for value in self._values:
+            raw_capacity += value.capacity()
         self._names.clear()
         self._values.clear()
         self._lower_names.clear()
+        if self._capacity_ticket.budget:
+            self._capacity_ticket.budget.value().release(raw_capacity)
+            self._capacity_ticket.amount -= raw_capacity
 
     def get_first(self, name: StringSlice) -> Optional[String]:
         var needle = String(name).lower()

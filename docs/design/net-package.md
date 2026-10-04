@@ -266,10 +266,19 @@ section records only the package-level boundaries.
   appending to pending storage retains the old + incoming + new growth peak
   and refunds copied incoming capacity only after storage destruction. HEAD
   and no-body statuses skip chunk/end allocation. Caller-owned allocations
-  before adoption and detached headers remain accounting gaps.
+  before adoption remain accounting gaps. Synchronous HTTP/1 response Headers
+  and detached START/RESPOND admit three array backing capacities and raw value
+  capacities. Supported add/add_bytes reserve grouped full new array targets
+  and the raw value before growth; this conservative admission includes all old
+  capacities rather than claiming a minimum sequential allocation peak.
+  clear retains the array charge. Whole Headers moves retain their ticket through
+  queue/batch/consumer ownership, and storage drops before refund. Pre-owned
+  caller Headers and direct public writer.headers replacement are admitted after
+  allocation; String backing/refcounts and request/parser Header admission remain
+  separate.
   Raw read scratch uses fixed stack arrays; TLS retains a charged retry buffer.
   Pending 100-continue bytes and HTTP/1 error wire reserve capacity before
-  allocation. Header/String/parser scratch, other encoders, native provider
+  allocation. String/header lookup/parser scratch, other encoders, native provider
   allocations and allocator overhead are not all covered; the budget is not
   a process RSS cap or recovery guarantee for allocator OOM.
   Admission failures send 503+close when the error response can be admitted;

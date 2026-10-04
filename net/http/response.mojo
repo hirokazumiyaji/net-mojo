@@ -9,6 +9,8 @@ of borrowed into a send queue.
 The synchronous HTTP/1 writer owns its body capacity in the shared budget;
 standalone writers enforce their body length limit. Direct body edits are
 reconciled separately and do not have the supported writes' growth guarantee.
+HTTP/1 response Headers reserve known array/raw value growth and retained
+capacity; direct public Headers replacement is admitted after allocation.
 """
 
 from net.error import NetError, NetErrorKind
@@ -79,7 +81,11 @@ struct ResponseWriter(Movable, Sized):
         self._drop_body()
 
     def _set_body_budget(mut self, var budget: SharedBufferBudget):
+        _ = self.headers._adopt_capacity_budget(Optional(budget.copy()))
         self._body_budget = budget^
+
+    def _drop_headers(mut self):
+        self.headers = Headers()
 
     def _reconcile_body_budget(mut self) -> Bool:
         var capacity = self.body.capacity()
