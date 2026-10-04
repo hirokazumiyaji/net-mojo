@@ -64,8 +64,17 @@ original send time, then waits for writable readiness without a zero-timer spin.
 Transport packet sends use a deduplicated ready-connection queue. Receive,
 response, timeout and shutdown work mark the affected connection; successful
 sends rotate it after one packet. Idle connections are not probed for every
-send, and terminal cleanup removes their queued keys. Response-stream driving
-still scans connections pending separate scheduler work.
+send, and terminal cleanup removes their queued keys.
+
+Application response driving uses a separate bounded deduplicated connection
+queue. Successful response admission, receive processing, actual transport
+timeouts and local stream cancellation mark only their affected connection
+with pending responses. Each drive drains one queued round; a blocked response
+waits for another event instead of retrying on every emitted transport packet.
+Only pending streams on those touched connections are visited. Completion,
+expiry and reset remove a queued key once no response remains; terminal removal
+also deletes its key. Unexpected send errors
+retain their affected ready work while preserving error propagation.
 
 Transport deadlines use an ordered index with at most one absolute entry per
 live connection. Receive, send, transport timeout and close outcomes refresh the
@@ -96,7 +105,7 @@ stopped transport stream and send errors remove HTTP/3 stream state when the
 request receive side has finished; queued provider responses satisfy that
 completed-request condition. Sibling streams and subsequent requests continue.
 
-Response driving and terminal sweeps still scan connections, so the full server
+Terminal sweeps and GOAWAY broadcasts remain separate work, so the full server
 loop is not yet proportional only to ready or due work.
 
 ### Canceled HTTP/3 request state
