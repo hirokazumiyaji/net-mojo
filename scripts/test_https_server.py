@@ -239,6 +239,24 @@ def test_https_alt_svc_advertisement():
             raise RuntimeError(
                 f"config Alt-Svc must not replace handler value: {custom!r}"
             )
+        with socket.create_connection(("127.0.0.1", port), timeout=5) as raw:
+            with context.wrap_socket(raw, server_hostname="localhost") as client:
+                client.sendall(
+                    b"GET /error HTTP/1.1\r\nHost: localhost\r\n"
+                    b"Connection: close\r\n\r\n"
+                )
+                response = bytearray()
+                while chunk := client.recv(4096):
+                    response.extend(chunk)
+        error = bytes(response)
+        header, body = error.split(b"\r\n\r\n", 1)
+        if (
+            not error.startswith(b"HTTP/1.1 500 Internal Server Error\r\n")
+            or b'Alt-Svc: h3=":8443"; ma=86400\r\n' not in header + b"\r\n"
+            or b"Content-Length: 25\r\n" not in header + b"\r\n"
+            or body != b"500 Internal Server Error"
+        ):
+            raise RuntimeError(f"unexpected TLS Alt-Svc error response: {error!r}")
         if alt_process.wait(timeout=5) != 0:
             raise RuntimeError(alt_process.stderr.read())
     except Exception:

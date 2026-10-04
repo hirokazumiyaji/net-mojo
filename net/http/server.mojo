@@ -14,7 +14,7 @@ Ownership and resources:
   including growth peaks, and lends synchronous HTTP/1 writer workspace.
   Decoded HTTP/1 body copies reserve capacity before materialization and hold
   that reservation until the borrowed request is dropped after its handler.
-  Buffered HTTP/1 wire is reserved before encoding; other encoding remains
+  Buffered HTTP/1 and error wire are reserved before encoding; other encoding remains
   separate.
   Read scratch uses a caller-owned stack array; TLS retains its charged
   retry buffer until connection close.
@@ -73,7 +73,8 @@ from ._encoder import (
     encode_chunk,
     encode_chunk_end,
     encode_chunked_start,
-    encode_error,
+    _encode_error_exact,
+    _measure_error,
     encode_response,
     _encode_response_budgeted,
 )
@@ -1084,22 +1085,19 @@ struct Server(Movable):
             self._remove_detached_conn(idx)
         # TLS error responses also advertise Alt-Svc when configured,
         # matching the handler path (_inject_alt_svc_for_tls).
-        var wire: List[Byte]
+        var alt_svc = String("")
         if self._conns[idx].is_tls() and self.config.alt_svc.byte_length() > 0:
-            wire = encode_error(
-                status,
-                True,
-                self._tick_date,
-                is_head=is_head,
-                alt_svc=self.config.alt_svc,
-            )
-        else:
-            wire = encode_error(status, True, self._tick_date, is_head=is_head)
-        # Error responses use a small fixed body: when even that does not
-        # fit the remaining budget, close bare.
-        if not self._conns[idx].set_pending(wire^, self._budget):
+            alt_svc = self.config.alt_svc.copy()
+        var capacity = _measure_error(
+            status, True, self._tick_date, is_head, alt_svc
+        )
+        if not self._budget.try_reserve(capacity):
             self._close_conn(idx)
             return
+        var wire = _encode_error_exact(
+            status, True, self._tick_date, capacity, is_head, alt_svc
+        )
+        self._conns[idx]._set_reserved_pending(wire^, self._budget)
         self._conns[idx].should_close = True
         self._conns[idx].write_at = deadline_from_now(
             self.config.write_deadline

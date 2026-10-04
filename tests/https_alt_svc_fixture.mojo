@@ -11,6 +11,8 @@ struct _AltSvcHandler(Handler):
 
     def handle(mut self, req: Request, mut writer: ResponseWriter) raises:
         self.requests += 1
+        if req.path == "/error":
+            raise Error("test error response")
         writer.set_status(200)
         writer.set_should_close(True)
         if req.path == "/custom":
@@ -33,7 +35,7 @@ def main() raises:
     )
     print(String("READY ") + String(server.local_address().port))
     var handler = _AltSvcHandler()
-    while handler.requests < 2:
+    while handler.requests < 3:
         _ = server.tick(handler, Timeout.seconds(2))
     while server.active_connections() > 0:
         _ = server.tick(handler, Timeout.seconds(2))

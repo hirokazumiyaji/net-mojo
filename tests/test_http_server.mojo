@@ -20,6 +20,65 @@ from net.http._deadline import NO_DEADLINE, now_ns
 from tests.support import _socket_pair, _tick_n
 
 
+def test_error_wire_exact_peak_denial_partial_close_and_reuse_preserve_foreign() raises:
+    for scenario in range(4):
+        var config = ServerConfig.default()
+        config.total_buffer_budget = [166, 165, 176, 175][scenario]
+        var server = Server(config^)
+        server._tick_date = "Sun, 06 Nov 1994 08:49:37 GMT"
+        var foreign = _interim_native_pair(server)
+        assert_true(server._charge_read(0, 5))
+        server._conns[0].append_bytes("GET /".as_bytes())
+        var client = _interim_native_pair(server)
+        var reservation = 0
+        if scenario >= 2:
+            var old = List[Byte](capacity=7)
+            old.extend("oldwire".as_bytes())
+            assert_true(server._conns[1].set_pending(old^, server._budget))
+            reservation = 3
+            assert_true(server._budget.try_reserve(reservation))
+            server._conns[1].reserved = reservation
+        server._send_error(1, 503)
+        if scenario % 2 == 0:
+            assert_true(server._conns[1].active)
+            assert_equal(server._conns[1].pending.capacity(), 161)
+            assert_equal(server._budget.used, 166 + reservation)
+            assert_equal(server._conns[1].reserved, reservation)
+            assert_equal(server._conns[1].try_write_pending_capped(11), 11)
+            assert_equal(server._conns[1].pending.capacity(), 161)
+            assert_equal(server._budget.used, 166 + reservation)
+            var out = List[Byte]()
+            _read_interim(client, out, 11)
+            server._pump_send(1, True)
+            _read_interim(client, out, 161)
+            assert_equal(
+                String(from_utf8_lossy=Span(out)),
+                (
+                    "HTTP/1.1 503 Service Unavailable\r\n"
+                    "Content-Type: text/plain\r\n"
+                    "Date: Sun, 06 Nov 1994 08:49:37 GMT\r\n"
+                    "Content-Length: 23\r\nConnection: close\r\n\r\n"
+                    "503 Service Unavailable"
+                ),
+            )
+        assert_false(server._conns[1].active)
+        assert_equal(server._budget.used, 5)
+        assert_equal(server._conns[1].pending.capacity(), 0)
+        assert_equal(server._conns[1].reserved, 0)
+        assert_true(server._conns[0].active)
+        client.close()
+        var retry = _interim_native_pair(server)
+        server._send_error(2, 503, is_head=True)
+        assert_equal(server._conns[2].pending.capacity(), 138)
+        assert_equal(server._budget.used, 143)
+        server._close_conn(2)
+        assert_equal(server._budget.used, 5)
+        retry.close()
+        foreign.close()
+        server._close_conn(0)
+        assert_equal(server._budget.used, 0)
+
+
 def _read_interim(mut client: TCPConn, mut out: List[Byte], wanted: Int) raises:
     var scratch = Array[Byte, 64](fill=0)
     var expires = Int(perf_counter_ns()) + 1_000_000_000
@@ -401,8 +460,11 @@ def test_pending_capacity_released_on_full_send_error_close_and_reuse() raises:
     assert_equal(server._conns[0].pending.capacity(), 0)
     assert_true(server._conns[0].active)
     server._send_error(0, 503)
+    assert_equal(server._conns[0].buf.capacity(), 0)
+    assert_equal(server._conns[0].reserved, 0)
     assert_equal(server._budget.used, server._conns[0].pending.capacity())
-    assert_true(server._budget.used > len(server._conns[0].pending))
+    assert_equal(server._budget.used, 161)
+    assert_equal(len(server._conns[0].pending), 161)
     var out = _drain_until_eof_driven(server, handler, client)
     assert_true(String(from_utf8_lossy=Span(out)).find("503") >= 0)
     assert_equal(server._budget.used, 0)
