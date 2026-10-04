@@ -14,8 +14,9 @@ Ownership and resources:
   including growth peaks and owned synchronous HTTP/1 writer bodies.
   Decoded HTTP/1 body copies reserve capacity before materialization and hold
   that reservation until the borrowed request is dropped after its handler.
-  Buffered HTTP/1 and error wire are reserved before encoding; other encoding remains
-  separate.
+  Buffered HTTP/1 wire is reserved before encoding. HTTP/1 error wire is
+  prepaid at connection admission and transferred into the same pending owner;
+  other encoding remains separate.
   Read scratch uses a caller-owned stack array; TLS retains its charged
   retry buffer until connection close.
   Request admission and the `ResponseWriter` cap derive from the remaining
@@ -56,6 +57,7 @@ from ._connection import (
     STATE_STREAMING,
     STATE_TLS_SHUTDOWN,
     READ_BUFFER_SIZE,
+    H1_ERROR_CAPACITY,
 )
 from ._deadline import NO_DEADLINE, deadline_from_now, now_ns
 from ._detach import (
@@ -75,7 +77,7 @@ from ._encoder import (
     _encode_chunk_budgeted,
     _encode_chunk_end_budgeted,
     _encode_chunked_start_budgeted,
-    _encode_error_exact,
+    _render_error,
     _measure_error,
     _encode_response_budgeted,
 )
@@ -194,6 +196,13 @@ struct Server(Movable):
                 s_ptr[].cancelled = True
                 s_ptr[].mutex.unlock()
                 _release_detach_state(addr, from_sender=False)
+            var wire_capacity = (
+                self._conns[idx].buf.capacity()
+                + self._conns[idx].pending.capacity()
+            )
+            self._conns[idx].buf = List[Byte]()
+            self._conns[idx].pending = List[Byte]()
+            self._budget.release(wire_capacity)
 
     def is_shutdown_requested(self) -> Bool:
         return self.control.is_shutdown_requested()
@@ -1007,6 +1016,21 @@ struct Server(Movable):
                         NO_DEADLINE,
                         NO_DEADLINE,
                     )
+                var error_capacity = H1_ERROR_CAPACITY
+                if entry.is_tls() and self.config.alt_svc.byte_length() > 0:
+                    error_capacity += 11 + self.config.alt_svc.byte_length()
+                if not entry._reserve_error_wire(
+                    self._budget.copy(), error_capacity
+                ):
+                    var tls_capacity = entry.tls_read_buffer.capacity()
+                    try:
+                        entry.close()
+                    except e:
+                        _ = e
+                    self._budget.release(tls_capacity)
+                    _ = self._reactor.remove(token)
+                    accepted += 1
+                    continue
                 self._ensure_slot_map(token.slot)
                 var idx: Int
                 if len(self._conn_free) > 0:
@@ -1055,9 +1079,10 @@ struct Server(Movable):
         # leaving the sent prefix charged would leak budget on every
         # partial-send close until unrelated requests see 503s. Any
         # admission reservation still held is released the same way.
-        self._budget.release(
+        var wire_capacity = (
             self._conns[idx].buf.capacity()
             + self._conns[idx].pending.capacity()
+            + self._conns[idx].tls_read_buffer.capacity()
         )
         self._budget.release(self._conns[idx].reserved)
         self._conns[idx].reserved = 0
@@ -1066,12 +1091,11 @@ struct Server(Movable):
         self._conns[idx].http2_body_reserved = 0
         self._budget.release(self._conns[idx].http2_response_bytes_reserved)
         self._conns[idx].http2_response_bytes_reserved = 0
-        if self._conns[idx].is_tls():
-            self._budget.release(READ_BUFFER_SIZE)
         try:
             self._conns[idx].close()
         except e:
             _ = e
+        self._budget.release(wire_capacity)
         self._conn_free.append(idx)
         self._active_conns -= 1
         if (
@@ -1100,13 +1124,16 @@ struct Server(Movable):
         var capacity = _measure_error(
             status, True, self._tick_date, is_head, alt_svc
         )
-        if not self._budget.try_reserve(capacity):
+        if capacity > self._conns[idx]._error_wire.capacity():
             self._close_conn(idx)
             return
-        var wire = _encode_error_exact(
-            status, True, self._tick_date, capacity, is_head, alt_svc
+        var wire = self._conns[idx]._take_error_wire()
+        var byte_count = 0
+        _render_error[False](
+            status, True, self._tick_date, is_head, alt_svc, wire, byte_count
         )
         self._conns[idx]._set_reserved_pending(wire^, self._budget)
+        self._conns[idx]._error_ticket.amount = 0
         self._conns[idx].should_close = True
         self._conns[idx].write_at = deadline_from_now(
             self.config.write_deadline
@@ -1144,6 +1171,7 @@ struct Server(Movable):
             if progress.is_complete():
                 var protocol = self._conns[idx].tls.value().selected_alpn()
                 if protocol == "h2":
+                    self._conns[idx]._drop_error_wire()
                     self._conns[idx].protocol = PROTOCOL_HTTP2
                     self._conns[idx].http2_session = Optional(
                         Http2RequestSession(

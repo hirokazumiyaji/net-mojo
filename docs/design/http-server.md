@@ -139,12 +139,17 @@ HTTP 読み取りの一時領域は event loop の stack array を使い、受�
 TLS は budget 計上済みの再試行用 buffer を維持し、読み取り完了分を stack array へコピーする。
 100-continue は静的な byte 列を直接送信し、送信待ちになった残りだけを正確な容量で予約してから確保する。
 HTTP/1 encoder は header の raw value を immutable Span で借用し、値を一時 List に複製しない。
-HTTP/1 error 応答の wire 容量も確保前に予約し、予約できなければ対象接続を閉じる。固定の emergency 容量と String の一時領域の計上は別途必要となる。
+HTTP/1 接続の受け入れ時に、error 応答用 List の容量 256 bytes を shared budget から予約して確保する。
+TLS は、その時点の Alt-Svc が空でなければ header framing の 11 bytes と値の byte 長も加える。
+error 応答はこの領域を既存の pending 所有者へ移し、部分送信中も容量全体を予約したまま保持する。
+未使用領域の破棄、送信完了、close、Server 破棄で、対象 storage を破棄してから予約を返す。
+String の一時領域や allocator metadata はこの容量予約の対象外である。
 parser／header／String の一時領域、他の encoder、detached header、他の固定 metadata と provider 内部の容量計上は別途必要となる。
 ResponseWriter の拡張前には旧容量と新容量が併存するピークを budget から予約する。budget の不足は handler error として処理し、使用していない予約は解放する。これは List／Arc の実 allocation OOM から復帰する保証ではない。
 一接続の上限だけでなく、同時 body 受信と slow reader が全体 budget を超えないよう admission を制限する。
 budget を予約できない request は受信を継続せず、可能なら 503 と close。
-現在は error 応答の wire 容量を必要時に予約し、予約できなければ close のみになる。
+error 用領域を受け入れ時に予約できない接続は、table に登録せず閉じる。
+受け入れ済みの接続は normal budget が不足しても事前確保した領域を使用する。
 接続上限に達したら listener の受け入れを一時停止し、空きができたら再開する。
 
 deadline は単調時計による絶対時刻とし、byte を一つ受信するたびに延長しない。
@@ -574,9 +579,11 @@ HTTP/2 の request 組立ては `tests/test_http2.mojo` の `test_http2_request_
 transport 失敗は `NetError`、HTTP 失敗は `HttpError(status, should_close)`。
 `handler` の raise と response budget 超過は未送信 response を破棄して 500 と close、
 詳細は response に漏らさない。budget 予約不可は可能なら 503 と close。
-HTTP/1 の未送信 error 応答は、detach timeout を含め、wire 容量を全体 budget から予約できる場合に送る。
-予約できなければ error 応答を組み立てずに対象接続を閉じるため、以下の status が必ず届く保証はない。
-固定の emergency 容量の事前予約は未実装である。
+HTTP/1 の未送信 error 応答は、detach timeout を含め、接続受け入れ時に事前確保した領域で送る。
+現在の status/date/Alt-Svc を測定し、確保済み容量に収まらない場合は組み立てずに close する。
+設定変更で Alt-Svc が受け入れ時より大きくなった場合も、値の省略・切り詰めや追加確保は行わない。
+送信後の補充は行わず、同じ接続で領域を消費済みの場合も close する。
+接続受け入れ時の予約不足や transport 失敗では、以下の status が届く保証はない。
 
 | 状態 | status | 備考 |
 | --- | --- | --- |
@@ -587,7 +594,7 @@ HTTP/1 の未送信 error 応答は、detach timeout を含め、wire 容量を�
 | 非対応 version | 505 | - |
 | 未知の `Expect` | 417 と close | `100-continue` のみ継続（header 検証と body 上限判定後に 100） |
 | handler error・response 拡張時の budget 超過 | 500 と close | 別接続の loop は継続 |
-| 全体 budget 予約不可 | 可能なら 503 と close | HTTP/1 の error wire 容量を予約できなければ close のみ |
+| 全体 budget 予約不可 | 可能なら 503 と close | 接続受け入れ時の error 領域予約不足、送信時の容量不足は close のみ |
 
 ### HTTP/1.1 の規則と検証範囲
 

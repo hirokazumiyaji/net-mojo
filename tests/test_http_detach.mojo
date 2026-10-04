@@ -6,6 +6,7 @@ from std.time import perf_counter_ns, sleep
 from net import TCPConn, Timeout, dial_tcp, listen_tcp
 from net._sys.common import EINTR
 from net.error import NetErrorKind
+from net.http._connection import H1_ERROR_CAPACITY
 from net.http._buffer import SharedBufferBudget
 from net.http import (
     Handler,
@@ -1074,6 +1075,7 @@ struct _BudgetedWorkerHandler(Handler):
 def test_writer_body_charge_returns_when_handler_starts_detached_worker() raises:
     var config = ServerConfig.default()
     config.total_buffer_budget = 512 + size_of[_SharedDetachState]()
+    config.total_buffer_budget += H1_ERROR_CAPACITY
     var server = Server(config^)
     server.add_listener(listen_tcp("127.0.0.1:0"))
     var client = dial_tcp(
@@ -1102,15 +1104,16 @@ def test_writer_body_charge_returns_when_handler_starts_detached_worker() raises
         server._budget.used(),
         size_of[_SharedDetachState]()
         + state[].messages.capacity() * size_of[DetachMessage]()
-        + state[].messages[0].body.capacity(),
+        + state[].messages[0].body.capacity()
+        + H1_ERROR_CAPACITY,
     )
     var response = _tick_and_read(server, handler, client)
     assert_true(context[].done)
     assert_equal(_body_of(response), "threaded-worker-reply")
-    assert_equal(server._budget.used(), 0)
+    assert_equal(server._budget.used(), H1_ERROR_CAPACITY)
     client.close()
     external_call["free", NoneType](context)
-    assert_equal(handler.body_charge, 18)
+    assert_equal(handler.body_charge, 18 + H1_ERROR_CAPACITY)
 
 
 struct _MailboxHandler(Handler):
@@ -1161,7 +1164,7 @@ struct _StateAdmissionHandler(Handler):
 def test_retained_cancelled_states_are_bounded_across_connection_slot_reuse() raises:
     var config = ServerConfig.default()
     config.max_connections = 1
-    config.total_buffer_budget = 1024
+    config.total_buffer_budget = 1024 + H1_ERROR_CAPACITY
     var server = Server(config^)
     server.add_listener(listen_tcp("127.0.0.1:0"))
     var handler = _StateAdmissionHandler()
@@ -1256,7 +1259,7 @@ def test_cancelled_state_charge_survives_server_and_budget_owner_drop() raises:
 
 def test_detached_mailbox_array_capacity_uses_the_shared_budget() raises:
     var config = ServerConfig.default()
-    config.total_buffer_budget = 4096
+    config.total_buffer_budget = 4096 + H1_ERROR_CAPACITY
     var server = Server(config^)
     server.add_listener(listen_tcp("127.0.0.1:0"))
     var handler = _MailboxHandler()
@@ -1283,7 +1286,10 @@ def test_detached_mailbox_array_capacity_uses_the_shared_budget() raises:
     assert_equal(capacity, 4)
     assert_equal(
         charged,
-        size_of[_SharedDetachState]() + 4 * size_of[DetachMessage]() + 2,
+        size_of[_SharedDetachState]()
+        + 4 * size_of[DetachMessage]()
+        + 2
+        + H1_ERROR_CAPACITY,
     )
     assert_equal(server._budget.used(), 0)
 
@@ -1304,6 +1310,7 @@ def _check_detached_response_wire_boundary(is_head: Bool) raises:
         config.total_buffer_budget = (
             state_size + element + 6000 + 5 + wire_size - Int(not admitted)
         )
+        config.total_buffer_budget += H1_ERROR_CAPACITY
         var server = Server(config^)
         server.add_listener(listen_tcp("127.0.0.1:0"))
         var handler = _MailboxHandler()
@@ -1321,7 +1328,10 @@ def _check_detached_response_wire_boundary(is_head: Bool) raises:
         for _ in range(6000):
             body.append(Byte(ord("a")))
         sender.respond(200, Headers(), body^, should_close=True)
-        assert_equal(server._budget.used(), state_size + element + 6000 + 5)
+        assert_equal(
+            server._budget.used(),
+            state_size + element + 6000 + 5 + H1_ERROR_CAPACITY,
+        )
         var response = _drain_head_error_to_eof(server, handler, client)
         assert_equal(server.active_connections(), 0)
         assert_equal(server._budget.used(), state_size + 5)
@@ -1347,13 +1357,8 @@ def _check_detached_response_wire_boundary(is_head: Bool) raises:
         assert_equal(_body_of(next_response), "")
         assert_equal(server._budget.used(), 5)
         server._budget.release(5)
-        if is_head and not admitted:
-            assert_equal(status, -1)
-            assert_equal(length, -1)
-            assert_equal(len(response), 0)
-        else:
-            assert_equal(status, 200 if admitted else 500)
-            assert_equal(length, 6000 if admitted else 25)
+        assert_equal(status, 200 if admitted else 500)
+        assert_equal(length, 6000 if admitted else 25)
         if is_head:
             assert_equal(response_body, "")
         elif admitted:
@@ -1510,7 +1515,7 @@ def _body_respond_thread(
 
 def test_pthread_response_body_and_headers_survive_batch_and_server_drop() raises:
     var config = ServerConfig.default()
-    config.total_buffer_budget = 4096
+    config.total_buffer_budget = 4096 + H1_ERROR_CAPACITY
     var server = Server(config^)
     server.add_listener(listen_tcp("127.0.0.1:0"))
     var observer = server._budget.copy()
@@ -1568,7 +1573,8 @@ def test_pthread_response_body_and_headers_survive_batch_and_server_drop() raise
         + size_of[DetachMessage]()
         + 64
         + header_capacity
-        + 17,
+        + 17
+        + H1_ERROR_CAPACITY,
     )
     assert_equal(
         batch_charge, size_of[DetachMessage]() + 64 + header_capacity + 17
@@ -1585,6 +1591,7 @@ def test_stream_start_admits_exact_wire_capacity_and_refunds_on_denial() raises:
             + 103
             - Int(not admitted)
         )
+        config.total_buffer_budget += H1_ERROR_CAPACITY
         var server = Server(config^)
         server.add_listener(listen_tcp("127.0.0.1:0"))
         var handler = _MailboxHandler()
@@ -1618,7 +1625,8 @@ def test_stream_start_admits_exact_wire_capacity_and_refunds_on_denial() raises:
             assert_equal(len(header), 103)
             assert_equal(String(from_utf8_lossy=Span(end)), "0\r\n\r\n")
         else:
-            assert_equal(len(header), 0)
+            assert_equal(_status_of(header), 500)
+            assert_equal(_body_of(header), "500 Internal Server Error")
             assert_equal(len(end), 0)
 
 
@@ -1628,6 +1636,7 @@ def test_stream_wire_denial_after_headers_closes_without_second_response() raise
         config.total_buffer_budget = (
             size_of[_SharedDetachState]() + size_of[DetachMessage]() + 5 + 103
         )
+        config.total_buffer_budget += H1_ERROR_CAPACITY
         var server = Server(config^)
         server.add_listener(listen_tcp("127.0.0.1:0"))
         var handler = _MailboxHandler()
@@ -1647,7 +1656,10 @@ def test_stream_wire_denial_after_headers_closes_without_second_response() raise
             server, handler, client, max_ticks=50, expect_body=False
         )
         assert_equal(_status_of(header), 200)
-        assert_equal(server._budget.used(), size_of[_SharedDetachState]() + 5)
+        assert_equal(
+            server._budget.used(),
+            size_of[_SharedDetachState]() + 5 + H1_ERROR_CAPACITY,
+        )
         var foreign = 5
         if chunk:
             var data = Array[Byte, 64](fill=42)
@@ -1657,7 +1669,8 @@ def test_stream_wire_denial_after_headers_closes_without_second_response() raise
                 size_of[_SharedDetachState]()
                 + size_of[DetachMessage]()
                 + 64
-                + 5,
+                + 5
+                + H1_ERROR_CAPACITY,
             )
         else:
             var extra = server._budget.remaining() - 4
@@ -1717,6 +1730,7 @@ def test_borrowed_respond_message_keeps_body_charge_through_consumer_returns() r
                 + 64
                 + 5
                 + server._conns[0].pending.capacity()
+                + (H1_ERROR_CAPACITY if mode == 0 else 0)
             )
             _ = msg^
             var after_message = server._budget.used()
@@ -1868,6 +1882,7 @@ def test_drained_batch_keeps_array_charge_while_pthread_refills() raises:
     for extra in [18, 17]:
         var config = ServerConfig.default()
         config.total_buffer_budget = state_size + 2 * element + extra
+        config.total_buffer_budget += H1_ERROR_CAPACITY
         var server = Server(config^)
         server.add_listener(listen_tcp("127.0.0.1:0"))
         var handler = _MailboxHandler()
@@ -1888,7 +1903,9 @@ def test_drained_batch_keeps_array_charge_while_pthread_refills() raises:
         var original = Int(state[].messages.unsafe_ptr())
         var batch = _take_batch(state)
         assert_equal(state[].messages.capacity(), 0)
-        assert_equal(server._budget.used(), state_size + element + 17)
+        assert_equal(
+            server._budget.used(), state_size + element + 17 + H1_ERROR_CAPACITY
+        )
         var ctx = _MailboxRefillContext(
             sender_addr=sender._take(), sent=False, failed=False
         )
@@ -1907,7 +1924,11 @@ def test_drained_batch_keeps_array_charge_while_pthread_refills() raises:
         assert_equal(ctx.failed, not admitted)
         assert_equal(
             server._budget.used(),
-            state_size + 17 + element + (element + 1) * Int(admitted),
+            state_size
+            + 17
+            + element
+            + (element + 1) * Int(admitted)
+            + H1_ERROR_CAPACITY,
         )
         assert_equal(Int(batch.messages.unsafe_ptr()), original)
         assert_equal(batch.messages[0].kind, MSG_KIND_START)
@@ -1920,7 +1941,7 @@ def test_drained_batch_keeps_array_charge_while_pthread_refills() raises:
         _ = batch^
         assert_equal(
             server._budget.used(),
-            state_size + 17 + (element + 1) * Int(admitted),
+            state_size + 17 + (element + 1) * Int(admitted) + H1_ERROR_CAPACITY,
         )
         client.close()
         server._close_conn(0)
@@ -2013,7 +2034,7 @@ def test_finish_follows_accepted_chunks_without_array_growth() raises:
     var response = _tick_and_read_chunked(server, handler, client)
     assert_equal(_status_of(response), 200)
     assert_equal(_body_of(response), "1\r\na\r\n1\r\nb\r\n0\r\n\r\n")
-    assert_equal(server._budget.used(), 0)
+    assert_equal(server._budget.used(), H1_ERROR_CAPACITY)
     client.close()
 
 
