@@ -31,6 +31,44 @@ Verified Phase 0 (loopback, `GOMAXPROCS=1`):
   or a separate host.
 - Production measurements use optimized executables.
 
+## Saturated HTTP/1 load
+
+Build the independent Go standard-library loader with Go 1.26.4:
+
+```bash
+go -C benchmarks/http_go build -o /tmp/http-load ./cmd/http-load
+/tmp/http-load -url http://127.0.0.1:18081/fixed -connections 64 -warmup 10s -duration 30s
+/tmp/http-load -url http://127.0.0.1:18080/json -connections 64 -warmup 10s -duration 30s
+/tmp/http-load -url http://127.0.0.1:18081/echo -body-size 65536 -chunked -connections 64
+/tmp/http-load -url http://127.0.0.1:18081/fixed -keepalive=false -connections 64
+```
+
+Use identical arguments for the Go and Mojo endpoints and repeat each run at
+least five times. The loader accepts plain HTTP URLs for `/fixed`, `/json` and
+`/echo`; `-method` defaults to GET or POST for echo. Each worker has one active
+request. `-timeout` bounds each request (default 5s). Warmup stops starting work
+at its deadline and finishes outstanding requests before measurement, retaining
+keep-alive connections. All drained warmup responses are validated, including
+those completed after its deadline. Set `-warmup 0` only when warmup is
+intentionally omitted.
+
+One JSON record reports configuration, warmup counts, measured `started`,
+`success`, `errors`, `cutoff`, `samples`, payload byte counts, requests/s,
+response payload bytes/s, and nearest-rank p50/p95/p99 latency in milliseconds.
+Only measured requests started and completed inside the fixed window count
+toward success/errors and latency. Requests crossing its deadline are canceled
+and reported as `cutoff`; `started = success + errors + cutoff` and
+`samples = success`. Rates always use the configured measurement duration.
+Warmup, worker startup and final cancellation time are excluded.
+
+Every success requires HTTP/1.1 status 200, explicit matching Content-Length and
+the exact benchmark body; compression and redirects are disabled. Invalid
+configuration, warmup failure, measured errors or zero successful measured
+requests produce a nonzero exit status and `valid: false`. Cutoff is reported
+separately. These runs measure saturated closed-loop throughput and its latency;
+fixed-arrival latency, resource sampling, idle and slow-client runs remain
+separate scenarios.
+
 ## Scenarios (from Issue #42)
 
 | Scenario | Conditions |
