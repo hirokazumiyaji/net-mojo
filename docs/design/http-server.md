@@ -316,32 +316,40 @@ streaming body と backpressure 対応 writer、複数 loop の worker model、�
 - [ ] correctness と resource bounds を満たす。
 - [ ] 性能比較を再現でき、暫定目標の達成／未達と後続課題が記録される。
 
-## Phase 0 固定事項（実装済み）
+## 現行の公開 API
 
-Phase 0 では API の実 signature、borrow 寿命、エラー契約、conformance table、
-HTTP/2・HTTP/3 を見据えた共通境界、計測条件を固定した。
-`Server.serve` の loop 本体は Phase 3、codec は Phase 1、reactor は Phase 2 で実装する。
-
-### 実 signature
-
-利用側は `from net.http import ...` とする。`net/__init__.mojo` への再 export は行わない。
+以下は現在の実装が提供する主要署名の抜粋である。
+利用側は `from net.http import ...` とする。
+`net/__init__.mojo` への再 export は行わない。
+設定 field の注記は `ServerConfig.default()` の既定値を示す。
 
 ```mojo
 # net/http/headers.mojo
 struct Headers(Movable, Sized):
     def __init__(out self)
     def add(mut self, var name: String, var value: String) raises NetError
+    def add_bytes[origin: ImmOrigin](
+        mut self, var name: String, value: Span[Byte, origin]
+    ) raises NetError
     def clear(mut self)
     def get_first(self, name: StringSlice) -> Optional[String]
     def get_all(self, name: StringSlice) -> List[String]
     def count(self, name: StringSlice) -> Int
     def name_at(self, index: Int) -> String
     def value_at(self, index: Int) -> String
+    def value_bytes_at(self, index: Int) -> List[Byte]
+    def value_byte_length(self, index: Int) -> Int
 
 # net/http/request.mojo
 struct HttpVersion(Copyable, Equatable, Writable):
+    @staticmethod
     def http10() -> Self
+    @staticmethod
     def http11() -> Self
+    @staticmethod
+    def http2() -> Self
+    @staticmethod
+    def http3() -> Self
     def is_supported(self) -> Bool
 
 struct Request(Movable):
@@ -360,14 +368,48 @@ def split_path_query(target: StringSlice) -> Tuple[String, String]
 
 # net/http/response.mojo
 struct ResponseWriter(Movable, Sized):
-    def __init__(out self, body_limit: Int)
+    var status: Int
+    var headers: Headers
+    var body: List[Byte]
+    var should_close: Bool
+    def __init__(
+        out self,
+        body_limit: Int,
+        slot: Int = -1,
+        generation: UInt64 = 0,
+        wakeup_fd: Int32 = -1,
+        queue_limit: Int = 1048576,
+    )
     def set_status(mut self, status: Int)
     def set_should_close(mut self, should_close: Bool)
     def body_limit(self) -> Int
     def write[origin: ImmOrigin](mut self, data: Span[Byte, origin]) raises NetError
     def write_string(mut self, data: StringSlice) raises NetError
+    def is_detached(self) -> Bool
+    def detach(mut self) raises NetError -> ResponseSender
 
 def has_body_for_status(status: Int, is_head: Bool) -> Bool
+def maybe_inject_alt_svc(mut writer: ResponseWriter, alt_svc: StringSlice) raises
+
+# net/http/_detach.mojo
+struct ResponseSender(Movable):
+    def is_active(self) -> Bool
+    def is_cancelled(self) -> Bool
+    def respond(
+        mut self,
+        status: Int = 200,
+        var headers: Headers = Headers(),
+        var body: List[Byte] = List[Byte](),
+        should_close: Bool = False,
+    ) raises NetError
+    def start(
+        mut self, status: Int = 200, var headers: Headers = Headers()
+    ) raises NetError
+    def send[origin: ImmOrigin](
+        mut self, data: Span[Byte, origin]
+    ) raises NetError -> Bool
+    def finish(mut self) raises NetError
+    def abort(mut self)
 
 # net/http/handler.mojo
 trait Handler(Movable):
@@ -383,27 +425,43 @@ struct HttpError(Copyable, Movable, Writable):
 
 # net/http/config.mojo
 struct ServerConfig(Copyable, Movable):
-    var max_connections: Int              # 10,000
-    var max_http2_streams_per_connection: Int # 100
-    var max_request_line: Int             # 8 KiB
-    var max_headers_bytes: Int            # 32 KiB
-    var max_headers_count: Int            # 100
-    var max_body_bytes: Int               # 1 MiB
-    var max_chunk_metadata: Int           # 64 KiB
-    var max_trailer_bytes: Int            # 8 KiB
-    var max_trailer_count: Int            # 32
-    var max_response_body: Int            # 1 MiB
-    var max_response_headers_bytes: Int   # 32 KiB
-    var max_response_headers_count: Int   # 100
-    var total_buffer_budget: Int          # 256 MiB
-    var header_deadline: Timeout          # 5 s
-    var body_deadline: Timeout            # 30 s
-    var write_deadline: Timeout           # 30 s
-    var idle_timeout: Timeout             # 60 s
-    var shutdown_grace: Timeout           # 30 s
-    var max_accept_per_tick: Int          # 64
-    var max_bytes_per_tick: Int           # 64 KiB
-    var max_requests_per_tick: Int        # 16
+    var max_connections: Int                   # 10,000
+    var quic_max_transport_memory_bytes: Int    # 2,621,440,000
+    var quic_receive_request_bytes: Int         # 64 MiB
+    var quic_receive_request_slots: Int         # 65,536
+    var quic_receive_control_bytes: Int         # 4 MiB
+    var quic_receive_control_slots: Int         # 131,072
+    var quic_receive_crypto_bytes: Int          # 16 MiB
+    var quic_receive_crypto_slots: Int          # 131,072
+    var max_http2_streams_per_connection: Int    # 100
+    var http2_max_new_streams_per_second: Int    # 1,000,000
+    var http2_max_control_frames_per_second: Int # 1,000
+    var http2_max_resets_per_second: Int         # 100
+    var max_request_line: Int                   # 8 KiB
+    var max_headers_bytes: Int                  # 32 KiB
+    var max_headers_count: Int                  # 100
+    var max_body_bytes: Int                     # 1 MiB
+    var max_chunk_metadata: Int                 # 64 KiB
+    var max_trailer_bytes: Int                  # 8 KiB
+    var max_trailer_count: Int                  # 32
+    var max_response_body: Int                  # 1 MiB
+    var max_response_headers_bytes: Int         # 32 KiB
+    var max_response_headers_count: Int         # 100
+    var total_buffer_budget: Int                # 256 MiB
+    var header_deadline: Timeout                # 5 s
+    var body_deadline: Timeout                  # 30 s
+    var write_deadline: Timeout                 # 30 s
+    var tls_handshake_timeout: Timeout          # 10 s
+    var idle_timeout: Timeout                   # 60 s
+    var shutdown_grace: Timeout                 # 30 s
+    var detached_response_timeout: Timeout      # 30 s
+    var stream_queue_limit: Int                 # 1 MiB
+    var stream_idle_timeout: Timeout            # 300 s
+    var max_accept_per_tick: Int                # 64
+    var max_bytes_per_tick: Int                 # 64 KiB
+    var max_requests_per_tick: Int              # 16
+    var hpack_library_path: String              # "build/http2/libnet_hpack"
+    var alt_svc: String                         # ""（広告なし）
     @staticmethod
     def default() raises -> Self
 
@@ -414,20 +472,59 @@ struct ServerControl(Copyable, Movable):
     def is_shutdown_requested(self) -> Bool
     def mark_exited(self)
 
+# net/http/server.mojo
 struct Server(Movable):
-    def __init__(out self, var config: ServerConfig)
+    def __init__(out self, var config: ServerConfig) raises
     def is_shutdown_requested(self) -> Bool
     def request_shutdown(mut self)
-    def serve[H: Handler](mut self, var listener: TCPListener, mut handler: H) raises
+    def active_connections(self) -> Int
+    def add_listener(mut self, var listener: TCPListener) raises
+    def add_tls_listener(
+        mut self, var listener: TCPListener, var tls_context: TLSContext
+    ) raises
+    def add_quic_endpoint(mut self, var endpoint: QuicUDPEndpoint) raises
+    def tick[H: Handler](
+        mut self, mut handler: H, timeout: Optional[Timeout] = None
+    ) raises -> Bool
+    def serve[H: Handler](
+        mut self, var listener: TCPListener, mut handler: H
+    ) raises
+    def serve_tls[H: Handler](
+        mut self,
+        var listener: TCPListener,
+        var tls_context: TLSContext,
+        mut handler: H,
+    ) raises
+    def serve_with_control[H: Handler](
+        mut self,
+        var listener: TCPListener,
+        mut handler: H,
+        control: ServerControl,
+    ) raises
+    def local_address(self) raises NetError -> SocketAddress
 
 def listen_and_serve[H: Handler](
     address: StringSlice, var config: ServerConfig, mut handler: H
 ) raises
+def listen_and_serve_with_control[H: Handler](
+    address: StringSlice,
+    var config: ServerConfig,
+    mut handler: H,
+    control: ServerControl,
+) raises
 ```
 
-`serve` と `listen_and_serve` は Phase 0 では signature 固定のみで `not implemented`
-を返す。compile probe は `tests/test_http_api.mojo`（14 tests）で handler trait、
-借用 Request、buffer 所有権、control handle を確認する。
+`serve` と `listen_and_serve` はイベントループを実行し、shutdown の完了まで処理する。
+`add_listener`、`add_tls_listener`、`add_quic_endpoint` で transport を登録し、`tick` で 1 回の loop を実行できる。
+`tick` は listener と QUIC endpoint がなく、TCP 接続も残らない終了状態で `False` を返す。
+`active_connections()` は TCP 接続数を返す。
+`ResponseSender` は HTTP/1 の `ResponseWriter.detach()` から取得する。
+API の検証は `tests/test_http_api.mojo`で、handler trait、所有 Request、buffer 所有権、control handle を確認する。
+
+`quic_max_transport_memory_bytes` は、接続あたり 256 KiB を計上するソフトな admission estimate の上限である。
+`quic_receive_*_bytes` と `quic_receive_*_slots` は、request、uni control、CRYPTO の受信 backing bytes と状態／fragment entry を provider 全体で共有する独立した上限である。
+受信 pool の byte 上限は retained backing allocation、slot 上限は状態と fragment entry を数える。
+`total_buffer_budget` は server が計上する buffer 用の予算であり、native TLS、QUIC の送信状態、allocator overhead を含む全エンジンの RSS 上限を定めない。
 
 ### borrow 寿命
 
