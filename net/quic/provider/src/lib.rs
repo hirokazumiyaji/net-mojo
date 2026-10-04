@@ -811,6 +811,8 @@ pub struct QuicServer {
     send_ready: SendReadyQueue,
     transport_timeouts: BTreeSet<(Instant, Vec<u8>)>,
     request_timeouts: BTreeSet<(Instant, Vec<u8>, u64)>,
+    response_timeouts: BTreeSet<(Instant, Vec<u8>, u64)>,
+    idle_timeouts: BTreeSet<(Instant, Vec<u8>)>,
     routes: HashMap<Vec<u8>, Vec<u8>>,
     requests: VecDeque<CompletedRequest>,
     request_routes: HashMap<u64, (Vec<u8>, u64)>,
@@ -846,6 +848,7 @@ enum ShutdownState {
 struct QuicConnection {
     transport: Connection,
     transport_deadline_at: Option<Instant>,
+    indexed_idle_deadline_at: Option<Instant>,
     http3: Option<quiche::h3::Connection>,
     requests: HashMap<u64, PendingRequest>,
     /// Deadlines for request streams that have become readable but have not
@@ -965,6 +968,8 @@ impl QuicServer {
             send_ready: SendReadyQueue::default(),
             transport_timeouts: BTreeSet::new(),
             request_timeouts: BTreeSet::new(),
+            response_timeouts: BTreeSet::new(),
+            idle_timeouts: BTreeSet::new(),
             routes: HashMap::new(),
             requests: VecDeque::new(),
             request_routes: HashMap::new(),
@@ -1109,6 +1114,7 @@ impl QuicServer {
                     QuicConnection {
                         transport: connection,
                         transport_deadline_at: None,
+                        indexed_idle_deadline_at: None,
                         http3: None,
                         requests: HashMap::new(),
                         header_deadlines: HashMap::new(),
@@ -1135,8 +1141,9 @@ impl QuicServer {
             },
         );
         self.refresh_transport_timeout(&key);
+        self.refresh_idle_timeout(&key);
         received?;
-        {
+        let http3_error = {
             let connection = self.connections.get_mut(&key).unwrap();
             connection.idle_deadline_at = Some(Instant::now() + self.idle_timeout);
             if connection.transport.is_established() && connection.http3.is_none() {
@@ -1144,11 +1151,20 @@ impl QuicServer {
                     &mut connection.transport,
                     &self.http3_config,
                 ) {
-                    Ok(http3) => connection.http3 = Some(http3),
-                    Err(quiche::h3::Error::InternalError | quiche::h3::Error::Done) => (),
-                    Err(error) => return Err(error.into()),
+                    Ok(http3) => {
+                        connection.http3 = Some(http3);
+                        None
+                    }
+                    Err(quiche::h3::Error::InternalError | quiche::h3::Error::Done) => None,
+                    Err(error) => Some(error),
                 }
+            } else {
+                None
             }
+        };
+        self.refresh_idle_timeout(&key);
+        if let Some(error) = http3_error {
+            return Err(error.into());
         }
 
         let mut cancelled_requests = Vec::new();
@@ -1185,14 +1201,17 @@ impl QuicServer {
         for stream_id in touched {
             self.refresh_request_timeout(&key, stream_id);
         }
+        for (request_id, stream_id, deadline) in cancelled_requests {
+            self.response_timeouts
+                .remove(&(deadline, key.clone(), stream_id));
+            self.request_routes.remove(&request_id);
+        }
+        self.refresh_idle_timeout(&key);
         let Some(completed) = completed else {
             // CONNECTION_CLOSE is queued; keep the connection until send/drain
             // emits it and quiche reports the transport closed.
             return Ok(());
         };
-        for request_id in cancelled_requests {
-            self.request_routes.remove(&request_id);
-        }
         let source_ids: Vec<Vec<u8>> = self
             .connections
             .get(&key)
@@ -1275,6 +1294,17 @@ impl QuicServer {
             self.request_timeouts
                 .remove(&(*deadline, connection_key.to_vec(), *stream_id));
         }
+        if let Some(deadline) = connection.indexed_idle_deadline_at {
+            self.idle_timeouts
+                .remove(&(deadline, connection_key.to_vec()));
+        }
+        for (stream_id, response) in &connection.responses {
+            self.response_timeouts.remove(&(
+                response.write_deadline_at,
+                connection_key.to_vec(),
+                *stream_id,
+            ));
+        }
         let in_flight_bytes: usize = connection
             .requests
             .values()
@@ -1313,7 +1343,7 @@ impl QuicServer {
         connection: &mut QuicConnection,
         buffered_request_bytes: &mut usize,
         buffered_response_bytes: &mut usize,
-        cancelled_requests: &mut Vec<u64>,
+        cancelled_requests: &mut Vec<(u64, u64, Instant)>,
         touched: &mut HashSet<u64>,
         max_request_body_bytes: usize,
         max_request_headers_bytes: usize,
@@ -1664,7 +1694,11 @@ impl QuicServer {
                     }
                     if let Some(reset) = connection.responses.remove(&stream_id) {
                         *buffered_response_bytes -= reset.buffered_bytes;
-                        cancelled_requests.push(reset.request_id);
+                        cancelled_requests.push((
+                            reset.request_id,
+                            stream_id,
+                            reset.write_deadline_at,
+                        ));
                     }
                 }
                 Ok(_) => (),
@@ -1743,26 +1777,18 @@ impl QuicServer {
                 write_deadline_at: Instant::now() + self.write_deadline,
             },
         );
+        self.index_response_timeout(&connection_key, stream_id);
+        self.refresh_idle_timeout(&connection_key);
         true
     }
 
     fn drive_responses(&mut self) -> Result<(), QuicServerError> {
-        let now = Instant::now();
+        self.expire_responses();
         let mut completed = Vec::new();
-        let mut expired = Vec::new();
         for (connection_key, connection) in self.connections.iter_mut() {
             let stream_ids: Vec<u64> = connection.responses.keys().copied().collect();
             for stream_id in stream_ids {
                 let response = connection.responses.get_mut(&stream_id).unwrap();
-                if now >= response.write_deadline_at {
-                    expired.push((
-                        connection_key.clone(),
-                        stream_id,
-                        response.request_id,
-                        response.buffered_bytes,
-                    ));
-                    continue;
-                }
                 let Some(http3) = connection.http3.as_mut() else {
                     continue;
                 };
@@ -1809,16 +1835,8 @@ impl QuicServer {
                 }
             }
         }
-        for (connection_key, stream_id, request_id, buffered_bytes) in expired {
-            if let Some(connection) = self.connections.get_mut(&connection_key) {
-                connection.responses.remove(&stream_id);
-                self.send_ready.push(&connection_key);
-                cancel_http3_request(connection, stream_id, H3_REQUEST_REJECTED);
-            }
-            self.buffered_response_bytes -= buffered_bytes;
-            self.request_routes.remove(&request_id);
-        }
         for (connection_key, stream_id, request_id) in completed {
+            self.remove_response_timeout(&connection_key, stream_id);
             let response = self
                 .connections
                 .get_mut(&connection_key)
@@ -1828,6 +1846,7 @@ impl QuicServer {
                 .unwrap();
             self.buffered_response_bytes -= response.buffered_bytes;
             self.request_routes.remove(&request_id);
+            self.refresh_idle_timeout(&connection_key);
         }
         Ok(())
     }
@@ -1864,6 +1883,59 @@ impl QuicServer {
             }
         }
         Ok(None)
+    }
+
+    fn refresh_idle_timeout(&mut self, key: &[u8]) {
+        let connection = self.connections.get_mut(key).unwrap();
+        let deadline = if connection.requests.is_empty()
+            && connection.header_deadlines.is_empty()
+            && connection.responses.is_empty()
+        {
+            connection.idle_deadline_at
+        } else {
+            None
+        };
+        if connection.indexed_idle_deadline_at == deadline {
+            return;
+        }
+        if let Some(previous) = connection.indexed_idle_deadline_at.take() {
+            self.idle_timeouts.remove(&(previous, key.to_vec()));
+        }
+        connection.indexed_idle_deadline_at = deadline;
+        if let Some(deadline) = deadline {
+            self.idle_timeouts.insert((deadline, key.to_vec()));
+        }
+    }
+
+    fn index_response_timeout(&mut self, key: &[u8], stream_id: u64) {
+        let deadline = self.connections[key].responses[&stream_id].write_deadline_at;
+        self.response_timeouts
+            .insert((deadline, key.to_vec(), stream_id));
+    }
+
+    fn remove_response_timeout(&mut self, key: &[u8], stream_id: u64) {
+        let deadline = self.connections[key].responses[&stream_id].write_deadline_at;
+        self.response_timeouts
+            .remove(&(deadline, key.to_vec(), stream_id));
+    }
+
+    fn expire_responses(&mut self) {
+        let now = Instant::now();
+        while self
+            .response_timeouts
+            .first()
+            .is_some_and(|(deadline, _, _)| *deadline <= now)
+        {
+            let (_, key, stream_id) = self.response_timeouts.pop_first().unwrap();
+            let connection = self.connections.get_mut(&key).unwrap();
+            let response = connection.responses.remove(&stream_id).unwrap();
+            self.buffered_response_bytes -= response.buffered_bytes;
+            self.request_routes.remove(&response.request_id);
+            self.send_ready.push(&key);
+            cancel_http3_request(connection, stream_id, H3_REQUEST_REJECTED);
+            self.refresh_transport_timeout(&key);
+            self.refresh_idle_timeout(&key);
+        }
     }
 
     fn refresh_request_timeout(&mut self, key: &[u8], stream_id: u64) {
@@ -1954,17 +2026,13 @@ impl QuicServer {
             .first()
             .map(|(deadline, _, _)| deadline.saturating_duration_since(now));
         let response_timeout = self
-            .connections
-            .values()
-            .flat_map(|connection| connection.responses.values())
-            .map(|response| response.write_deadline_at.saturating_duration_since(now))
-            .min();
+            .response_timeouts
+            .first()
+            .map(|(deadline, _, _)| deadline.saturating_duration_since(now));
         let connection_idle_timeout = self
-            .connections
-            .values()
-            .filter_map(|connection| connection.idle_deadline_at)
-            .map(|deadline| deadline.saturating_duration_since(now))
-            .min();
+            .idle_timeouts
+            .first()
+            .map(|(deadline, _)| deadline.saturating_duration_since(now));
         let stream_timeout = [request_timeout, response_timeout, connection_idle_timeout]
             .into_iter()
             .flatten()
@@ -2016,32 +2084,22 @@ impl QuicServer {
             }
             cancel_http3_request(connection, stream_id, H3_REQUEST_REJECTED);
             self.refresh_transport_timeout(&key);
+            self.refresh_idle_timeout(&key);
         }
     }
 
     fn expire_idle_connections(&mut self) {
         let now = Instant::now();
-        let mut closed = Vec::new();
-        for (connection_key, connection) in &self.connections {
-            let Some(deadline) = connection.idle_deadline_at else {
-                continue;
-            };
-            if now < deadline {
-                continue;
-            }
-            if !connection.requests.is_empty()
-                || !connection.responses.is_empty()
-                || !connection.header_deadlines.is_empty()
-            {
-                continue;
-            }
-            closed.push(connection_key.clone());
-        }
-        for connection_key in closed {
-            if let Some(connection) = self.connections.get_mut(&connection_key) {
-                let _ = connection.transport.close(true, 0x00, b"idle timeout");
-            }
-            self.force_drop_connection(&connection_key);
+        while self
+            .idle_timeouts
+            .first()
+            .is_some_and(|(deadline, _)| *deadline <= now)
+        {
+            let (_, key) = self.idle_timeouts.pop_first().unwrap();
+            let connection = self.connections.get_mut(&key).unwrap();
+            connection.indexed_idle_deadline_at = None;
+            let _ = connection.transport.close(true, 0x00, b"idle timeout");
+            self.force_drop_connection(&key);
         }
     }
 
@@ -2157,6 +2215,7 @@ mod tests {
                 super::QuicConnection {
                     transport,
                     transport_deadline_at: None,
+                    indexed_idle_deadline_at: None,
                     http3: None,
                     requests: Default::default(),
                     header_deadlines: Default::default(),
@@ -2204,6 +2263,258 @@ mod tests {
         )
         .unwrap();
         (server, client, h3, local, remote)
+    }
+
+    #[test]
+    fn busy_request_disarms_expired_idle_until_request_phase_clears() {
+        let (mut server, mut client, mut h3, local, remote) = request_timer_peer();
+        let mut packet = [0; 65535];
+        let headers = [
+            quiche::h3::Header::new(b":method", b"POST"),
+            quiche::h3::Header::new(b":scheme", b"https"),
+            quiche::h3::Header::new(b":authority", b"localhost"),
+            quiche::h3::Header::new(b":path", b"/idle"),
+        ];
+        let id = h3.send_request(&mut client, &headers, false).unwrap();
+        h3.send_body(&mut client, id, b"busy", false).unwrap();
+        for _ in 0..32 {
+            pump_in_memory(
+                &mut client,
+                &mut server,
+                &mut packet,
+                local,
+                remote,
+                false,
+                false,
+            );
+        }
+        let key = server.connections.keys().next().unwrap().clone();
+        let now = std::time::Instant::now();
+        server.connections.get_mut(&key).unwrap().idle_deadline_at = Some(now);
+        server
+            .connections
+            .get_mut(&key)
+            .unwrap()
+            .requests
+            .get_mut(&id)
+            .unwrap()
+            .body_deadline_at = Some(now + Duration::from_secs(2));
+        server.refresh_request_timeout(&key, id);
+        server.refresh_idle_timeout(&key);
+        server.set_transport_timeout(&key, None);
+        assert!(
+            server.timeout().unwrap() > Duration::ZERO,
+            "busy requests must wait for their active phase, not expired connection idle"
+        );
+        assert!(server.idle_timeouts.is_empty());
+        server.expire_idle_connections();
+        assert!(server.connections.contains_key(&key));
+        server
+            .connections
+            .get_mut(&key)
+            .unwrap()
+            .requests
+            .get_mut(&id)
+            .unwrap()
+            .body_deadline_at = Some(now);
+        server.refresh_request_timeout(&key, id);
+        server.expire_incomplete_requests();
+        assert_eq!(server.idle_timeouts.first().unwrap().0, now);
+        assert_eq!(server.timeout(), Some(Duration::ZERO));
+        server.expire_idle_connections();
+        assert!(server.connections.is_empty());
+        assert!(server.idle_timeouts.is_empty());
+        assert!(server.request_timeouts.is_empty());
+        assert_eq!(server.buffered_request_bytes, 0);
+    }
+
+    #[test]
+    fn busy_response_disarms_expired_idle_and_expiry_releases_budget() {
+        let (mut server, mut client, mut h3, local, remote) = request_timer_peer();
+        let mut packet = [0; 65535];
+        let headers = [
+            quiche::h3::Header::new(b":method", b"GET"),
+            quiche::h3::Header::new(b":scheme", b"https"),
+            quiche::h3::Header::new(b":authority", b"localhost"),
+            quiche::h3::Header::new(b":path", b"/idle"),
+        ];
+        h3.send_request(&mut client, &headers, true).unwrap();
+        for _ in 0..32 {
+            pump_in_memory(
+                &mut client,
+                &mut server,
+                &mut packet,
+                local,
+                remote,
+                false,
+                false,
+            );
+        }
+        let request = server.next_request().unwrap();
+        let key = server.connections.keys().next().unwrap().clone();
+        assert!(server.enqueue_response(request.id, 200, Vec::new(), vec![42; 2_000_000]));
+        server.drive_responses().unwrap();
+        assert_eq!(server.connections[&key].responses.len(), 1);
+        let now = std::time::Instant::now();
+        server.connections.get_mut(&key).unwrap().idle_deadline_at = Some(now);
+        server.refresh_idle_timeout(&key);
+        server.set_transport_timeout(&key, None);
+        assert!(
+            server.timeout().unwrap() > Duration::ZERO,
+            "busy responses must wait for their write deadline"
+        );
+        let id = request.stream_id;
+        for _ in 0..1000 {
+            server.index_response_timeout(&key, id);
+        }
+        assert_eq!(server.response_timeouts.len(), 1);
+        assert!(server.idle_timeouts.is_empty());
+        server.remove_response_timeout(&key, id);
+        server
+            .connections
+            .get_mut(&key)
+            .unwrap()
+            .responses
+            .get_mut(&id)
+            .unwrap()
+            .write_deadline_at = now;
+        server.index_response_timeout(&key, id);
+        server.drive_responses().unwrap();
+        assert!(server.response_timeouts.is_empty());
+        assert_eq!(server.buffered_response_bytes, 0);
+        assert!(!server.request_routes.contains_key(&request.id));
+        assert_eq!(server.idle_timeouts.first().unwrap().0, now);
+        assert_eq!(server.timeout(), Some(Duration::ZERO));
+        server.expire_idle_connections();
+        assert!(server.connections.is_empty());
+    }
+
+    #[test]
+    fn response_completion_and_terminal_drop_remove_write_deadlines() {
+        for mode in 0..2 {
+            let (mut server, mut client, mut h3, local, remote) = request_timer_peer();
+            let mut packet = [0; 65535];
+            let headers = [
+                quiche::h3::Header::new(b":method", b"GET"),
+                quiche::h3::Header::new(b":scheme", b"https"),
+                quiche::h3::Header::new(b":authority", b"localhost"),
+                quiche::h3::Header::new(b":path", b"/idle"),
+            ];
+            h3.send_request(&mut client, &headers, true).unwrap();
+            for _ in 0..32 {
+                pump_in_memory(
+                    &mut client,
+                    &mut server,
+                    &mut packet,
+                    local,
+                    remote,
+                    false,
+                    false,
+                );
+            }
+            let request = server.next_request().unwrap();
+            let key = server.connections.keys().next().unwrap().clone();
+            assert!(server.enqueue_response(
+                request.id,
+                200,
+                Vec::new(),
+                if mode == 0 {
+                    vec![42; 4]
+                } else {
+                    vec![42; 2_000_000]
+                }
+            ));
+            let retained = server.buffered_response_bytes;
+            let original_deadline = server.response_timeouts.first().unwrap().0;
+            let mut provider = super::NetQuicServer { _inner: server };
+            let headers = [0u8; 4];
+            let body = b"duplicate";
+            assert_eq!(
+                unsafe {
+                    super::net_quic_server_respond(
+                        &mut provider,
+                        request.id,
+                        200,
+                        headers.as_ptr(),
+                        headers.len(),
+                        body.as_ptr(),
+                        body.len(),
+                    )
+                },
+                0
+            );
+            server = provider._inner;
+            assert_eq!(server.buffered_response_bytes, retained);
+            assert_eq!(server.response_timeouts.len(), 1);
+            assert_eq!(
+                server.response_timeouts.first().unwrap().0,
+                original_deadline
+            );
+            if mode == 0 {
+                server.drive_responses().unwrap();
+            } else {
+                server.force_drop_connection(&key);
+            }
+            assert!(server.response_timeouts.is_empty());
+            assert_eq!(server.buffered_response_bytes, 0);
+            assert!(!server.request_routes.contains_key(&request.id));
+        }
+    }
+
+    #[test]
+    fn idle_index_replaces_deadlines_disarms_and_allows_key_reuse() {
+        let mut server = super::QuicServer::new(stress_server_config()).unwrap();
+        insert_idle_transports(&mut server, 128);
+        let key = [0; 16];
+        let now = std::time::Instant::now();
+        for key in server.connections.keys().cloned().collect::<Vec<_>>() {
+            server.connections.get_mut(&key).unwrap().idle_deadline_at =
+                Some(now + Duration::from_secs(16));
+            server.refresh_idle_timeout(&key);
+        }
+        assert_eq!(server.idle_timeouts.len(), 128);
+        for tick in 0..1000 {
+            server
+                .connections
+                .get_mut(&key[..])
+                .unwrap()
+                .idle_deadline_at = Some(now + Duration::from_secs(8) + Duration::from_nanos(tick));
+            server.refresh_idle_timeout(&key);
+        }
+        assert_eq!(server.idle_timeouts.len(), 128);
+        server
+            .connections
+            .get_mut(&key[..])
+            .unwrap()
+            .idle_deadline_at = Some(now + Duration::from_secs(20));
+        server.refresh_idle_timeout(&key);
+        assert_ne!(server.idle_timeouts.first().unwrap().1, key);
+        server
+            .connections
+            .get_mut(&key[..])
+            .unwrap()
+            .idle_deadline_at = Some(now + Duration::from_secs(1));
+        server.refresh_idle_timeout(&key);
+        assert_eq!(server.idle_timeouts.first().unwrap().1, key);
+        server
+            .connections
+            .get_mut(&key[..])
+            .unwrap()
+            .idle_deadline_at = None;
+        server.refresh_idle_timeout(&key);
+        assert_eq!(server.idle_timeouts.len(), 127);
+        server.force_drop_connection(&key);
+        insert_idle_transports(&mut server, 1);
+        server
+            .connections
+            .get_mut(&key[..])
+            .unwrap()
+            .idle_deadline_at = Some(now);
+        server.refresh_idle_timeout(&key);
+        server.expire_idle_connections();
+        assert_eq!(server.connections.len(), 127);
+        assert_eq!(server.idle_timeouts.len(), 127);
+        assert!(!server.connections.contains_key(&key[..]));
     }
 
     #[test]
@@ -2334,6 +2645,7 @@ mod tests {
                 .header_deadlines
                 .contains_key(&id)
         );
+        assert!(server.idle_timeouts.is_empty());
         client
             .stream_shutdown(id, quiche::Shutdown::Write, 0x10c)
             .unwrap();
@@ -2358,6 +2670,7 @@ mod tests {
                 .contains_key(&id)
         );
         assert!(server.request_timeouts.is_empty());
+        assert_eq!(server.idle_timeouts.len(), 1);
         assert!(
             server
                 .connections
@@ -2469,12 +2782,14 @@ mod tests {
             .get_mut(&key[..])
             .unwrap()
             .idle_deadline_at = Some(now);
+        server.refresh_idle_timeout(&key);
         assert_eq!(server.timeout(), Some(Duration::ZERO));
         server
             .connections
             .get_mut(&key[..])
             .unwrap()
             .idle_deadline_at = None;
+        server.refresh_idle_timeout(&key);
         server.set_transport_timeout(&key, Some(now));
         assert_eq!(server.timeout(), Some(Duration::ZERO));
         server.set_transport_timeout(&key, None);
