@@ -261,25 +261,67 @@ settings and actual C/Mojo/HTTP configuration forwarding. Finite defaults keep
 the 1 MiB echo, cancellation/sibling/reuse and slow upload contracts. These
 84 MiB of backing capacities exclude allocator overhead, send/retransmission,
 TLS and other engine state; slot capacities count entries rather than bytes.
-They do not guarantee 10,000 simultaneous full handshakes. Flow-control windows
-and MAX_DATA are unchanged; independent control flow credit remains open.
+They do not guarantee 10,000 simultaneous full handshakes. Retained-byte pools
+are separate from the connection flow-credit policy below.
 
 These patches do not establish an allocator cap. The independent 64 MiB
 request/response counters count logical field/body bytes rather than Vec
 capacity, container entries or allocation overhead. Transport admission still
 uses the soft 256 KiB per-connection estimate; default admission budget is
-2,621,440,000 bytes. Initial receive credit is 10,000,000 connection bytes and
-1,000,000 bytes per stream, with quiche's default autotuned maxima of 24 MiB
-per connection and 16 MiB per stream. Out-of-order fragment metadata, native
+2,621,440,000 bytes. Initial connection credit and its maximum window are
+3,456,106,496 bytes (3.21875 GiB of offset credit), with 1,000,000 initial bytes
+per stream and a 16 MiB maximum stream window. Out-of-order fragment metadata, native
 response/retransmission copies and active H3 field buffers are outside those
 application counts. Three peer uni streams permit control/QPACK, but share
-connection MAX_DATA with requests; reserving control byte credit and measuring
-actual allocated capacities remain separate design units.
+connection MAX_DATA with requests; the connection envelope preserves allowance
+for their advertised windows. Whole-engine allocated capacities remain separate.
 
 Still deferred: enabling 0-RTT and full path migration. macOS Mojo end-to-end
 HTTP/3 is covered in CI (`http3` job on `macos-14`, `http3-client-test` against
 the Mojo fixture); only packaged-artifact distribution verification remains
 optional.
+
+## Connection credit for critical streams
+
+The provider keeps 100 peer bidi streams and three peer uni streams. With a
+16 MiB maximum stream window, total possible unconsumed offset exposure is
+R=(100+3)*16 MiB. Initial connection credit and its maximum receive window are
+C=2R=3,456,106,496 bytes. Per-stream credit, stream counts, body/field limits and
+finite shared receive pools are unchanged.
+
+After a connection update M=U0+C. Before the organic half-window update threshold,
+M-U>=R. Received but unconsumed request and uni exposure E_b+E_u is bounded by R.
+Connection remainder M-rx therefore covers at least R_u-E_u, the remaining allowed
+uni exposure. Once consumption crosses the threshold, control can queue MAX_DATA
+without reading held request bodies. Completed/reset stream retirement consumes
+its remaining horizon before replacement MAX_STREAMS credit, preserving the bound.
+Lost MAX_DATA may transiently block an older peer limit; ordinary recovery resends
+it. This is eventual progress under finite loss, not progress under permanent loss.
+
+The real TLS/H3 regression leaves eleven partial 1 MiB POST bodies unread after
+HEADERS. The former 10,000,000 connection limit rejects a valid 9-byte priority
+update despite available control stream and congestion allowance. The envelope
+permits that control update without request-body reads and preserves complete
+echoes, connection reuse and refunds. Pure source algebra covers the default
+window, prior consumption, strict half boundary and autotuning clamp. Separate
+genuine QUIC component tests use two bidi/one uni streams with 4096-byte maximum
+windows. They withhold an actually emitted MAX_DATA, deliver the later stream
+update, then reorder the original packet or drop it and recover via real PING,
+ACK and timer records. They preserve held request exposure through RESET and
+replacement. This reduced profile proves counter/recovery behavior, rather than
+default HTTP/3 throughput. A separate zero-table/zero-blocked HTTP/3 case
+legally delays the peer's QPACK streams until bodies are held. It proves the
+encoder type (one byte), decoder type plus a correctly encoded cancellation
+(two bytes), and one decoder instruction byte reach the parser without body
+reads. The cancellation refers to a separately abandoned unfinished response,
+with actual STOP_SENDING observed. This proves critical-stream byte progress,
+rather than dynamic QPACK instruction conformance.
+
+This is advertised offset credit, not allocated memory. The independent backing
+capacities total 84 MiB and exclude node/Arc overhead, send state, native TLS and
+RSS. Record the connection and stream flow settings with benchmark source revision;
+historical measurements used the earlier connection defaults. Formal memory and
+performance acceptance remains separate from this transport policy.
 
 ## Source material
 

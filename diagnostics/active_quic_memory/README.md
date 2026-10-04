@@ -53,9 +53,13 @@ pixi run -e tls-http3 cargo test --locked --release \
   -- --test-threads=1
 ```
 
-The diagnostic script stages fresh pinned source and all four ordered patches
-before every run and appends test-only helpers. It verifies that the production configuration still matches
-the explicit fixture values. It uses an independent cargo target directory and
+The diagnostic script stages fresh pinned source and the current ordered patches
+before every run and appends test-only helpers. Its allocation comparison keeps
+the expressly historical 10,000,000 connection / 1,000,000 initial stream credit
+profile and 100 bidi / three uni streams. The runner verifies those fixture
+values and records the current production helper and its hash separately; a
+production flow-credit change does not relabel previous allocation artifacts.
+It uses an independent cargo target directory and
 does not build or modify the parent integration worktree. Re-staging through a
 different build entrypoint removes these test additions; rerun this script.
 
