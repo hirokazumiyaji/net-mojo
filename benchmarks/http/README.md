@@ -168,6 +168,44 @@ checks are still required to establish that the generator is not saturated.
 
 ## Scenarios (from Issue #42)
 
+For the many-idle scenario, hold 9,900 idle sockets alongside 100 active
+original connections, for exactly 10,000 total:
+
+```bash
+/tmp/http-load -url http://127.0.0.1:18081/fixed -idle-connections 9900 -connections 100 -warmup 10s -duration 30s
+/tmp/http-load -url http://127.0.0.1:18080/fixed -idle-connections 9900 -connections 100 -warmup 10s -duration 30m
+```
+
+Use matching one-hour server idle deadlines as described above. The second
+command illustrates the separate 30-minute soak; repeat the 30-second scenario
+at least five times against each server. This mode requires `/fixed` and
+keepalive. Each idle socket completes a strict initial fixed-response handshake,
+receives no workload traffic through warmup/measurement, and completes the same
+strict handshake on its original socket afterward. No reconnect can replace a
+lost idle socket. Only initial/final confirmed counts are reported; final
+confirmation detects EOF, reset or invalid replies and is required for validity.
+
+Each active worker owns a client pinned to one preflight-confirmed original
+socket. Reconnection attempts, `Connection: close`, local closure before the
+measurement deadline or a worker unused during measurement invalidate the row.
+Deadline cancellation remains explicit cutoff. Ordinary mode keeps the shared
+client behavior. Setup/postflight each have a separate two-minute deadline
+(`-connection-check-timeout`), with the existing `-timeout` bounding individual
+operations. Their elapsed times are recorded outside the workload window.
+
+The `idle_connections` result object records requested total, confirmed idle
+initial/final and active initial counts, measured active use, forbidden
+replacement attempts, early active closures, setup/postflight times and the
+loader's effective soft/hard FD limits, read inside the running Go process.
+Go can raise its own soft limit at startup, so an inherited launcher value is
+insufficient. Requests exceeding that loader limit fail before
+dialing; other setup failures retain partial confirmed counts and fail the row.
+Sockets close on every exit path. The loader's limit does not describe the
+server's limit: record the actual server FD limit and configured buffer budget
+separately, together with timestamped server/client CPU, RSS and FD samples.
+Short functional probes do not satisfy the exact 10,000-connection or 30-minute
+soak evidence requirements.
+
 | Scenario | Conditions |
 | --- | --- |
 | Small fixed response | GET 64 B body, connections 1 / 64 / 1024 |

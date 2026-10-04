@@ -42,14 +42,14 @@ func arrivalOffset(index uint64, rate int) time.Duration {
 	return time.Duration(n)
 }
 
-func runPhase(client *http.Client, c config, w workload, duration time.Duration, sample bool) phaseResult {
+func runPhase(clients []*http.Client, c config, w workload, duration time.Duration, sample bool) phaseResult {
 	if c.Rate == 0 {
-		return phase(client, c, w, duration, sample)
+		return phase(clients, c, w, duration, sample)
 	}
-	return arrivalPhase(client, c, w, duration, sample)
+	return arrivalPhase(clients, c, w, duration, sample)
 }
 
-func arrivalPhase(client *http.Client, c config, w workload, duration time.Duration, sample bool) phaseResult {
+func arrivalPhase(clients []*http.Client, c config, w workload, duration time.Duration, sample bool) phaseResult {
 	scheduled, _ := arrivalCount(duration, c.Rate)
 	jobs := make(chan time.Time, c.Connections)
 	start := make(chan struct{})
@@ -63,6 +63,7 @@ func arrivalPhase(client *http.Client, c config, w workload, duration time.Durat
 	var deadline time.Time
 	var ctx context.Context
 	for i := 0; i < c.Connections; i++ {
+		client := clients[i]
 		go func() {
 			ready.Done()
 			<-start
@@ -134,7 +135,7 @@ func arrivalPhase(client *http.Client, c config, w workload, duration time.Durat
 	}
 	wait(deadline)
 	close(jobs)
-	total := phaseResult{window: newPhaseWindow(begin, deadline)}
+	total := phaseResult{window: newPhaseWindow(begin, deadline), deadline: deadline}
 	var service, lag []time.Duration
 	for i := 0; i < c.Connections; i++ {
 		r := <-results
