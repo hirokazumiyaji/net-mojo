@@ -65,14 +65,20 @@ Transport packet sends use a deduplicated ready-connection queue. Receive,
 response, timeout and shutdown work mark the affected connection; successful
 sends rotate it after one packet. Idle connections are not probed for every
 send, and terminal cleanup removes their queued keys. Response-stream driving
-and global deadline selection still use scans pending separate scheduler work.
+and response/connection-idle deadlines still use scans pending separate scheduler work.
 
 Transport deadlines use an ordered index with at most one absolute entry per
 live connection. Receive, send, transport timeout and close outcomes refresh the
 entry; terminal removal deletes it directly. Only due transport keys are
-visited for quiche timeout dispatch. Application deadline selection/expiration
-and the terminal sweep still scan their state, so overall timeout work is not
-yet proportional only to due connections.
+visited for quiche timeout dispatch.
+
+Request deadlines use one indexed minimum per incomplete stream across header,
+body and request-idle phases. Receive processing refreshes only streams touched
+by readable headers or HTTP/3 events, including errors. Completion, reset,
+expiration and connection removal directly remove their entries; resets also
+clear incomplete-header state. Response/connection-idle deadlines and the
+terminal sweep still scan their state, so overall timeout work is not yet
+proportional only to due connections.
 
 ### Canceled HTTP/3 request state
 
