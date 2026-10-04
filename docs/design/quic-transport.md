@@ -94,6 +94,11 @@ provider does not allocate additional source IDs, and quiche retains its last
 source ID across retirement errors and closure; no global CID ownership scan
 or additional ownership map is needed.
 
+Completed request routes have a per-connection set of owned IDs. Handler
+delivery retains ownership until response completion, cancellation, rejection
+or expiry. Connection teardown removes only those IDs from the global route
+map; the set holds one entry per live route.
+
 Each initial shutdown stage broadcasts to live connections once. Subsequent
 GOAWAY driving uses a bounded deduplicated queue of connections with unfinished
 flags, refreshed by receive, native timeout and local cancellation events.
@@ -129,7 +134,7 @@ request receive side has finished; queued provider responses satisfy that
 completed-request condition. Sibling streams and subsequent requests continue.
 
 Initial shutdown broadcasts still visit every live connection, and actual
-connection teardown still scans request-route/completed-request ownership. The
+connection teardown still scans the completed-request FIFO. The
 full server loop is not yet proportional only to ready or due work.
 
 ### Canceled HTTP/3 request state
