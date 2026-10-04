@@ -64,6 +64,14 @@ expires.
 
 ## Remaining protocol work
 
+Cancelled request uploads terminate both directions of the QUIC stream. The
+provider closes its send direction when it receives a reset, including uploads
+that never produced a response, so repeated cancellations return bidirectional
+stream credit. An in-memory regression cancels 105 requests against the initial
+100-stream allowance and then completes another request on the same connection.
+This proves stream-credit and application-request-budget release; it does not
+measure the QUIC engine's total retained memory.
+
 The QUIC engine supplies HTTP/3 control and QPACK behavior; the application does
 not implement duplicate control streams or a second QPACK implementation.
 Interoperability coverage currently uses aioquic 1.3.0 and quiche. Issue #42
@@ -78,7 +86,7 @@ present in every worktree tip):
 | Opt-in HTTPS `Alt-Svc` + same-origin TCP/UDP docs | Done — [PR #77](https://github.com/hirokazumiyaji/net-mojo/pull/77) + this ops PR |
 | Application datagram reorder + reset-storm siblings | Done — [PR #78](https://github.com/hirokazumiyaji/net-mojo/pull/78) |
 | Measured H2 / H3 benches | Done — [PR #79](https://github.com/hirokazumiyaji/net-mojo/pull/79)–[#80](https://github.com/hirokazumiyaji/net-mojo/pull/80) |
-| Multiplex matrix + special scenarios | Partially done — [PR #81](https://github.com/hirokazumiyaji/net-mojo/pull/81) records the H2/H3 throughput matrix and specials for Go/aioquic under the current single-connection harness in `benchmarks/http/README.md`; `h2 \| Mojo` specials are not run (Mojo build blocked on this host) and `h3 \| Mojo` specials predate the current criteria (†); H2 loss still needs a root-capable host for pf/dummynet |
+| Multiplex matrix + special scenarios | Partially done — [PR #81](https://github.com/hirokazumiyaji/net-mojo/pull/81) records the H2/H3 throughput matrix and specials for Go/aioquic. The current H3 slow/cancel/loss checks pass after reset-credit cleanup; see the 2026-10-04 validation in `benchmarks/http/README.md`. H2 Mojo specials, valid H2 loss measurements and formal full-duration comparisons remain pending |
 
 Still deferred / out of scope for #42: server push, CONNECT, enabling 0-RTT,
 broader independent-client matrices beyond aioquic/quiche, and CI workflow edits.
