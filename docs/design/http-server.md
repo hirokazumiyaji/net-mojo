@@ -549,7 +549,14 @@ handler は一つずつ実行し、Request は handler 終了時、detach の採
 quiche の opt-in `Config::set_send_budget()` は、各送信 view の `AsRef` backing bytes と、owner および実際に確保された deque cell の数を、受信 pool と独立して計上する。
 ACK は破棄された backing を返却し、空になった deque の再利用可能な容量は reset、CRYPTO clear、Drop まで計上を保つ。
 TLS callback で検出した送信 quota 超過は handshake 処理から `SendBufferExceeded` として返り、HTTP/3 control stream の初期化も同じエラーを返す。TLS は QUIC の非 application `INTERNAL_ERROR` として終了し、HTTP/3 初期化はこの quota エラーを汎用の application error に変換しない。
-provider の送信 pool 設定は含まず、既定の送信上限は無制限のままである。任意の `BufFactory` が隠す追加の allocation は計上対象外である。
+provider は接続間で共有する送信 pool を設定し、request/response は 128 MiB、control は 8 MiB、CRYPTO は 64 MiB、各 pool の owner/deque cell は 524,288 個を上限とする。
+受信 pool は独立しており、engine 単体の既定の送信上限は無制限のままである。
+任意の `BufFactory` が隠す追加の allocation や TLS/recovery metadata、プロセス全体の RSS はこの計上対象に含まれず、任意の 10,000 接続の同時 handshake を保証する上限ではない。
+
+送信 quota 超過は、対象接続だけを QUIC の非 application `INTERNAL_ERROR` (0x1) で終了させる。
+provider の待機中 request/response と論理予算は回収し、native の送信 storage と接続は実際の close/drain、ACK、reset、epoch clear、Drop に従って保持または解放する。
+他の接続は処理を継続し、通常の TLS/H3 エラーの分類は保持する。
+admission 前の quota 超過は Initial を拒否し、設定を固定しない。
 
 ### borrow 寿命
 
