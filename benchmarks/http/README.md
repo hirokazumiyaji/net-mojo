@@ -72,6 +72,14 @@ controlled comparison runs to establish client capacity or server efficiency.
 
 ## Saturated HTTP/1 load
 
+The dedicated Mojo HTTP/1 benchmark records a one-hour idle deadline, a
+10,000-connection limit and its configured buffer budget at startup. Match that
+deadline with `http_go -idle-timeout 1h` for HTTP/1 comparisons, including the
+many-idle and 30-minute soak scenarios. The Go flag defaults to 60 seconds for
+existing HTTPS/HTTP2 runs; zero or negative values are rejected. Production
+`ServerConfig.default()` still uses a 60-second idle deadline. Header, body and
+write deadlines retain their existing 5/30/30-second settings on both sides.
+
 Build the independent Go standard-library loader with Go 1.26.4:
 
 ```bash
