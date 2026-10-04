@@ -1,0 +1,163 @@
+--- a/src/range_buf.rs
++++ b/src/range_buf.rs
+@@ -156,6 +156,17 @@
+     }
+ }
+ 
++impl RangeBuf<DefaultBufFactory> {
++    pub(crate) fn compact_receive_view(self) -> Self {
++        if self.data.as_ref().len() > self.len() {
++            // A trimmed receive range must not retain a whole incoming frame.
++            return Self::from(&self, self.off(), self.fin());
++        }
++
++        self
++    }
++}
++
+ impl<F: BufFactory> Deref for RangeBuf<F> {
+     type Target = [u8];
+ 
+@@ -184,3 +195,48 @@
+         self.off == other.off
+     }
+ }
++
++#[cfg(test)]
++mod receive_view_compaction {
++    use super::*;
++
++    #[test]
++    fn ordinary_buffer_keeps_backing() {
++        let buf: RangeBuf = RangeBuf::from(b"abcdefgh", 20, true);
++        let pointer = buf.data.as_ref().as_ptr();
++        let compact = buf.compact_receive_view();
++        assert_eq!(compact.data.as_ref().as_ptr(), pointer);
++        assert_eq!(&compact[..], b"abcdefgh");
++        assert_eq!(
++            (compact.off(), compact.max_off(), compact.fin()),
++            (20, 28, true)
++        );
++    }
++
++    #[test]
++    fn current_view_keeps_bytes_offset_and_fin() {
++        let mut buf: RangeBuf = RangeBuf::from(b"abcdefgh", 20, true);
++        buf.consume(2);
++        let mut tail = buf.split_off(6);
++        tail.consume(1);
++        let compact = tail.compact_receive_view();
++        assert_eq!(&compact[..], b"h");
++        assert_eq!(compact.data.as_ref().len(), 1);
++        assert_eq!(
++            (compact.off(), compact.max_off(), compact.fin()),
++            (27, 28, true)
++        );
++    }
++
++    #[test]
++    fn empty_fin_keeps_final_offset() {
++        let mut buf: RangeBuf = RangeBuf::from(b"abc", 30, true);
++        buf.consume(3);
++        let compact = buf.compact_receive_view();
++        assert_eq!(compact.data.as_ref().len(), 0);
++        assert_eq!(
++            (compact.off(), compact.max_off(), compact.fin()),
++            (33, 33, true)
++        );
++    }
++}
+--- a/src/stream/recv_buf.rs
++++ b/src/stream/recv_buf.rs
+@@ -188,6 +188,7 @@
+             self.len = cmp::max(self.len, buf.max_off());
+ 
+             if !self.drain {
++                let buf = buf.compact_receive_view();
+                 self.data.insert(buf.max_off(), buf);
+             } else {
+                 // we are not storing any data, off == len
+@@ -1236,3 +1237,83 @@
+         assert_emit_discard_done(&mut recv, false);
+     }
+ }
++
++#[cfg(test)]
++mod receive_view_compaction {
++    use super::*;
++
++    fn receiver() -> RecvBuf {
++        RecvBuf::new(100, 100, 100)
++    }
++
++    fn assert_body(recv: &mut RecvBuf, expected: &[u8]) {
++        let mut body = vec![0; expected.len()];
++        assert_eq!(recv.emit(&mut body), Ok((expected.len(), true)));
++        assert_eq!(&body[..], expected);
++        assert!(recv.data.is_empty());
++    }
++
++    #[test]
++    fn prefix_overlap_preserves_tail_fin() {
++        let mut recv = receiver();
++        recv.write(RangeBuf::from(b"abcd", 0, false)).unwrap();
++        recv.write(RangeBuf::from(b"cdefgh", 2, true)).unwrap();
++        assert_eq!(recv.data.len(), 2);
++        assert_eq!(recv.max_off(), 8);
++        assert_body(&mut recv, b"abcdefgh");
++    }
++
++    #[test]
++    fn suffix_overlap_preserves_existing_end() {
++        let mut recv = receiver();
++        recv.write(RangeBuf::from(b"efgh", 4, false)).unwrap();
++        recv.write(RangeBuf::from(b"abcdef", 0, false)).unwrap();
++        recv.write(RangeBuf::from(b"", 8, true)).unwrap();
++        assert_eq!(recv.data.len(), 2);
++        assert_eq!(recv.max_off(), 8);
++        assert_body(&mut recv, b"abcdefgh");
++    }
++
++    #[test]
++    fn islands_keep_all_novel_ranges() {
++        let mut recv = receiver();
++        recv.write(RangeBuf::from(b"cd", 2, false)).unwrap();
++        recv.write(RangeBuf::from(b"gh", 6, false)).unwrap();
++        recv.write(RangeBuf::from(b"kl", 10, false)).unwrap();
++        recv.write(RangeBuf::from(b"abcdefghijklmn", 0, true)).unwrap();
++        assert_eq!(recv.data.len(), 7);
++        assert_eq!(recv.max_off(), 14);
++        assert_body(&mut recv, b"abcdefghijklmn");
++    }
++
++    #[test]
++    fn consumed_prefix_preserves_remaining_bytes() {
++        let mut recv = receiver();
++        recv.write(RangeBuf::from(b"abcdef", 0, false)).unwrap();
++        let mut prefix = [0; 4];
++        assert_eq!(recv.emit(&mut prefix), Ok((4, false)));
++        assert_eq!(&prefix, b"abcd");
++        let existing = recv.data.first_key_value().unwrap().1;
++        let pointer = &existing[0] as *const u8;
++        assert_eq!((existing.start, existing.pos, existing.len), (0, 4, 6));
++        recv.write(RangeBuf::from(b"cdefgh", 2, true)).unwrap();
++        let existing = recv.data.first_key_value().unwrap().1;
++        assert_eq!(&existing[0] as *const u8, pointer);
++        assert_eq!((existing.start, existing.pos, existing.len), (0, 4, 6));
++        assert_eq!(recv.data.len(), 2);
++        assert_body(&mut recv, b"efgh");
++    }
++
++    #[test]
++    fn trimmed_empty_fin_preserves_final_size() {
++        let mut recv = receiver();
++        let mut fin = RangeBuf::from(b"xyz", 3, true);
++        fin.consume(3);
++        recv.write(fin).unwrap();
++        assert_eq!(recv.max_off(), 6);
++        assert_eq!(recv.fin_off, Some(6));
++        assert_eq!(recv.data.len(), 1);
++        recv.write(RangeBuf::from(b"abcdef", 0, false)).unwrap();
++        assert_body(&mut recv, b"abcdef");
++    }
++}

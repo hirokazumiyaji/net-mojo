@@ -67,7 +67,7 @@ mod active_receive_allocation_diagnostic {
             Pattern::Sparse => BODY - 1,
             Pattern::Overlap => BODY - CHUNK,
         };
-        let backing = if matches!(pattern, Pattern::Overlap) { nodes * CHUNK } else { BODY - 1 };
+        let backing = BODY - 1;
         (nodes, BODY - 1, backing)
     }
 
@@ -207,6 +207,6 @@ mod active_receive_allocation_diagnostic {
             assert!(reset < *held.last().unwrap());
         }
         assert!(held[1] > held[0]);
-        assert!(held[2] > held[1]);
+        assert!(held[2] < held[1]);
     }
 }
