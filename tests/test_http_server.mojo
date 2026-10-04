@@ -1,4 +1,5 @@
 from std.testing import assert_equal, assert_false, assert_true, TestSuite
+from std.sys import size_of
 from std.time import perf_counter_ns, sleep
 
 from net import TCPConn, Timeout, dial_tcp, listen_tcp
@@ -9,6 +10,7 @@ from net.http._buffer import BufferBudget, SharedBufferBudget
 from net.http._connection import HttpConnection, STATE_SENDING_100
 from net.http._deadline import now_ns
 from net.http import (
+    Headers,
     Handler,
     Request,
     ResponseWriter,
@@ -870,6 +872,217 @@ def test_handler_writer_charges_only_its_body_and_allows_foreign_admission() rai
     assert_true(handler.foreign_admitted)
     assert_equal(handler.with_body, 15)
     assert_equal(server._budget.used(), 0)
+
+
+struct _HeaderCapacityHandler(Handler):
+    var budget: SharedBufferBudget
+    var before: Int
+    var after: Int
+    var names_capacity: Int
+    var lower_capacity: Int
+    var values_capacity: Int
+    var raw_capacity: Int
+    var raw_matches: Bool
+
+    def __init__(out self, var budget: SharedBufferBudget):
+        self.budget = budget^
+        self.before = -1
+        self.after = -1
+        self.names_capacity = -1
+        self.lower_capacity = -1
+        self.values_capacity = -1
+        self.raw_capacity = -1
+        self.raw_matches = False
+
+    def handle(mut self, req: Request, mut writer: ResponseWriter) raises:
+        var value = Array[Byte, 64](fill=Byte(ord("a")))
+        self.before = self.budget.used()
+        writer.headers.add_bytes(String("X-Probe"), Span(value))
+        self.after = self.budget.used()
+        self.names_capacity = writer.headers._names.capacity()
+        self.lower_capacity = writer.headers._lower_names.capacity()
+        self.values_capacity = writer.headers._values.capacity()
+        self.raw_capacity = writer.headers._values[0].capacity()
+        self.raw_matches = len(writer.headers._values[0]) == 64
+        for i in range(len(writer.headers._values[0])):
+            self.raw_matches = (
+                self.raw_matches and writer.headers._values[0][i] == value[i]
+            )
+        writer.set_status(204)
+
+
+def test_http1_handler_charges_owned_header_backing_before_return() raises:
+    var server = Server(ServerConfig.default())
+    server.add_listener(listen_tcp("127.0.0.1:0"))
+    var observer = server._budget.copy()
+    var foreign_admitted = observer.try_reserve(5)
+    var handler = _HeaderCapacityHandler(observer.copy())
+    var client = dial_tcp(
+        String("127.0.0.1:") + String(server.local_address().port),
+        Timeout.seconds(1),
+    )
+    client.write_all(
+        "GET / HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n".as_bytes(),
+        Timeout.seconds(1),
+    )
+    var out = List[Byte]()
+    var scratch = Array[Byte, 1024](fill=0)
+    var eof = False
+    var unexpected_io = False
+    var expires = Int(perf_counter_ns()) + 2_000_000_000
+    while not eof and Int(perf_counter_ns()) < expires:
+        _ = server.tick(handler, Timeout.milliseconds(1))
+        try:
+            var count = client.try_read(Span(scratch))
+            if count == 0:
+                eof = True
+            else:
+                out.extend(Span(scratch)[0:count])
+        except error:
+            if error.kind != NetErrorKind.timeout():
+                unexpected_io = True
+                break
+    client.close()
+    server.request_shutdown()
+    var stopped = False
+    expires = Int(perf_counter_ns()) + 2_000_000_000
+    while not stopped and Int(perf_counter_ns()) < expires:
+        stopped = not server.tick(handler, Timeout.milliseconds(1))
+    var active = server.active_connections()
+    var before_owner_drop = observer.used()
+    var before = handler.before
+    var after = handler.after
+    var names_capacity = handler.names_capacity
+    var lower_capacity = handler.lower_capacity
+    var values_capacity = handler.values_capacity
+    var raw_capacity = handler.raw_capacity
+    var raw_matches = handler.raw_matches
+    _ = server^
+    var after_owner_drop = observer.used()
+    if foreign_admitted:
+        observer.release(5)
+    var after_refund = observer.used()
+    _ = handler^
+
+    assert_true(foreign_admitted)
+    assert_false(unexpected_io)
+    assert_true(eof)
+    assert_true(stopped)
+    assert_equal(active, 0)
+    assert_equal(before_owner_drop, 5)
+    assert_equal(after_owner_drop, 5)
+    assert_equal(after_refund, 0)
+    assert_equal(_status_of(out), 204)
+    var wire = String(from_utf8_lossy=Span(out))
+    assert_true(wire.find("\r\nX-Probe: " + String("a") * 64 + "\r\n") >= 0)
+    assert_true(raw_matches)
+    assert_equal(names_capacity, 1)
+    assert_equal(lower_capacity, 1)
+    assert_equal(values_capacity, 1)
+    assert_equal(raw_capacity, 64)
+    var known = (
+        names_capacity * size_of[String]()
+        + lower_capacity * size_of[String]()
+        + values_capacity * size_of[List[Byte]]()
+        + raw_capacity
+    )
+    assert_equal(known, 64 + 2 * size_of[String]() + size_of[List[Byte]]())
+    assert_equal(after - before, known)
+
+
+struct _HeaderAdoptionErrorHandler(Handler):
+    var budget: SharedBufferBudget
+    var mode: Int
+    var foreign: Int
+
+    def __init__(out self, var budget: SharedBufferBudget, mode: Int):
+        self.budget = budget^
+        self.mode = mode
+        self.foreign = 0
+
+    def handle(mut self, req: Request, mut writer: ResponseWriter) raises:
+        var room: Int
+        if self.mode < 2:
+            var headers = Headers()
+            headers.add(String("X-Owned"), String("a"))
+            headers._values[0].reserve(256)
+            writer.headers = headers^
+            comptime known = 256 + 2 * size_of[String]() + size_of[List[Byte]]()
+            room = known + 128 if self.mode == 0 else known - 1
+            writer.set_status(204)
+        else:
+            if self.mode == 2:
+                var raw = Array[Byte, 64](fill=97)
+                writer.headers.add_bytes(String("X-Owned"), Span(raw))
+            else:
+                writer.headers.add(
+                    String("Transfer-Encoding"), String("chunked")
+                )
+            var known = (
+                writer.headers._names.capacity() * size_of[String]()
+                + writer.headers._lower_names.capacity() * size_of[String]()
+                + writer.headers._values.capacity() * size_of[List[Byte]]()
+                + writer.headers._values[0].capacity()
+            )
+            room = (140 if req.method == "HEAD" else 165) - known
+        self.foreign = self.budget.remaining() - room
+        assert_true(self.budget.try_reserve(self.foreign))
+        if self.mode == 2:
+            raise Error("after budgeted header")
+
+
+def _check_header_replacement_and_error(mode: Int, is_head: Bool) raises:
+    var server = Server(ServerConfig.default())
+    server.add_listener(listen_tcp("127.0.0.1:0"))
+    var observer = server._budget.copy()
+    assert_true(observer.try_reserve(5))
+    var handler = _HeaderAdoptionErrorHandler(observer.copy(), mode)
+    var client = dial_tcp(
+        String("127.0.0.1:") + String(server.local_address().port),
+        Timeout.seconds(1),
+    )
+    var method = String("HEAD") if is_head else String("GET")
+    client.write_all(
+        (
+            method + " / HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n"
+        ).as_bytes(),
+        Timeout.seconds(1),
+    )
+    var response = _drain_head_error_to_eof(server, handler, client)
+    client.close()
+    var retained_foreign = 5 + handler.foreign
+    var remaining = observer.used()
+    observer.release(retained_foreign)
+    _ = server^
+    _ = handler^
+    assert_equal(remaining, retained_foreign)
+    assert_equal(observer.used(), 0)
+    assert_equal(_status_of(response), 204 if mode == 0 else 500)
+    if mode == 0:
+        assert_true(
+            String(from_utf8_lossy=Span(response)).find("\r\nX-Owned: a\r\n")
+            >= 0
+        )
+    else:
+        var wire = String(from_utf8_lossy=Span(response))
+        assert_true(wire.find("\r\nContent-Length: 25\r\n") >= 0)
+        assert_true(
+            wire.endswith("\r\n\r\n") if is_head else wire.endswith(
+                "\r\n\r\n500 Internal Server Error"
+            )
+        )
+
+
+def test_http1_header_replacement_admits_retained_capacity() raises:
+    for mode in [0, 1]:
+        for is_head in [False, True]:
+            _check_header_replacement_and_error(mode, is_head)
+
+
+def test_http1_header_error_destroys_backing_before_wire_reservation() raises:
+    for mode in [2, 3]:
+        for is_head in [False, True]:
+            _check_header_replacement_and_error(mode, is_head)
 
 
 struct _RequestWorkspaceHandler(Handler):

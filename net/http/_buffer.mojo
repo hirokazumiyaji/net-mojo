@@ -16,8 +16,10 @@ detached state reserves its requested malloc payload until final free. Detached
 message bodies retain adopted capacity reservations through their destruction;
 send reserves exact chunk capacity before allocation. Streaming wire reserves
 exact start/chunk/end capacity before allocation and transfers its charge into
-pending storage, retaining old + incoming + new growth peaks. Header and String
-allocations remain separate.
+pending storage, retaining old + incoming + new growth peaks. Response Headers
+charge their three List arrays and raw value capacities through owned tickets;
+grouped growth reserves full new arrays while the old storage stays charged.
+String backing/scratch and request/parser Header admission remain separate.
 """
 
 from std.memory import ArcPointer
@@ -109,6 +111,36 @@ struct SharedBufferBudget(Copyable, _CapacityBudget):
         self._state[].mutex.lock()
         self._state[].budget.release(amount)
         self._state[].mutex.unlock()
+
+    def _shares_storage(self, other: Self) -> Bool:
+        return self._state.ptr() == other._state.ptr()
+
+
+struct _CapacityTicket(Movable):
+    var budget: Optional[SharedBufferBudget]
+    var amount: Int
+
+    def __init__(
+        out self,
+        var budget: Optional[SharedBufferBudget] = None,
+        amount: Int = 0,
+    ):
+        self.budget = budget^
+        self.amount = amount
+
+    def _try_reserve(mut self, amount: Int) -> Bool:
+        if self.budget and not self.budget.value().try_reserve(amount):
+            return False
+        self.amount = amount
+        return True
+
+    def release(mut self):
+        if self.budget:
+            self.budget.value().release(self.amount)
+        self.amount = 0
+
+    def __deinit__(deinit self):
+        self.release()
 
 
 def _reserve_capacity[

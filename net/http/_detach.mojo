@@ -9,7 +9,8 @@ Architecture (Erlang-inspired Actor / Message-Passing):
   and reactor interests.
 - `ResponseSender` acts as a movable actor endpoint / proxy.
 - A copied budget capability charges state allocation until its last reference frees
-  it, and message arrays/bodies through queue/batch ownership. Headers remain separate.
+  it, and message arrays/bodies through queue/batch ownership. Headers retain their
+  known array/raw value ticket; String backing and scratch remain separate.
 - Data messages use a mutex-protected mailbox; ordered finish/abort state requires
   no additional message allocation.
 - A non-blocking wakeup file descriptor (via `socketpair`) notifies the reactor
@@ -23,7 +24,11 @@ from std.sys import size_of
 
 from net._actor import PthreadMutex, signal_wakeup_fd
 from net.error import NetError, NetErrorKind
-from net.http._buffer import SharedBufferBudget, _reserve_capacity
+from net.http._buffer import (
+    SharedBufferBudget,
+    _CapacityTicket,
+    _reserve_capacity,
+)
 from net.http.headers import Headers
 
 
@@ -33,33 +38,6 @@ comptime MSG_KIND_START: UInt8 = 2
 comptime MSG_KIND_CHUNK: UInt8 = 3
 comptime MSG_KIND_FINISH: UInt8 = 4
 comptime MSG_KIND_ABORT: UInt8 = 5
-
-
-struct _CapacityTicket(Movable):
-    var budget: Optional[SharedBufferBudget]
-    var amount: Int
-
-    def __init__(
-        out self,
-        var budget: Optional[SharedBufferBudget] = None,
-        amount: Int = 0,
-    ):
-        self.budget = budget^
-        self.amount = amount
-
-    def _try_reserve(mut self, amount: Int) -> Bool:
-        if self.budget and not self.budget.value().try_reserve(amount):
-            return False
-        self.amount = amount
-        return True
-
-    def release(mut self):
-        if self.budget:
-            self.budget.value().release(self.amount)
-        self.amount = 0
-
-    def __deinit__(deinit self):
-        self.release()
 
 
 struct DetachMessage(Movable):
@@ -427,7 +405,9 @@ struct ResponseSender(Movable):
         s_ptr[].responded = True
         s_ptr[].finished = True
         var ticket = _CapacityTicket(s_ptr[].budget.copy())
-        var admitted = ticket._try_reserve(body.capacity())
+        var admitted = headers._adopt_capacity_budget(s_ptr[].budget.copy())
+        if admitted:
+            admitted = ticket._try_reserve(body.capacity())
         if admitted:
             admitted = _append_message(
                 s_ptr,
@@ -499,9 +479,16 @@ struct ResponseSender(Movable):
                 "response already started or finished",
             )
         s_ptr[].started = True
-        var admitted = _append_message(
-            s_ptr, DetachMessage.start(status, headers^)
-        )
+        var admitted = headers._adopt_capacity_budget(s_ptr[].budget.copy())
+        if admitted:
+            admitted = _append_message(
+                s_ptr, DetachMessage.start(status, headers^)
+            )
+        else:
+            _ = headers^
+            s_ptr[].cancelled = True
+            s_ptr[].finished = True
+            s_ptr[].terminal_kind = MSG_KIND_ABORT
         var wakeup_fd = s_ptr[].wakeup_fd
         s_ptr[].mutex.unlock()
         signal_wakeup_fd(wakeup_fd)
