@@ -10,7 +10,9 @@ stay comparable.
   `go version` output with each measurement.
 - Go baseline: `benchmarks/http_go/main.go` (`go.mod` pins `go 1.26` and
   `golang.org/x/net` for HTTPS+HTTP/2).
-- Mojo toolchain: `pixi.toml` pinned `mojo >=1.0.0,<2` (local `1.0.0`).
+- Current Mojo toolchain: `pixi.toml` requires `mojo >=1.1.0,<1.2`;
+  `pixi.lock` resolves Mojo `1.1.0`. Record the actual `mojo --version`
+  for each run; historical results retain their recorded toolchain.
 - Build: Go `go -C benchmarks/http_go build -o /tmp/http_go_baseline .` (run from the repository root; `benchmarks/http_go` is its own module);
   Mojo optimized executable (`mojo build`), compile and startup time
   excluded from the measurement window.
