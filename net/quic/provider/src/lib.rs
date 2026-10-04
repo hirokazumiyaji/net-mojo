@@ -1803,6 +1803,15 @@ impl QuicServer {
                             response.headers_sent = true;
                             self.send_ready.push(connection_key);
                         }
+                        Err(quiche::h3::Error::TransportError(quiche::Error::StreamStopped(_))) => {
+                            self.send_ready.push(connection_key);
+                            completed.push((
+                                connection_key.clone(),
+                                stream_id,
+                                response.request_id,
+                            ));
+                            continue;
+                        }
                         Err(quiche::h3::Error::Done | quiche::h3::Error::StreamBlocked) => continue,
                         Err(error) => return Err(error.into()),
                     }
@@ -1829,6 +1838,10 @@ impl QuicServer {
                                 response.request_id,
                             ));
                         }
+                    }
+                    Err(quiche::h3::Error::TransportError(quiche::Error::StreamStopped(_))) => {
+                        self.send_ready.push(connection_key);
+                        completed.push((connection_key.clone(), stream_id, response.request_id));
                     }
                     Err(quiche::h3::Error::Done | quiche::h3::Error::StreamBlocked) => (),
                     Err(error) => return Err(error.into()),
@@ -2263,6 +2276,115 @@ mod tests {
         )
         .unwrap();
         (server, client, h3, local, remote)
+    }
+
+    #[test]
+    fn stop_sending_cancels_blocked_response_without_aborting_siblings_or_reuse() {
+        for started in [false, true] {
+            let (mut server, mut client, mut h3, local, remote) = request_timer_peer();
+            let mut packet = [0; 65535];
+            let headers = [
+                quiche::h3::Header::new(b":method", b"GET"),
+                quiche::h3::Header::new(b":scheme", b"https"),
+                quiche::h3::Header::new(b":authority", b"localhost"),
+                quiche::h3::Header::new(b":path", b"/stop"),
+            ];
+            let cancelled_id = h3.send_request(&mut client, &headers, true).unwrap();
+            for _ in 0..32 {
+                pump_in_memory(
+                    &mut client,
+                    &mut server,
+                    &mut packet,
+                    local,
+                    remote,
+                    false,
+                    false,
+                );
+            }
+            let request = server.next_request().unwrap();
+            assert_eq!(request.stream_id, cancelled_id);
+            assert!(server.enqueue_response(request.id, 200, Vec::new(), vec![42; 2_000_000]));
+            if started {
+                server.drive_responses().unwrap();
+            }
+            let key = server.connections.keys().next().unwrap().clone();
+            let response = &server.connections[&key].responses[&cancelled_id];
+            assert_eq!(response.headers_sent, started);
+            if started {
+                assert!(response.body_offset > 0 && response.body_offset < response.body.len());
+            } else {
+                assert_eq!(response.body_offset, 0);
+            }
+            client
+                .stream_shutdown(cancelled_id, quiche::Shutdown::Read, 0x10c)
+                .unwrap();
+            for datagram in collect_client_datagrams(&mut client, &mut packet) {
+                deliver_client_datagram(&mut server, &datagram, local, remote);
+            }
+            let result = server.drive_responses();
+            assert!(
+                result.is_ok(),
+                "peer STOP_SENDING must cancel only its response: {result:?}"
+            );
+            assert!(server.connections[&key].responses.is_empty());
+            assert!(server.response_timeouts.is_empty());
+            assert_eq!(server.buffered_response_bytes, 0);
+            assert!(!server.request_routes.contains_key(&request.id));
+            assert!(server.connections[&key].transport.local_error().is_none());
+            for _ in 0..2 {
+                let id = h3.send_request(&mut client, &headers, true).unwrap();
+                for _ in 0..32 {
+                    pump_in_memory(
+                        &mut client,
+                        &mut server,
+                        &mut packet,
+                        local,
+                        remote,
+                        false,
+                        false,
+                    );
+                }
+                let request = server.next_request().unwrap();
+                assert_eq!(request.stream_id, id);
+                assert!(server.enqueue_response(request.id, 200, Vec::new(), b"alive".to_vec()));
+                let mut body = Vec::new();
+                let mut finished = false;
+                for _ in 0..64 {
+                    pump_in_memory(
+                        &mut client,
+                        &mut server,
+                        &mut packet,
+                        local,
+                        remote,
+                        false,
+                        false,
+                    );
+                    loop {
+                        match h3.poll(&mut client) {
+                            Ok((stream_id, quiche::h3::Event::Data)) if stream_id == id => {
+                                let mut chunk = [0; 64];
+                                while let Ok(length) = h3.recv_body(&mut client, id, &mut chunk) {
+                                    body.extend_from_slice(&chunk[..length]);
+                                }
+                            }
+                            Ok((stream_id, quiche::h3::Event::Finished)) if stream_id == id => {
+                                finished = true
+                            }
+                            Ok(_) => (),
+                            Err(quiche::h3::Error::Done) => break,
+                            Err(error) => panic!("sibling response failed: {error:?}"),
+                        }
+                    }
+                    if finished {
+                        break;
+                    }
+                }
+                assert!(finished);
+                assert_eq!(body, b"alive");
+                assert_eq!(server.connections.len(), 1);
+                assert!(server.response_timeouts.is_empty());
+            }
+        }
     }
 
     #[test]
