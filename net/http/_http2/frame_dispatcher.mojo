@@ -83,6 +83,10 @@ struct Http2FrameDispatcher(Movable):
     var _failed: Bool
     var _max_control_frames_per_second: Int
     var _max_resets_per_second: Int
+    var _max_new_streams_per_second: Int
+    var _new_stream_window_start_ns: Int
+    var _new_stream_count: Int
+    var _last_headers_stream_id: UInt32
     var _control_window_start_ns: Int
     var _control_count: Int
     var _reset_window_start_ns: Int
@@ -93,6 +97,7 @@ struct Http2FrameDispatcher(Movable):
         initial_settings: Http2PeerSettingsSnapshot,
         max_control_frames_per_second: Int = 1000,
         max_resets_per_second: Int = 100,
+        max_new_streams_per_second: Int = 1000000,
     ):
         self._sequence = Http2ContinuationSequence()
         self._peer_settings = Http2PeerSettings()
@@ -112,6 +117,10 @@ struct Http2FrameDispatcher(Movable):
         self._failed = False
         self._max_control_frames_per_second = max_control_frames_per_second
         self._max_resets_per_second = max_resets_per_second
+        self._max_new_streams_per_second = max_new_streams_per_second
+        self._new_stream_window_start_ns = 0
+        self._new_stream_count = 0
+        self._last_headers_stream_id = UInt32(0)
         self._control_window_start_ns = 0
         self._control_count = 0
         self._reset_window_start_ns = 0
@@ -143,6 +152,16 @@ struct Http2FrameDispatcher(Movable):
         self._reset_count += 1
         return self._reset_count > self._max_resets_per_second
 
+    def _new_stream_exceeded(mut self, now: Int) -> Bool:
+        if (
+            self._new_stream_window_start_ns == 0
+            or now - self._new_stream_window_start_ns >= _RATE_WINDOW_NS
+        ):
+            self._new_stream_window_start_ns = now
+            self._new_stream_count = 0
+        self._new_stream_count += 1
+        return self._new_stream_count > self._max_new_streams_per_second
+
     def accept[
         origin: Origin
     ](
@@ -153,6 +172,16 @@ struct Http2FrameDispatcher(Movable):
         if self._failed or not self._sequence.accept(frame):
             self._failed = True
             return Http2DispatchResult.error()
+
+        if frame.frame_type == Byte(1):
+            if (frame.stream_id & UInt32(1)) == UInt32(0):
+                self._failed = True
+                return Http2DispatchResult.error()
+            if frame.stream_id > self._last_headers_stream_id:
+                if self._new_stream_exceeded(now_ns()):
+                    return self._flood()
+                self._last_headers_stream_id = frame.stream_id
+            return Http2DispatchResult.ignored()
 
         if frame.frame_type == Byte(4):
             var settings = parse_settings_frame(frame, payload)

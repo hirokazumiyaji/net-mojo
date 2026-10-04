@@ -155,6 +155,7 @@ struct Http2ServerConnectionInput(Movable):
     var _failed: Bool
     var _max_control_frames_per_second: Int
     var _max_resets_per_second: Int
+    var _max_new_streams_per_second: Int
 
     def __init__(
         out self,
@@ -162,6 +163,7 @@ struct Http2ServerConnectionInput(Movable):
         max_concurrent_streams: Int = 100,
         max_control_frames_per_second: Int = 1000,
         max_resets_per_second: Int = 100,
+        max_new_streams_per_second: Int = 1000000,
     ):
         self._bootstrap = Http2ConnectionBootstrap(
             max_frame_size, max_concurrent_streams
@@ -169,10 +171,12 @@ struct Http2ServerConnectionInput(Movable):
         self._reader = Http2FrameReader(max_frame_size)
         self._max_control_frames_per_second = max_control_frames_per_second
         self._max_resets_per_second = max_resets_per_second
+        self._max_new_streams_per_second = max_new_streams_per_second
         self._dispatcher = Http2FrameDispatcher(
             self._bootstrap.peer_settings(),
             max_control_frames_per_second,
             max_resets_per_second,
+            max_new_streams_per_second,
         )
         self._failed = False
 
@@ -192,6 +196,7 @@ struct Http2ServerConnectionInput(Movable):
                     self._bootstrap.peer_settings(),
                     self._max_control_frames_per_second,
                     self._max_resets_per_second,
+                    self._max_new_streams_per_second,
                 )
             var consumed = bootstrap.consumed
             if len(bootstrap.output) > 0:

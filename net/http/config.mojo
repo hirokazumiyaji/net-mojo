@@ -13,6 +13,7 @@ struct ServerConfig(Copyable, Movable):
     var max_connections: Int
     var quic_max_transport_memory_bytes: Int
     var max_http2_streams_per_connection: Int
+    var http2_max_new_streams_per_second: Int
     # Tumbling 1s window; non-ACK PING/SETTINGS, WINDOW_UPDATE, PRIORITY.
     var http2_max_control_frames_per_second: Int
     # Tumbling 1s window for RST_STREAM; separate from control-frame budget.
@@ -54,6 +55,7 @@ struct ServerConfig(Copyable, Movable):
             # Soft estimate: 10_000 connections × 256 KiB per-conn quiche charge.
             quic_max_transport_memory_bytes=2621440000,
             max_http2_streams_per_connection=100,
+            http2_max_new_streams_per_second=1000000,
             http2_max_control_frames_per_second=1000,
             http2_max_resets_per_second=100,
             max_request_line=8192,
