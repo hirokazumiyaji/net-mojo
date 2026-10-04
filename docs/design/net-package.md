@@ -243,16 +243,19 @@ section records only the package-level boundaries.
   and the connection owns the queued response until it is sent.
 - One global `BufferBudget` charges retained receive and adopted pending
   capacity, including old + new growth peaks and incoming pending wire.
-  Content-Length HTTP/1 body copies reserve exact capacity before parsing,
+  Decoded HTTP/1 body copies reserve exact capacity before materialization,
   retain that charge during the borrowed handler call, and release it after
   the request is dropped, before response wire encoding.
+  Content-Length reserves at head admission; chunked input reserves its exact
+  decoded size after complete structural validation, with no decoded body
+  allocation or reservation while the wire is incomplete.
   Synchronous HTTP/1 `write`/`write_string` use globally reserved body
   workspace and check growth peaks; direct body edits are reconciled without
   a pre-growth guarantee. Buffered synchronous HTTP/1 wire capacity is
   measured and reserved while its writer body remains charged, then
   transferred to the pending queue. Temporary read chunks, header/String
   scratch, error/100/chunk/detached/H2/H3 encoding,
-  chunked parser body copies, other writer paths and
+  other parser scratch, other writer paths and
   protocol/provider allocations are not all included yet.
   Admission failures become 503+close, handler
   overruns and raises become 500+close without leaking details, and a

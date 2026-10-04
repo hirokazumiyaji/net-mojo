@@ -405,7 +405,7 @@ struct _RequestWorkspaceHandler(Handler):
             _ = writer.detach()
 
 
-def test_request_capacity_limits_workspace_and_returns_on_terminal_paths() raises:
+def _check_request_capacity_workspace(request: String) raises:
     var config = ServerConfig.default()
     config.total_buffer_budget = 512
     var server = Server(config^)
@@ -414,7 +414,9 @@ def test_request_capacity_limits_workspace_and_returns_on_terminal_paths() raise
     var handler = _RequestWorkspaceHandler()
     var waiting = dial_tcp(address, Timeout.seconds(1))
     waiting.write_all("GET /".as_bytes(), Timeout.seconds(1))
-    _tick_n(server, handler, 2)
+    var expires = Int(perf_counter_ns()) + 1_000_000_000
+    while server._budget.used != 5 and Int(perf_counter_ns()) < expires:
+        _ = server.tick(handler, Timeout.milliseconds(1))
     assert_equal(server._budget.used, 5)
     for action in range(4):
         handler.action = action
@@ -423,10 +425,7 @@ def test_request_capacity_limits_workspace_and_returns_on_terminal_paths() raise
             server,
             handler,
             client,
-            (
-                "POST / HTTP/1.1\r\nHost: x\r\nContent-Length: 5\r\nConnection:"
-                " close\r\n\r\nbody!"
-            ),
+            request,
         )
         assert_equal(_status_of(out), 200 if action == 0 else 500)
         assert_equal(handler.workspace, 502)
@@ -435,6 +434,70 @@ def test_request_capacity_limits_workspace_and_returns_on_terminal_paths() raise
     server._close_conn(0)
     assert_equal(server._budget.used, 0)
     waiting.close()
+
+
+def test_request_capacity_limits_workspace_and_returns_on_terminal_paths() raises:
+    _check_request_capacity_workspace(
+        "POST / HTTP/1.1\r\nHost: x\r\nContent-Length: 5\r\nConnection:"
+        " close\r\n\r\nbody!"
+    )
+
+
+def test_chunked_capacity_limits_workspace_and_returns_on_terminal_paths() raises:
+    _check_request_capacity_workspace(
+        "POST / HTTP/1.1\r\nHost: x\r\nTransfer-Encoding:"
+        " chunked\r\nConnection:"
+        " close\r\n\r\n2\r\nbo\r\n3\r\ndy!\r\n0\r\nX-Final: yes\r\n\r\n"
+    )
+
+
+def test_chunked_copy_peak_is_rejected_before_handler() raises:
+    var config = ServerConfig.default()
+    config.total_buffer_budget = 8192
+    var server = Server(config^)
+    server.add_listener(listen_tcp("127.0.0.1:0"))
+    var handler = _BodyCountHandler()
+    var client = dial_tcp(
+        String("127.0.0.1:") + String(server.local_address().port),
+        Timeout.seconds(1),
+    )
+    var request = (
+        String(
+            "POST / HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n"
+            "Connection: close\r\n\r\n1770\r\n"
+        )
+        + String("b") * 6000
+        + String("\r\n0\r\n\r\n")
+    )
+    var out = _exchange(server, handler, client, request)
+    assert_equal(_status_of(out), 503)
+    assert_equal(server._budget.used, 0)
+    client.close()
+
+
+def test_partial_chunked_body_does_not_reserve_decoded_allocation() raises:
+    var config = ServerConfig.default()
+    config.total_buffer_budget = 512
+    var server = Server(config^)
+    server.add_listener(listen_tcp("127.0.0.1:0"))
+    var handler = _EchoHandler()
+    var client = dial_tcp(
+        String("127.0.0.1:") + String(server.local_address().port),
+        Timeout.seconds(1),
+    )
+    client.write_all(
+        "POST /echo HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n"
+        "Connection: close\r\n\r\n2\r\nbo\r\n3\r\nd".as_bytes(),
+        Timeout.seconds(1),
+    )
+    _tick_n(server, handler, 4)
+    assert_equal(server._conns[0].http1_body_reserved, 0)
+    assert_equal(server._budget.used, server._conns[0].buf.capacity())
+    var out = _exchange(server, handler, client, "y!\r\n0\r\n\r\n")
+    assert_equal(_status_of(out), 200)
+    _assert_body(out, "body!")
+    assert_equal(server._budget.used, 0)
+    client.close()
 
 
 def test_request_copy_peak_is_rejected_before_receiving_body() raises:
