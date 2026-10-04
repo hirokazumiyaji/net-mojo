@@ -8,8 +8,8 @@ Architecture (Erlang-inspired Actor / Message-Passing):
 - The connection actor on the event loop remains the exclusive owner of the socket
   and reactor interests.
 - `ResponseSender` acts as a movable actor endpoint / proxy.
-- A copied budget capability charges retained message-array capacity through queue
-  and drained-batch ownership. Payload, header and fixed-state storage remain separate.
+- A copied budget capability charges state allocation until its last reference frees
+  it, and message arrays through queue/batch ownership. Payload and headers remain separate.
 - Data messages use a mutex-protected mailbox; ordered finish/abort state requires
   no additional message allocation.
 - A non-blocking wakeup file descriptor (via `socketpair`) notifies the reactor
@@ -18,7 +18,7 @@ Architecture (Erlang-inspired Actor / Message-Passing):
   its slot / descriptor is recycled.
 """
 
-from std.ffi import c_int, c_size_t, external_call
+from std.ffi import c_int, c_size_t, external_call, get_errno
 from std.sys import size_of
 
 from net._actor import PthreadMutex, signal_wakeup_fd
@@ -155,11 +155,13 @@ struct _SharedDetachState:
     var budget: Optional[SharedBufferBudget]
     var array_ticket: _CapacityTicket
     var terminal_kind: UInt8
+    var state_ticket: _CapacityTicket
 
     def __init__(
         out self,
         slot: Int,
         generation: UInt64,
+        var state_ticket: _CapacityTicket,
         wakeup_fd: Int32 = -1,
         queue_limit: Int = 1048576,
         var budget: Optional[SharedBufferBudget] = None,
@@ -179,6 +181,7 @@ struct _SharedDetachState:
         self.budget = budget^
         self.array_ticket = _CapacityTicket(self.budget.copy())
         self.terminal_kind = MSG_KIND_NONE
+        self.state_ticket = state_ticket^
 
     def __deinit__(deinit self):
         _ = self.messages^
@@ -234,19 +237,38 @@ def _create_detach_state(
     wakeup_fd: Int32 = -1,
     queue_limit: Int = 1048576,
     var budget: Optional[SharedBufferBudget] = None,
-) -> Int:
+) raises NetError -> Int:
     """Allocates a new heap _SharedDetachState and returns its integer address.
     """
+    var ticket = _CapacityTicket(budget.copy())
+    if budget:
+        var amount = size_of[_SharedDetachState]()
+        if not budget.value().try_reserve(amount):
+            raise NetError(
+                NetErrorKind.invalid_argument(),
+                "detach",
+                None,
+                "detached state exceeds budget",
+            )
+        ticket.amount = amount
     var ptr = external_call["malloc", Pointer[Byte, MutUntrackedOrigin]](
         c_size_t(size_of[_SharedDetachState]())
     )
     if Int(ptr) == 0:
-        return 0
+        var errno = get_errno().value
+        ticket.release()
+        raise NetError(
+            NetErrorKind.system_error(),
+            "detach",
+            Int(errno),
+            "detached state allocation failed",
+        )
     var s_ptr = ptr.unsafe_bitcast[_SharedDetachState]()
     s_ptr.unsafe_write(
         _SharedDetachState(
             slot=slot,
             generation=generation,
+            state_ticket=ticket^,
             wakeup_fd=wakeup_fd,
             queue_limit=queue_limit,
             budget=budget^,
@@ -287,8 +309,12 @@ def _release_detach_state(addr: Int, from_sender: Bool):
         signal_wakeup_fd(wakeup_fd)
 
     if should_free:
+        var ticket_ptr = Pointer(to=s_ptr[].state_ticket)
+        var ticket = ticket_ptr.unsafe_take_pointee()
+        ticket_ptr.unsafe_write(_CapacityTicket())
         s_ptr.unsafe_deinit_pointee()
         external_call["free", NoneType](ptr)
+        ticket.release()
 
 
 struct ResponseSender(Movable):
