@@ -8,7 +8,7 @@ use std::slice;
 use std::time::{Duration, Instant};
 
 use quiche::h3::NameValue;
-use quiche::{Connection, ConnectionId, RecvInfo, SendInfo};
+use quiche::{Connection, ConnectionId, ReceiveBudget, ReceiveLimit, ReceiveLimits, RecvInfo, SendInfo};
 
 /// Whether provider quiche configs enable TLS early data (0-RTT).
 ///
@@ -40,6 +40,23 @@ fn apply_provider_quic_transport_settings(config: &mut quiche::Config) {
     config.set_initial_max_streams_bidi(100);
     config.set_initial_max_streams_uni(3);
     config.set_max_idle_timeout(60_000);
+}
+
+fn default_receive_limits() -> ReceiveLimits {
+    ReceiveLimits {
+        request: ReceiveLimit {
+            backing_bytes: 64 * 1024 * 1024,
+            slots: 65_536,
+        },
+        control: ReceiveLimit {
+            backing_bytes: 4 * 1024 * 1024,
+            slots: 131_072,
+        },
+        crypto: ReceiveLimit {
+            backing_bytes: 16 * 1024 * 1024,
+            slots: 131_072,
+        },
+    }
 }
 
 pub struct NetQuicServerConfig {
@@ -147,6 +164,40 @@ pub unsafe extern "C" fn net_quic_server_set_transport_memory_limit(
     }
     unsafe { &mut *server }._inner.max_transport_memory_bytes = limit;
     1
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn net_quic_server_set_receive_limits(
+    server: *mut NetQuicServer,
+    request_bytes: usize,
+    request_slots: usize,
+    control_bytes: usize,
+    control_slots: usize,
+    crypto_bytes: usize,
+    crypto_slots: usize,
+) -> i32 {
+    if server.is_null() {
+        return -1;
+    }
+    let limits = ReceiveLimits {
+        request: ReceiveLimit {
+            backing_bytes: request_bytes,
+            slots: request_slots,
+        },
+        control: ReceiveLimit {
+            backing_bytes: control_bytes,
+            slots: control_slots,
+        },
+        crypto: ReceiveLimit {
+            backing_bytes: crypto_bytes,
+            slots: crypto_slots,
+        },
+    };
+    if unsafe { &mut *server }._inner.set_receive_limits(limits) {
+        1
+    } else {
+        -1
+    }
 }
 
 #[unsafe(no_mangle)]
@@ -801,6 +852,8 @@ impl SendReadyQueue {
 }
 
 pub struct QuicServer {
+    receive_budget: ReceiveBudget,
+    receive_budget_locked: bool,
     config: quiche::Config,
     http3_config: quiche::h3::Config,
     connections: HashMap<Vec<u8>, QuicConnection>,
@@ -1035,12 +1088,16 @@ impl From<quiche::h3::Error> for QuicServerError {
 }
 
 impl QuicServer {
-    pub fn new(config: quiche::Config) -> io::Result<Self> {
+    pub fn new(mut config: quiche::Config) -> io::Result<Self> {
+        let receive_budget = ReceiveBudget::new(default_receive_limits());
+        config.set_receive_budget(receive_budget.clone());
         let mut http3_config = quiche::h3::Config::new().unwrap();
         http3_config.set_max_field_section_size(32_768);
         http3_config.set_qpack_max_table_capacity(0);
         http3_config.set_qpack_blocked_streams(0);
         Ok(Self {
+            receive_budget,
+            receive_budget_locked: false,
             config,
             http3_config,
             connections: HashMap::new(),
@@ -1084,6 +1141,16 @@ impl QuicServer {
             buffered_response_bytes: 0,
             shutdown: ShutdownState::Active,
         })
+    }
+
+    fn set_receive_limits(&mut self, limits: ReceiveLimits) -> bool {
+        if self.receive_budget_locked {
+            return false;
+        }
+        let budget = ReceiveBudget::new(limits);
+        self.config.set_receive_budget(budget.clone());
+        self.receive_budget = budget;
+        true
     }
 
     pub fn begin_shutdown(&mut self) -> Result<(), QuicServerError> {
@@ -1176,6 +1243,7 @@ impl QuicServer {
                 self.random.read_exact(&mut source_id)?;
                 let source_id = ConnectionId::from_ref(&source_id);
                 let connection = quiche::accept(&source_id, None, local, remote, &mut self.config)?;
+                self.receive_budget_locked = true;
                 let key = source_id.as_ref().to_vec();
                 self.routes.insert(destination_id.clone(), key.clone());
                 self.routes.insert(key.clone(), key.clone());
@@ -7041,4 +7109,6 @@ mod tests {
         assert_eq!(response_bodies[&second_stream_id], b"handled:data");
         assert!(fixture.wait().unwrap().success());
     }
+    include!("receive_budget_tests.rs");
+
 }

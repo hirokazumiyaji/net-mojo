@@ -48,3 +48,5 @@ cargo test --locked --release \
 cargo test --locked --release \
     --manifest-path "$task_quiche_source/Cargo.toml" \
     --target-dir build/quic/cargo receive_budget
+
+python3 tests/test_http3_receive_limits.py

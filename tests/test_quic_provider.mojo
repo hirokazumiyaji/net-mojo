@@ -169,6 +169,31 @@ def test_pacing_delay_conversion_saturates_monotonic_deadline() raises:
     assert_true(_send_at(UInt64(0), 100) == 100)
 
 
+def test_receive_limits_reject_negative_capacities() raises:
+    var provider = QuicProvider("build/quic/libnet_quic_provider")
+    var config = provider.server_config(
+        "build/tls/test-cert.pem", "build/tls/test-key.pem"
+    )
+    var server = provider.server(config^)
+    for invalid in range(6):
+        var capacities: Array[Int, 6] = [64, 6, 4096, 32, 16384, 64]
+        capacities[invalid] = -1
+        var rejected = False
+        try:
+            server.set_receive_limits(
+                capacities[0],
+                capacities[1],
+                capacities[2],
+                capacities[3],
+                capacities[4],
+                capacities[5],
+            )
+        except:
+            rejected = True
+        assert_true(rejected)
+    server.set_receive_limits(64, 6, 4096, 32, 16384, 64)
+
+
 def main() raises:
     var provider = QuicProvider("build/quic/libnet_quic_provider")
     assert_true(provider.version() == "0.29.3")
@@ -219,6 +244,7 @@ def main() raises:
         running = http_server.tick(handler, Timeout.milliseconds(5))
     assert_false(running)
 
+    test_receive_limits_reject_negative_capacities()
     test_pacing_delay_conversion_saturates_monotonic_deadline()
     test_pending_datagram_waits_for_pacing_due_time()
     test_pending_pacing_timer_rounds_up_to_next_microsecond()
