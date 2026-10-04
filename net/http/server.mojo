@@ -1920,6 +1920,8 @@ struct Server(Movable):
         mut handler: H,
     ) raises:
         var req = result.take_request()
+        if self._conns[idx].is_tls():
+            req.scheme = String("https")
         var is_head = req.method == "HEAD"
         self._conns[idx].is_head = is_head
         # Keep a framing margin when advertising the body limit.
