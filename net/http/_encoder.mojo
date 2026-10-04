@@ -292,7 +292,7 @@ def _render_response[
     )
     for i in range(len(writer.headers)):
         var name = writer.headers.name_at(i)
-        var value = writer.headers.value_bytes_at(i)
+        var value_bytes = writer.headers._value_bytes_span(i)
         # Skip a caller Content-Length on no-body responses; it is
         # re-derived below for framed bodies only.
         if name.lower() == "content-length":
@@ -301,7 +301,6 @@ def _render_response[
         # line before the wire: reject CR/LF here on the exact bytes
         # being emitted (names are ASCII tokens by construction).
         var name_bytes = name.as_bytes()
-        var value_bytes = Span(value)
         for k in range(len(name_bytes)):
             if name_bytes[k] == Byte(ord("\r")) or name_bytes[k] == Byte(
                 ord("\n")
@@ -560,9 +559,8 @@ def encode_chunked_start(
     )
     for i in range(len(writer.headers)):
         var name = writer.headers.name_at(i)
-        var value = writer.headers.value_bytes_at(i)
+        var value_bytes = writer.headers._value_bytes_span(i)
         var name_bytes = name.as_bytes()
-        var value_bytes = Span(value)
         for k in range(len(name_bytes)):
             if name_bytes[k] == Byte(ord("\r")) or name_bytes[k] == Byte(
                 ord("\n")

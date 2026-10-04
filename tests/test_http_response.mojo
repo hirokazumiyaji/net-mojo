@@ -6,12 +6,54 @@ from net.http import ResponseWriter, has_body_for_status
 from net.http._encoder import (
     current_http_date,
     encode_100_continue,
+    encode_chunked_start,
     encode_error,
     encode_response,
     http_date,
     _encode_response_budgeted,
     _measure_response,
 )
+
+
+def test_encoder_borrowed_duplicate_obs_text_headers_match_exact_wire() raises:
+    var writer = ResponseWriter(32)
+    var first: Array[Byte, 3] = [97, 128, 255]
+    var second: Array[Byte, 2] = [255, 98]
+    writer.headers.add_bytes(String("X-Bin"), Span(first))
+    writer.headers.add_bytes(String("X-Bin"), Span(second))
+    var value_address = Int(writer.headers._value_bytes_span(0).unsafe_ptr())
+    for chunked in [False, True]:
+        var expected = List[Byte]()
+        expected.extend("HTTP/1.1 200 OK\r\nX-Bin: ".as_bytes())
+        expected.extend(Span(first))
+        expected.extend("\r\nX-Bin: ".as_bytes())
+        expected.extend(Span(second))
+        if chunked:
+            expected.extend(
+                "\r\nDate: date\r\nTransfer-Encoding: chunked\r\n\r\n".as_bytes()
+            )
+        else:
+            expected.extend(
+                "\r\nDate: date\r\nContent-Length: 0\r\n\r\n".as_bytes()
+            )
+        var wire: List[Byte]
+        if chunked:
+            wire = encode_chunked_start(writer, False, "date", 100, 32768)
+        else:
+            var capacity = _measure_response(writer, False, "date", 100, 32768)
+            assert_equal(capacity, len(expected))
+            var budget = BufferBudget(capacity)
+            wire = _encode_response_budgeted(
+                writer, False, "date", 100, 32768, budget
+            )
+            assert_equal(wire.capacity(), capacity)
+            assert_equal(budget.used, capacity)
+        assert_equal(len(wire), len(expected))
+        for i in range(len(expected)):
+            assert_equal(wire[i], expected[i])
+        assert_equal(
+            Int(writer.headers._value_bytes_span(0).unsafe_ptr()), value_address
+        )
 
 
 def test_budgeted_wire_exact_capacity_matches_framing_and_raw_headers() raises:

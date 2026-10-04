@@ -177,5 +177,10 @@ struct Headers(Movable, Sized):
             out.append(stored[i])
         return out^
 
+    def _value_bytes_span(
+        self, index: Int
+    ) -> Span[Byte, origin_of(self._values[index])]:
+        return Span(self._values[index])
+
     def value_byte_length(self, index: Int) -> Int:
         return len(self._values[index])

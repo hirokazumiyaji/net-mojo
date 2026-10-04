@@ -385,6 +385,26 @@ def test_header_values_reject_control_bytes() raises:
     assert_equal(len(headers), 1)
 
 
+def test_header_value_span_borrows_storage_and_owned_copy_survives_clear() raises:
+    var headers = Headers()
+    var raw: Array[Byte, 3] = [97, 128, 255]
+    headers.add_bytes(String("X-Bin"), Span(raw))
+    var owned = headers.value_bytes_at(0)
+    owned[0] = 42
+    var view = headers._value_bytes_span(0)
+    assert_equal(len(view), 3)
+    assert_equal(Int(view.unsafe_ptr()), Int(headers._values[0].unsafe_ptr()))
+    assert_equal(view[0], 97)
+    assert_equal(view[1], 128)
+    assert_equal(view[2], 255)
+    assert_true(Int(view.unsafe_ptr()) != Int(owned.unsafe_ptr()))
+    headers.clear()
+    assert_equal(len(owned), 3)
+    assert_equal(owned[0], 42)
+    assert_equal(owned[1], 128)
+    assert_equal(owned[2], 255)
+
+
 def test_header_values_preserve_wire_bytes() raises:
     # Legal obs-text bytes have no UTF-8 decoding: they must survive
     # storage exactly and reappear on the wire unchanged.
