@@ -6,6 +6,10 @@ windows and admission policy. Diagnostic additions to staged source are
 views immediately before retention. The three earlier patches are unchanged.
 This does not implement a memory quota.
 
+The diagnostic-only follow-up from 18cf35a adds 4/16/64 KiB scaling, two held
+requests and receive-state conservation. See [SCALING.md](SCALING.md) for the
+current measurements, transition assertions and reproduction commands.
+
 ## Current reproducer and historical baseline
 
 The original focused reproducer is `test/issue42-active-quic-memory`, based on
