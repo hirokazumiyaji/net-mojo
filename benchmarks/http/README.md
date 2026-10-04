@@ -699,6 +699,21 @@ All runs: 0 failed, rc=0.
 
 ### Special scenarios
 
+The slow/cancel drivers also report timing for the existing sibling batch.
+`sibling_samples` counts only exact successful bodies/statuses with actual
+dispatch and completion timestamps; `sibling_completed` and
+`sibling_missing_timing` disclose usable and missing/out-of-window timings.
+`sibling_req_s` divides successes by the interval beginning just before phase
+dispatch and ending at the last actual sibling completion, excluding idle polls,
+target drain, deliberate sleep and reuse. Latencies include upload and withheld
+credit waits. `sibling_p50_us`, `sibling_p95_us` and `sibling_p99_us` use sorted
+index `floor(fraction * (samples - 1))`; empty quantiles are `None`.
+Failures preserve the existing verdict and use the actual observation endpoint
+with `sibling_window_scope=failed_phase_observation`. Window epochs use one
+bracketed wall-clock anchor; its span and half-span uncertainty are reported.
+These small batches are not 30-second saturated throughput or population tail
+estimates. Keep each trial separate and retain full-fixture `elapsed_ms`.
+
 Both HTTP/2 special scenarios run over a **single** HTTP/2 connection
 (`benchmarks/http/http2_scenarios.py`, hyper-h2): the target stream and its
 siblings share one connection, so a server with per-connection

@@ -26,6 +26,8 @@ import time
 from typing import List, Optional
 from urllib.parse import urlparse
 
+from sibling_metrics import begin_sibling_window, sibling_metrics
+
 from aioquic.asyncio import connect
 from aioquic.asyncio.protocol import QuicConnectionProtocol
 from aioquic.h3.connection import H3_ALPN, H3Connection
@@ -387,12 +389,18 @@ async def run_slow(url: str, slow_s: float, siblings: int) -> dict:
             len(slow_body), slow_body[:prefix_len], authority
         )
         target_unfinished_at_dispatch = not slow_pending["future"].done()
+        window = begin_sibling_window()
         sibling_tasks = [
             asyncio.create_task(client.get(path, authority))
             for _ in range(siblings)
         ]
         sibling_results = await asyncio.gather(
             *sibling_tasks, return_exceptions=True
+        )
+        metrics = sibling_metrics(
+            sibling_results,
+            lambda result: result.get("status") == b"200" and _body_ok(path, result),
+            window, time.perf_counter(),
         )
         target_unfinished_during_siblings = not slow_pending["future"].done()
         if slow_s > 0:
@@ -452,6 +460,7 @@ async def run_slow(url: str, slow_s: float, siblings: int) -> dict:
         "elapsed_ms": elapsed_ms,
         "slow_s": slow_s,
         "siblings": siblings,
+        **metrics,
     }
 
 
@@ -632,8 +641,10 @@ async def run_cancel(url: str, siblings: int) -> dict:
             assert isinstance(client, ScenarioProtocol)
             result = await client.post_echo(sibling_body, authority)
             body_ok = bytes(result.get("body", b"")) == sibling_body
-            return {"status": result.get("status"), "body_ok": body_ok}
+            return {"status": result.get("status"), "body_ok": body_ok,
+                    "start": result["start"], "done_at": result["done_at"]}
 
+        window = begin_sibling_window()
         cancel_task = asyncio.create_task(_cancel_large())
         # Siblings use a large echo so they are still in flight when the
         # reset fires: 64-byte /fixed responses finish within the 5 ms
@@ -646,6 +657,11 @@ async def run_cancel(url: str, siblings: int) -> dict:
         cancelled, sibling_results = await asyncio.gather(
             cancel_task,
             asyncio.gather(*sibling_tasks, return_exceptions=True),
+        )
+        metrics = sibling_metrics(
+            sibling_results,
+            lambda result: result.get("status") == b"200" and result.get("body_ok"),
+            window, time.perf_counter(),
         )
         # Match H2 cancel: a server that GOAWAYs / drains on RST can still
         # finish already-admitted siblings. Probe a fresh GET on the same
@@ -699,6 +715,7 @@ async def run_cancel(url: str, siblings: int) -> dict:
         "post_reset_ok": int(post_reset_ok),
         "elapsed_ms": elapsed_ms,
         "siblings": siblings,
+        **metrics,
     }
 
 
