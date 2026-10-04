@@ -118,8 +118,8 @@ struct ResponseWriter(Movable, Sized):
                 None,
                 "response already detached",
             )
-        self._detached = True
         if self._detach_state_addr != 0:
+            self._detached = True
             return ResponseSender(self._detach_state_addr)
         var addr = _create_detach_state(
             slot=self._slot,
@@ -129,6 +129,7 @@ struct ResponseWriter(Movable, Sized):
             budget=self._body_budget.copy(),
         )
         self._detach_state_addr = addr
+        self._detached = True
         return ResponseSender(addr)
 
     def __len__(self) -> Int:

@@ -10,8 +10,9 @@ capacity reservation directly; other writer paths and other reservations still
 need separate capacity accounting.
 
 The global counter uses a mutex-protected shared capability. Detached message
-arrays charge their retained capacity through drained-batch destruction; payload,
-header, fixed-state and detached wire allocations remain separate.
+arrays charge their retained capacity through drained-batch destruction. HTTP/1
+detached state reserves its requested malloc payload until final free; payload,
+header and detached wire allocations remain separate.
 """
 
 from std.memory import ArcPointer
