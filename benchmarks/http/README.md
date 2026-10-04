@@ -55,6 +55,13 @@ no interval percent. Linux reads `/proc` directly, with CPU resolution of one
 clock tick. macOS reads cumulative `ps` TIME (0.01-second resolution) and counts
 numeric `lsof` FDs, excluding mappings such as `cwd` and `txt`.
 
+Linux records each PID's current `fd_limit_soft` and `fd_limit_hard` from
+`/proc/PID/limits` on every sample, with source `proc_limits`. Finite limits are
+integers; an unlimited value is the string `unlimited`. This required metadata
+failing to read or parse makes the observation an error. macOS reports null
+limits with source `not_exposed`; join direct startup `getrlimit` metadata by
+original PID separately. Process limits do not describe the system-wide FD pool.
+
 Linux also reports CPU affinity and the strictest visible cgroup v2 ancestor
 quota. `visible_limit` and `visible_unlimited` describe only that visible tree:
 outer ancestor quotas can be hidden by a cgroup namespace. `unavailable` means
