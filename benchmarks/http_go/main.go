@@ -19,13 +19,16 @@ package main
 import (
 	"context"
 	"crypto/tls"
+	"encoding/json"
 	"flag"
 	"fmt"
 	"io"
 	"log"
 	"net"
 	"net/http"
+	"os"
 	"strings"
+	"syscall"
 	"time"
 
 	"golang.org/x/net/http2"
@@ -124,6 +127,15 @@ func main() {
 	flag.Parse()
 	if *idleTimeout <= 0 {
 		log.Fatal("idle-timeout must be positive")
+	}
+	var limit syscall.Rlimit
+	if err := syscall.Getrlimit(syscall.RLIMIT_NOFILE, &limit); err != nil {
+		log.Fatal(err)
+	}
+	if err := json.NewEncoder(os.Stdout).Encode(map[string]any{
+		"event": "fd_limits", "source": "getrlimit", "pid": os.Getpid(), "soft": limit.Cur, "hard": limit.Max,
+	}); err != nil {
+		log.Fatal(err)
 	}
 
 	mux := http.NewServeMux()

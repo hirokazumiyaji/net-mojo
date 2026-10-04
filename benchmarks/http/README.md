@@ -72,6 +72,24 @@ controlled comparison runs to establish client capacity or server efficiency.
 
 ## Saturated HTTP/1 load
 
+The Mojo H1/H2/H3 entrypoints and Go baseline emit a startup JSON line with
+`event: "fd_limits"`, `source: "getrlimit"`, their own PID, and exact current
+soft/hard `RLIMIT_NOFILE` values. This records the actual process after runtime
+initialization; Go can raise its soft limit, so a parent's inherited limit does
+not describe the running server. The values are a startup snapshot of process
+limits, including each OS's raw infinity sentinel, not a global FD availability
+claim. Join the PID to the monitored original process and record successful
+connection counts and buffer settings separately.
+
+```bash
+python3 benchmarks/http/check_fd_metadata.py --mojo-server /tmp/http1-server --go-server /tmp/http_go
+```
+
+This check changes FD limits only inside owned test children, validates exact
+limits/field order and Go runtime adjustment, and checks the exact fixed body.
+Linux PID limit snapshots during the workload remain separate from this startup
+record; macOS resource samples do not expose another process's current FD limit.
+
 The dedicated Mojo HTTP/1 benchmark records a one-hour idle deadline, a
 10,000-connection limit and its configured buffer budget at startup. Match that
 deadline with `http_go -idle-timeout 1h` for HTTP/1 comparisons, including the

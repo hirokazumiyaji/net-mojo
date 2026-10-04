@@ -14,11 +14,13 @@ Build optimized: `mojo build -I . benchmarks/http2_tls_server.mojo -o ...`
 
 from net import listen_tcp
 from benchmarks.http_handler import BenchHandler
+from benchmarks._process_resources import print_fd_limits
 from net.http import Server, ServerConfig
 from net.tls import TLSContext
 
 
 def main() raises:
+    print_fd_limits()
     var config = ServerConfig.default()
     var server = Server(config^)
     var listener = listen_tcp("127.0.0.1:18443")
