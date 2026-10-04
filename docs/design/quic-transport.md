@@ -86,6 +86,16 @@ connections retain their original idle timestamp without scheduling it; clearing
 the busy phase restores that timestamp, including an already expired deadline.
 This prevents expired idle timers from causing zero waits during active work.
 Deadline queries read index minima and idle expiry visits only due connections.
+
+Peer STOP_SENDING during response headers or body sending cancels only that
+queued response. The exact quiche error `TransportError(StreamStopped(_))`
+uses the existing completion cleanup to release its body budget, route and
+write deadline, while keeping transport output ready. Other HTTP/3 errors
+remain errors. In pinned quiche 0.29.3, capacity/writability checks collect the
+stopped transport stream and send errors remove HTTP/3 stream state when the
+request receive side has finished; queued provider responses satisfy that
+completed-request condition. Sibling streams and subsequent requests continue.
+
 Response driving and terminal sweeps still scan connections, so the full server
 loop is not yet proportional only to ready or due work.
 
