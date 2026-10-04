@@ -16,6 +16,8 @@ Ownership and resources:
   that reservation until the borrowed request is dropped after its handler.
   Buffered HTTP/1 wire is reserved before encoding; other encoding remains
   separate.
+  Read scratch uses a caller-owned stack array; TLS retains its charged
+  retry buffer until connection close.
   Request admission and the `ResponseWriter` cap derive from the remaining
   budget; a request that
   cannot be admitted gets 503 and close, a handler overrun becomes 500.
@@ -1678,6 +1680,7 @@ struct Server(Movable):
             return
         if self._conns[idx].read_eof:
             return
+        var scratch = Array[Byte, READ_BUFFER_SIZE](fill=0)
         while True:
             var room = (
                 self.config.max_bytes_per_tick
@@ -1690,8 +1693,10 @@ struct Server(Movable):
                 self._conns[idx].more_work = True
                 break
             try:
-                var chunk = self._conns[idx].try_read_bytes(limit)
-                if len(chunk) == 0:
+                var count = self._conns[idx].try_read_into(
+                    Span(scratch)[0:limit]
+                )
+                if count == 0:
                     self._conns[idx].read_eof = True
                     if (
                         self._conns[idx].state == STATE_READING
@@ -1702,17 +1707,17 @@ struct Server(Movable):
                         self._close_conn(idx)
                         return
                     break
-                if not self._charge_read(idx, len(chunk)):
+                if not self._charge_read(idx, count):
                     self._admit_over_budget(idx)
                     return
                 var first = self._conns[idx].buffered_len() == 0
-                self._conns[idx].append_bytes(Span(chunk))
-                self._conns[idx].bytes_this_tick += len(chunk)
+                self._conns[idx].append_bytes(Span(scratch)[0:count])
+                self._conns[idx].bytes_this_tick += count
                 if first:
                     self._conns[idx].header_at = deadline_from_now(
                         self.config.header_deadline
                     )
-                if len(chunk) < limit:
+                if count < limit:
                     break
             except e:
                 if e.kind == NetErrorKind.timeout():
