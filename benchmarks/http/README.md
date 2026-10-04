@@ -442,16 +442,88 @@ kill "$server_pid"
 The provider also has an in-memory regression that cancels 105 requests against
 the 100-stream allowance, verifies pending request-byte release and completes a
 subsequent request. The older dagger-marked H3 rows above remain historical;
-the current checks supply the missing current-criteria H3 evidence. H2 Mojo
-specials, H2 packet-loss measurements, full-duration comparisons and engine
-memory measurements remain separate work.
+the current checks supply the missing current-criteria H3 evidence. H2
+packet-loss measurements, full-duration comparisons and engine memory
+measurements remain separate work.
 
 The two `h2 | Mojo` rows in the earlier table are *not run* rather than carried over: the previous
 `pass` entries came from the `curl` + `h2load` version, which cannot exercise
 these properties at all, so re-recording them was not possible even before the
-build problem. Mojo 1.1 now builds both servers. The H3 rerun above passes;
-the current H2 cancel driver passes Go but stalls against Mojo, so its diagnosis
-and successful rerun remain separate work before completing the matrix.
+build problem. Mojo 1.1 now builds both servers. Those rows remain historical;
+the current H2 rerun below and H3 rerun above supply the current correctness
+evidence without replacing the earlier throughput measurements.
+
+### Current HTTP/2 slow/cancel validation (2026-10-04)
+
+The cancellation driver's upload loop left DATA queued while waiting for credit,
+then continued polling until the peer went idle even after enough credit
+arrived. With Mojo's smaller receive windows, those repeated idle waits could
+exhaust the scenario's 300-second budget. Driver `c538fb5` flushes queued DATA
+before waiting and resumes upload as soon as the next frame fits. Ordinary
+response draining, deadlines and all correctness assertions are unchanged;
+this result required no HTTP/2 server change.
+
+Both server sources are main `43938a8d5f536e09f3d252cc04622223d949ffc8`;
+the scenario driver is `c538fb56ad69a9417bbbf9b0ff92519ebe8ffd18`.
+Recorded on Apple M2 Pro (12 CPUs, 32 GiB), macOS 27.0.1 / Darwin 27.0.0
+arm64, with Mojo 1.1.0 (8189361e), Go 1.26.4, OpenSSL 3.6.4 and hyper-h2
+4.4.1. The optimized Mojo executable used the existing TLS/HPACK artifacts
+and generated test certificate; Go used its default `GOMAXPROCS`. Servers
+and client shared the host, with no CPU pinning or induced network loss.
+
+| Server | Scenario | Current result |
+| --- | --- | --- |
+| Mojo | Slow | Pass: 8/8 exact sibling bodies while the target upload remained unfinished; final target echo and body validated, elapsed 138 ms |
+| Go | Slow | Pass: the same assertions, elapsed 115 ms |
+| Mojo | Cancel | Pass: 274 cycles, 65,535 target response bytes at reset; target flow-blocked at reset and siblings flow-blocked before and after reset; 8/8 sibling bodies, full echo reuse and subsequent GET validated, elapsed 17,234 ms |
+| Go | Cancel | Pass: the same assertions and counts, elapsed 15,245 ms |
+
+The cancellation proof's estimated unreleased response remainder is
+269,353,234 B, exceeding the configured 268,435,456 B response budget.
+Each scenario uses one connection. These are single-run protocol correctness
+checks; elapsed time is diagnostic wall time, not a request latency or
+throughput comparison. They do not establish fixed-arrival latency, allocation
+or syscall cost, nonzero RTT/loss behavior, or 30-minute RSS/fd stability.
+The full production performance matrix remains incomplete.
+
+Reproduce with the toolchain versions above, from a checkout of the server
+revision with the fixed driver available in Git:
+
+```bash
+pixi run -e tls-http2 tls-build
+pixi run -e tls-http2 hpack-test
+pixi run -e tls-http2 mojo build --Werror -I . \
+  benchmarks/http2_tls_server.mojo -o /tmp/http2_server
+go -C benchmarks/http_go build -o /tmp/http_go_h2 .
+git show c538fb56ad69a9417bbbf9b0ff92519ebe8ffd18:benchmarks/http/http2_scenarios.py \
+  > /tmp/http2_scenarios.py
+/tmp/http2_server &
+mojo_pid=$!
+/tmp/http_go_h2 -tls -addr 127.0.0.1:18442 \
+  -cert build/tls/test-cert.pem -key build/tls/test-key.pem &
+go_pid=$!
+pixi run -e tls-http2 python - <<'PY'
+import socket
+import time
+for port in (18443, 18442):
+    deadline = time.monotonic() + 5
+    while True:
+        try:
+            with socket.create_connection(("127.0.0.1", port), timeout=0.1):
+                break
+        except OSError:
+            if time.monotonic() >= deadline:
+                raise
+            time.sleep(0.05)
+PY
+for port in 18443 18442; do
+  for scenario in slow cancel; do
+    pixi run -e tls-http2 python /tmp/http2_scenarios.py \
+      --url "https://127.0.0.1:$port" --scenario "$scenario" --siblings 8
+  done
+done
+kill "$mojo_pid" "$go_pid"
+```
 
 ### Target check
 
@@ -495,14 +567,15 @@ complete while the large upload is still unfinished, then the upload is
 finished and the echo body is checked. Cancellation on both protocols also
 requires a post-reset request on the same connection so a GOAWAY/draining
 server that only finishes already-admitted siblings cannot pass.
-That claim is scoped to the runs above. Mojo's HTTP/2 multiplexing behaviour
-is untested here (`h2 | Mojo` not run), and the `h3 | Mojo` rows predate the
-current criteria (†), so neither is offered as evidence that Mojo multiplexes
-correctly; the H2 throughput matrix in the tables above remains the measured
-Mojo result. Loss via pf/dummynet is skipped on this host (no passwordless
-sudo); the measurable 5% client-side datagram drop passes for aioquic with 0
-failed requests under the current harness, and for Mojo at the earlier
-revision (†). When dummynet is available the harness reads `dnctl pipe list`
+That claim is scoped to the runs above. The current H2 and H3 validation
+sections provide Mojo's slow/cancel correctness evidence; the earlier
+`not run` and dagger-marked rows remain historical. The throughput matrix
+is unchanged. Loss via pf/dummynet is skipped on this host (no passwordless
+sudo). The current H3 validation at `349a1f6` records a 5% client-side
+datagram-drop check for Mojo with zero failures; the dagger-marked loss rows
+remain historical. This supplies correctness evidence under induced loss,
+without a pinned throughput comparison. When dummynet is available the
+harness reads `dnctl pipe list`
 and configures the first unused id (H2 42–61, H3 62–81) rather than a fixed
 one, because `dnctl pipe N config` targets an existing pipe instead of
 allocating a private one; the chosen id is recorded in the scenario detail
