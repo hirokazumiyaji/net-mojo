@@ -35,6 +35,7 @@ tar -xzf "$task_quiche_archive" -C "$task_quiche_stage"
 task_quiche_patches=(
     quiche-0.29.3-cancel-request.patch
     quiche-0.29.3-collected-stream-ranges.patch
+    quiche-0.29.3-unknown-stream-retirement.patch
 )
 for task_quiche_patch in "${task_quiche_patches[@]}"; do
     patch --silent --directory "$task_quiche_stage/quiche-0.29.3" -p1 \
