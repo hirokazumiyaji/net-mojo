@@ -275,7 +275,55 @@ drip writes, and complete a validated cycle plus postflight to make the row vali
 Ordinary cutoff, response checks and dropped/unstarted arrival gates apply
 unchanged. Tick lag and arrival diagnostics expose scheduling pressure; record
 actual loader/server CPU, RSS and FD evidence separately before claiming client
-capacity. Slow readers and formal five-trial comparison results remain separate.
+capacity. Reader behavior is described below; formal five-trial comparison results remain separate.
+
+Add `-slow-readers 8` to the same mixed `/fixed` keepalive commands to include
+slow readers (default zero). Each reader owns one original socket, requests a
+65536-byte receive buffer and records its actual raw `SO_RCVBUF` plus original
+local/remote addresses. Set/query failures invalidate setup; the reported raw
+value can differ across operating systems.
+
+A finite reader batch sends eight pipelined 1 MiB `/echo` bodies and validates
+eight exact HTTP/1.1 200 replies in order. The first byte of response i must be
+`b+i`, with the remaining bytes all `b`; one shared immutable payload supplies
+the uploads. The writer proceeds concurrently with 65536-byte paced reads,
+using one validation buffer per reader. At the 250 ms default, each response
+has sixteen read quanta (4 s nominal) and a full batch takes 32 s. Uploads do
+not wait for previous replies; accepted uploads can themselves block.
+
+Reader directional I/O uses a fresh 30 s budget clamped to an absolute finite
+batch cap from `-connection-check-timeout` (2 min default), recorded separately
+from ordinary `-timeout`. This cap starts at each batch admission. A caller's
+shorter cap can invalidate the batch. Pacing waits also stop at the finite cap,
+and an expired batch is rejected before reading buffered body bytes. Nominal
+response pacing reaching 30 s is
+rejected. Server 5/30/30 s deadlines and ordinary requests remain unchanged;
+a single aggregate 30 s cap would incorrectly reject the default 32 s batch.
+At workload end, stop starting batches and pacing, finish the finite concurrent
+uploads/reads, confirm the original socket, close and join. Errors close that
+owned socket before joining its blocked writer.
+
+`slow_clients.readers` has the same per-kind connection gates. `reader_sockets`
+records actual socket buffer values and tuples; reader profile constants and
+I/O/batch budgets are explicit. Reader windows record returned payload bytes,
+actual scheduled `paced_response_bytes_read` and `paced_read_quanta`, tick lag,
+validated responses/payloads and batches. `incomplete_ns` for readers measures
+known unread response time after strict headers until body consumption, clipped
+to the identical ordinary windows. Header prefetch, upload writes and sleep
+duration cannot qualify a reader as measured; actual paced reads and known
+unread overlap plus all eight strict replies/postflight are required. Totals
+retain events outside the workload windows. No profile work inflates ordinary
+success, throughput or latency, and ordinary overload remains invalid.
+
+`reader_server_send_pressure` reports `unverified`: client unread state or
+slower reads do not establish that a server application send blocked. The real
+TCP test fixture proves a large server Write remains pending with an owned
+small send buffer while ordinary siblings progress, then completes after read
+credit is released. This fixture does not change benchmark socket settings.
+Unchanged actual Go/Mojo server pressure requires separate independent evidence.
+Do not treat a sleeping socket, a blocked client upload or functional reader
+validation as that proof. Formal five-trial comparisons and capacity evidence
+remain separate from short functional checks and instrumented pressure trials.
 
 | Scenario | Conditions |
 | --- | --- |
