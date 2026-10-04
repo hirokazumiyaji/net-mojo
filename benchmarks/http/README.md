@@ -66,8 +66,41 @@ the exact benchmark body; compression and redirects are disabled. Invalid
 configuration, warmup failure, measured errors or zero successful measured
 requests produce a nonzero exit status and `valid: false`. Cutoff is reported
 separately. These runs measure saturated closed-loop throughput and its latency;
-fixed-arrival latency, resource sampling, idle and slow-client runs remain
-separate scenarios.
+fixed-arrival latency uses the mode below. Resource sampling, idle and slow-client
+runs remain separate scenarios.
+
+## Fixed-arrival HTTP/1 latency
+
+Use `-rate` to schedule a fixed integer number of requests per second:
+
+```bash
+/tmp/http-load -url http://127.0.0.1:18081/fixed -rate 1000 -connections 64 -warmup 10s -duration 30s
+/tmp/http-load -url http://127.0.0.1:18080/fixed -rate 1000 -connections 64 -warmup 10s -duration 30s
+```
+
+`-rate 0` keeps saturated closed-loop behavior. A positive rate places arrivals
+at absolute offsets `k / rate` from each window's start, without waiting for
+previous responses. Workers and queue capacity each equal `-connections`.
+Only those workers issue requests; a full queue records a dropped arrival and
+the original schedule continues. Queue memory is bounded by the worker count.
+
+`arrivals.scheduled` counts every planned arrival inside the measurement window.
+`dropped` counts full-queue admissions; `unstarted` includes arrivals the scheduler
+missed and queued requests that could not start before the deadline. The
+invariants are `scheduled = started + dropped + unstarted` and
+`started = success + errors + cutoff`. Any dropped/unstarted work, response error
+or zero latency samples makes the result invalid and the command exit nonzero.
+Warmup uses the same schedule, accounts for dropped/unstarted arrivals, and
+validates all admitted work through its bounded drain before measurement.
+
+Successful `latency_ms` samples run from planned arrival to completed validation,
+including scheduler lag and queue waiting. `arrivals.service_latency_ms` measures
+actual request start to completion for the same successful responses.
+`start_lag_p99_ms`, `start_lag_max_ms` and `start_lag_samples` describe planned-to-
+actual-start delay for all started requests, including errors and cutoff.
+Invalid runs contain partial diagnostic latency samples and cannot establish a
+latency comparison. These fields expose client lag; independent client resource
+checks are still required to establish that the generator is not saturated.
 
 ## Scenarios (from Issue #42)
 
