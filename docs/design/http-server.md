@@ -579,23 +579,32 @@ transport 失敗は `NetError`、HTTP 失敗は `HttpError(status, should_close)
 | handler error・response 拡張時の budget 超過 | 500 と close | 別接続の loop は継続 |
 | 全体 budget 予約不可 | 503 と close | - |
 
-### HTTP conformance table（RFC 9112 対応付け）
+### HTTP/1.1 の規則と検証範囲
 
-| # | 方針 | RFC 9112 節 | fixture / test（予定） |
+次表は [RFC 9112](https://www.rfc-editor.org/rfc/rfc9112.html) の framing と接続管理、[RFC 9110](https://www.rfc-editor.org/rfc/rfc9110.html) の意味規則を、現在の実装方針と fixture の入力／期待結果に対応付ける。
+parser と encoder の単体 fixture は wire bytes を入力または出力し、server と detach の fixture は loopback TCP を使う。
+各行は記載した例の検証範囲であり、参照節の全要件への適合認定ではない。
+
+以下の `P`、`R`、`S`、`D` は、それぞれ `tests/test_http_parser.mojo`、`tests/test_http_response.mojo`、`tests/test_http_server.mojo`、`tests/test_http_detach.mojo` を表す。
+
+| # | 現在の方針 | 関連する RFC の節 | fixture と確認する結果 |
 | --- | --- | --- | --- |
-| C1 | 任意 byte 境界分割・連結・binary body・複数 request 同時到着 | §2.1, §5, §6 | `test_http_parser`: 全境界分割 table |
-| C2 | request line・header は CRLF 厳密、不正 token・注入・obs-fold 拒否 | §2.2, §5.1, §5.2, §5.5 | malformed corpus + 400 |
-| C3 | Host 欠落/重複/不正を拒否 | §3.2 | Host table |
-| C4 | origin-form・absolute-form（authority を Host に優先）・`OPTIONS *` | §3.1, §3.2 | target-form table |
-| C5 | CONNECT・Upgrade は切替せず明示 error | §3.1, §7.2 相当 | 400/505 側に整理 |
-| C6 | Content-Length・chunked、併存・矛盾・不正 chunk・overflow を拒否して close。重複 CL は同値でも拒否 | §6.1–§6.3 | CL/TE table + overflow |
-| C7 | chunk extension・trailer は別上限で検証、header に混入せず framing/routing 不変 | §7.1 | trailer 分離 test |
-| C8 | `Expect: 100-continue` は検証後に 100、その他は 417 と close | §10.1.1 | 100-continue test |
-| C9 | keep-alive・`Connection: close`。pipelining は一接続一 request ずつ順序保存、無制限 queue なし | §7.3, §9.3 | keep-alive・pipeline 順序 |
-| C10 | HEAD・204・304 の body 規則は encoder 集約。通常は確定 Content-Length。Date 生成。response 注入拒否 | §6.4, §5.3 相当 | `test_http_response` |
-| C11 | EOF が完全 request の後なら送って close、未完は成功扱いしない | §9.6 | EOF test |
+| C1 | 分割受信を蓄積し、1 request 分だけ消費する。body は bytes として保持する | 9112 §2.1、§2.2、§6.3 | P `test_fragmentation_at_every_boundary` は CL と chunked の各 1 例を全 split 点で分割し、consumed、method、path、body 長を比較。P `test_pipelined_requests_leave_remainder` は連結した 2 request を別々に parse。S `test_binary_body_roundtrip` は NUL、CR、LF、0xff を含む body の長さと指定 bytes を確認 |
+| C2 | CRLF を要求し、不正 field name、colon 前の空白、obs-fold を 400 にする | 9112 §2.2、§5.1、§5.2。9110 §5.5、§5.6.2 | P `test_strict_crlf_token_obs_fold` の bare LF、`Bad Header`、`X-A :`、折返し行が 400。P `test_obs_text_header_value_preserved` は 0x80 を保持。R `test_response_injection_rejected` は CRLF を含む value の追加を拒否 |
+| C3 | HTTP/1.1 の Host 欠落、複数行、空値、不正 authority を 400 にする | 9112 §3.2。9110 §7.2 | P `test_host_missing_duplicate_invalid` の欠落、重複、空値、空白と、`test_host_authority_structure` の host／port／IPv6 の有効例と不正例を確認 |
+| C4 | origin-form、absolute-form、`OPTIONS *` を受理し、absolute-form の authority を優先する | 9112 §3.2.1、§3.2.2、§3.2.4 | P `test_path_query_split_without_decoding` は percent escape を保持。`test_absolute_form_and_options_star` は Host と異なる absolute authority と `*` を確認。`test_absolute_query_only_normalizes_to_root` は空 path を `/` にする。URI 全体の再構築への適合はこの例から判断しない |
+| C5 | CONNECT と Upgrade は未対応で、現在は 400 にする（実装方針） | CONNECT: 9112 §3.2.3、9110 §9.3.6。Upgrade: 9110 §7.8 | P `test_strict_crlf_token_obs_fold` は CONNECT と `Upgrade: h2c` に 400。505 は同じ fixture の `HTTP/2.0` に対する別の結果。切替成功の適合試験は含まない |
+| C6 | CL と chunked を処理し、CL/TE 併存、重複 CL、不正 framing、overflow を拒否する。同値 CL も拒否する方針 | 9112 §6.1、§6.2、§6.3、§7.1。9110 §8.6 | P `test_content_length_and_transfer_encoding` は同値の重複 CL、CL/TE、非数値 CL、`gzip` 単独を 400、`Chunked` を受理。P `test_overflow_and_limits` は decimal overflow と不正 hex を 400。S `test_chunked_echo_roundtrip` は decoded `hello` を返す。これらの parser の 400 assertion 自体は TCP close を検証しない |
+| C7 | chunk extension を検証し、trailer を通常 header と別に保持する。metadata と trailer に別上限を適用する | 9112 §7.1.1、§7.1.2。9110 §6.5、§6.5.1、§6.5.2 | P `test_chunked_with_extension_and_trailer` は `X-Trailer` の値と別 storage を確認。`test_chunk_extension_grammar` は token／quoted extension と不正例。`test_chunk_metadata_and_trailer_limits` は trailer 件数超過を 431、指定した framing、認証、content 等の field を 400 |
+| C8 | header 検証と宣言 body 上限判定後に 100 Continue を送り、未対応 Expect は 417 と close にする | 9110 §10.1.1、§15.2.1、§15.5.18 | S `test_100_continue_flow` は body 送信前に 100 を受信し、3-byte body 送信後に 200 と `abc` を確認。P `test_multiple_expect_fields_all_must_agree` は両 field 順序で 417。S `test_unknown_expectation_is_417` は 417 の status のみ確認 |
+| C9 | HTTP/1.1 の接続を再利用し、`Connection: close` を処理する。pipeline の応答順序を保つ | 9112 §9.2、§9.3、§9.3.2。9110 §7.6.1 | S `test_hello_keep_alive_two_requests` は同一接続で 200、404。`test_connection_close_roundtrip` は close header と接続消滅。`test_pipeline_order_preserved` は ONE が TWO より前。D `test_detached_pipeline_order_preserved` は detach 中の後続 request の順序を確認 |
+| C10 | buffered response は確定 CL と Date を出力する。HEAD は body を省略し、1xx／204／205／304 は body と CL を省略する。detached streaming は chunked を使う | 9112 §6.3、§7.1。9110 §6.6.1、§8.6、§9.3.2、§15.3.5、§15.3.6、§15.4.5 | R `test_normal_response_has_length_and_date`、`test_head_keeps_length_but_omits_body`、`test_no_body_statuses_drop_body_and_length` は出力 header と body 終端を確認。D `test_detached_response_streaming_chunks` は 3 chunks、zero 終端、接続再利用。304 で CL を省略するのは現在の方針で、条件付き GET の処理を証明しない |
+| C11 | 完全 request 後の EOF は応答後に close、未完 body の EOF は成功応答にしない | 9112 §6.3、§8、§9.6 | S `test_eof_after_complete_responds_then_closes` は 200、body、EOF、接続消滅。`test_eof_after_pipelined_batch_serves_all` は 3 応答。`test_eof_mid_request_closes_without_success` は CL 100 に 3 bytes だけ送り、接続消滅と応答 bytes なしを確認 |
 
-method・status の意味は RFC 9110 による。Phase 1 で節番号付き table と wire fixture に対応付ける。
+未検証の範囲は、全 request の全分割点、malformed corpus 全件の wire 上の status と close、全 trailer field 定義、全 method／status の意味規則である。
+absolute-form から得る `scheme` は現在 `http` 固定であり、TLS の接続情報を含めた target URI 再構築（9112 §3.3）への適合は別に検証する。
+CONNECT／Upgrade の 400 と、未対応 transfer-coding の一律 400 は実装方針であり、RFC の要求する唯一の応答ではない（9112 §6.1 は未理解 coding に 501 を推奨する）。
+この表だけで HTTP/2、HTTP/3、proxy、cache の適合を判定しない。
 
 ### HTTP/2 と HTTP/3 の request 変換
 
