@@ -68,6 +68,23 @@ fn default_receive_limits() -> ReceiveLimits {
     }
 }
 
+fn default_send_limits() -> quiche::SendLimits {
+    quiche::SendLimits {
+        request: quiche::SendLimit {
+            backing_bytes: 128 * 1024 * 1024,
+            slots: 524_288,
+        },
+        control: quiche::SendLimit {
+            backing_bytes: 8 * 1024 * 1024,
+            slots: 524_288,
+        },
+        crypto: quiche::SendLimit {
+            backing_bytes: 64 * 1024 * 1024,
+            slots: 524_288,
+        },
+    }
+}
+
 pub struct NetQuicServerConfig {
     _inner: Option<quiche::Config>,
 }
@@ -1100,6 +1117,7 @@ impl QuicServer {
     pub fn new(mut config: quiche::Config) -> io::Result<Self> {
         let receive_budget = ReceiveBudget::new(default_receive_limits());
         config.set_receive_budget(receive_budget.clone());
+        config.set_send_budget(quiche::SendBudget::new(default_send_limits()));
         let mut http3_config = quiche::h3::Config::new().unwrap();
         http3_config.set_max_field_section_size(32_768);
         http3_config.set_qpack_max_table_capacity(0);
@@ -1193,7 +1211,10 @@ impl QuicServer {
         let mut first_error = None;
         let mut timeouts = Vec::new();
         for (connection_key, connection) in self.connections.iter_mut() {
-            if connection.transport.is_closed() || connection.transport.is_draining() {
+            if connection.transport.local_error().is_some()
+                || connection.transport.is_closed()
+                || connection.transport.is_draining()
+            {
                 continue;
             }
             self.send_ready.push(connection_key);
@@ -1251,7 +1272,14 @@ impl QuicServer {
                 let mut source_id = [0; 16];
                 self.random.read_exact(&mut source_id)?;
                 let source_id = ConnectionId::from_ref(&source_id);
-                let connection = quiche::accept(&source_id, None, local, remote, &mut self.config)?;
+                let connection =
+                    match quiche::accept(&source_id, None, local, remote, &mut self.config) {
+                        Ok(connection) => connection,
+                        Err(quiche::Error::SendBufferExceeded) => {
+                            return Err(quiche::Error::Done.into());
+                        }
+                        Err(error) => return Err(error.into()),
+                    };
                 self.receive_budget_locked = true;
                 let key = source_id.as_ref().to_vec();
                 self.routes.insert(destination_id.clone(), key.clone());
@@ -1295,14 +1323,26 @@ impl QuicServer {
         self.refresh_idle_timeout(&key);
         self.refresh_response_ready(&key);
         self.refresh_goaway_ready(&key);
-        if let Err(error) = received {
-            self.reap_closed_connection(&key);
-            return Err(error.into());
+        match received {
+            Err(quiche::Error::SendBufferExceeded) => {
+                self.terminate_send_quota(&key);
+                return Ok(());
+            }
+            Err(error) => {
+                self.reap_closed_connection(&key);
+                return Err(error.into());
+            }
+            Ok(_) => (),
         }
         let http3_error = {
             let connection = self.connections.get_mut(&key).unwrap();
             connection.idle_deadline_at = Some(Instant::now() + self.idle_timeout);
-            if connection.transport.is_established() && connection.http3.is_none() {
+            if connection.transport.is_established()
+                && connection.transport.local_error().is_none()
+                && !connection.transport.is_draining()
+                && !connection.transport.is_closed()
+                && connection.http3.is_none()
+            {
                 match quiche::h3::Connection::with_transport(
                     &mut connection.transport,
                     &self.http3_config,
@@ -1320,6 +1360,10 @@ impl QuicServer {
         };
         self.refresh_idle_timeout(&key);
         if let Some(error) = http3_error {
+            if error == quiche::h3::Error::TransportError(quiche::Error::SendBufferExceeded) {
+                self.terminate_send_quota(&key);
+                return Ok(());
+            }
             self.reap_closed_connection(&key);
             return Err(error.into());
         }
@@ -1418,6 +1462,9 @@ impl QuicServer {
         }
         let connection = &self.connections[key];
         if self.shutdown < ShutdownState::Closing
+            && connection.transport.local_error().is_none()
+            && !connection.transport.is_draining()
+            && !connection.transport.is_closed()
             && (!connection.goaway_sent
                 || (self.shutdown >= ShutdownState::Finishing && !connection.final_goaway_sent))
         {
@@ -1439,6 +1486,12 @@ impl QuicServer {
                 self.goaway_checks += 1;
             }
             let connection = self.connections.get_mut(&key).unwrap();
+            if connection.transport.local_error().is_some()
+                || connection.transport.is_draining()
+                || connection.transport.is_closed()
+            {
+                continue;
+            }
             let Some(http3) = connection.http3.as_mut() else {
                 continue;
             };
@@ -1449,6 +1502,10 @@ impl QuicServer {
                         self.send_ready.push(&key);
                     }
                     Err(quiche::h3::Error::StreamBlocked | quiche::h3::Error::Done) => continue,
+                    Err(quiche::h3::Error::TransportError(quiche::Error::SendBufferExceeded)) => {
+                        self.terminate_send_quota(&key);
+                        continue;
+                    }
                     Err(error) => {
                         self.goaway_ready.push(&key);
                         return Err(error.into());
@@ -1469,6 +1526,10 @@ impl QuicServer {
                         self.send_ready.push(&key);
                     }
                     Err(quiche::h3::Error::StreamBlocked | quiche::h3::Error::Done) => (),
+                    Err(quiche::h3::Error::TransportError(quiche::Error::SendBufferExceeded)) => {
+                        self.terminate_send_quota(&key);
+                        continue;
+                    }
                     Err(error) => {
                         self.goaway_ready.push(&key);
                         return Err(error.into());
@@ -1494,44 +1555,77 @@ impl QuicServer {
         self.force_drop_connection(connection_key);
     }
 
-    fn force_drop_connection(&mut self, connection_key: &[u8]) {
-        let Some(connection) = self.connections.remove(connection_key) else {
-            return;
-        };
-        self.send_ready.remove(connection_key);
+    fn terminate_send_quota(&mut self, connection_key: &[u8]) {
+        let connection = self.connections.get_mut(connection_key).unwrap();
+        let _ = connection.transport.close(false, 0x1, b"send buffer limit");
+        self.clear_connection_requests(connection_key);
+        self.send_ready.push(connection_key);
+        self.refresh_transport_timeout(connection_key);
+        self.reap_closed_connection(connection_key);
+    }
+
+    fn clear_connection_requests(&mut self, connection_key: &[u8]) {
+        let connection = self.connections.get_mut(connection_key).unwrap();
         self.response_ready.remove(connection_key);
         self.goaway_ready.remove(connection_key);
-        if let Some(deadline) = connection.transport_deadline_at {
-            self.transport_timeouts
-                .remove(&(deadline, connection_key.to_vec()));
-        }
-        for (stream_id, deadline) in &connection.indexed_request_deadlines {
+        for (stream_id, deadline) in connection.indexed_request_deadlines.drain() {
             self.request_timeouts
-                .remove(&(*deadline, connection_key.to_vec(), *stream_id));
+                .remove(&(deadline, connection_key.to_vec(), stream_id));
         }
-        if let Some(deadline) = connection.indexed_idle_deadline_at {
+        if let Some(deadline) = connection.indexed_idle_deadline_at.take() {
             self.idle_timeouts
                 .remove(&(deadline, connection_key.to_vec()));
         }
-        for (stream_id, response) in &connection.responses {
+        connection.idle_deadline_at = None;
+        connection.header_deadlines.clear();
+        connection.http3 = None;
+        let requests = std::mem::take(&mut connection.requests);
+        let in_flight_bytes: usize = requests
+            .values()
+            .map(|request| request.retained_bytes)
+            .sum();
+        drop(requests);
+        self.buffered_request_bytes -= in_flight_bytes;
+        let responses = std::mem::take(&mut connection.responses);
+        for (stream_id, response) in &responses {
             self.response_timeouts.remove(&(
                 response.write_deadline_at,
                 connection_key.to_vec(),
                 *stream_id,
             ));
         }
-        let in_flight_bytes: usize = connection
-            .requests
-            .values()
-            .map(|request| request.retained_bytes)
-            .sum();
-        self.buffered_request_bytes -= in_flight_bytes;
-        let response_bytes: usize = connection
-            .responses
+        let response_bytes: usize = responses
             .values()
             .map(|response| response.buffered_bytes)
             .sum();
+        drop(responses);
         self.buffered_response_bytes -= response_bytes;
+        for request_id in connection.request_route_ids.drain() {
+            #[cfg(test)]
+            {
+                self.request_route_visits += 1;
+                self.completed_request_visits += 1;
+            }
+            self.request_routes.remove(&request_id);
+            if let Some(request) = self.requests.remove(request_id) {
+                let retained_bytes = completed_request_retained_bytes(&request);
+                drop(request);
+                self.buffered_request_bytes -= retained_bytes;
+            }
+        }
+    }
+
+    fn force_drop_connection(&mut self, connection_key: &[u8]) {
+        if !self.connections.contains_key(connection_key) {
+            return;
+        }
+        self.clear_connection_requests(connection_key);
+        let connection = self.connections.remove(connection_key).unwrap();
+        self.send_ready.remove(connection_key);
+        if let Some(deadline) = connection.transport_deadline_at {
+            self.transport_timeouts
+                .remove(&(deadline, connection_key.to_vec()));
+        }
         #[cfg(test)]
         {
             self.cid_route_visits += 1;
@@ -1543,21 +1637,6 @@ impl QuicServer {
                 self.cid_route_visits += 1;
             }
             self.routes.remove(source_id.as_ref());
-        }
-        let request_ids = connection.request_route_ids;
-        for request_id in &request_ids {
-            #[cfg(test)]
-            {
-                self.request_route_visits += 1;
-            }
-            self.request_routes.remove(request_id);
-            #[cfg(test)]
-            {
-                self.completed_request_visits += 1;
-            }
-            if let Some(request) = self.requests.remove(*request_id) {
-                self.buffered_request_bytes -= completed_request_retained_bytes(&request);
-            }
         }
     }
 
@@ -2023,7 +2102,7 @@ impl QuicServer {
     fn drive_responses(&mut self) -> Result<(), QuicServerError> {
         self.expire_responses();
         let ready = self.response_ready.entries.len();
-        for _ in 0..ready {
+        'connections: for _ in 0..ready {
             let connection_key = self.response_ready.pop().unwrap();
             let mut completed = Vec::new();
             let connection = self.connections.get_mut(&connection_key).unwrap();
@@ -2058,6 +2137,12 @@ impl QuicServer {
                             continue;
                         }
                         Err(quiche::h3::Error::Done | quiche::h3::Error::StreamBlocked) => continue,
+                        Err(quiche::h3::Error::TransportError(
+                            quiche::Error::SendBufferExceeded,
+                        )) => {
+                            self.terminate_send_quota(&connection_key);
+                            continue 'connections;
+                        }
                         Err(error) => {
                             self.response_ready.push(&connection_key);
                             return Err(error.into());
@@ -2092,6 +2177,10 @@ impl QuicServer {
                         completed.push((connection_key.clone(), stream_id, response.request_id));
                     }
                     Err(quiche::h3::Error::Done | quiche::h3::Error::StreamBlocked) => (),
+                    Err(quiche::h3::Error::TransportError(quiche::Error::SendBufferExceeded)) => {
+                        self.terminate_send_quota(&connection_key);
+                        continue 'connections;
+                    }
                     Err(error) => {
                         self.response_ready.push(&connection_key);
                         return Err(error.into());
@@ -2140,6 +2229,7 @@ impl QuicServer {
                     return Ok(Some((length, info)));
                 }
                 Err(quiche::Error::Done) => self.reap_closed_connection(&key),
+                Err(quiche::Error::SendBufferExceeded) => self.terminate_send_quota(&key),
                 Err(error) => {
                     self.send_ready.push(&key);
                     return Err(error.into());
@@ -2159,7 +2249,10 @@ impl QuicServer {
 
     fn refresh_idle_timeout(&mut self, key: &[u8]) {
         let connection = self.connections.get_mut(key).unwrap();
-        let deadline = if connection.requests.is_empty()
+        let deadline = if connection.transport.local_error().is_none()
+            && !connection.transport.is_draining()
+            && !connection.transport.is_closed()
+            && connection.requests.is_empty()
             && connection.header_deadlines.is_empty()
             && connection.responses.is_empty()
         {
@@ -7119,5 +7212,5 @@ mod tests {
         assert!(fixture.wait().unwrap().success());
     }
     include!("receive_budget_tests.rs");
-
+    include!("send_policy_tests.rs");
 }
