@@ -99,6 +99,12 @@ delivery retains ownership until response completion, cancellation, rejection
 or expiry. Connection teardown removes only those IDs from the global route
 map; the set holds one entry per live route.
 
+The completed-request FIFO stores each queued request once in a map with
+arrival-order links. Delivery removes its head; connection teardown directly
+removes owned queued IDs and releases their retained header/body bytes.
+Already delivered IDs release no queued bytes. Numeric ID wrap does not change
+arrival order, and removals retain no request tombstones.
+
 Each initial shutdown stage broadcasts to live connections once. Subsequent
 GOAWAY driving uses a bounded deduplicated queue of connections with unfinished
 flags, refreshed by receive, native timeout and local cancellation events.
@@ -133,8 +139,8 @@ stopped transport stream and send errors remove HTTP/3 stream state when the
 request receive side has finished; queued provider responses satisfy that
 completed-request condition. Sibling streams and subsequent requests continue.
 
-Initial shutdown broadcasts still visit every live connection, and actual
-connection teardown still scans the completed-request FIFO. The
+Initial shutdown broadcasts still visit every live connection, and response
+driving visits active streams within each affected connection. The
 full server loop is not yet proportional only to ready or due work.
 
 ### Canceled HTTP/3 request state
