@@ -39,6 +39,18 @@ def main() raises:
         config.quic_receive_crypto_bytes = 0
     elif mode == "crypto_slots":
         config.quic_receive_crypto_slots = 4
+    elif mode == "send_request_bytes":
+        config.quic_send_request_bytes = 0
+    elif mode == "send_request_slots":
+        config.quic_send_request_slots = 0
+    elif mode == "send_control_bytes":
+        config.quic_send_control_bytes = 0
+    elif mode == "send_control_slots":
+        config.quic_send_control_slots = 0
+    elif mode == "send_crypto_bytes":
+        config.quic_send_crypto_bytes = 0
+    elif mode == "send_crypto_slots":
+        config.quic_send_crypto_slots = 0
     var server = Server(config^)
     server.add_quic_endpoint(
         QuicUDPEndpoint(provider.server(native^), listener^)

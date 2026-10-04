@@ -18,6 +18,12 @@ struct ServerConfig(Copyable, Movable):
     var quic_receive_control_slots: Int
     var quic_receive_crypto_bytes: Int
     var quic_receive_crypto_slots: Int
+    var quic_send_request_bytes: Int
+    var quic_send_request_slots: Int
+    var quic_send_control_bytes: Int
+    var quic_send_control_slots: Int
+    var quic_send_crypto_bytes: Int
+    var quic_send_crypto_slots: Int
     var max_http2_streams_per_connection: Int
     var http2_max_new_streams_per_second: Int
     # Tumbling 1s window; non-ACK PING/SETTINGS, WINDOW_UPDATE, PRIORITY.
@@ -66,6 +72,12 @@ struct ServerConfig(Copyable, Movable):
             quic_receive_control_slots=131072,
             quic_receive_crypto_bytes=16777216,
             quic_receive_crypto_slots=131072,
+            quic_send_request_bytes=134217728,
+            quic_send_request_slots=524288,
+            quic_send_control_bytes=8388608,
+            quic_send_control_slots=524288,
+            quic_send_crypto_bytes=67108864,
+            quic_send_crypto_slots=524288,
             max_http2_streams_per_connection=100,
             http2_max_new_streams_per_second=1000000,
             http2_max_control_frames_per_second=1000,

@@ -205,6 +205,46 @@ struct QuicServer(Movable):
                 "receive limits cannot change after accepting a connection",
             )
 
+    def set_send_limits(
+        mut self,
+        request_bytes: Int,
+        request_slots: Int,
+        control_bytes: Int,
+        control_slots: Int,
+        crypto_bytes: Int,
+        crypto_slots: Int,
+    ) raises NetError:
+        if (
+            request_bytes < 0
+            or request_slots < 0
+            or control_bytes < 0
+            or control_slots < 0
+            or crypto_bytes < 0
+            or crypto_slots < 0
+        ):
+            raise NetError(
+                NetErrorKind.invalid_state(),
+                "set QUIC send limits",
+                None,
+                "send capacities must be nonnegative",
+            )
+        var result = self._library.call["net_quic_set_send_limits", c_int](
+            self._server,
+            c_size_t(request_bytes),
+            c_size_t(request_slots),
+            c_size_t(control_bytes),
+            c_size_t(control_slots),
+            c_size_t(crypto_bytes),
+            c_size_t(crypto_slots),
+        )
+        if result != 1:
+            raise NetError(
+                NetErrorKind.invalid_state(),
+                "set QUIC send limits",
+                None,
+                "send limits cannot change after accepting a connection",
+            )
+
     def transport_memory_bytes(self) -> Int:
         return Int(
             self._library.call["net_quic_transport_memory_bytes", c_size_t](
@@ -437,6 +477,24 @@ struct QuicUDPEndpoint(Movable):
         crypto_slots: Int,
     ) raises NetError:
         self._server.set_receive_limits(
+            request_bytes,
+            request_slots,
+            control_bytes,
+            control_slots,
+            crypto_bytes,
+            crypto_slots,
+        )
+
+    def set_send_limits(
+        mut self,
+        request_bytes: Int,
+        request_slots: Int,
+        control_bytes: Int,
+        control_slots: Int,
+        crypto_bytes: Int,
+        crypto_slots: Int,
+    ) raises NetError:
+        self._server.set_send_limits(
             request_bytes,
             request_slots,
             control_bytes,

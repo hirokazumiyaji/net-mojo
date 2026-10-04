@@ -442,6 +442,12 @@ struct ServerConfig(Copyable, Movable):
     var quic_receive_control_slots: Int         # 131,072
     var quic_receive_crypto_bytes: Int          # 16 MiB
     var quic_receive_crypto_slots: Int          # 131,072
+    var quic_send_request_bytes: Int            # 128 MiB
+    var quic_send_request_slots: Int            # 524,288
+    var quic_send_control_bytes: Int            # 8 MiB
+    var quic_send_control_slots: Int            # 524,288
+    var quic_send_crypto_bytes: Int             # 64 MiB
+    var quic_send_crypto_slots: Int             # 524,288
     var max_http2_streams_per_connection: Int    # 100
     var http2_max_new_streams_per_second: Int    # 1,000,000
     var http2_max_control_frames_per_second: Int # 1,000
@@ -550,6 +556,7 @@ quiche の opt-in `Config::set_send_budget()` は、各送信 view の `AsRef` b
 ACK は破棄された backing を返却し、空になった deque の再利用可能な容量は reset、CRYPTO clear、Drop まで計上を保つ。
 TLS callback で検出した送信 quota 超過は handshake 処理から `SendBufferExceeded` として返り、HTTP/3 control stream の初期化も同じエラーを返す。TLS は QUIC の非 application `INTERNAL_ERROR` として終了し、HTTP/3 初期化はこの quota エラーを汎用の application error に変換しない。
 provider は接続間で共有する送信 pool を設定し、request/response は 128 MiB、control は 8 MiB、CRYPTO は 64 MiB、各 pool の owner/deque cell は 524,288 個を上限とする。
+`ServerConfig.quic_send_{request,control,crypto}_{bytes,slots}` と `QuicServer` / `QuicUDPEndpoint.set_send_limits()` で変更できる。値は非負で、0 は実際の容量 0 として扱う。送受信 pool の設定は最初の接続受け入れ前だけ変更でき、受け入れ失敗では固定されず、一度受け入れた接続を閉じても固定を解除しない。
 受信 pool は独立しており、engine 単体の既定の送信上限は無制限のままである。
 任意の `BufFactory` が隠す追加の allocation や TLS/recovery metadata、プロセス全体の RSS はこの計上対象に含まれず、任意の 10,000 接続の同時 handshake を保証する上限ではない。
 

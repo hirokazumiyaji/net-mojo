@@ -227,6 +227,40 @@ pub unsafe extern "C" fn net_quic_server_set_receive_limits(
 }
 
 #[unsafe(no_mangle)]
+pub unsafe extern "C" fn net_quic_server_set_send_limits(
+    server: *mut NetQuicServer,
+    request_bytes: usize,
+    request_slots: usize,
+    control_bytes: usize,
+    control_slots: usize,
+    crypto_bytes: usize,
+    crypto_slots: usize,
+) -> i32 {
+    if server.is_null() {
+        return -1;
+    }
+    let limits = quiche::SendLimits {
+        request: quiche::SendLimit {
+            backing_bytes: request_bytes,
+            slots: request_slots,
+        },
+        control: quiche::SendLimit {
+            backing_bytes: control_bytes,
+            slots: control_slots,
+        },
+        crypto: quiche::SendLimit {
+            backing_bytes: crypto_bytes,
+            slots: crypto_slots,
+        },
+    };
+    if unsafe { &mut *server }._inner.set_send_limits(limits) {
+        1
+    } else {
+        -1
+    }
+}
+
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn net_quic_server_transport_memory_bytes(
     server: *const NetQuicServer,
 ) -> usize {
@@ -1185,6 +1219,14 @@ impl QuicServer {
         let budget = ReceiveBudget::new(limits);
         self.config.set_receive_budget(budget.clone());
         self.receive_budget = budget;
+        true
+    }
+
+    fn set_send_limits(&mut self, limits: quiche::SendLimits) -> bool {
+        if self.receive_budget_locked {
+            return false;
+        }
+        self.config.set_send_budget(quiche::SendBudget::new(limits));
         true
     }
 

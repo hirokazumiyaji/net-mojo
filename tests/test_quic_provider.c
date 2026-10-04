@@ -5,7 +5,9 @@
 #include "net_quic_provider.h"
 #include "quiche.h"
 
-static int test_receive_limits(struct NetQuicServer *server) {
+static int test_pool_limits(struct NetQuicServer *server,
+    int32_t (*set_limits)(struct NetQuicServer *, size_t, size_t, size_t,
+                          size_t, size_t, size_t), size_t denied_crypto_slots) {
     quiche_config *client_config = quiche_config_new(QUICHE_PROTOCOL_VERSION);
     const uint8_t protocols[] = {2, 'h', '3'};
     if (client_config == NULL ||
@@ -30,20 +32,22 @@ static int test_receive_limits(struct NetQuicServer *server) {
     quiche_send_info info;
     ssize_t length = quiche_conn_send(client, original, sizeof(original), &info);
     if (length <= 0 ||
-        net_quic_set_receive_limits(server, 64, 6, 4096, 32, 16384, 4) != 1) {
+        set_limits(server, 64, 6, 4096, 32, 16384, denied_crypto_slots) != 1) {
         return 7;
     }
     memcpy(packet, original, (size_t)length);
     int rejected = net_quic_receive(server, packet, (size_t)length,
                                     "127.0.0.1:4433", "127.0.0.1:54700");
-    int restored = net_quic_set_receive_limits(server, 64, 6, 4096, 32, 16384, 64);
+    int restored = set_limits(server, 64, 6, 4096, 32, 16384, 64);
     if (rejected != 0 || restored != 1) {
-        fprintf(stderr, "receive rejection=%d restore=%d\n", rejected, restored);
+        fprintf(stderr, "pool rejection=%d restore=%d\n", rejected, restored);
         return 8;
     }
     memcpy(packet, original, (size_t)length);
     if (net_quic_receive(server, packet, (size_t)length,
                          "127.0.0.1:4433", "127.0.0.1:54700") != 1 ||
+        set_limits(server, 65, 6, 4096, 32, 16384, 64) != -1 ||
+        net_quic_set_send_limits(server, 65, 6, 4096, 32, 16384, 64) != -1 ||
         net_quic_set_receive_limits(server, 65, 6, 4096, 32, 16384, 64) != -1) {
         return 9;
     }
@@ -75,10 +79,18 @@ int main(int argc, char **argv) {
         send_delay_ns != 0) {
         return 4;
     }
-    int receive_result = test_receive_limits(server);
+    int receive_result = test_pool_limits(server, net_quic_set_receive_limits, 4);
     if (receive_result != 0) {
         return receive_result;
     }
+    net_quic_free(server);
+    net_quic_config_free(config);
+    config = net_quic_config_new(argv[1], argv[2]);
+    if (config == NULL) { return 10; }
+    server = net_quic_create(config);
+    if (server == NULL) { return 11; }
+    int send_result = test_pool_limits(server, net_quic_set_send_limits, 0);
+    if (send_result != 0) { return send_result; }
     net_quic_free(server);
     net_quic_config_free(config);
     puts("QUIC provider server ownership: ok");
