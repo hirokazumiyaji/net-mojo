@@ -18,6 +18,87 @@ from net.http import (
     split_path_query,
 )
 from net.http._encoder import encode_response
+from net.http._buffer import BufferBudget, _reserve_capacity
+
+
+def test_receive_growth_charges_capacity_and_old_new_peak() raises:
+    var budget = BufferBudget(24)
+    var bytes = List[Byte]()
+    var reserved = 0
+    assert_true(_reserve_capacity(bytes, budget, 8, reserved))
+    bytes.extend(List[Byte](length=8, fill=42))
+    assert_equal(bytes.capacity(), 8)
+    assert_equal(budget.used, 8)
+    assert_true(_reserve_capacity(bytes, budget, 9, reserved))
+    assert_equal(bytes.capacity(), 16)
+    assert_equal(budget.used, 16)
+    assert_equal(len(bytes), 8)
+    assert_equal(bytes[7], 42)
+
+
+def test_receive_growth_clamps_to_peak_available_capacity() raises:
+    var budget = BufferBudget(20)
+    var bytes = List[Byte]()
+    var reserved = 0
+    assert_true(_reserve_capacity(bytes, budget, 8, reserved))
+    assert_true(_reserve_capacity(bytes, budget, 9, reserved))
+    assert_equal(bytes.capacity(), 12)
+    assert_equal(budget.used, 12)
+
+
+def test_receive_growth_rejects_final_fit_without_peak_space() raises:
+    var budget = BufferBudget(16)
+    var bytes = List[Byte]()
+    var reserved = 0
+    assert_true(_reserve_capacity(bytes, budget, 8, reserved))
+    bytes.append(42)
+    assert_false(_reserve_capacity(bytes, budget, 9, reserved))
+    assert_equal(bytes.capacity(), 8)
+    assert_equal(budget.used, 8)
+    assert_equal(len(bytes), 1)
+    assert_equal(bytes[0], 42)
+
+
+def test_receive_growth_consumes_admission_and_releases_old_capacity() raises:
+    var budget = BufferBudget(24)
+    var bytes = List[Byte]()
+    var reserved = 0
+    assert_true(_reserve_capacity(bytes, budget, 8, reserved))
+    assert_true(budget.try_reserve(12))
+    reserved = 12
+    assert_true(_reserve_capacity(bytes, budget, 9, reserved))
+    assert_equal(bytes.capacity(), 16)
+    assert_equal(reserved, 0)
+    assert_equal(budget.used, 16)
+
+
+def test_receive_growth_preserves_unused_admission() raises:
+    var budget = BufferBudget(40)
+    var bytes = List[Byte]()
+    var reserved = 0
+    assert_true(_reserve_capacity(bytes, budget, 8, reserved))
+    assert_true(budget.try_reserve(20))
+    reserved = 20
+    assert_true(_reserve_capacity(bytes, budget, 9, reserved))
+    assert_equal(bytes.capacity(), 16)
+    assert_equal(reserved, 4)
+    assert_equal(budget.used, 20)
+    assert_true(_reserve_capacity(bytes, budget, 10, reserved))
+    assert_equal(reserved, 4)
+    assert_equal(budget.used, 20)
+
+
+def test_receive_failed_growth_preserves_admission() raises:
+    var budget = BufferBudget(16)
+    var bytes = List[Byte]()
+    var reserved = 0
+    assert_true(_reserve_capacity(bytes, budget, 8, reserved))
+    assert_true(budget.try_reserve(8))
+    reserved = 8
+    assert_false(_reserve_capacity(bytes, budget, 9, reserved))
+    assert_equal(bytes.capacity(), 8)
+    assert_equal(reserved, 8)
+    assert_equal(budget.used, 16)
 
 
 struct _HelloHandler(Handler):

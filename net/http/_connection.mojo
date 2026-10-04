@@ -211,10 +211,13 @@ struct HttpConnection(Movable):
             self.buf.append(data[i])
 
     def drain_prefix(mut self, count: Int):
-        var rest = List[Byte]()
-        for i in range(count, len(self.buf)):
-            rest.append(self.buf[i])
-        self.buf = rest^
+        var remaining = len(self.buf) - count
+        if remaining == 0:
+            self.buf = List[Byte]()
+        else:
+            for i in range(remaining):
+                self.buf[i] = self.buf[count + i]
+            self.buf.shrink(remaining)
         # The drained prefix was necessarily scanned; the remainder
         # keeps its scanned prefix length.
         if self.scanned_len > count:

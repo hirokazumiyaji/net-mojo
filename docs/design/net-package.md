@@ -241,8 +241,11 @@ section records only the package-level boundaries.
   `max_body_bytes`) arrives before the call. `Request` views and
   `ResponseWriter` live only for the call; retaining means copying,
   and the connection owns the queued response until it is sent.
-- One global `BufferBudget` counts wire bytes in receive buffers and
-  queued responses. Admission failures become 503+close, handler
+- One global `BufferBudget` charges retained receive capacity and its
+  old + new growth peak; queued responses still charge wire lengths.
+  Temporary read chunks, parser copies, writer/encoder allocations and
+  protocol/provider allocations are not all included yet.
+  Admission failures become 503+close, handler
   overruns and raises become 500+close without leaking details, and a
   slow reader pauses further reads so kernel buffers absorb the
   backpressure instead of user memory.
