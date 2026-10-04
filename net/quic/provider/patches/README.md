@@ -96,3 +96,43 @@ in `quic-suite`. The real client also verifies a full 1 MiB echo and reuse.
 This fixes retained backing amplification, not a memory quota. Sparse fragment
 nodes, Arc headers, empty-map capacity, partly read backing, transient input/copy
 allocations, retransmission and native TLS/RSS costs remain separate work.
+
+The fifth patch adds an opt-in native `ReceiveBudget` shared by clones installed
+with `Config::set_receive_budget()`. Its immutable capacities separately limit
+bidirectional receive data, all unidirectional receive data, and CRYPTO data.
+The existing provider still uses the actual unlimited default budget. Selecting
+finite server policy and exposing provider settings remain separate work.
+
+Each live receive object reserves two metadata/terminal tokens. Each positive
+fragment additionally reserves one token and its full retained backing length.
+Partly consumed backing remains charged until that fragment is removed.
+Reset, Read shutdown and CRYPTO clear refund retained fragments; metadata stays
+charged until the receive object is dropped. CRYPTO clear preserves the object
+and its original shared budget across packet epochs.
+
+An allocation-free overlap planner reserves all novel fragments in an incoming
+frame before map, FIN, stream length or connection received-byte mutation.
+Already covered bytes need no new reservation and remain acceptable at full
+quota. New compacted views are charged using their actual backing accessor.
+Unaccepted admission cannot consume stream-open counts. RAII reservations and
+owners refund failed construction and connection disposal.
+
+Exhausted STREAM resources return `ReceiveBufferExceeded` and close transport
+with QUIC INTERNAL_ERROR (`0x1`); the C error value is `-24`. Exhausted CRYPTO
+resources retain the existing CRYPTO_BUFFER_EXCEEDED (`0xd`) mapping. The native
+C header records these error values; this unit adds no C settings interface.
+
+`quic-suite` verifies atomic rejection, empty FIN/marker replacement, consumed
+input split around islands, partial and complete read/discard, reset, clear,
+constructor rollback and arithmetic overflow. Authenticated packet tests use
+two real connections sharing a finite budget, preserve receiver state on
+rejection and check a real HTTP/3 priority update while request resources are
+full. CRYPTO has its own finite pool. Synthetic packet injections deliberately
+receive no ACK flight because their sender has no recovery records; these are
+receive-state tests, not loss, recovery or full control-progress proofs.
+
+Slots bound receive-object/fragment population without assuming portable
+allocator bytes per node. Backing charges conservatively count each retained
+view; map capacity, Arc/node overhead, transient input/copies, H3/application
+state, send state, native TLS and RSS are outside the byte ledger. This native
+opt-in facility does not establish a whole-engine or default server memory cap.
