@@ -395,20 +395,22 @@ struct _DeferredHandler(Handler):
 
 
 struct _FailingDetachedStreamHandler(Handler):
-    # Explicit no-op initializer; matches `_DropSenderHandler` above.
+    var sender_addr: Int
+
     def __init__(out self):
-        pass
+        self.sender_addr = 0
 
     def handle(mut self, req: Request, mut writer: ResponseWriter) raises:
         var sender = writer.detach()
-        sender.start(200)
+        var headers = Headers()
+        headers.add(String("X-Fail"), String("too large"))
+        sender.start(200, headers^)
         _ = sender.send("chunk".as_bytes())
+        sender.finish()
+        self.sender_addr = sender._take()
 
 
-def disabled_test_detached_start_failure_drops_remaining_batch() raises:
-    # Known defect: detach start-failure sets status 500 in server state but
-    # never puts the response on the wire (`_tick_and_read` sees no status).
-    # Renamed out of TestSuite discovery until that path is fixed.
+def test_detached_start_failure_drops_remaining_batch() raises:
     var config = ServerConfig.default()
     config.max_response_headers_bytes = 1
     var server = Server(config^)
@@ -425,6 +427,13 @@ def disabled_test_detached_start_failure_drops_remaining_batch() raises:
 
     var response = _tick_and_read(server, handler, client)
     assert_equal(_status_of(response), 500)
+    assert_equal(_body_of(response), "500 Internal Server Error")
+    assert_equal(
+        len(response), _header_end(response) + _content_length_of(response)
+    )
+    assert_equal(len(_split_responses(response)), 1)
+    var sender = ResponseSender(handler.sender_addr)
+    assert_true(sender.is_cancelled())
 
     client.close()
 
