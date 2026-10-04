@@ -1238,6 +1238,8 @@ struct _HeaderCapacityHandler(Handler):
     var values_capacity: Int
     var raw_capacity: Int
     var raw_matches: Bool
+    var original_name_capacity: Int
+    var lowercase_name_capacity: Int
 
     def __init__(out self, var budget: SharedBufferBudget):
         self.budget = budget^
@@ -1248,12 +1250,18 @@ struct _HeaderCapacityHandler(Handler):
         self.values_capacity = -1
         self.raw_capacity = -1
         self.raw_matches = False
+        self.original_name_capacity = -1
+        self.lowercase_name_capacity = -1
 
     def handle(mut self, req: Request, mut writer: ResponseWriter) raises:
         var value = Array[Byte, 64](fill=Byte(ord("a")))
         self.before = self.budget.used()
         writer.headers.add_bytes(String("X-Probe"), Span(value))
         self.after = self.budget.used()
+        self.original_name_capacity = writer.headers._names[0].capacity_bytes()
+        self.lowercase_name_capacity = writer.headers._lower_names[
+            0
+        ].capacity_bytes()
         self.names_capacity = writer.headers._names.capacity()
         self.lower_capacity = writer.headers._lower_names.capacity()
         self.values_capacity = writer.headers._values.capacity()
@@ -1312,6 +1320,8 @@ def test_http1_handler_charges_owned_header_backing_before_return() raises:
     var values_capacity = handler.values_capacity
     var raw_capacity = handler.raw_capacity
     var raw_matches = handler.raw_matches
+    var original_name_capacity = handler.original_name_capacity
+    var lowercase_name_capacity = handler.lowercase_name_capacity
     _ = server^
     var after_owner_drop = observer.used()
     if foreign_admitted:
@@ -1342,18 +1352,28 @@ def test_http1_handler_charges_owned_header_backing_before_return() raises:
         + raw_capacity
     )
     assert_equal(known, 64 + 2 * size_of[String]() + size_of[List[Byte]]())
-    assert_equal(after - before, known)
+    assert_equal(
+        after - before,
+        known
+        + original_name_capacity
+        + lowercase_name_capacity
+        + 2 * String.REF_COUNT_SIZE,
+    )
 
 
 struct _HeaderAdoptionErrorHandler(Handler):
     var budget: SharedBufferBudget
     var mode: Int
     var foreign: Int
+    var room: Int
+    var header_capacity: Int
 
     def __init__(out self, var budget: SharedBufferBudget, mode: Int):
         self.budget = budget^
         self.mode = mode
         self.foreign = 0
+        self.room = -1
+        self.header_capacity = -1
 
     def handle(mut self, req: Request, mut writer: ResponseWriter) raises:
         var room: Int
@@ -1362,7 +1382,15 @@ struct _HeaderAdoptionErrorHandler(Handler):
             headers.add(String("X-Owned"), String("a"))
             headers._values[0].reserve(256)
             writer.headers = headers^
-            comptime known = 256 + 2 * size_of[String]() + size_of[List[Byte]]()
+            var known = (
+                256
+                + 2 * size_of[String]()
+                + size_of[List[Byte]]()
+                + writer.headers._names[0].capacity_bytes()
+                + writer.headers._lower_names[0].capacity_bytes()
+                + 2 * String.REF_COUNT_SIZE
+            )
+            self.header_capacity = known
             room = known + 128 if self.mode == 0 else known - 1
             writer.set_status(204)
         else:
@@ -1378,8 +1406,13 @@ struct _HeaderAdoptionErrorHandler(Handler):
                 + writer.headers._lower_names.capacity() * size_of[String]()
                 + writer.headers._values.capacity() * size_of[List[Byte]]()
                 + writer.headers._values[0].capacity()
+                + writer.headers._names[0].capacity_bytes()
+                + writer.headers._lower_names[0].capacity_bytes()
+                + 2 * String.REF_COUNT_SIZE
             )
-            room = (140 if req.method == "HEAD" else 165) - known
+            self.header_capacity = known
+            room = max(0, (140 if req.method == "HEAD" else 165) - known)
+        self.room = room
         self.foreign = self.budget.remaining() - room
         assert_true(self.budget.try_reserve(self.foreign))
         if self.mode == 2:
@@ -1406,12 +1439,40 @@ def _check_header_replacement_and_error(mode: Int, is_head: Bool) raises:
     var response = _drain_head_error_to_eof(server, handler, client)
     client.close()
     var retained_foreign = 5 + handler.foreign
+    var room = handler.room
+    var header_capacity = handler.header_capacity
     var remaining = observer.used()
     observer.release(retained_foreign)
     _ = server^
     _ = handler^
     assert_equal(remaining, retained_foreign)
     assert_equal(observer.used(), 0)
+    if mode == 2:
+        assert_equal(room, 0)
+        assert_equal(
+            header_capacity,
+            64
+            + 2 * size_of[String]()
+            + size_of[List[Byte]]()
+            + String("X-Owned").capacity_bytes()
+            + String.INLINE_CAPACITY
+            + 2 * String.REF_COUNT_SIZE,
+        )
+    elif mode == 3:
+        assert_equal(room, 5 if is_head else 30)
+    else:
+        assert_equal(
+            header_capacity,
+            256
+            + 2 * size_of[String]()
+            + size_of[List[Byte]]()
+            + String("X-Owned").capacity_bytes()
+            + String.INLINE_CAPACITY
+            + 2 * String.REF_COUNT_SIZE,
+        )
+        assert_equal(
+            room, header_capacity + 128 if mode == 0 else header_capacity - 1
+        )
     assert_equal(_status_of(response), 204 if mode == 0 else 500)
     if mode == 0:
         assert_true(

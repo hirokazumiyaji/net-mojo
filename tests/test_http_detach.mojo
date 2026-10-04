@@ -1564,9 +1564,14 @@ def test_pthread_response_body_and_headers_survive_batch_and_server_drop() raise
     assert_equal(batch.messages[0].headers.value_byte_length(0), 64)
     _ = batch^
     assert_equal(observer.used(), 17)
-    comptime header_capacity = 64 + 2 * size_of[String]() + size_of[
-        List[Byte]
-    ]()
+    var header_capacity = (
+        64
+        + 2 * size_of[String]()
+        + size_of[List[Byte]]()
+        + String("X-Owned").capacity_bytes()
+        + String.INLINE_CAPACITY
+        + 2 * String.REF_COUNT_SIZE
+    )
     assert_equal(
         queued_charge,
         size_of[_SharedDetachState]()
@@ -1800,7 +1805,14 @@ def _header_submit_thread(
 def test_pthread_header_admission_and_batch_lifetime_keep_actual_capacity() raises:
     comptime state_size = size_of[_SharedDetachState]()
     comptime element = size_of[DetachMessage]()
-    comptime known = 256 + 2 * size_of[String]() + size_of[List[Byte]]()
+    var known = (
+        256
+        + 2 * size_of[String]()
+        + size_of[List[Byte]]()
+        + String("X-Owned").capacity_bytes()
+        + String.INLINE_CAPACITY
+        + 2 * String.REF_COUNT_SIZE
+    )
     for streaming in [False, True]:
         var body_capacity = 0 if streaming else 2
         for available in [
