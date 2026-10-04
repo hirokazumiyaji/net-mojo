@@ -405,6 +405,13 @@ curl -k --http2 https://127.0.0.1:18442/fixed -o /tmp/fixed.h2.body
   `benchmarks/http3_load.py` (aioquic client; Homebrew `h2load` lacks
   ngtcp2/nghttp3).
 
+## macOS stack diagnostic
+
+The [2026-10-04 HTTP/1 stack diagnostic](MACOS_CPU_DIAGNOSTIC.md) records
+separate sampled/control trials, source and tool provenance, observed sampling
+perturbation and stack-occupancy limits. It is independent of the formal Linux
+throughput/latency targets and provides no allocation-count evidence.
+
 ## Phase 3 poll baseline (preliminary, same host)
 
 Not the formal procedure above (loader shared the server host, no CPU
