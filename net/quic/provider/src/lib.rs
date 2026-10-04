@@ -816,6 +816,8 @@ pub struct QuicServer {
     terminal_checks: usize,
     #[cfg(test)]
     goaway_checks: usize,
+    #[cfg(test)]
+    cid_route_visits: usize,
     transport_timeouts: BTreeSet<(Instant, Vec<u8>)>,
     request_timeouts: BTreeSet<(Instant, Vec<u8>, u64)>,
     response_timeouts: BTreeSet<(Instant, Vec<u8>, u64)>,
@@ -854,6 +856,7 @@ enum ShutdownState {
 
 struct QuicConnection {
     transport: Connection,
+    initial_destination_id: Vec<u8>,
     transport_deadline_at: Option<Instant>,
     indexed_idle_deadline_at: Option<Instant>,
     #[cfg(test)]
@@ -981,6 +984,8 @@ impl QuicServer {
             terminal_checks: 0,
             #[cfg(test)]
             goaway_checks: 0,
+            #[cfg(test)]
+            cid_route_visits: 0,
             transport_timeouts: BTreeSet::new(),
             request_timeouts: BTreeSet::new(),
             response_timeouts: BTreeSet::new(),
@@ -1101,12 +1106,13 @@ impl QuicServer {
                 let source_id = ConnectionId::from_ref(&source_id);
                 let connection = quiche::accept(&source_id, None, local, remote, &mut self.config)?;
                 let key = source_id.as_ref().to_vec();
-                self.routes.insert(destination_id, key.clone());
+                self.routes.insert(destination_id.clone(), key.clone());
                 self.routes.insert(key.clone(), key.clone());
                 self.connections.insert(
                     key.clone(),
                     QuicConnection {
                         transport: connection,
+                        initial_destination_id: destination_id,
                         transport_deadline_at: None,
                         indexed_idle_deadline_at: None,
                         #[cfg(test)]
@@ -1372,8 +1378,18 @@ impl QuicServer {
             .map(|response| response.buffered_bytes)
             .sum();
         self.buffered_response_bytes -= response_bytes;
-        self.routes
-            .retain(|_, owner_key| owner_key.as_slice() != connection_key);
+        #[cfg(test)]
+        {
+            self.cid_route_visits += 1;
+        }
+        self.routes.remove(&connection.initial_destination_id);
+        for source_id in connection.transport.source_ids() {
+            #[cfg(test)]
+            {
+                self.cid_route_visits += 1;
+            }
+            self.routes.remove(source_id.as_ref());
+        }
         let request_ids: Vec<u64> = self
             .request_routes
             .iter()
@@ -2303,9 +2319,10 @@ mod tests {
             )
             .unwrap();
             server.connections.insert(
-                key,
+                key.clone(),
                 super::QuicConnection {
                     transport,
+                    initial_destination_id: key,
                     transport_deadline_at: None,
                     indexed_idle_deadline_at: None,
                     response_drive_visits: 0,
@@ -2780,6 +2797,131 @@ mod tests {
     }
 
     #[test]
+    fn cid_cleanup_visits_only_owned_aliases_and_preserves_another_peer() {
+        let (mut server, mut client, mut h3, local, remote) = request_timer_peer();
+        let request = completed_ready_request(&mut server, &mut client, &mut h3, local, remote);
+        let key = server.connections.keys().next().unwrap().clone();
+        let original = server
+            .routes
+            .iter()
+            .find_map(|(alias, owner)| (owner == &key && alias != &key).then_some(alias.clone()))
+            .unwrap();
+        assert_ne!(original, key);
+        assert_eq!(server.connections[&key].initial_destination_id, original);
+        assert_eq!(server.connections[&key].transport.active_scids(), 1);
+        let other: SocketAddr = "127.0.0.1:30406".parse().unwrap();
+        let mut sibling = quiche::connect(
+            Some("localhost"),
+            &ConnectionId::from_ref(&[0x9d; 16]),
+            other,
+            local,
+            &mut stress_client_config(),
+        )
+        .unwrap();
+        establish_http3_in_memory(
+            &mut sibling,
+            &mut server,
+            &mut [0; 65535],
+            local,
+            other,
+            false,
+        );
+        let mut sibling_h3 = quiche::h3::Connection::with_transport(
+            &mut sibling,
+            &quiche::h3::Config::new().unwrap(),
+        )
+        .unwrap();
+        let sibling_request =
+            completed_ready_request(&mut server, &mut sibling, &mut sibling_h3, local, other);
+        let mut packet = [0; 65535];
+        for index in 0_u16..128 {
+            let source = index.to_be_bytes().repeat(8);
+            let address = SocketAddr::new(local.ip(), 22000 + index);
+            let mut waiting = quiche::connect(
+                Some("localhost"),
+                &ConnectionId::from_ref(&source),
+                address,
+                local,
+                &mut stress_client_config(),
+            )
+            .unwrap();
+            let (length, _) = waiting.send(&mut packet).unwrap();
+            deliver_client_datagram(&mut server, &packet[..length], local, address);
+        }
+        assert_eq!(server.routes.len(), 260);
+        let unrelated: std::collections::HashMap<_, _> = server
+            .routes
+            .iter()
+            .filter(|(_, owner)| *owner != &key)
+            .map(|(alias, owner)| (alias.clone(), owner.clone()))
+            .collect();
+        client.close(true, 0x100, b"CID cleanup").unwrap();
+        for packet in collect_client_datagrams(&mut client, &mut packet) {
+            deliver_client_datagram(&mut server, &packet, local, remote);
+        }
+        assert!(server.connections[&key].transport.is_draining());
+        assert!(server.routes.contains_key(&original));
+        assert!(server.routes.contains_key(&key));
+        let deadline = server.connections[&key]
+            .transport
+            .timeout_instant()
+            .unwrap();
+        std::thread::sleep(
+            deadline.saturating_duration_since(std::time::Instant::now())
+                + Duration::from_millis(1),
+        );
+        server.cid_route_visits = 0;
+        server.on_timeout();
+        assert_eq!(server.cid_route_visits, 2);
+        assert_eq!(server.routes, unrelated);
+        assert!(!server.request_routes.contains_key(&request.id));
+        assert!(server.request_routes.contains_key(&sibling_request.id));
+        assert!(server.enqueue_response(sibling_request.id, 200, Vec::new(), b"survivor".to_vec()));
+        let mut received = Vec::new();
+        let mut finished = false;
+        for _ in 0..32 {
+            pump_in_memory(
+                &mut sibling,
+                &mut server,
+                &mut packet,
+                local,
+                other,
+                false,
+                false,
+            );
+            let (body, ended) =
+                drain_ready_body(&mut sibling, &mut sibling_h3, sibling_request.stream_id);
+            received.extend(body);
+            finished |= ended;
+            if finished {
+                break;
+            }
+        }
+        assert!(finished);
+        assert_eq!(received, b"survivor");
+        let surviving_routes = server.routes.clone();
+        insert_idle_transports(&mut server, 1);
+        let idle_key = 0_u16.to_be_bytes().repeat(8);
+        let mut fresh = server.connections.remove(&idle_key).unwrap();
+        fresh.transport = quiche::accept(
+            &ConnectionId::from_ref(&key),
+            None,
+            local,
+            remote,
+            &mut server.config,
+        )
+        .unwrap();
+        fresh.initial_destination_id = original.clone();
+        server.connections.insert(key.clone(), fresh);
+        server.routes.insert(key.clone(), key.clone());
+        server.routes.insert(original.clone(), key.clone());
+        server.cid_route_visits = 0;
+        server.force_drop_connection(&key);
+        assert_eq!(server.cid_route_visits, 2);
+        assert_eq!(server.routes, surviving_routes);
+    }
+
+    #[test]
     fn terminal_checks_skip_idle_connections_without_due_work() {
         let mut server = super::QuicServer::new(stress_server_config()).unwrap();
         insert_idle_transports(&mut server, 128);
@@ -2819,6 +2961,7 @@ mod tests {
         );
         assert!(server.connections.is_empty());
         assert_eq!(server.terminal_checks, 1);
+        assert_eq!(server.cid_route_visits, 2);
         assert!(server.routes.is_empty());
         assert!(server.send_ready.entries.is_empty());
         assert!(server.send_ready.queued.is_empty());
