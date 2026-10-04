@@ -91,6 +91,13 @@ curl -k --http2 https://127.0.0.1:18442/fixed -o /tmp/fixed.h2.body
 
 ## Mojo benchmarks
 
+- `benchmarks/http1_server.mojo`: optimized HTTP/1.1 `serve`-loop endpoint on
+  `127.0.0.1:18081`, using the same fixed/JSON/echo handlers as H2/H3 and Go.
+  Build with `pixi run mojo build --Werror -I . benchmarks/http1_server.mojo
+  -o /tmp/http1_server`. Verify exact responses and keep-alive with
+  `python3 tests/test_http1_benchmark.py --server /tmp/http1_server
+  --go-baseline /tmp/http_go_baseline` from the repository root.
+
 - `benchmarks/http_parse.mojo` (Phase 1): parser time by input size.
 - `benchmarks/http_server.mojo` (Phase 4): `pixi run benchmark-http-server`.
   Sequential keep-alive round-trips plus nonblocking tick time with many
