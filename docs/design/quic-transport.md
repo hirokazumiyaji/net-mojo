@@ -81,6 +81,12 @@ live connection. Receive, send, transport timeout and close outcomes refresh the
 entry; terminal removal deletes it directly. Only due transport keys are
 visited for quiche timeout dispatch.
 
+Terminal checks follow affected receive, send, native timeout and explicit close
+outcomes instead of sweeping idle connections on each timeout. Immediate
+receive errors release already closed transports before propagating the error.
+Closing and draining connections remain owned until quiche reports closure;
+their native draining deadline schedules the final check and cleanup.
+
 Request deadlines use one indexed minimum per incomplete stream across header,
 body and request-idle phases. Receive processing refreshes only streams touched
 by readable headers or HTTP/3 events, including errors. Completion, reset,
@@ -105,8 +111,9 @@ stopped transport stream and send errors remove HTTP/3 stream state when the
 request receive side has finished; queued provider responses satisfy that
 completed-request condition. Sibling streams and subsequent requests continue.
 
-Terminal sweeps and GOAWAY broadcasts remain separate work, so the full server
-loop is not yet proportional only to ready or due work.
+GOAWAY drivers still scan during shutdown, and actual connection teardown still
+scans route/request ownership. The full server loop is not yet proportional
+only to ready or due work.
 
 ### Canceled HTTP/3 request state
 
