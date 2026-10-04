@@ -36,6 +36,7 @@ task_quiche_patches=(
     quiche-0.29.3-cancel-request.patch
     quiche-0.29.3-collected-stream-ranges.patch
     quiche-0.29.3-unknown-stream-retirement.patch
+    quiche-0.29.3-receive-view-compaction.patch
 )
 for task_quiche_patch in "${task_quiche_patches[@]}"; do
     GIT_CEILING_DIRECTORIES="$task_quiche_stage" \

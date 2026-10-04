@@ -1,19 +1,26 @@
 # Active QUIC receive allocation diagnostic
 
-This is an observational diagnostic, not a production patch or memory quota.
-It reproduces active retained-state amplification with unchanged receive
-windows and admission policy. All additions to staged quiche source are
-`cfg(test)`; the existing three production patches are unchanged.
+This diagnostic verifies receive-backing compaction with unchanged receive
+windows and admission policy. Diagnostic additions to staged source are
+`cfg(test)`; the fourth production source patch compacts only trimmed receive
+views immediately before retention. The three earlier patches are unchanged.
+This does not implement a memory quota.
 
 ## Current reproducer and historical baseline
 
-Current focused branch: `test/issue42-active-quic-memory`, based on
+The original focused reproducer is `test/issue42-active-quic-memory`, based on
 `a54ff807bce29c0c4ec0a6501816ef5ae7291dbc` (unknown-stream retirement).
-It contains only these five diagnostic files; the staged integration snapshot
-is not part of this branch or commit.
+That diagnostic commit contains only five files and no integration snapshot.
 
-The rerun on this base produced exactly the historical measurements below.
-A byte-for-byte comparison verified all three existing patches, the staging
+The compaction branch `fix/issue42-quic-receive-compaction` starts from
+`a37771d580dfb7f67c8a51374acda891fc21ef5d`.
+It adds the fourth explicit source patch and strengthens the same low-level
+and authenticated tests to require compact backing. No integration snapshot
+is included.
+
+The original diagnostic rerun on a54ff80 produced exactly the historical
+measurements below. A byte-for-byte comparison verified all three existing
+patches, the staging
 script, upstream Cargo.lock/Cargo.toml/COPYING, and native lib/frame/range_buf/
 flowcontrol/stream/recv_buf/H3 source (including identical test appendices).
 All 14 comparisons passed. Source hashes are recorded in
@@ -42,8 +49,8 @@ pixi run -e tls-http3 cargo test --locked --release \
   -- --test-threads=1
 ```
 
-The diagnostic script stages fresh pinned source before every run and appends
-test-only helpers. It verifies that the production configuration still matches
+The diagnostic script stages fresh pinned source and all four ordered patches
+before every run and appends test-only helpers. It verifies that the production configuration still matches
 the explicit fixture values. It uses an independent cargo target directory and
 does not build or modify the parent integration worktree. Re-staging through a
 different build entrypoint removes these test additions; rerun this script.
@@ -76,7 +83,7 @@ allocation layouts. It measures allocations released by dropping only the
 server transport after dropping its H3 engine. Client transport, client H3,
 packet buffers and fixture state remain alive outside that drop interval.
 
-## Baseline measurements
+## Historical baseline measurements
 
 The historical runs and the focused-branch rerun produced identical values:
 
@@ -92,7 +99,56 @@ transport bytes on drop. After authenticated RESET_STREAM followed by the
 supported H3 request cancellation, all patterns have zero entries/body/backing
 bytes and release 23,280 Rust transport bytes on drop.
 
-Independent low-level RecvBuf results:
+## Compaction RED/GREEN and current measurements
+
+Before the fourth patch, both strengthened diagnostics fail at the same exact
+backing tuple: `(15,360 entries, 16,383 body bytes, 15,728,640 backing bytes)`
+versus the required 16,383 backing bytes. Contiguous and sparse cases pass
+before the fix. After the patch, both full diagnostics pass.
+
+| Held pattern | Arc backing after | Server transport Rust before | Server transport Rust after |
+| --- | ---: | ---: | ---: |
+| Contiguous | 16,383 | 42,068 | 42,068 |
+| Sparse | 16,383 | 2,417,772 | 2,417,772 |
+| Overlap | 16,383 | 17,874,276 | 2,269,532 |
+
+Low-level overlap Rust allocation falls from 17,851,104 to 2,246,360 bytes.
+All entry counts, offsets, exact read/Finished and RESET cleanup results are
+unchanged. Empty-map/read and reset footprints remain 720/0 at low level and
+23,892/23,280 for the server transport.
+
+Validation on Darwin arm64:
+
+- `pixi run -e tls-http3 quic-suite`: 128 Rust tests, C ownership and Mojo FFI
+  pass. Rust groups comprise 22 provider, 60 existing native patch contracts,
+  eight new view/overlap/FIN/partial-read contracts and 38 existing RecvBuf tests.
+- `pixi run -e tls-http3 http3-client-test`: independent aioquic reorder,
+  reset-storm siblings, exact roundtrips and ALPN h3 pass.
+- `check_echo.py` against the actual Mojo benchmark server: exact mixed-byte
+  1,048,576-byte request and response, then GET reuse on the same connection.
+  This uses normal aioquic sender/ACK history, not synthetic packet injection.
+- Unchanged live cancel: 257 cycles / 67,371,008 submitted bytes, eight siblings
+  outstanding at reset, eight exact full bodies and post-reset reuse pass
+  (3138.85 ms). Slow request/eight siblings also pass (364.98 ms).
+
+Reproduce live checks after `quic-build` and `tls-build`: build and start
+`benchmarks/http3_server.mojo` from the worktree, wait for its listening output,
+then run:
+
+```sh
+pixi run -e tls-http3 python diagnostics/active_quic_memory/check_echo.py \
+  --url https://127.0.0.1:18453/echo
+pixi run -e tls-http3 python benchmarks/http/http3_scenarios.py \
+  --url https://127.0.0.1:18453/fixed --scenario cancel
+pixi run -e tls-http3 python benchmarks/http/http3_scenarios.py \
+  --url https://127.0.0.1:18453/fixed --scenario slow
+```
+
+Compaction logs are `/private/tmp/net-mojo-quic-compaction-{red,green,quic-suite,
+client,1mib,live-cancel,live-slow}.out`. These are local correctness measurements,
+not a formal performance/RSS/soak matrix.
+
+Historical independent low-level RecvBuf results:
 
 | Held pattern | Rust allocation bytes released by RecvBuf drop |
 | --- | ---: |
@@ -128,10 +184,12 @@ state, not historical canceled-stream retention; normal read/reset releases
 them. Both exceed the current soft 256 KiB per-connection admission estimate
 with only one request and 16 KiB of body offset credit.
 
-The first focused production unit proposed after this diagnostic is receive
-backing compaction only: compact a trimmed range before RecvBuf insertion,
-retain offsets/FIN exactly, and leave windows, admission and quota APIs alone.
-Sparse-fragment cost remains visible and is not solved by that unit.
+The fourth source patch implements receive backing compaction only: compact a
+trimmed range before RecvBuf insertion, retain offsets/FIN exactly, and leave
+windows, admission and quota APIs alone. Generic send buffers and partial
+application reads do not copy. Sparse-fragment cost, Arc headers, empty-map
+capacity, partially read frame backing and transient parsing/copy costs remain.
+The retained overlap footprint still exceeds the soft 256 KiB estimate.
 
 A later independent accounting API proposal, also requiring design review:
 
@@ -167,10 +225,9 @@ can bound this object's population; full native byte accounting needs additional
 container/base/send/crypto counters. The 720-byte empty-map observation must not
 be lost when active entry counters reach zero.
 
-The next unit needs meaningful RED/GREEN assertions for retained backing and
-quota exhaustion, all existing RecvBuf overlap/read/reset tests, unchanged
->=1 MiB bodies, and the 257-cancel/eight-sibling/reuse proof. No production code
-should be written until the counter, quota and close contract is reviewed.
+A future quota unit needs meaningful exhaustion/release regressions and the
+same interoperability proof. It must wait for separate review of the counter,
+quota and close contract; backing compaction alone does not establish it.
 
 ## Limits of this evidence
 

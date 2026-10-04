@@ -79,3 +79,20 @@ transport repair restores credit but retained 2,404,680 H3 Rust allocation bytes
 after 10,000 FIN unknown streams in the same fixture. That intermediate case
 fails the allocation regression; it does not describe the old exhausted-credit
 behavior.
+
+The fourth patch compacts a received RangeBuf view immediately before RecvBuf
+insertion when its Arc backing is larger than the retained bytes. It preserves
+bytes, current offset, final offset and FIN. Ordinary receive buffers retain
+their backing; generic send buffers and partial application reads are unchanged.
+
+The authenticated diagnostic in `diagnostics/active_quic_memory` holds the
+same 16,383-byte body and missing first byte under contiguous, one-byte and
+consistent overlapping frames. Overlap backing falls from 15,728,640 to 16,383
+bytes; server transport Rust allocations released after H3 drop fall from
+17,874,276 to 2,269,532 bytes. Node counts and read/reset cleanup are unchanged.
+All 38 existing RecvBuf contracts and eight new view/overlap/FIN contracts run
+in `quic-suite`. The real client also verifies a full 1 MiB echo and reuse.
+
+This fixes retained backing amplification, not a memory quota. Sparse fragment
+nodes, Arc headers, empty-map capacity, partly read backing, transient input/copy
+allocations, retransmission and native TLS/RSS costs remain separate work.

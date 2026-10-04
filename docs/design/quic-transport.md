@@ -206,6 +206,16 @@ these fixtures plus all four FIN/RESET arrival orders, exact consumed byte and
 same-type stream credit, pending bidi send state and critical stream errors.
 This is a protocol-state allocation measurement, not a transport or RSS cap.
 
+The fourth pinned patch compacts only trimmed default receive-buffer views
+before retention. Overlap trimming can otherwise keep a full frame's Arc for
+one novel byte. The authenticated equal-body diagnostic reduces overlapping
+backing from 15,728,640 to 16,383 bytes and server transport Rust state from
+17,874,276 to 2,269,532 bytes. It preserves offsets, FIN, exact read/reset
+delivery and node counts. Untrimmed buffers, generic send buffers and partial
+application reads retain their existing behavior. `quic-suite` runs the 38
+existing RecvBuf contracts and eight new compaction/overlap/FIN contracts;
+the live client verifies a full 1 MiB echo plus connection reuse.
+
 These patches do not establish an allocator cap. The independent 64 MiB
 request/response counters count logical field/body bytes rather than Vec
 capacity, container entries or allocation overhead. Transport admission still
