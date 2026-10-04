@@ -2,7 +2,7 @@
 
 Receive and adopted pending buffers charge retained capacity and growth
 peaks. Pending growth also charges its incoming wire allocation. Synchronous
-HTTP/1 buffered response wire is reserved before allocation. Other encoding,
+HTTP/1 buffered response and error wire are reserved before allocation. Other encoding,
 parser scratch and provider allocations remain separate. Decoded
 HTTP/1 body copies reserve their exact capacity before materialization and remain
 charged through the handler call. Synchronous

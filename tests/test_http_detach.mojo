@@ -830,6 +830,9 @@ def test_detached_handler_exception_cancels_and_cleans_up() raises:
 
     var resp = _tick_and_read(server, handler, client)
     assert_equal(_status_of(resp), 500)
+    assert_equal(_body_of(resp), "500 Internal Server Error")
+    assert_equal(server.active_connections(), 0)
+    assert_equal(server._budget.used, 0)
 
     var sender_addr = box[]
     assert_true(sender_addr != 0)

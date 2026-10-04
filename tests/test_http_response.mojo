@@ -12,6 +12,8 @@ from net.http._encoder import (
     http_date,
     _encode_response_budgeted,
     _measure_response,
+    _measure_error,
+    _encode_error_exact,
 )
 
 
@@ -403,6 +405,55 @@ def test_invalid_status_codes_are_rejected() raises:
             assert_equal(error.kind, NetErrorKind.invalid_argument())
             failed = True
         assert_true(failed)
+
+
+def test_error_exact_measure_and_render_preserve_head_close_and_alt_svc() raises:
+    for is_head in [False, True]:
+        for close in [False, True]:
+            for advertised in [False, True]:
+                var alt_svc = String(
+                    'h3=":8443"; ma=86400'
+                ) if advertised else String("")
+                var expected = String(
+                    "HTTP/1.1 503 Service Unavailable\r\n"
+                    "Content-Type: text/plain\r\n"
+                    "Date: Sun, 06 Nov 1994 08:49:37 GMT\r\n"
+                    "Content-Length: 23\r\n"
+                )
+                if close:
+                    expected += "Connection: close\r\n"
+                if advertised:
+                    expected += 'Alt-Svc: h3=":8443"; ma=86400\r\n'
+                expected += "\r\n"
+                if not is_head:
+                    expected += "503 Service Unavailable"
+                var capacity = _measure_error(
+                    503,
+                    close,
+                    "Sun, 06 Nov 1994 08:49:37 GMT",
+                    is_head,
+                    alt_svc,
+                )
+                assert_equal(capacity, expected.byte_length())
+                var exact = _encode_error_exact(
+                    503,
+                    close,
+                    "Sun, 06 Nov 1994 08:49:37 GMT",
+                    capacity,
+                    is_head,
+                    alt_svc,
+                )
+                var public = encode_error(
+                    503,
+                    close,
+                    "Sun, 06 Nov 1994 08:49:37 GMT",
+                    is_head,
+                    alt_svc,
+                )
+                assert_equal(exact.capacity(), capacity)
+                assert_equal(public.capacity(), capacity)
+                assert_equal(_bytes_to_string(Span(exact)), expected)
+                assert_equal(_bytes_to_string(Span(public)), expected)
 
 
 def test_error_encoding_is_bounded() raises:

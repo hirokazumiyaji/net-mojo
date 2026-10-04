@@ -422,6 +422,87 @@ def encode_100_continue() -> List[Byte]:
     return out^
 
 
+def _render_error[
+    measure: Bool
+](
+    status: Int,
+    should_close: Bool,
+    date: StringSlice,
+    is_head: Bool,
+    alt_svc: StringSlice,
+    mut out: List[Byte],
+    mut byte_count: Int,
+):
+    var reason = _status_reason(status)
+    var body = String(status) + String(" ") + reason
+    _append_response_string[measure](
+        out,
+        String("HTTP/1.1 ")
+        + String(status)
+        + String(" ")
+        + reason
+        + String("\r\n"),
+        byte_count,
+    )
+    _append_response_string[measure](
+        out, "Content-Type: text/plain\r\n", byte_count
+    )
+    _append_response_string[measure](
+        out, String("Date: ") + String(date) + String("\r\n"), byte_count
+    )
+    _append_response_string[measure](
+        out,
+        String("Content-Length: ")
+        + String(body.byte_length())
+        + String("\r\n"),
+        byte_count,
+    )
+    if should_close:
+        _append_response_string[measure](
+            out, "Connection: close\r\n", byte_count
+        )
+    if alt_svc.byte_length() > 0:
+        _append_response_string[measure](
+            out,
+            String("Alt-Svc: ") + String(alt_svc) + String("\r\n"),
+            byte_count,
+        )
+    _append_response_string[measure](out, "\r\n", byte_count)
+    if not is_head:
+        _append_response_string[measure](out, body, byte_count)
+
+
+def _measure_error(
+    status: Int,
+    should_close: Bool,
+    date: StringSlice,
+    is_head: Bool = False,
+    alt_svc: StringSlice = "",
+) -> Int:
+    var out = List[Byte]()
+    var byte_count = 0
+    _render_error[True](
+        status, should_close, date, is_head, alt_svc, out, byte_count
+    )
+    return byte_count
+
+
+def _encode_error_exact(
+    status: Int,
+    should_close: Bool,
+    date: StringSlice,
+    capacity: Int,
+    is_head: Bool = False,
+    alt_svc: StringSlice = "",
+) -> List[Byte]:
+    var out = List[Byte](capacity=capacity)
+    var byte_count = 0
+    _render_error[False](
+        status, should_close, date, is_head, alt_svc, out, byte_count
+    )
+    return out^
+
+
 def encode_error(
     status: Int,
     should_close: Bool,
@@ -429,37 +510,11 @@ def encode_error(
     is_head: Bool = False,
     alt_svc: StringSlice = "",
 ) -> List[Byte]:
-    """Minimal error response with a fixed small body. Never fails:
-    used on paths where only a static buffer is available."""
-    var reason = _status_reason(status)
-    var body = String(status) + String(" ") + reason
-    var out = List[Byte]()
-    _append_string(
-        out,
-        String("HTTP/1.1 ")
-        + String(status)
-        + String(" ")
-        + reason
-        + String("\r\n"),
+    """Encodes an error response with a fixed small body."""
+    var capacity = _measure_error(status, should_close, date, is_head, alt_svc)
+    return _encode_error_exact(
+        status, should_close, date, capacity, is_head, alt_svc
     )
-    _append_string(out, String("Content-Type: text/plain\r\n"))
-    _append_string(out, String("Date: ") + String(date) + String("\r\n"))
-    _append_string(
-        out,
-        String("Content-Length: ")
-        + String(body.byte_length())
-        + String("\r\n"),
-    )
-    if should_close:
-        _append_string(out, String("Connection: close\r\n"))
-    if alt_svc.byte_length() > 0:
-        _append_string(
-            out, String("Alt-Svc: ") + String(alt_svc) + String("\r\n")
-        )
-    _append_string(out, String("\r\n"))
-    if not is_head:
-        _append_string(out, body)
-    return out^
 
 
 def _append_hex(mut out: List[Byte], val: Int):
