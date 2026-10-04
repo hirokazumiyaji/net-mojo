@@ -304,6 +304,56 @@ struct _BoomHandler(Handler):
         raise Error("boom")
 
 
+struct _WorkspaceHandler(Handler):
+    var action: Int
+    var workspace: Int
+
+    def __init__(out self):
+        self.action = 0
+        self.workspace = 0
+
+    def handle(mut self, req: Request, mut writer: ResponseWriter) raises:
+        self.workspace = writer._body_budget.value().total
+        writer.write_string(String("a") * 64)
+        if self.action == 1:
+            raise Error("after body allocation")
+        if self.action == 2:
+            writer.body.reserve(1024)
+            return
+        if self.action == 3:
+            writer.headers.add(String("Content-Length"), String("999"))
+        writer.write_string(String("b") * 64)
+
+
+def test_writer_workspace_returns_on_success_handler_and_encoder_errors() raises:
+    var config = ServerConfig.default()
+    config.total_buffer_budget = 512
+    var server = Server(config^)
+    server.add_listener(listen_tcp("127.0.0.1:0"))
+    var address = String("127.0.0.1:") + String(server.local_address().port)
+    var handler = _WorkspaceHandler()
+    var waiting = dial_tcp(address, Timeout.seconds(1))
+    waiting.write_all("GET /".as_bytes(), Timeout.seconds(1))
+    _tick_n(server, handler, 2)
+    assert_equal(server._budget.used, 5)
+    for action in range(4):
+        handler.action = action
+        var client = dial_tcp(address, Timeout.seconds(1))
+        var out = _exchange(
+            server,
+            handler,
+            client,
+            "GET / HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n",
+        )
+        assert_equal(_status_of(out), 200 if action == 0 else 500)
+        assert_equal(handler.workspace, 507)
+        assert_equal(server._budget.used, 5)
+        client.close()
+    server._close_conn(0)
+    assert_equal(server._budget.used, 0)
+    waiting.close()
+
+
 struct _HugeHandler(Handler):
     def __init__(out self):
         pass

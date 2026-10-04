@@ -5,11 +5,16 @@ returns. The writer never touches the socket and never waits.
 The connection owns the encoded bytes until the send completes, so
 handler-local values must be copied in (which `write` does) instead
 of borrowed into a send queue.
+
+The synchronous HTTP/1 server lends capacity workspace to supported writes;
+standalone writers enforce their body length limit. Direct body edits are
+reconciled separately and do not have the supported writes' growth guarantee.
 """
 
 from net.error import NetError, NetErrorKind
 
 from ._detach import ResponseSender, _create_detach_state
+from ._buffer import BufferBudget, _reserve_capacity
 from .headers import Headers
 
 
@@ -27,6 +32,7 @@ struct ResponseWriter(Movable, Sized):
     var _generation: UInt64
     var _wakeup_fd: Int32
     var _queue_limit: Int
+    var _body_budget: Optional[BufferBudget]
 
     def __init__(
         out self,
@@ -50,6 +56,7 @@ struct ResponseWriter(Movable, Sized):
         # against late signaling if Server deinitializes.
         self._wakeup_fd = wakeup_fd
         self._queue_limit = queue_limit
+        self._body_budget = None
 
     def __init__(out self, *, deinit move: Self):
         self.status = move.status
@@ -63,6 +70,21 @@ struct ResponseWriter(Movable, Sized):
         self._generation = move._generation
         self._wakeup_fd = move._wakeup_fd
         self._queue_limit = move._queue_limit
+        self._body_budget = move._body_budget^
+
+    def _set_body_budget(mut self, workspace: Int):
+        self._body_budget = BufferBudget(workspace)
+
+    def _reconcile_body_budget(mut self) -> Bool:
+        var difference = self.body.capacity() - self._body_budget.value().used
+        if difference >= 0:
+            return self._body_budget.value().try_reserve(difference)
+        self._body_budget.value().release(-difference)
+        return True
+
+    def _drop_body(mut self):
+        self.body = List[Byte]()
+        self._body_budget.value().release(self._body_budget.value().used)
 
     def is_detached(self) -> Bool:
         return self._detached
@@ -118,22 +140,27 @@ struct ResponseWriter(Movable, Sized):
                 None,
                 "response body exceeds limit",
             )
-        self.body.reserve(len(self.body) + len(data))
+        if self._body_budget:
+            var reservation = 0
+            if not self._reconcile_body_budget() or not _reserve_capacity(
+                self.body,
+                self._body_budget.value(),
+                len(self.body) + len(data),
+                reservation,
+            ):
+                raise NetError(
+                    NetErrorKind.invalid_argument(),
+                    "write response body",
+                    None,
+                    "response body capacity exceeds workspace",
+                )
+        else:
+            self.body.reserve(len(self.body) + len(data))
         for i in range(len(data)):
             self.body.append(data[i])
 
     def write_string(mut self, data: StringSlice) raises NetError:
-        var bytes = data.as_bytes()
-        if len(self.body) + len(bytes) > self._limit:
-            raise NetError(
-                NetErrorKind.invalid_argument(),
-                "write response body",
-                None,
-                "response body exceeds limit",
-            )
-        self.body.reserve(len(self.body) + len(bytes))
-        for i in range(len(bytes)):
-            self.body.append(bytes[i])
+        self.write(data.as_bytes())
 
 
 def has_body_for_status(status: Int, is_head: Bool) -> Bool:

@@ -21,6 +21,77 @@ from net.http._encoder import encode_response
 from net.http._buffer import BufferBudget, _reserve_capacity
 
 
+def test_writer_body_workspace_clamps_capacity_to_growth_peak() raises:
+    var writer = ResponseWriter(32)
+    writer._set_body_budget(20)
+    writer.write_string("12345678")
+    writer.write_string("9")
+    assert_equal(writer.body.capacity(), 12)
+    assert_equal(writer._body_budget.value().used, 12)
+    assert_equal(len(writer.body), 9)
+
+
+def test_writer_body_workspace_rejects_peak_without_changing_body() raises:
+    var writer = ResponseWriter(32)
+    writer._set_body_budget(16)
+    writer.write_string("12345678")
+    var rejected = False
+    try:
+        writer.write_string("9")
+    except e:
+        assert_equal(e.kind, NetErrorKind.invalid_argument())
+        rejected = True
+    assert_true(rejected)
+    writer.write_string("")
+    assert_equal(writer.body.capacity(), 8)
+    assert_equal(writer._body_budget.value().used, 8)
+    assert_equal(len(writer.body), 8)
+    assert_equal(writer.body[7], Byte(ord("8")))
+
+
+def test_writer_span_move_and_drop_preserve_workspace_accounting() raises:
+    var writer = ResponseWriter(32)
+    writer._set_body_budget(24)
+    writer.write_string("12345678")
+    var moved = writer^
+    moved.write(String("9").as_bytes())
+    assert_equal(moved._body_budget.value().total, 24)
+    assert_equal(moved._body_budget.value().used, 16)
+    assert_equal(moved.body.capacity(), 16)
+    moved._drop_body()
+    assert_equal(moved.body.capacity(), 0)
+    assert_equal(moved._body_budget.value().used, 0)
+
+
+def test_writer_reconciles_direct_capacity_before_supported_growth() raises:
+    var writer = ResponseWriter(32)
+    writer._set_body_budget(24)
+    writer.body = List[Byte](length=8, fill=42)
+    writer.write_string("9")
+    assert_equal(writer._body_budget.value().used, 16)
+    writer.body = List[Byte](length=4, fill=43)
+    assert_true(writer._reconcile_body_budget())
+    assert_equal(writer._body_budget.value().used, 4)
+
+
+def test_writer_rejects_direct_capacity_outside_workspace() raises:
+    var writer = ResponseWriter(32)
+    writer._set_body_budget(16)
+    writer.body.reserve(20)
+    assert_false(writer._reconcile_body_budget())
+    assert_equal(writer._body_budget.value().used, 0)
+    writer._drop_body()
+    assert_equal(writer.body.capacity(), 0)
+
+
+def test_standalone_writer_keeps_exact_reserve_behavior() raises:
+    var writer = ResponseWriter(32)
+    writer.write_string("12345678")
+    writer.write_string("9")
+    assert_false(Bool(writer._body_budget))
+    assert_equal(writer.body.capacity(), 9)
+
+
 def test_receive_growth_charges_capacity_and_old_new_peak() raises:
     var budget = BufferBudget(24)
     var bytes = List[Byte]()

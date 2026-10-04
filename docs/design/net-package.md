@@ -243,7 +243,10 @@ section records only the package-level boundaries.
   and the connection owns the queued response until it is sent.
 - One global `BufferBudget` charges retained receive and adopted pending
   capacity, including old + new growth peaks and incoming pending wire.
-  Temporary read chunks, encoding before adoption, parser copies, writer and
+  Synchronous HTTP/1 `write`/`write_string` use globally reserved body
+  workspace and check growth peaks; direct body edits are reconciled without
+  a pre-growth guarantee. Temporary read chunks, encoding/header allocations,
+  parser copies, other writer paths and
   protocol/provider allocations are not all included yet.
   Admission failures become 503+close, handler
   overruns and raises become 500+close without leaking details, and a

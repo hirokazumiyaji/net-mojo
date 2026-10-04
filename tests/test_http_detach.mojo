@@ -908,6 +908,65 @@ def _worker_respond_thread(
     return arg
 
 
+struct _BudgetedWorkerHandler(Handler):
+    var context: Pointer[_WorkerRespondContext, MutUntrackedOrigin]
+    var thread: UInt64
+    var started: Bool
+
+    def __init__(
+        out self, context: Pointer[_WorkerRespondContext, MutUntrackedOrigin]
+    ):
+        self.context = context
+        self.thread = 0
+        self.started = False
+
+    def handle(mut self, req: Request, mut writer: ResponseWriter) raises:
+        writer.write_string("handler-local body")
+        var sender = writer.detach()
+        self.context[].sender_addr = sender._take()
+        var rc = external_call["pthread_create", c_int](
+            Pointer(to=self.thread),
+            Optional[Pointer[Byte, MutUntrackedOrigin]](None),
+            _worker_respond_thread,
+            self.context.unsafe_bitcast[Byte](),
+        )
+        assert_equal(Int(rc), 0)
+        self.started = True
+
+
+def test_writer_workspace_returns_when_handler_starts_detached_worker() raises:
+    var config = ServerConfig.default()
+    config.total_buffer_budget = 512
+    var server = Server(config^)
+    server.add_listener(listen_tcp("127.0.0.1:0"))
+    var client = dial_tcp(
+        String("127.0.0.1:") + String(server.local_address().port),
+        Timeout.seconds(1),
+    )
+    var context = external_call[
+        "malloc", Pointer[_WorkerRespondContext, MutUntrackedOrigin]
+    ](c_size_t(size_of[_WorkerRespondContext]()))
+    assert_true(Int(context) != 0)
+    context.unsafe_write(_WorkerRespondContext(sender_addr=0, done=False))
+    var handler = _BudgetedWorkerHandler(context)
+    client.write_all(
+        "GET / HTTP/1.1\r\nHost: x\r\n\r\n".as_bytes(), Timeout.seconds(1)
+    )
+    for _ in range(20):
+        _ = server.tick(handler, Timeout.nanoseconds(0))
+        if handler.started:
+            break
+    assert_true(handler.started)
+    assert_equal(server._budget.used, 0)
+    var response = _tick_and_read(server, handler, client)
+    _join_thread(handler.thread)
+    assert_true(context[].done)
+    assert_equal(_body_of(response), "threaded-worker-reply")
+    assert_equal(server._budget.used, 0)
+    client.close()
+    external_call["free", NoneType](context)
+
+
 def test_cross_thread_worker_respond_and_wakeup() raises:
     var server = Server(ServerConfig.default())
     server.add_listener(listen_tcp("127.0.0.1:0"))
