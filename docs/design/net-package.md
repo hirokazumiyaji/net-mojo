@@ -234,14 +234,17 @@ section records only the package-level boundaries.
   semantics never leak into `net/_sys`.
 - One event loop owns the listener and the connection table. `serve`
   takes listener ownership; `tick` runs one iteration and returns
-  `False` once the listener is gone and no connection remains. Tests
+  `False` when no listener, QUIC endpoint or TCP connection remains. Tests
   drive `tick` directly for deterministic I/O.
 - Handlers (`Handler.handle`) run synchronously on the loop thread and
   see bounded buffered requests only: the full body (up to
-  `max_body_bytes`) arrives before the call. `Request` views and
-  `ResponseWriter` live only for the call; retaining means copying,
-  and the connection owns the queued response until it is sent.
-- One global `BufferBudget` charges retained receive and adopted pending
+  `max_body_bytes`) arrives before the call. `Request` owns decoded strings,
+  headers and body; the handler borrows it and mutates the writer during the
+  call. Retain copies of request fields, not borrowed views. Public header
+  getters return owned values. The connection owns the queued response.
+  Only HTTP/1 supports detached/deferred or streaming responses; HTTP/2 and
+  HTTP/3 handlers return bounded buffered responses.
+- One shared global budget charges retained receive and adopted pending
   capacity, including old + new growth peaks and incoming pending wire.
   Decoded HTTP/1 body copies reserve exact capacity before materialization,
   retain that charge during the borrowed handler call, and release it after
@@ -249,16 +252,23 @@ section records only the package-level boundaries.
   Content-Length reserves at head admission; chunked input reserves its exact
   decoded size after complete structural validation, with no decoded body
   allocation or reservation while the wire is incomplete.
-  Synchronous HTTP/1 `write`/`write_string` use globally reserved body
-  workspace and check growth peaks; direct body edits are reconciled without
-  a pre-growth guarantee. Buffered synchronous HTTP/1 wire capacity is
+  Synchronous HTTP/1 `write`/`write_string` reserve their writer-owned body
+  capacity and full old + new growth peaks. Body storage is destroyed before
+  its reservation is returned; direct body edits are reconciled without a
+  pre-growth guarantee. Buffered synchronous HTTP/1 wire capacity is
   measured and reserved while its writer body remains charged, then
-  transferred to the pending queue. Temporary read chunks, header/String
-  scratch, error/100/chunk/detached/H2/H3 encoding,
-  other parser scratch, other writer paths and
-  protocol/provider allocations are not all included yet.
-  Admission failures become 503+close, handler
-  overruns and raises become 500+close without leaking details, and a
+  transferred to the pending queue. HTTP/1 detached state reserves its
+  requested malloc bytes through final free, and mailbox arrays retain their
+  capacity reservations through drained-batch destruction. Detached payload,
+  headers and wire remain separate accounting gaps.
+  Raw read scratch uses fixed stack arrays; TLS retains a charged retry buffer.
+  Pending 100-continue bytes and HTTP/1 error wire reserve capacity before
+  allocation. Header/String/parser scratch, other encoders, native provider
+  allocations and allocator overhead are not all covered; the budget is not
+  a process RSS cap or recovery guarantee for allocator OOM.
+  Admission failures send 503+close when the error response can be admitted;
+  otherwise the connection closes. Handler overruns and raises become
+  500+close without leaking details, and a
   slow reader pauses further reads so kernel buffers absorb the
   backpressure instead of user memory.
 - Deadlines are absolute monotonic timestamps fixed at phase entry
