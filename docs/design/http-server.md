@@ -537,7 +537,8 @@ API の検証は `tests/test_http_api.mojo`で、handler trait、所有 Request�
 
 quiche の opt-in `Config::set_send_budget()` は、各送信 view の `AsRef` backing bytes と、owner および実際に確保された deque cell の数を、受信 pool と独立して計上する。
 ACK は破棄された backing を返却し、空になった deque の再利用可能な容量は reset、CRYPTO clear、Drop まで計上を保つ。
-この engine patch は provider の送信 pool 設定と TLS/H3 境界での quota エラー伝播を含まず、既定の送信上限は無制限のままである。任意の `BufFactory` が隠す追加の allocation は計上対象外である。
+TLS callback で検出した送信 quota 超過は handshake 処理から `SendBufferExceeded` として返り、HTTP/3 control stream の初期化も同じエラーを返す。TLS は QUIC の非 application `INTERNAL_ERROR` として終了し、HTTP/3 初期化はこの quota エラーを汎用の application error に変換しない。
+provider の送信 pool 設定は含まず、既定の送信上限は無制限のままである。任意の `BufFactory` が隠す追加の allocation は計上対象外である。
 
 ### borrow 寿命
 
