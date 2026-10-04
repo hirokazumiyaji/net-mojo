@@ -142,7 +142,8 @@ HTTP/1 error 応答の wire 容量も確保前に予約し、予約できなけ�
 parser／header／String の一時領域、他の encoder、detached header／wire、他の固定 metadata と provider 内部の容量計上は別途必要となる。
 ResponseWriter の拡張前には旧容量と新容量が併存するピークを budget から予約する。budget の不足は handler error として処理し、使用していない予約は解放する。これは List／Arc の実 allocation OOM から復帰する保証ではない。
 一接続の上限だけでなく、同時 body 受信と slow reader が全体 budget を超えないよう admission を制限する。
-budget を予約できない request は受信を継続せず、可能なら 503 と close。エラー応答用に小さい固定容量を確保する。
+budget を予約できない request は受信を継続せず、可能なら 503 と close。
+現在は error 応答の wire 容量を必要時に予約し、予約できなければ close のみになる。
 接続上限に達したら listener の受け入れを一時停止し、空きができたら再開する。
 
 deadline は単調時計による絶対時刻とし、byte を一つ受信するたびに延長しない。
@@ -567,7 +568,10 @@ HTTP/2 の request 組立ては `tests/test_http2.mojo` の `test_http2_request_
 
 transport 失敗は `NetError`、HTTP 失敗は `HttpError(status, should_close)`。
 `handler` の raise と response budget 超過は未送信 response を破棄して 500 と close、
-詳細は response に漏らさない。budget 予約不可は 503 と close（小さい固定の error 応答容量を確保）。
+詳細は response に漏らさない。budget 予約不可は可能なら 503 と close。
+HTTP/1 の未送信 error 応答は、detach timeout を含め、wire 容量を全体 budget から予約できる場合に送る。
+予約できなければ error 応答を組み立てずに対象接続を閉じるため、以下の status が必ず届く保証はない。
+固定の emergency 容量の事前予約は未実装である。
 
 | 状態 | status | 備考 |
 | --- | --- | --- |
@@ -578,7 +582,7 @@ transport 失敗は `NetError`、HTTP 失敗は `HttpError(status, should_close)
 | 非対応 version | 505 | - |
 | 未知の `Expect` | 417 と close | `100-continue` のみ継続（header 検証と body 上限判定後に 100） |
 | handler error・response 拡張時の budget 超過 | 500 と close | 別接続の loop は継続 |
-| 全体 budget 予約不可 | 503 と close | - |
+| 全体 budget 予約不可 | 可能なら 503 と close | HTTP/1 の error wire 容量を予約できなければ close のみ |
 
 ### HTTP/1.1 の規則と検証範囲
 
@@ -717,7 +721,7 @@ handler をイベントループ上でブロックさせると全接続が停止
   - `ResponseWriter.detach()` と `_SharedDetachState` 連携（接続 slot、generation、wakeup_fd の引き渡し）。
   - `STATE_DETACHED` 状態機械の導入、パイプライン要求の順序保存（detach 中は次要求の parse を保留、完了後に `_push_urgent` で順次再開、バッファ空時のみ読み込み許可によるバッファバジェット保護）。
   - クライアントのハーフクローズ（`shutdown(SHUT_WR)`）耐性と正常応答・クローズ遷移。
-  - `ServerConfig.detached_response_timeout` による厳格なタイムアウト処理（503 Service Unavailable と close、共有状態への `cancelled = True` 設定）。
+  - `ServerConfig.detached_response_timeout` による厳格なタイムアウト処理（可能なら 503 Service Unavailable と close、共有状態への `cancelled = True` 設定）。
   - ハンドラが `detach()` 後に例外送出した際の状態キャンセル・解放と 500 送信（メモリリーク防止）。
   - 複数接続同時 detach 時の多重 pop 防止、generation 不一致時の安全な無効化、完了・タイムアウト・中断時の確実な deadline 再登録。
   - RFC 9110 に準拠した `HEAD` 要求でのエラー・遅延応答時のボディ省略（Content-Length は維持）。
@@ -819,14 +823,14 @@ handler をイベントループ上でブロックさせると全接続が停止
    - 応答完了（`respond` または `finish`）後に `_push_urgent` で次要求の処理を再開し、HTTP/1.1 の要求・応答順序を厳格に保持する。
 2. **タイムアウト・切断時のフレーミング保護**:
    - `STATE_STREAMING` 移行後にタイムアウトやエラーが発生した場合、不正な 500/503 応答を送信せず、直ちにソケットをクローズする（すでに 200 OK ヘッダーがクライアントに届いているため、後からステータスを送ると HTTP フレーミング違反になる）。
-   - `STATE_DETACHED` で未 `start()` のままタイムアウトした場合は、503 Service Unavailable を送信してクローズする。
+   - `STATE_DETACHED` で未 `start()` のままタイムアウトした場合は、可能なら 503 Service Unavailable を送信してクローズする。
 
 ### リソース上限と設定契約
 
 | 設定項目 | 型 | デフォルト値 | 振る舞い・契約 |
 | --- | --- | --- | --- |
-| `ServerConfig.stream_queue_limit` | `Int` | `1048576` (1 MiB) | `ResponseSender` から積まれる未送信メッセージのバイト数上限。この上限を超えて `send()` または `respond()` された場合、キュー肥大化による OOM を防ぐため接続は直ちに abort されクローズされる。 |
-| `ServerConfig.detached_response_timeout` | `Duration` | 30 秒 | `writer.detach()` 後に `respond()` または `start()` が呼ばれるまでの最大許容時間。満了時は 503 を返し `cancelled = True` にしてクローズ。 |
+| `ServerConfig.stream_queue_limit` | `Int` | `1048576` (1 MiB) | `send()` で積む未送信 body chunk の合計バイト数上限。超過時は abort を通知し、server が接続を閉じる。`respond()` の全 body はこの上限の対象外で、shared budget と `max_response_body` の制限を受ける。 |
+| `ServerConfig.detached_response_timeout` | `Duration` | 30 秒 | `writer.detach()` 後に `respond()` または `start()` が呼ばれるまでの最大許容時間。満了時は可能なら 503 を返し `cancelled = True` にしてクローズ。 |
 | `ServerConfig.stream_idle_timeout` | `Duration` | 300 秒 | ストリーミング中に新しいチャンクが送信されないまま経過できる最大アイドル時間。満了時は接続をクローズし、送信側には `cancelled = True` を設定。 |
 | `ServerConfig.write_deadline` | `Duration` | 30 秒 | ソケットへのノンブロッキング write が進行しない場合のデッドライン。満了時は接続クローズ。 |
 | `ServerConfig.shutdown_grace` | `Duration` | 30 秒 | graceful shutdown 要求後の猶予期間。猶予内に `finish()` したストリームは正常完了し、猶予超過したストリームは強制キャンセル。 |
