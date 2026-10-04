@@ -10,8 +10,8 @@ Ownership and resources:
 - `serve` takes listener ownership and runs until shutdown completes or
   the listener and every connection are gone. Connections live in the
   internal table; only raw fd numbers are ever handed to the reactor.
-- One global `BufferBudget` charges receive and adopted pending capacity,
-  including growth peaks, and lends synchronous HTTP/1 writer workspace.
+- One global `SharedBufferBudget` charges receive and adopted pending capacity,
+  including growth peaks and owned synchronous HTTP/1 writer bodies.
   Decoded HTTP/1 body copies reserve capacity before materialization and hold
   that reservation until the borrowed request is dropped after its handler.
   Buffered HTTP/1 and error wire are reserved before encoding; other encoding remains
@@ -1896,10 +1896,6 @@ struct Server(Movable):
         self._conns[idx].sent_100 = True
         return True
 
-    def _drop_writer_body(mut self, mut writer: ResponseWriter, charge: Int):
-        writer._drop_body()
-        self._budget.release(charge)
-
     def _release_http1_body(mut self, idx: Int):
         self._budget.release(self._conns[idx].http1_body_reserved)
         self._conns[idx].http1_body_reserved = 0
@@ -1931,8 +1927,7 @@ struct Server(Movable):
             wakeup_fd=self._wakeup_channel.write_fd(),
             queue_limit=self.config.stream_queue_limit,
         )
-        _ = self._budget.try_reserve(workspace)
-        writer._set_body_budget(workspace)
+        writer._set_body_budget(self._budget.copy())
         # The wire must advertise close whenever the connection will not
         # persist, even when the handler leaves the writer untouched.
         if req_close or self._shutdown_at != NO_DEADLINE:
@@ -1955,14 +1950,14 @@ struct Server(Movable):
                     s_ptr[].mutex.unlock()
                     _release_detach_state(addr, from_sender=False)
                     writer._detach_state_addr = 0
-            self._drop_writer_body(writer, workspace)
+            writer._drop_body()
             self._send_error(idx, 500, is_head=is_head)
             return
 
         _ = req^
         self._release_http1_body(idx)
         if writer.is_detached():
-            self._drop_writer_body(writer, workspace)
+            writer._drop_body()
             var addr = writer._detach_state_addr
             if addr == 0:
                 self._send_error(idx, 500, is_head=is_head)
@@ -1988,18 +1983,16 @@ struct Server(Movable):
             return
 
         if len(writer.body) > cap or not writer._reconcile_body_budget():
-            self._drop_writer_body(writer, workspace)
+            writer._drop_body()
             self._send_error(idx, 500, is_head=is_head)
             return
-        var writer_charge = writer.body.capacity()
-        self._budget.release(workspace - writer_charge)
         # Header count/bytes are enforced inside the encoder, the single
         # authoritative site; its failure below becomes a 500 the same way.
         try:
             self._inject_alt_svc_for_tls(idx, writer)
         except e:
             _ = e
-            self._drop_writer_body(writer, writer_charge)
+            writer._drop_body()
             self._send_error(idx, 500, is_head=is_head)
             return
         var wire: List[Byte]
@@ -2014,10 +2007,10 @@ struct Server(Movable):
             )
         except e:
             _ = e
-            self._drop_writer_body(writer, writer_charge)
+            writer._drop_body()
             self._send_error(idx, 500, is_head=is_head)
             return
-        self._drop_writer_body(writer, writer_charge)
+        writer._drop_body()
         self._conns[idx]._set_reserved_pending(wire^, self._budget)
         # A half-closed peer (read_eof) forces close only when nothing
         # is left to answer: pipelined requests already buffered must

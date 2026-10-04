@@ -6,7 +6,7 @@ The connection owns the encoded bytes until the send completes, so
 handler-local values must be copied in (which `write` does) instead
 of borrowed into a send queue.
 
-The synchronous HTTP/1 server lends capacity workspace to supported writes;
+The synchronous HTTP/1 writer owns its body capacity in the shared budget;
 standalone writers enforce their body length limit. Direct body edits are
 reconciled separately and do not have the supported writes' growth guarantee.
 """
@@ -14,7 +14,7 @@ reconciled separately and do not have the supported writes' growth guarantee.
 from net.error import NetError, NetErrorKind
 
 from ._detach import ResponseSender, _create_detach_state
-from ._buffer import BufferBudget, _reserve_capacity
+from ._buffer import SharedBufferBudget, _reserve_capacity
 from .headers import Headers
 
 
@@ -32,7 +32,8 @@ struct ResponseWriter(Movable, Sized):
     var _generation: UInt64
     var _wakeup_fd: Int32
     var _queue_limit: Int
-    var _body_budget: Optional[BufferBudget]
+    var _body_budget: Optional[SharedBufferBudget]
+    var _body_capacity_reserved: Int
 
     def __init__(
         out self,
@@ -57,6 +58,7 @@ struct ResponseWriter(Movable, Sized):
         self._wakeup_fd = wakeup_fd
         self._queue_limit = queue_limit
         self._body_budget = None
+        self._body_capacity_reserved = 0
 
     def __init__(out self, *, deinit move: Self):
         self.status = move.status
@@ -71,20 +73,30 @@ struct ResponseWriter(Movable, Sized):
         self._wakeup_fd = move._wakeup_fd
         self._queue_limit = move._queue_limit
         self._body_budget = move._body_budget^
+        self._body_capacity_reserved = move._body_capacity_reserved
 
-    def _set_body_budget(mut self, workspace: Int):
-        self._body_budget = BufferBudget(workspace)
+    def __deinit__(deinit self):
+        self._drop_body()
+
+    def _set_body_budget(mut self, var budget: SharedBufferBudget):
+        self._body_budget = budget^
 
     def _reconcile_body_budget(mut self) -> Bool:
-        var difference = self.body.capacity() - self._body_budget.value().used
+        var capacity = self.body.capacity()
+        var difference = capacity - self._body_capacity_reserved
         if difference >= 0:
-            return self._body_budget.value().try_reserve(difference)
-        self._body_budget.value().release(-difference)
+            if not self._body_budget.value().try_reserve(difference):
+                return False
+        else:
+            self._body_budget.value().release(-difference)
+        self._body_capacity_reserved = capacity
         return True
 
     def _drop_body(mut self):
         self.body = List[Byte]()
-        self._body_budget.value().release(self._body_budget.value().used)
+        if self._body_budget:
+            self._body_budget.value().release(self._body_capacity_reserved)
+        self._body_capacity_reserved = 0
 
     def is_detached(self) -> Bool:
         return self._detached
@@ -152,8 +164,9 @@ struct ResponseWriter(Movable, Sized):
                     NetErrorKind.invalid_argument(),
                     "write response body",
                     None,
-                    "response body capacity exceeds workspace",
+                    "response body capacity exceeds budget",
                 )
+            self._body_capacity_reserved = self.body.capacity()
         else:
             self.body.reserve(len(self.body) + len(data))
         for i in range(len(data)):

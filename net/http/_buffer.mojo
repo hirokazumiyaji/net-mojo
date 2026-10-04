@@ -5,12 +5,12 @@ peaks. Pending growth also charges its incoming wire allocation. Synchronous
 HTTP/1 buffered response and error wire are reserved before allocation. Other encoding,
 parser scratch and provider allocations remain separate. Decoded
 HTTP/1 body copies reserve their exact capacity before materialization and remain
-charged through the handler call. Synchronous
-HTTP/1 writer bodies use a reserved workspace; other writer paths and other
-reservations still need separate capacity accounting.
+charged through the handler call. Synchronous HTTP/1 writer bodies own their
+capacity reservation directly; other writer paths and other reservations still
+need separate capacity accounting.
 
-The global counter uses a mutex-protected shared capability; local writer
-workspace counters remain plain. Detached allocation accounting is separate.
+The global counter uses a mutex-protected shared capability. Detached allocation
+accounting is separate.
 """
 
 from std.memory import ArcPointer
