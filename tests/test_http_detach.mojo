@@ -1,7 +1,7 @@
 from std.ffi import c_int, c_size_t, c_ulong, external_call
 from std.sys import size_of
 from std.testing import assert_equal, assert_false, assert_true, TestSuite
-from std.time import sleep
+from std.time import perf_counter_ns, sleep
 
 from net import TCPConn, Timeout, dial_tcp, listen_tcp
 from net._sys.common import EINTR
@@ -17,12 +17,15 @@ from net.http import (
     ServerConfig,
 )
 from net.http._detach import (
+    DetachMessage,
     MSG_KIND_ABORT,
     MSG_KIND_CHUNK,
     MSG_KIND_FINISH,
     MSG_KIND_RESPOND,
     MSG_KIND_START,
     _create_detach_state,
+    _DetachedBatch,
+    _take_batch,
     _release_detach_state,
     _SharedDetachState,
 )
@@ -157,7 +160,7 @@ def test_detach_state_lifecycle_and_cleanup() raises:
     # sender deinit releases other ref upon exit
 
 
-def test_sender_drop_without_respond_queues_abort() raises:
+def test_sender_drop_without_respond_records_abort_without_array_growth() raises:
     var state_addr = _create_detach_state(slot=2, generation=10)
     assert_true(state_addr != 0)
 
@@ -174,10 +177,10 @@ def test_sender_drop_without_respond_queues_abort() raises:
     _ = sender._take()  # manually simulate dropping with cleanup
     _release_detach_state(state_addr, from_sender=True)
 
-    # Inspect that an abort message was automatically queued
     s_ptr[].mutex.lock()
-    assert_equal(len(s_ptr[].messages), 1)
-    assert_equal(s_ptr[].messages[0].kind, MSG_KIND_ABORT)
+    assert_equal(len(s_ptr[].messages), 0)
+    assert_equal(s_ptr[].messages.capacity(), 0)
+    assert_equal(s_ptr[].terminal_kind, MSG_KIND_ABORT)
     s_ptr[].mutex.unlock()
 
     # Server side releases remaining ref
@@ -977,15 +980,336 @@ def test_writer_body_charge_returns_when_handler_starts_detached_worker() raises
         if handler.started:
             break
     assert_true(handler.started)
-    assert_equal(server._budget.used(), 0)
-    var response = _tick_and_read(server, handler, client)
     _join_thread(handler.thread)
+    var state = Pointer[_SharedDetachState, MutUntrackedOrigin](
+        unsafe_from_address=server._conns[0].detach_state_addr
+    )
+    assert_equal(
+        server._budget.used(),
+        state[].messages.capacity() * size_of[DetachMessage](),
+    )
+    var response = _tick_and_read(server, handler, client)
     assert_true(context[].done)
     assert_equal(_body_of(response), "threaded-worker-reply")
     assert_equal(server._budget.used(), 0)
     client.close()
     external_call["free", NoneType](context)
     assert_equal(handler.body_charge, 18)
+
+
+struct _MailboxHandler(Handler):
+    var addr: Int
+
+    def __init__(out self):
+        self.addr = 0
+
+    def handle(mut self, req: Request, mut writer: ResponseWriter) raises:
+        var sender = writer.detach()
+        self.addr = sender._take()
+
+
+def _wait_mailbox_handler(
+    mut server: Server, mut handler: _MailboxHandler
+) raises:
+    var deadline = perf_counter_ns() + 2_000_000_000
+    while handler.addr == 0 and perf_counter_ns() < deadline:
+        _ = server.tick(handler, Timeout.milliseconds(1))
+    assert_true(handler.addr != 0)
+
+
+def test_detached_mailbox_array_capacity_uses_the_shared_budget() raises:
+    var config = ServerConfig.default()
+    config.total_buffer_budget = 4096
+    var server = Server(config^)
+    server.add_listener(listen_tcp("127.0.0.1:0"))
+    var handler = _MailboxHandler()
+    var client = dial_tcp(
+        String("127.0.0.1:") + String(server.local_address().port),
+        Timeout.seconds(1),
+    )
+    client.write_all(
+        "GET / HTTP/1.1\r\nHost: x\r\n\r\n".as_bytes(), Timeout.seconds(1)
+    )
+    _wait_mailbox_handler(server, handler)
+    var sender = ResponseSender(handler.addr)
+    sender.start()
+    assert_true(sender.send("a".as_bytes()))
+    assert_true(sender.send("b".as_bytes()))
+    var state = Pointer[_SharedDetachState, MutUntrackedOrigin](
+        unsafe_from_address=handler.addr
+    )
+    var capacity = state[].messages.capacity()
+    var charged = server._budget.used()
+    client.close()
+    server._close_conn(0)
+    _ = sender^
+    assert_equal(capacity, 4)
+    assert_equal(charged, 4 * size_of[DetachMessage]())
+    assert_equal(server._budget.used(), 0)
+
+
+@fieldwise_init
+struct _MailboxRefillContext:
+    var sender_addr: Int
+    var sent: Bool
+    var failed: Bool
+
+
+def _mailbox_refill_thread(
+    arg: Pointer[Byte, MutUntrackedOrigin],
+) -> Pointer[Byte, MutUntrackedOrigin]:
+    var ctx = arg.unsafe_bitcast[_MailboxRefillContext]()
+    var sender = ResponseSender(ctx[].sender_addr)
+    try:
+        ctx[].sent = sender.send("x".as_bytes())
+    except:
+        ctx[].failed = True
+    ctx[].sender_addr = sender._take()
+    return arg
+
+
+def test_drained_batch_keeps_array_charge_while_pthread_refills() raises:
+    comptime element = size_of[DetachMessage]()
+    for extra in [17, 16]:
+        var config = ServerConfig.default()
+        config.total_buffer_budget = 2 * element + extra
+        var server = Server(config^)
+        server.add_listener(listen_tcp("127.0.0.1:0"))
+        var handler = _MailboxHandler()
+        var client = dial_tcp(
+            String("127.0.0.1:") + String(server.local_address().port),
+            Timeout.seconds(1),
+        )
+        client.write_all(
+            "GET / HTTP/1.1\r\nHost: x\r\n\r\n".as_bytes(), Timeout.seconds(1)
+        )
+        _wait_mailbox_handler(server, handler)
+        assert_true(server._budget.try_reserve(17))
+        var sender = ResponseSender(handler.addr)
+        sender.start()
+        var state = Pointer[_SharedDetachState, MutUntrackedOrigin](
+            unsafe_from_address=handler.addr
+        )
+        var original = Int(state[].messages.unsafe_ptr())
+        var batch = _take_batch(state)
+        assert_equal(state[].messages.capacity(), 0)
+        assert_equal(server._budget.used(), element + 17)
+        var ctx = _MailboxRefillContext(
+            sender_addr=sender._take(), sent=False, failed=False
+        )
+        var thread: UInt64 = 0
+        var rc = external_call["pthread_create", c_int](
+            Pointer(to=thread),
+            Optional[Pointer[Byte, MutUntrackedOrigin]](None),
+            _mailbox_refill_thread,
+            Pointer(to=ctx).unsafe_bitcast[Byte](),
+        )
+        assert_equal(Int(rc), 0)
+        _join_thread(thread)
+        var returned = ResponseSender(ctx.sender_addr)
+        var admitted = extra == 17
+        assert_equal(ctx.sent, admitted)
+        assert_equal(ctx.failed, not admitted)
+        assert_equal(server._budget.used(), 17 + element * (1 + Int(admitted)))
+        assert_equal(Int(batch.messages.unsafe_ptr()), original)
+        assert_equal(batch.messages[0].kind, MSG_KIND_START)
+        if admitted:
+            assert_true(Int(state[].messages.unsafe_ptr()) != original)
+            assert_equal(state[].messages.capacity(), 1)
+        else:
+            assert_equal(state[].messages.capacity(), 0)
+            assert_equal(state[].terminal_kind, MSG_KIND_ABORT)
+        _ = batch^
+        assert_equal(server._budget.used(), 17 + element * Int(admitted))
+        client.close()
+        server._close_conn(0)
+        assert_true(returned.is_cancelled())
+        assert_equal(server._budget.used(), 17)
+        _ = returned^
+        assert_equal(server._budget.used(), 17)
+        server._budget.release(17)
+
+
+def test_mailbox_growth_denial_retains_old_array_and_foreign_charge() raises:
+    comptime element = size_of[DetachMessage]()
+    var budget = SharedBufferBudget(3 * element + 16)
+    assert_true(budget.try_reserve(17))
+    var addr = _create_detach_state(slot=0, generation=1, budget=budget.copy())
+    var sender = ResponseSender(addr)
+    sender.start()
+    var rejected = False
+    try:
+        _ = sender.send("x".as_bytes())
+    except e:
+        rejected = e.kind == NetErrorKind.invalid_argument()
+    var state = Pointer[_SharedDetachState, MutUntrackedOrigin](
+        unsafe_from_address=addr
+    )
+    assert_true(rejected)
+    assert_equal(len(state[].messages), 1)
+    assert_equal(state[].messages.capacity(), 1)
+    assert_equal(state[].terminal_kind, MSG_KIND_ABORT)
+    assert_equal(budget.used(), element + 17)
+    _release_detach_state(addr, from_sender=False)
+    _ = sender^
+    assert_equal(budget.used(), 17)
+
+
+def _throw_with_owned_batch(var batch: _DetachedBatch) raises:
+    assert_equal(batch.messages[0].kind, MSG_KIND_START)
+    raise Error("batch unwind")
+
+
+def test_owned_batch_unwind_refunds_only_its_array() raises:
+    comptime element = size_of[DetachMessage]()
+    var budget = SharedBufferBudget(element + 9)
+    assert_true(budget.try_reserve(9))
+    var addr = _create_detach_state(slot=0, generation=1, budget=budget.copy())
+    var sender = ResponseSender(addr)
+    sender.start()
+    var state = Pointer[_SharedDetachState, MutUntrackedOrigin](
+        unsafe_from_address=addr
+    )
+    var batch = _take_batch(state)
+    _release_detach_state(addr, from_sender=False)
+    _ = sender^
+    assert_equal(budget.used(), element + 9)
+    var threw = False
+    try:
+        _throw_with_owned_batch(batch^)
+    except:
+        threw = True
+    assert_true(threw)
+    assert_equal(budget.used(), 9)
+
+
+def test_finish_follows_accepted_chunks_without_array_growth() raises:
+    var server = Server(ServerConfig.default())
+    server.add_listener(listen_tcp("127.0.0.1:0"))
+    var handler = _MailboxHandler()
+    var client = dial_tcp(
+        String("127.0.0.1:") + String(server.local_address().port),
+        Timeout.seconds(1),
+    )
+    client.write_all(
+        "GET / HTTP/1.1\r\nHost: x\r\n\r\n".as_bytes(), Timeout.seconds(1)
+    )
+    _wait_mailbox_handler(server, handler)
+    var sender = ResponseSender(handler.addr)
+    sender.start()
+    assert_true(sender.send("a".as_bytes()))
+    assert_true(sender.send("b".as_bytes()))
+    var state = Pointer[_SharedDetachState, MutUntrackedOrigin](
+        unsafe_from_address=handler.addr
+    )
+    var capacity = state[].messages.capacity()
+    sender.finish()
+    assert_equal(state[].messages.capacity(), capacity)
+    assert_equal(len(state[].messages), 3)
+    assert_equal(state[].terminal_kind, MSG_KIND_FINISH)
+    _ = sender^
+    var response = _tick_and_read_chunked(server, handler, client)
+    assert_equal(_status_of(response), 200)
+    assert_equal(_body_of(response), "1\r\na\r\n1\r\nb\r\n0\r\n\r\n")
+    assert_equal(server._budget.used(), 0)
+    client.close()
+
+
+def _apply_terminal(var sender: ResponseSender, mode: Int) raises:
+    if mode == 0:
+        sender.finish()
+    elif mode == 1:
+        sender.abort()
+
+
+def test_shared_terminal_needs_no_space_after_accepted_data() raises:
+    comptime element = size_of[DetachMessage]()
+    for mode in [0, 1, 2]:
+        var budget = SharedBufferBudget(3 * element)
+        var addr = _create_detach_state(
+            slot=0, generation=1, budget=budget.copy()
+        )
+        var sender = ResponseSender(addr)
+        sender.start()
+        assert_true(sender.send("a".as_bytes()))
+        assert_true(budget.try_reserve(element))
+        assert_equal(budget.remaining(), 0)
+        _apply_terminal(sender^, mode)
+        var state = Pointer[_SharedDetachState, MutUntrackedOrigin](
+            unsafe_from_address=addr
+        )
+        assert_equal(len(state[].messages), 2)
+        assert_equal(state[].messages.capacity(), 2)
+        assert_equal(state[].array_ticket.amount, 2 * element)
+        assert_equal(budget.remaining(), 0)
+        var batch = _take_batch(state)
+        _release_detach_state(addr, from_sender=False)
+        assert_equal(budget.used(), 3 * element)
+        assert_equal(batch.messages[0].kind, MSG_KIND_START)
+        assert_equal(batch.messages[1].kind, MSG_KIND_CHUNK)
+        assert_equal(batch.messages[1].body[0], Byte(ord("a")))
+        assert_equal(
+            batch.terminal_kind,
+            MSG_KIND_FINISH if mode == 0 else MSG_KIND_ABORT,
+        )
+        _ = batch^
+        assert_equal(budget.used(), element)
+
+
+def test_overflow_terminal_preserves_full_budget_and_old_batch() raises:
+    comptime element = size_of[DetachMessage]()
+    var budget = SharedBufferBudget(3 * element + 5)
+    assert_true(budget.try_reserve(5))
+    var addr = _create_detach_state(
+        slot=0, generation=1, queue_limit=1, budget=budget.copy()
+    )
+    var sender = ResponseSender(addr)
+    sender.start()
+    assert_true(sender.send("a".as_bytes()))
+    var state = Pointer[_SharedDetachState, MutUntrackedOrigin](
+        unsafe_from_address=addr
+    )
+    var old = _take_batch(state)
+    assert_true(sender.send("b".as_bytes()))
+    assert_equal(budget.remaining(), 0)
+    var rejected = False
+    try:
+        _ = sender.send("c".as_bytes())
+    except e:
+        rejected = e.kind == NetErrorKind.invalid_argument()
+    assert_true(rejected)
+    assert_equal(len(state[].messages), 1)
+    assert_equal(state[].messages.capacity(), 1)
+    assert_equal(state[].array_ticket.amount, element)
+    assert_equal(budget.remaining(), 0)
+    var pending = _take_batch(state)
+    _release_detach_state(addr, from_sender=False)
+    _ = sender^
+    assert_equal(budget.used(), 3 * element + 5)
+    assert_equal(old.messages[0].kind, MSG_KIND_START)
+    assert_equal(old.messages[1].body[0], Byte(ord("a")))
+    assert_equal(pending.messages[0].kind, MSG_KIND_CHUNK)
+    assert_equal(pending.messages[0].body[0], Byte(ord("b")))
+    assert_equal(pending.terminal_kind, MSG_KIND_ABORT)
+    _ = old^
+    assert_equal(budget.used(), element + 5)
+    _ = pending^
+    assert_equal(budget.used(), 5)
+
+
+def test_sender_abort_and_drop_do_not_allocate_mailbox_storage() raises:
+    for abort_explicitly in [False, True]:
+        var addr = _create_detach_state(slot=0, generation=1)
+        var sender = ResponseSender(addr)
+        if abort_explicitly:
+            sender.abort()
+        _ = sender^
+        var state = Pointer[_SharedDetachState, MutUntrackedOrigin](
+            unsafe_from_address=addr
+        )
+        var capacity = state[].messages.capacity()
+        _release_detach_state(addr, from_sender=False)
+        assert_equal(capacity, 0)
 
 
 def test_cross_thread_worker_respond_and_wakeup() raises:

@@ -5,12 +5,13 @@ from the synchronous handler on the event loop, enabling deferred responses
 and response streaming from another thread (e.g. GPU inference or worker threads).
 
 Architecture (Erlang-inspired Actor / Message-Passing):
-- The connection actor on the event loop remains the exclusive owner of the socket,
-  buffer budget, and reactor interests.
+- The connection actor on the event loop remains the exclusive owner of the socket
+  and reactor interests.
 - `ResponseSender` acts as a movable actor endpoint / proxy.
-- Detached operations in Phase B (`respond`, `abort`) enqueue
-  structured messages into a thread-safe mailbox protected by a POSIX mutex
-  (streaming operations `start`, `send`, `finish` are planned for Phase C).
+- A copied budget capability charges retained message-array capacity through queue
+  and drained-batch ownership. Payload, header and fixed-state storage remain separate.
+- Data messages use a mutex-protected mailbox; ordered finish/abort state requires
+  no additional message allocation.
 - A non-blocking wakeup file descriptor (via `socketpair`) notifies the reactor
   to awaken the event loop without polling latency.
 - Generation checks guard against stale writes if a connection is closed and
@@ -22,6 +23,7 @@ from std.sys import size_of
 
 from net._actor import PthreadMutex, signal_wakeup_fd
 from net.error import NetError, NetErrorKind
+from net.http._buffer import SharedBufferBudget, _reserve_capacity
 from net.http.headers import Headers
 
 
@@ -31,6 +33,27 @@ comptime MSG_KIND_START: UInt8 = 2
 comptime MSG_KIND_CHUNK: UInt8 = 3
 comptime MSG_KIND_FINISH: UInt8 = 4
 comptime MSG_KIND_ABORT: UInt8 = 5
+
+
+struct _CapacityTicket(Movable):
+    var budget: Optional[SharedBufferBudget]
+    var amount: Int
+
+    def __init__(
+        out self,
+        var budget: Optional[SharedBufferBudget] = None,
+        amount: Int = 0,
+    ):
+        self.budget = budget^
+        self.amount = amount
+
+    def release(mut self):
+        if self.budget:
+            self.budget.value().release(self.amount)
+        self.amount = 0
+
+    def __deinit__(deinit self):
+        self.release()
 
 
 struct DetachMessage(Movable):
@@ -98,25 +121,17 @@ struct DetachMessage(Movable):
             False,
         )
 
-    @staticmethod
-    def finish() -> Self:
-        return Self(
-            MSG_KIND_FINISH,
-            200,
-            Headers(),
-            List[Byte](),
-            False,
-        )
 
-    @staticmethod
-    def abort() -> Self:
-        return Self(
-            MSG_KIND_ABORT,
-            500,
-            Headers(),
-            List[Byte](),
-            True,
-        )
+@fieldwise_init
+struct _DetachedBatch(Movable):
+    var messages: List[DetachMessage]
+    var ticket: _CapacityTicket
+    var terminal_kind: UInt8
+    var generation: UInt64
+
+    def __deinit__(deinit self):
+        _ = self.messages^
+        self.ticket.release()
 
 
 struct _SharedDetachState:
@@ -137,6 +152,9 @@ struct _SharedDetachState:
     var queue_limit: Int
     var queued_bytes: Int
     var messages: List[DetachMessage]
+    var budget: Optional[SharedBufferBudget]
+    var array_ticket: _CapacityTicket
+    var terminal_kind: UInt8
 
     def __init__(
         out self,
@@ -144,8 +162,9 @@ struct _SharedDetachState:
         generation: UInt64,
         wakeup_fd: Int32 = -1,
         queue_limit: Int = 1048576,
+        var budget: Optional[SharedBufferBudget] = None,
     ):
-        self.mutex = PthreadMutex()
+        self.mutex = PthreadMutex._uninitialized()
         self.ref_count = 2  # 1 for connection actor, 1 for ResponseSender
         self.wakeup_fd = wakeup_fd
         self.slot = slot
@@ -157,6 +176,56 @@ struct _SharedDetachState:
         self.queue_limit = queue_limit
         self.queued_bytes = 0
         self.messages = List[DetachMessage]()
+        self.budget = budget^
+        self.array_ticket = _CapacityTicket(self.budget.copy())
+        self.terminal_kind = MSG_KIND_NONE
+
+    def __deinit__(deinit self):
+        _ = self.messages^
+        self.array_ticket.release()
+        self.mutex.destroy()
+
+
+def _append_message(
+    state: Pointer[_SharedDetachState, MutUntrackedOrigin],
+    var message: DetachMessage,
+) -> Bool:
+    var needed = len(state[].messages) + 1
+    if state[].budget:
+        var reservation = 0
+        if not _reserve_capacity(
+            state[].messages, state[].budget.value(), needed, reservation
+        ):
+            _ = message^
+            state[].cancelled = True
+            state[].finished = True
+            state[].terminal_kind = MSG_KIND_ABORT
+            return False
+    else:
+        state[].messages.reserve(max(needed, state[].messages.capacity() * 2))
+    state[].array_ticket.amount = (
+        state[].messages.capacity() * size_of[DetachMessage]()
+    )
+    state[].messages.append(message^)
+    return True
+
+
+def _take_batch(
+    state: Pointer[_SharedDetachState, MutUntrackedOrigin],
+) -> _DetachedBatch:
+    state[].mutex.lock()
+    var messages_ptr = Pointer(to=state[].messages)
+    var messages = messages_ptr.unsafe_take_pointee()
+    messages_ptr.unsafe_write(List[DetachMessage]())
+    var ticket_ptr = Pointer(to=state[].array_ticket)
+    var ticket = ticket_ptr.unsafe_take_pointee()
+    ticket_ptr.unsafe_write(_CapacityTicket(state[].budget.copy()))
+    var terminal_kind = state[].terminal_kind
+    var generation = state[].generation
+    state[].queued_bytes = 0
+    state[].terminal_kind = MSG_KIND_NONE
+    state[].mutex.unlock()
+    return _DetachedBatch(messages^, ticket^, terminal_kind, generation)
 
 
 def _create_detach_state(
@@ -164,6 +233,7 @@ def _create_detach_state(
     generation: UInt64,
     wakeup_fd: Int32 = -1,
     queue_limit: Int = 1048576,
+    var budget: Optional[SharedBufferBudget] = None,
 ) -> Int:
     """Allocates a new heap _SharedDetachState and returns its integer address.
     """
@@ -179,8 +249,10 @@ def _create_detach_state(
             generation=generation,
             wakeup_fd=wakeup_fd,
             queue_limit=queue_limit,
+            budget=budget^,
         )
     )
+    s_ptr[].mutex._initialize()
     return Int(ptr)
 
 
@@ -201,7 +273,7 @@ def _release_detach_state(addr: Int, from_sender: Bool):
 
     s_ptr[].mutex.lock()
     if from_sender and not s_ptr[].responded and not s_ptr[].finished:
-        s_ptr[].messages.append(DetachMessage.abort())
+        s_ptr[].terminal_kind = MSG_KIND_ABORT
         s_ptr[].finished = True
         needs_wakeup = True
         wakeup_fd = s_ptr[].wakeup_fd
@@ -215,7 +287,6 @@ def _release_detach_state(addr: Int, from_sender: Bool):
         signal_wakeup_fd(wakeup_fd)
 
     if should_free:
-        s_ptr[].mutex.destroy()
         s_ptr.unsafe_deinit_pointee()
         external_call["free", NoneType](ptr)
 
@@ -309,12 +380,19 @@ struct ResponseSender(Movable):
             )
         s_ptr[].responded = True
         s_ptr[].finished = True
-        s_ptr[].messages.append(
-            DetachMessage.respond(status, headers^, body^, should_close)
+        var admitted = _append_message(
+            s_ptr, DetachMessage.respond(status, headers^, body^, should_close)
         )
         var wakeup_fd = s_ptr[].wakeup_fd
         s_ptr[].mutex.unlock()
         signal_wakeup_fd(wakeup_fd)
+        if not admitted:
+            raise NetError(
+                NetErrorKind.invalid_argument(),
+                "respond",
+                None,
+                "mailbox capacity exceeds budget",
+            )
 
     def start(
         mut self,
@@ -363,10 +441,19 @@ struct ResponseSender(Movable):
                 "response already started or finished",
             )
         s_ptr[].started = True
-        s_ptr[].messages.append(DetachMessage.start(status, headers^))
+        var admitted = _append_message(
+            s_ptr, DetachMessage.start(status, headers^)
+        )
         var wakeup_fd = s_ptr[].wakeup_fd
         s_ptr[].mutex.unlock()
         signal_wakeup_fd(wakeup_fd)
+        if not admitted:
+            raise NetError(
+                NetErrorKind.invalid_argument(),
+                "start",
+                None,
+                "mailbox capacity exceeds budget",
+            )
 
     def send[
         origin: ImmOrigin
@@ -400,7 +487,7 @@ struct ResponseSender(Movable):
         if s_ptr[].queued_bytes + len(data) > s_ptr[].queue_limit:
             s_ptr[].cancelled = True
             s_ptr[].finished = True
-            s_ptr[].messages.append(DetachMessage.abort())
+            s_ptr[].terminal_kind = MSG_KIND_ABORT
             var wakeup_fd = s_ptr[].wakeup_fd
             s_ptr[].mutex.unlock()
             signal_wakeup_fd(wakeup_fd)
@@ -410,15 +497,23 @@ struct ResponseSender(Movable):
                 None,
                 "stream queue limit exceeded",
             )
-        s_ptr[].queued_bytes += len(data)
         var chunk_bytes = List[Byte]()
         chunk_bytes.reserve(len(data))
         for i in range(len(data)):
             chunk_bytes.append(data[i])
-        s_ptr[].messages.append(DetachMessage.chunk(chunk_bytes^))
+        var admitted = _append_message(s_ptr, DetachMessage.chunk(chunk_bytes^))
+        if admitted:
+            s_ptr[].queued_bytes += len(data)
         var wakeup_fd = s_ptr[].wakeup_fd
         s_ptr[].mutex.unlock()
         signal_wakeup_fd(wakeup_fd)
+        if not admitted:
+            raise NetError(
+                NetErrorKind.invalid_argument(),
+                "send",
+                None,
+                "mailbox capacity exceeds budget",
+            )
         return True
 
     def finish(mut self) raises NetError:
@@ -456,7 +551,7 @@ struct ResponseSender(Movable):
                 "streaming response not started or already finished",
             )
         s_ptr[].finished = True
-        s_ptr[].messages.append(DetachMessage.finish())
+        s_ptr[].terminal_kind = MSG_KIND_FINISH
         var wakeup_fd = s_ptr[].wakeup_fd
         s_ptr[].mutex.unlock()
         signal_wakeup_fd(wakeup_fd)
@@ -475,7 +570,7 @@ struct ResponseSender(Movable):
             s_ptr[].mutex.unlock()
             return
         s_ptr[].finished = True
-        s_ptr[].messages.append(DetachMessage.abort())
+        s_ptr[].terminal_kind = MSG_KIND_ABORT
         var wakeup_fd = s_ptr[].wakeup_fd
         s_ptr[].mutex.unlock()
         signal_wakeup_fd(wakeup_fd)

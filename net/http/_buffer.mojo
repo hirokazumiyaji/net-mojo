@@ -9,11 +9,13 @@ charged through the handler call. Synchronous HTTP/1 writer bodies own their
 capacity reservation directly; other writer paths and other reservations still
 need separate capacity accounting.
 
-The global counter uses a mutex-protected shared capability. Detached allocation
-accounting is separate.
+The global counter uses a mutex-protected shared capability. Detached message
+arrays charge their retained capacity through drained-batch destruction; payload,
+header, fixed-state and detached wire allocations remain separate.
 """
 
 from std.memory import ArcPointer
+from std.sys import size_of
 
 from net._actor import PthreadMutex
 
@@ -104,9 +106,9 @@ struct SharedBufferBudget(Copyable, _CapacityBudget):
 
 
 def _reserve_capacity[
-    B: _CapacityBudget
+    T: Movable, B: _CapacityBudget
 ](
-    mut bytes: List[Byte],
+    mut bytes: List[T],
     mut budget: B,
     needed: Int,
     mut reservation: Int,
@@ -114,16 +116,18 @@ def _reserve_capacity[
     var old_capacity = bytes.capacity()
     if needed <= old_capacity:
         return True
-    var available = reservation + budget.remaining()
+    comptime element_size = size_of[T]()
+    var available = (reservation + budget.remaining()) // element_size
     var target = max(needed, old_capacity * 2)
     target = min(target, available)
     if target < needed:
         return False
-    var covered = min(target, reservation)
-    if not budget.try_reserve(target - covered):
+    var target_bytes = target * element_size
+    var covered = min(target_bytes, reservation)
+    if not budget.try_reserve(target_bytes - covered):
         return False
     # Keep the old allocation charged until reserve replaces it.
     bytes.reserve(target)
     reservation -= covered
-    budget.release(old_capacity)
+    budget.release(old_capacity * element_size)
     return True

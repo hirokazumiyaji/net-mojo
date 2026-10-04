@@ -62,9 +62,11 @@ from ._detach import (
     MSG_KIND_ABORT,
     MSG_KIND_CHUNK,
     MSG_KIND_FINISH,
+    MSG_KIND_NONE,
     MSG_KIND_RESPOND,
     MSG_KIND_START,
     _release_detach_state,
+    _take_batch,
     _SharedDetachState,
     DetachMessage,
 )
@@ -2182,6 +2184,11 @@ struct Server(Movable):
             var s_ptr = ptr.unsafe_bitcast[_SharedDetachState]()
             s_ptr[].mutex.lock()
             s_ptr[].cancelled = True
+            s_ptr[].finished = True
+            s_ptr[].messages = List[DetachMessage]()
+            s_ptr[].array_ticket.release()
+            s_ptr[].queued_bytes = 0
+            s_ptr[].terminal_kind = MSG_KIND_NONE
             s_ptr[].mutex.unlock()
 
     def _cleanup_detached_state(mut self, idx: Int):
@@ -2259,27 +2266,22 @@ struct Server(Movable):
                 unsafe_from_address=addr
             )
             var s_ptr = ptr.unsafe_bitcast[_SharedDetachState]()
-            s_ptr[].mutex.lock()
-            if len(s_ptr[].messages) == 0:
-                s_ptr[].mutex.unlock()
+            var batch = _take_batch(s_ptr)
+            if (
+                len(batch.messages) == 0
+                and batch.terminal_kind == MSG_KIND_NONE
+            ):
                 i += 1
                 continue
-            var msgs = List[DetachMessage]()
-            while len(s_ptr[].messages) > 0:
-                msgs.append(s_ptr[].messages.pop(0))
-            s_ptr[].queued_bytes = 0
-            s_ptr[].mutex.unlock()
 
-            while len(msgs) > 0:
-                var msg = msgs.pop(0)
+            while len(batch.messages) > 0:
+                var msg = batch.messages.pop(0)
                 if not self._conns[idx].active:
                     break
                 if self._conns[idx].detach_state_addr != addr:
                     break
-                if self._conns[idx].token.generation != s_ptr[].generation:
-                    s_ptr[].mutex.lock()
-                    s_ptr[].cancelled = True
-                    s_ptr[].mutex.unlock()
+                if self._conns[idx].token.generation != batch.generation:
+                    self._mark_detached_cancelled(idx)
                     if self._conns[idx].detach_state_addr == addr:
                         self._cleanup_detached_state(idx)
                     break
@@ -2290,14 +2292,20 @@ struct Server(Movable):
                     self._handle_detached_start(idx, msg)
                 elif msg.kind == MSG_KIND_CHUNK:
                     self._handle_detached_chunk(idx, msg)
-                elif msg.kind == MSG_KIND_FINISH:
-                    self._handle_detached_finish(idx)
-                elif msg.kind == MSG_KIND_ABORT:
-                    self._handle_detached_abort(idx)
-                    break
                 else:
                     self._handle_detached_abort(idx)
                     break
+
+            if (
+                batch.terminal_kind != MSG_KIND_NONE
+                and self._conns[idx].active
+                and self._conns[idx].detach_state_addr == addr
+                and self._conns[idx].token.generation == batch.generation
+            ):
+                if batch.terminal_kind == MSG_KIND_FINISH:
+                    self._handle_detached_finish(idx)
+                else:
+                    self._handle_detached_abort(idx)
 
             if not self._conns[idx].active:
                 if (
