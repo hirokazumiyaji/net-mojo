@@ -233,7 +233,9 @@ pub unsafe extern "C" fn net_quic_server_transport_memory_bytes(
     if server.is_null() {
         return 0;
     }
-    unsafe { &*server }._inner.estimated_transport_memory_bytes()
+    unsafe { &*server }
+        ._inner
+        .estimated_transport_memory_bytes()
 }
 
 #[unsafe(no_mangle)]
@@ -536,12 +538,7 @@ pub unsafe extern "C" fn net_quic_server_respond(
     } else {
         unsafe { slice::from_raw_parts(body_data, body_length) }.to_vec()
     };
-    i32::from(inner.enqueue_response(
-        request_id,
-        status as u16,
-        headers,
-        body,
-    ))
+    i32::from(inner.enqueue_response(request_id, status as u16, headers, body))
 }
 
 fn read_u32(data: &[u8], offset: &mut usize) -> Option<u32> {
@@ -645,11 +642,7 @@ fn normalize_http3_response_header_name(name: &[u8]) -> Option<Vec<u8>> {
         lower.push(byte.to_ascii_lowercase());
     }
     match lower.as_slice() {
-        b"connection"
-        | b"proxy-connection"
-        | b"keep-alive"
-        | b"transfer-encoding"
-        | b"upgrade"
+        b"connection" | b"proxy-connection" | b"keep-alive" | b"transfer-encoding" | b"upgrade"
         | b"te" => None,
         _ => Some(lower),
     }
@@ -689,9 +682,10 @@ fn is_valid_http_field_name(name: &[u8]) -> bool {
 }
 
 fn is_valid_http_field_value(value: &[u8]) -> bool {
-    value.iter().copied().all(|byte| {
-        byte == b'\t' || (byte >= 0x20 && byte != 0x7f)
-    })
+    value
+        .iter()
+        .copied()
+        .all(|byte| byte == b'\t' || (byte >= 0x20 && byte != 0x7f))
 }
 
 fn content_length_matches_body(headers: &[(Vec<u8>, Vec<u8>)], body_len: usize) -> bool {
@@ -729,9 +723,9 @@ fn is_valid_http_scheme(scheme: &[u8]) -> bool {
     if !first.is_ascii_alphabetic() {
         return false;
     }
-    rest.iter().copied().all(|byte| {
-        byte.is_ascii_alphanumeric() || matches!(byte, b'+' | b'-' | b'.')
-    })
+    rest.iter()
+        .copied()
+        .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'+' | b'-' | b'.'))
 }
 
 fn is_valid_http_path(path: &[u8]) -> bool {
@@ -741,7 +735,9 @@ fn is_valid_http_path(path: &[u8]) -> bool {
     if path[0] != b'/' && path != b"*" {
         return false;
     }
-    path.iter().copied().all(|byte| byte > 0x20 && byte < 0x7f && byte != b'#')
+    path.iter()
+        .copied()
+        .all(|byte| byte > 0x20 && byte < 0x7f && byte != b'#')
 }
 
 fn is_valid_port(port: &[u8]) -> bool {
@@ -777,8 +773,20 @@ fn is_reg_name(hostname: &[u8]) -> bool {
         if !(byte.is_ascii_alphanumeric()
             || matches!(
                 byte,
-                b'-' | b'.' | b'_' | b'~' | b'!' | b'$' | b'&' | b'\'' | b'(' | b')'
-                    | b'*' | b'+' | b',' | b';' | b'='
+                b'-' | b'.'
+                    | b'_'
+                    | b'~'
+                    | b'!'
+                    | b'$'
+                    | b'&'
+                    | b'\''
+                    | b'('
+                    | b')'
+                    | b'*'
+                    | b'+'
+                    | b','
+                    | b';'
+                    | b'='
             ))
         {
             return false;
@@ -802,9 +810,7 @@ fn is_valid_http_authority(authority: &[u8]) -> bool {
         return false;
     }
     if authority.iter().any(|byte| {
-        *byte <= 0x20
-            || *byte == 0x7f
-            || matches!(*byte, b'/' | b'?' | b'#' | b'\r' | b'\n')
+        *byte <= 0x20 || *byte == 0x7f || matches!(*byte, b'/' | b'?' | b'#' | b'\r' | b'\n')
     }) {
         return false;
     }
@@ -818,10 +824,12 @@ fn is_valid_http_authority(authority: &[u8]) -> bool {
         if close + 1 == authority.len() {
             return true;
         }
-        return authority.get(close + 1) == Some(&b':')
-            && is_valid_port(&authority[close + 2..]);
+        return authority.get(close + 1) == Some(&b':') && is_valid_port(&authority[close + 2..]);
     }
-    if authority.iter().any(|byte| matches!(*byte, b'[' | b']' | b'@')) {
+    if authority
+        .iter()
+        .any(|byte| matches!(*byte, b'[' | b']' | b'@'))
+    {
         return false;
     }
     let colon_positions: Vec<usize> = authority
@@ -1319,6 +1327,7 @@ impl QuicServer {
                 to: local,
             },
         );
+        self.discard_path_notifications(&key);
         self.refresh_transport_timeout(&key);
         self.refresh_idle_timeout(&key);
         self.refresh_response_ready(&key);
@@ -1703,9 +1712,7 @@ impl QuicServer {
                             {
                                 invalid = true;
                             }
-                            request
-                                .trailers
-                                .push((name.to_vec(), value.to_vec()));
+                            request.trailers.push((name.to_vec(), value.to_vec()));
                         }
                         if invalid {
                             let code = if request.trailer_bytes > max_request_trailer_bytes {
@@ -1713,11 +1720,7 @@ impl QuicServer {
                             } else {
                                 0x10e
                             };
-                            http3.cancel_request(
-                                &mut connection.transport,
-                                stream_id,
-                                code,
-                            )?;
+                            http3.cancel_request(&mut connection.transport, stream_id, code)?;
                             if let Some(rejected) = connection.requests.remove(&stream_id) {
                                 release_pending_request_bytes(buffered_request_bytes, &rejected);
                             }
@@ -1735,9 +1738,7 @@ impl QuicServer {
                                         stream_id,
                                         H3_EXCESSIVE_LOAD,
                                     )?;
-                                    if let Some(rejected) =
-                                        connection.requests.remove(&stream_id)
-                                    {
+                                    if let Some(rejected) = connection.requests.remove(&stream_id) {
                                         release_pending_request_bytes(
                                             buffered_request_bytes,
                                             &rejected,
@@ -1827,8 +1828,7 @@ impl QuicServer {
                                     invalid = true;
                                 }
                                 if name == b"host" {
-                                    if host.is_some() || !is_valid_http_authority(header.value())
-                                    {
+                                    if host.is_some() || !is_valid_http_authority(header.value()) {
                                         invalid = true;
                                     } else {
                                         host = Some(header.value().to_vec());
@@ -1843,10 +1843,7 @@ impl QuicServer {
                     request.header_bytes = header_bytes;
                     request.header_count = header_count;
                     if let Some(host_value) = host.as_ref() {
-                        if !authority_equals_ignore_ascii_case(
-                            &request.authority,
-                            host_value,
-                        ) {
+                        if !authority_equals_ignore_ascii_case(&request.authority, host_value) {
                             invalid = true;
                         }
                     }
@@ -1863,11 +1860,7 @@ impl QuicServer {
                         } else {
                             0x10e
                         };
-                        http3.cancel_request(
-                            &mut connection.transport,
-                            stream_id,
-                            code,
-                        )?;
+                        http3.cancel_request(&mut connection.transport, stream_id, code)?;
                         continue;
                     }
                     let now = Instant::now();
@@ -1940,7 +1933,9 @@ impl QuicServer {
                                 }
                             }
                             Err(quiche::h3::Error::Done) => break,
-                            Err(quiche::h3::Error::TransportError(quiche::Error::StreamReset(error))) => {
+                            Err(quiche::h3::Error::TransportError(quiche::Error::StreamReset(
+                                error,
+                            ))) => {
                                 http3.cancel_request(
                                     &mut connection.transport,
                                     stream_id,
@@ -1985,11 +1980,7 @@ impl QuicServer {
                 Ok((stream_id, quiche::h3::Event::Reset(error))) => {
                     touched.insert(stream_id);
                     connection.header_deadlines.remove(&stream_id);
-                    http3.cancel_request(
-                        &mut connection.transport,
-                        stream_id,
-                        error,
-                    )?;
+                    http3.cancel_request(&mut connection.transport, stream_id, error)?;
                     if let Some(reset) = connection.requests.remove(&stream_id) {
                         release_pending_request_bytes(buffered_request_bytes, &reset);
                     }
@@ -2207,6 +2198,11 @@ impl QuicServer {
         Ok(())
     }
 
+    fn discard_path_notifications(&mut self, key: &[u8]) {
+        let transport = &mut self.connections.get_mut(key).unwrap().transport;
+        while transport.path_event_next().is_some() {}
+    }
+
     pub fn send(
         &mut self,
         packet: &mut [u8],
@@ -2222,6 +2218,7 @@ impl QuicServer {
                 .unwrap()
                 .transport
                 .send(packet);
+            self.discard_path_notifications(&key);
             self.refresh_transport_timeout(&key);
             match result {
                 Ok((length, info)) => {
@@ -2426,6 +2423,7 @@ impl QuicServer {
                 .unwrap()
                 .transport
                 .on_timeout();
+            self.discard_path_notifications(&key);
             self.send_ready.push(&key);
             self.refresh_transport_timeout(&key);
             self.refresh_response_ready(&key);
@@ -5952,11 +5950,9 @@ mod tests {
         duplicate_request_datagrams: bool,
         reorder_request_datagrams: bool,
     ) -> super::CompletedRequest {
-        let mut client_h3 = quiche::h3::Connection::with_transport(
-            client,
-            &quiche::h3::Config::new().unwrap(),
-        )
-        .unwrap();
+        let mut client_h3 =
+            quiche::h3::Connection::with_transport(client, &quiche::h3::Config::new().unwrap())
+                .unwrap();
         // Reorder case needs multiple datagrams per round to actually swap;
         // use a larger body so 1-RTT data spans several QUIC datagrams.
         let body: Vec<u8> = if reorder_request_datagrams {
@@ -6002,8 +5998,7 @@ mod tests {
             while sent < body.len() {
                 let end = (sent + 4096).min(body.len());
                 let fin = end == body.len();
-                match client_h3.send_body(client, stream_id, &body[sent..end], fin)
-                {
+                match client_h3.send_body(client, stream_id, &body[sent..end], fin) {
                     Ok(wrote) => {
                         sent += wrote;
                         if wrote == 0 {
@@ -6061,10 +6056,7 @@ mod tests {
             }
         }
         if reorder_request_datagrams {
-            assert!(
-                swapped,
-                "reorder test never swapped 1-RTT datagrams"
-            );
+            assert!(swapped, "reorder test never swapped 1-RTT datagrams");
         }
 
         server
@@ -6309,8 +6301,7 @@ mod tests {
     }
 
     fn unknown_uni_retained_bytes(cycles: usize, fin: bool) -> isize {
-        let mut server =
-            super::QuicServer::new(stress_server_config()).unwrap();
+        let mut server = super::QuicServer::new(stress_server_config()).unwrap();
         let local = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 4433);
         let remote = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 54321);
         let mut config = stress_client_config();
@@ -6323,14 +6314,7 @@ mod tests {
         )
         .unwrap();
         let mut packet = [0; 65535];
-        establish_http3_in_memory(
-            &mut client,
-            &mut server,
-            &mut packet,
-            local,
-            remote,
-            false,
-        );
+        establish_http3_in_memory(&mut client, &mut server, &mut packet, local, remote, false);
         client.stream_send(2, b"\x00\x04\x00", false).unwrap();
         for _ in 0..4 {
             pump_in_memory(
@@ -6373,11 +6357,7 @@ mod tests {
         }
         assert_eq!(client.peer_streams_left_uni(), 2);
         client
-            .stream_send(
-                0,
-                b"\x01\x10\x00\x00\xd1\xd7\xc1\x50\x09localhost",
-                true,
-            )
+            .stream_send(0, b"\x01\x10\x00\x00\xd1\xd7\xc1\x50\x09localhost", true)
             .unwrap();
         for _ in 0..64 {
             pump_in_memory(
@@ -6410,7 +6390,9 @@ mod tests {
         let before = super::allocation_probe::live();
         drop(http3);
         let retained = before - super::allocation_probe::live();
-        eprintln!("unknown uni churn={cycles} fin={fin} retained server H3 Rust bytes={retained} remaining_uni_credit=2 valid_GET_after_churn=true");
+        eprintln!(
+            "unknown uni churn={cycles} fin={fin} retained server H3 Rust bytes={retained} remaining_uni_credit=2 valid_GET_after_churn=true"
+        );
         retained
     }
 
@@ -6766,12 +6748,7 @@ mod tests {
                 // address (not just ACKs/PATH_CHALLENGE) before declaring
                 // the connection usable.
                 assert!(
-                    server.enqueue_response(
-                        request.id,
-                        200,
-                        Vec::new(),
-                        b"rebound-ok".to_vec()
-                    ),
+                    server.enqueue_response(request.id, 200, Vec::new(), b"rebound-ok".to_vec()),
                     "server must enqueue rebound response"
                 );
                 let mut response_bytes_to_rebound = 0;
@@ -6805,18 +6782,14 @@ mod tests {
                         match client_h3.poll(&mut client) {
                             Ok((id, quiche::h3::Event::Headers { list, .. })) => {
                                 for header in list {
-                                    if header.name() == b":status"
-                                        && header.value() == b"200"
-                                    {
+                                    if header.name() == b":status" && header.value() == b"200" {
                                         got_status_200 = true;
                                     }
                                 }
                             }
                             Ok((id, quiche::h3::Event::Data)) => {
                                 let mut buf = [0; 1024];
-                                while let Ok(n) =
-                                    client_h3.recv_body(&mut client, id, &mut buf)
-                                {
+                                while let Ok(n) = client_h3.recv_body(&mut client, id, &mut buf) {
                                     response_body.extend_from_slice(&buf[..n]);
                                 }
                             }
@@ -6833,9 +6806,7 @@ mod tests {
                 // Migration is only "continued" when the application
                 // response actually arrived on the rebound path; otherwise
                 // fall through to the cleanup assertions below.
-                if response_bytes_to_rebound > 0
-                    && got_status_200
-                    && response_body == b"rebound-ok"
+                if response_bytes_to_rebound > 0 && got_status_200 && response_body == b"rebound-ok"
                 {
                     continued = true;
                     break;
@@ -6883,7 +6854,8 @@ mod tests {
             // No full path migration: idle / loss timers must drop CID routes.
             for _ in 0..40 {
                 drive_timeouts(&mut client, &mut server);
-                let _ = flush_server_to_client(&mut client, &mut server, &mut packet, original_remote);
+                let _ =
+                    flush_server_to_client(&mut client, &mut server, &mut packet, original_remote);
                 if server.connections.is_empty() && server.routes.is_empty() {
                     break;
                 }
@@ -7212,5 +7184,6 @@ mod tests {
         assert!(fixture.wait().unwrap().success());
     }
     include!("receive_budget_tests.rs");
+    include!("path_event_tests.rs");
     include!("send_policy_tests.rs");
 }
