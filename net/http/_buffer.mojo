@@ -2,8 +2,9 @@
 
 Receive and adopted pending buffers charge retained capacity and growth
 peaks. Pending growth also charges its incoming wire allocation. Encoding
-before adoption, parser, writer and provider allocations remain separate;
-other reservations still charge wire lengths.
+before adoption, parser and provider allocations remain separate. Synchronous
+HTTP/1 writer bodies use a reserved workspace; other writer paths and other
+reservations still need separate capacity accounting.
 """
 
 

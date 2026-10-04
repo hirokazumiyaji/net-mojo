@@ -11,7 +11,8 @@ Ownership and resources:
   the listener and every connection are gone. Connections live in the
   internal table; only raw fd numbers are ever handed to the reactor.
 - One global `BufferBudget` charges receive and adopted pending capacity,
-  including growth peaks. Encoding before adoption remains separate.
+  including growth peaks, and lends synchronous HTTP/1 writer workspace.
+  Encoding before adoption remains separate.
   Request admission and the `ResponseWriter` cap derive from the remaining
   budget; a request that
   cannot be admitted gets 503 and close, a handler overrun becomes 500.
@@ -1857,6 +1858,10 @@ struct Server(Movable):
         self._conns[idx].sent_100 = True
         return True
 
+    def _drop_writer_body(mut self, mut writer: ResponseWriter, charge: Int):
+        writer._drop_body()
+        self._budget.release(charge)
+
     def _respond[
         H: Handler
     ](
@@ -1869,17 +1874,10 @@ struct Server(Movable):
         var req = result.take_request()
         var is_head = req.method == "HEAD"
         self._conns[idx].is_head = is_head
-        # The advertised body cap subtracts a fixed framing margin for
-        # the status line, Date, Content-Length, and terminator (~130B
-        # worst case, held at 256B), so a body within cap always fits
-        # the wire: handlers are never promised bytes the encoder
-        # cannot send. Subtracting the whole response-header allowance
-        # instead would be dishonest in the other direction — e.g. a
-        # 6KiB echo on an 8KiB budget with a 32KiB header allowance
-        # would cap at zero and 500 everything — while per-header
-        # count/byte caps still bound header-heavy responses above.
+        # Keep a framing margin when advertising the body limit.
+        var workspace = self._budget.remaining()
         var cap = self.config.max_response_body
-        var room = self._budget.remaining() - 256
+        var room = workspace - 256
         if room < cap:
             cap = room
         if cap < 0:
@@ -1891,6 +1889,8 @@ struct Server(Movable):
             wakeup_fd=self._wakeup_channel.write_fd(),
             queue_limit=self.config.stream_queue_limit,
         )
+        _ = self._budget.try_reserve(workspace)
+        writer._set_body_budget(workspace)
         # The wire must advertise close whenever the connection will not
         # persist, even when the handler leaves the writer untouched.
         if req_close or self._shutdown_at != NO_DEADLINE:
@@ -1911,10 +1911,12 @@ struct Server(Movable):
                     s_ptr[].mutex.unlock()
                     _release_detach_state(addr, from_sender=False)
                     writer._detach_state_addr = 0
+            self._drop_writer_body(writer, workspace)
             self._send_error(idx, 500)
             return
 
         if writer.is_detached():
+            self._drop_writer_body(writer, workspace)
             var addr = writer._detach_state_addr
             if addr == 0:
                 self._send_error(idx, 500)
@@ -1939,18 +1941,19 @@ struct Server(Movable):
             self._sync_interests(idx)
             return
 
-        # Handlers may append to `writer.body` directly, bypassing the
-        # per-call cap enforced by `write`; re-check the bound here so
-        # an oversized body becomes a 500 either way.
-        if len(writer.body) > cap:
+        if len(writer.body) > cap or not writer._reconcile_body_budget():
+            self._drop_writer_body(writer, workspace)
             self._send_error(idx, 500)
             return
+        var writer_charge = writer.body.capacity()
+        self._budget.release(workspace - writer_charge)
         # Header count/bytes are enforced inside the encoder, the single
         # authoritative site; its failure below becomes a 500 the same way.
         try:
             self._inject_alt_svc_for_tls(idx, writer)
         except e:
             _ = e
+            self._drop_writer_body(writer, writer_charge)
             self._send_error(idx, 500)
             return
         var wire: List[Byte]
@@ -1964,8 +1967,10 @@ struct Server(Movable):
             )
         except e:
             _ = e
+            self._drop_writer_body(writer, writer_charge)
             self._send_error(idx, 500)
             return
+        self._drop_writer_body(writer, writer_charge)
         if not self._conns[idx].set_pending(wire^, self._budget):
             self._send_error(idx, 500)
             return
