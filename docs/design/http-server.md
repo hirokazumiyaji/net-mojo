@@ -602,7 +602,8 @@ parser と encoder の単体 fixture は wire bytes を入力または出力し�
 | C11 | 完全 request 後の EOF は応答後に close、未完 body の EOF は成功応答にしない | 9112 §6.3、§8、§9.6 | S `test_eof_after_complete_responds_then_closes` は 200、body、EOF、接続消滅。`test_eof_after_pipelined_batch_serves_all` は 3 応答。`test_eof_mid_request_closes_without_success` は CL 100 に 3 bytes だけ送り、接続消滅と応答 bytes なしを確認 |
 
 未検証の範囲は、全 request の全分割点、malformed corpus 全件の wire 上の status と close、全 trailer field 定義、全 method／status の意味規則である。
-absolute-form から得る `scheme` は現在 `http` 固定であり、TLS の接続情報を含めた target URI 再構築（9112 §3.3）への適合は別に検証する。
+HTTP/1 の `scheme` は接続の TLS 状態を表し、平文では `http`、TLS では `https` になる。
+absolute-form の記載 scheme をそのまま公開する契約ではなく、target URI 全体の再構築（9112 §3.3）への適合は別に検証する。
 CONNECT／Upgrade の 400 と、未対応 transfer-coding の一律 400 は実装方針であり、RFC の要求する唯一の応答ではない（9112 §6.1 は未理解 coding に 501 を推奨する）。
 この表だけで HTTP/2、HTTP/3、proxy、cache の適合を判定しない。
 
@@ -617,7 +618,7 @@ HTTP/3 の実装は `net/quic/provider/src/lib.rs` と `net/quic/__init__.mojo` 
 | `method` | request line の method token | `:method` |
 | `target` | 検証した request target | `:path` |
 | `path` と `query` | origin-form は最初の `?` で分離。absolute-form は scheme と authority を除いた path と query | `:path` の最初の `?` で分離 |
-| `scheme` | 現在の parser は TLS listener でも `http` を設定 | `:scheme` |
+| `scheme` | server adapter が接続の TLS 状態から設定する。平文は `http`、TLS は `https`。absolute-form の記載 scheme はこの判定を変えない | `:scheme` |
 | `authority` | absolute-form の authority、または `Host` | `:authority`。HTTP/2 は省略時に妥当な `Host` を使える。HTTP/3 は必須 |
 | `version` | `HttpVersion.http11()` | `HttpVersion.http2()` または `HttpVersion.http3()` |
 | `headers` | 通常 header。`Host` も保持 | pseudo-header を除いた通常 header |

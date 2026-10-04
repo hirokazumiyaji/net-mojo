@@ -630,6 +630,32 @@ try:
         raise RuntimeError(
             f"Alt-Svc must be absent when ServerConfig.alt_svc is empty: {wire!r}"
         )
+    if b"\r\nX-Request-Scheme: https\r\n" not in wire:
+        raise RuntimeError(f"HTTPS handler observed an insecure scheme: {wire!r}")
+    for target in [
+        b"https://absolute.example/secure?q=one",
+        b"http://absolute.example/plain?q=two",
+    ]:
+        with socket.create_connection(("127.0.0.1", port), timeout=5) as raw:
+            with context.wrap_socket(raw, server_hostname="localhost") as client:
+                if client.selected_alpn_protocol() != "http/1.1":
+                    raise RuntimeError("server did not negotiate HTTP/1.1")
+                client.sendall(
+                    b"GET " + target + b" HTTP/1.1\r\nHost: localhost\r\n"
+                    b"Connection: close\r\n\r\n"
+                )
+                response = bytearray()
+                while chunk := client.recv(4096):
+                    response.extend(chunk)
+        wire = bytes(response)
+        if not wire.startswith(b"HTTP/1.1 200 "):
+            raise RuntimeError(f"unexpected absolute-form HTTPS response: {wire!r}")
+        if not wire.endswith(b"\r\n\r\nhello over https"):
+            raise RuntimeError(f"unexpected absolute-form HTTPS body: {wire!r}")
+        if b"\r\nX-Request-Scheme: https\r\n" not in wire:
+            raise RuntimeError(
+                f"absolute-form HTTPS handler observed an insecure scheme: {wire!r}"
+            )
     if process.wait(timeout=5) != 0:
         raise RuntimeError(process.stderr.read())
     test_http2_shutdown_goaway()
