@@ -535,6 +535,17 @@ API の検証は `tests/test_http_api.mojo`で、handler trait、所有 Request�
 受信 pool の byte 上限は retained backing allocation、slot 上限は状態と fragment entry を数える。
 `total_buffer_budget` は server が計上する buffer 用の予算であり、native TLS、QUIC の送信状態、allocator overhead を含む全エンジンの RSS 上限を定めない。
 
+HTTP/1 の parser が組み立てる `Request.headers`、`trailers`、field の `String` と検証用の一時 storage は、この budget に計上していない。
+既定の入力上限は request line 8 KiB、header 32 KiB／100 fields、trailer 8 KiB／32 fields である。
+これらの materialized values は同期処理中の loop 内で所有し、不完全な body を待つ間は接続に保存しない。
+handler は一つずつ実行し、Request は handler 終了時、detach の採用前に破棄する。
+アプリケーションが handler の borrow から明示的にコピーして保持する値は、呼び出し側が所有する。
+
+64-bit の Mojo 1.1.0 と既定上限では、三つの List 配列、raw value capacity、元の名前と cached lowercase 名前の参照容量を保守的に合計した値は、header 一組で 80,952 bytes、trailer 一組で 20,672 bytes 以下となる。
+同じ head の再構築を含めて二組と trailer を数えると 182,576 bytes であり、この見積りを idle 接続数で乗算しない。
+これは parser の全 peak allocation や RSS の上限を示さず、comma-token の一時配列、UTF-8 lossy conversion の拡張、allocation 置換中の旧容量、allocator cache／overhead は別に残る。
+入力上限を変更した場合はこの見積りも変わり、RSS の安定範囲は実際の測定で確認する。
+
 quiche の opt-in `Config::set_send_budget()` は、各送信 view の `AsRef` backing bytes と、owner および実際に確保された deque cell の数を、受信 pool と独立して計上する。
 ACK は破棄された backing を返却し、空になった deque の再利用可能な容量は reset、CRYPTO clear、Drop まで計上を保つ。
 TLS callback で検出した送信 quota 超過は handshake 処理から `SendBufferExceeded` として返り、HTTP/3 control stream の初期化も同じエラーを返す。TLS は QUIC の非 application `INTERNAL_ERROR` として終了し、HTTP/3 初期化はこの quota エラーを汎用の application error に変換しない。
