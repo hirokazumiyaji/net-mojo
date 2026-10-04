@@ -125,6 +125,7 @@ run_load() {
     local sample="$OUT_DIR/${label}_c${clients}_m${streams}_r${run_idx}.sample"
     local log="$OUT_DIR/${label}_c${clients}_m${streams}_r${run_idx}.log"
 
+    rm -f "$sample"
     (
         # WARMUP_S / MEASURE_S accept floats (the loader parses them as
         # such), so compute the sampler delay without Bash integers.
@@ -150,12 +151,12 @@ run_load() {
 
     local line req_s p50 p95 p99 ok failed
     line="$(rg -N '^req_s=' "$out" | tail -1 || true)"
-    req_s="$(printf '%s' "$line" | rg -o 'req_s=([0-9.]+)' -r '$1' || true)"
-    p50="$(printf '%s' "$line" | rg -o 'p50_us=([0-9.]+)' -r '$1' || true)"
-    p95="$(printf '%s' "$line" | rg -o 'p95_us=([0-9.]+)' -r '$1' || true)"
-    p99="$(printf '%s' "$line" | rg -o 'p99_us=([0-9.]+)' -r '$1' || true)"
-    ok="$(printf '%s' "$line" | rg -o 'ok=([0-9]+)' -r '$1' || true)"
-    failed="$(printf '%s' "$line" | rg -o 'failed=([0-9]+)' -r '$1' || true)"
+    req_s="$(printf '%s' "$line" | rg -o '\breq_s=(\S+)' -r '$1' || true)"
+    p50="$(printf '%s' "$line" | rg -o '\bp50_us=(\S+)' -r '$1' || true)"
+    p95="$(printf '%s' "$line" | rg -o '\bp95_us=(\S+)' -r '$1' || true)"
+    p99="$(printf '%s' "$line" | rg -o '\bp99_us=(\S+)' -r '$1' || true)"
+    ok="$(printf '%s' "$line" | rg -o '\bok=(\S+)' -r '$1' || true)"
+    failed="$(printf '%s' "$line" | rg -o '\bfailed=(\S+)' -r '$1' || true)"
 
     local sample_line
     sample_line="$(tr '\n' ' ' <"$sample" | sed 's/ *$//')"
@@ -167,16 +168,25 @@ run_load() {
         | tee -a "$OUT_DIR/summary.tsv"
 
     cp "$out" "$log"
-    local cell_failed=0
-    if [ "$rc" -ne 0 ]; then cell_failed=1; fi
-    # The loader now exits nonzero on failed>0 as well, but reject the
-    # parsed failure count directly so partial measurements can never be
-    # accepted even if run through an older loader.
-    if [ -n "${failed:-}" ] && [ "${failed}" != "0" ]; then cell_failed=1; fi
-    if [ -z "${req_s:-}" ]; then cell_failed=1; fi
-    if [ "$cell_failed" -ne 0 ]; then
+    if [ "$rc" -ne 0 ] || ! "$PIXI_PYTHON" - "$req_s" "$p50" "$p95" "$p99" \
+        "$ok" "$failed" <<'PY'
+import math, sys
+try:
+    rate, p50, p95, p99 = map(float, sys.argv[1:5])
+    valid = (
+        all(math.isfinite(value) for value in (rate, p50, p95, p99))
+        and rate > 0
+        and 0 <= p50 <= p95 <= p99
+        and int(sys.argv[5]) > 0
+        and sys.argv[6] == "0"
+    )
+except ValueError:
+    valid = False
+sys.exit(0 if valid else 1)
+PY
+    then
         BENCH_FAILURES=$((BENCH_FAILURES + 1))
-        echo "benchmark failed: $label c=$clients m=$streams run=$run_idx rc=$rc failed=${failed:-?} (see $out)" >&2
+        echo "benchmark failed: $label c=$clients m=$streams run=$run_idx rc=$rc req_s=${req_s:-?} ok=${ok:-?} failed=${failed:-?} p50=${p50:-?} p95=${p95:-?} p99=${p99:-?} (see $out)" >&2
     fi
     return 0
 }

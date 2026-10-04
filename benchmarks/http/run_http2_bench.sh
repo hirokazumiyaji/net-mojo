@@ -159,20 +159,14 @@ PY
 # Convert h2load duration token (e.g. 114us, 1.25ms, 2.00s) to microseconds.
 to_us() {
     python3 - "$1" <<'PY'
-import sys
+import re, sys
 s = sys.argv[1].strip()
-if s in ("", "N/A", "nan"):
+match = re.fullmatch(r"([0-9]+(?:\.[0-9]+)?)(us|ms|s)", s)
+if match is None:
     print("nan")
     raise SystemExit(0)
-num = float(''.join(c for c in s if c.isdigit() or c == '.' or c == '-'))
-if s.endswith("us"):
-    print(int(round(num)))
-elif s.endswith("ms"):
-    print(int(round(num * 1000)))
-elif s.endswith("s"):
-    print(int(round(num * 1_000_000)))
-else:
-    print(int(round(num)))
+num, unit = match.groups()
+print(int(round(float(num) * {"us": 1, "ms": 1000, "s": 1_000_000}[unit])))
 PY
 }
 
@@ -189,6 +183,7 @@ run_h2load() {
     local sample="$OUT_DIR/${label}_c${clients}_m${streams}_r${run_idx}.sample"
     local out="$OUT_DIR/${label}_c${clients}_m${streams}_r${run_idx}.out"
 
+    rm -f "$sample"
     (
         # WARMUP_S / MEASURE_S accept floats, so avoid Bash integers here.
         sleep "$(python3 -c 'import sys; print(float(sys.argv[1]) + float(sys.argv[2]) / 2)' "$WARMUP_S" "$MEASURE_S")"
@@ -242,18 +237,25 @@ run_h2load() {
         | tee -a "$OUT_DIR/summary.tsv"
 
     cp "$out" "$log"
-    if [ "$rc" -ne 0 ]; then
+    if [ "$rc" -ne 0 ] || ! python3 - "$req_s" "$p50" "$p95" "$p99" \
+        "$success" "$failed" "$errored" "$timedout" <<'PY'
+import math, sys
+try:
+    rate, p50, p95, p99 = map(float, sys.argv[1:5])
+    valid = (
+        all(math.isfinite(value) for value in (rate, p50, p95, p99))
+        and rate > 0
+        and 0 <= p50 <= p95 <= p99
+        and int(sys.argv[5]) > 0
+        and sys.argv[6:] == ["0", "0", "0"]
+    )
+except ValueError:
+    valid = False
+sys.exit(0 if valid else 1)
+PY
+    then
         BENCH_FAILURES=$((BENCH_FAILURES + 1))
-        echo "benchmark failed: $label c=$clients m=$streams run=$run_idx rc=$rc (see $out)" >&2
-    elif [ "${failed:-0}" != "0" ] && [ -n "${failed:-}" ]; then
-        BENCH_FAILURES=$((BENCH_FAILURES + 1))
-        echo "benchmark failed: $label c=$clients m=$streams run=$run_idx failed=${failed} (see $out)" >&2
-    elif [ -n "${errored:-}" ] && [ "${errored}" != "0" ]; then
-        BENCH_FAILURES=$((BENCH_FAILURES + 1))
-        echo "benchmark failed: $label c=$clients m=$streams run=$run_idx errored=${errored} (see $out)" >&2
-    elif [ -n "${timedout:-}" ] && [ "${timedout}" != "0" ]; then
-        BENCH_FAILURES=$((BENCH_FAILURES + 1))
-        echo "benchmark failed: $label c=$clients m=$streams run=$run_idx timeout=${timedout} (see $out)" >&2
+        echo "benchmark failed: $label c=$clients m=$streams run=$run_idx rc=$rc req_s=${req_s:-?} succeeded=${success:-?} failed=${failed:-?} errored=${errored:-?} timeout=${timedout:-?} p50=$p50 p95=$p95 p99=$p99 (see $out)" >&2
     fi
     return 0
 }
