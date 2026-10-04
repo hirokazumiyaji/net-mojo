@@ -277,12 +277,19 @@ section records only the package-level boundaries.
   allocation; String backing/refcounts and request/parser Header admission remain
   separate.
   Raw read scratch uses fixed stack arrays; TLS retains a charged retry buffer.
-  Pending 100-continue bytes and HTTP/1 error wire reserve capacity before
-  allocation. String/header lookup/parser scratch, other encoders, native provider
+  Pending 100-continue bytes reserve capacity before allocation. HTTP/1 admission
+  prepays a 256-byte error List from the shared budget; TLS adds 11 bytes plus
+  the admission-time Alt-Svc byte length when nonempty. Error encoding uses this
+  existing storage and transfers its charge into pending without a new reservation.
+  Partial sends retain the full charge; storage destruction precedes its refund
+  on completion, close or Server drop. HTTP/2 ALPN drops the unused H1 reserve.
+  String/header lookup/parser scratch, other encoders, native provider
   allocations and allocator overhead are not all covered; the budget is not
   a process RSS cap or recovery guarantee for allocator OOM.
-  Admission failures send 503+close when the error response can be admitted;
-  otherwise the connection closes. Handler overruns and raises become
+  Accepted HTTP/1 connections can send 503+close despite normal-budget saturation.
+  Admission reserve denial closes before installation; an error exceeding its
+  prepaid capacity also closes, including later Alt-Svc growth without truncation
+  or reallocation. Handler overruns and raises become
   500+close without leaking details, and a
   slow reader pauses further reads so kernel buffers absorb the
   backpressure instead of user memory.

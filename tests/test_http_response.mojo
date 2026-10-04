@@ -14,6 +14,7 @@ from net.http._encoder import (
     _measure_response,
     _measure_error,
     _encode_error_exact,
+    _render_error,
     encode_chunk,
     encode_chunk_end,
     _measure_chunked_start,
@@ -569,6 +570,24 @@ def test_error_exact_measure_and_render_preserve_head_close_and_alt_svc() raises
                     is_head,
                     alt_svc,
                 )
+                var prepaid_capacity = 256 + (
+                    11 + alt_svc.byte_length() if advertised else 0
+                )
+                var prepaid = List[Byte](capacity=prepaid_capacity)
+                var address = Int(prepaid.unsafe_ptr())
+                var byte_count = 0
+                _render_error[False](
+                    503,
+                    close,
+                    "Sun, 06 Nov 1994 08:49:37 GMT",
+                    is_head,
+                    alt_svc,
+                    prepaid,
+                    byte_count,
+                )
+                assert_equal(prepaid.capacity(), prepaid_capacity)
+                assert_equal(Int(prepaid.unsafe_ptr()), address)
+                assert_equal(_bytes_to_string(Span(prepaid)), expected)
                 assert_equal(exact.capacity(), capacity)
                 assert_equal(public.capacity(), capacity)
                 assert_equal(_bytes_to_string(Span(exact)), expected)
