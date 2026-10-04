@@ -811,8 +811,11 @@ pub struct QuicServer {
     connections: HashMap<Vec<u8>, QuicConnection>,
     send_ready: SendReadyQueue,
     response_ready: SendReadyQueue,
+    goaway_ready: SendReadyQueue,
     #[cfg(test)]
     terminal_checks: usize,
+    #[cfg(test)]
+    goaway_checks: usize,
     transport_timeouts: BTreeSet<(Instant, Vec<u8>)>,
     request_timeouts: BTreeSet<(Instant, Vec<u8>, u64)>,
     response_timeouts: BTreeSet<(Instant, Vec<u8>, u64)>,
@@ -973,8 +976,11 @@ impl QuicServer {
             connections: HashMap::new(),
             send_ready: SendReadyQueue::default(),
             response_ready: SendReadyQueue::default(),
+            goaway_ready: SendReadyQueue::default(),
             #[cfg(test)]
             terminal_checks: 0,
+            #[cfg(test)]
+            goaway_checks: 0,
             transport_timeouts: BTreeSet::new(),
             request_timeouts: BTreeSet::new(),
             response_timeouts: BTreeSet::new(),
@@ -1007,6 +1013,7 @@ impl QuicServer {
     pub fn begin_shutdown(&mut self) -> Result<(), QuicServerError> {
         if self.shutdown < ShutdownState::Draining {
             self.shutdown = ShutdownState::Draining;
+            self.queue_shutdown_goaways();
         }
         self.drive_goaways()
     }
@@ -1014,37 +1021,15 @@ impl QuicServer {
     pub fn finish_shutdown(&mut self) -> Result<(), QuicServerError> {
         if self.shutdown < ShutdownState::Finishing {
             self.shutdown = ShutdownState::Finishing;
+            self.queue_shutdown_goaways();
         }
-        self.drive_goaways()?;
-        self.drive_final_goaways()
+        self.drive_goaways()
     }
 
-    fn drive_final_goaways(&mut self) -> Result<(), QuicServerError> {
-        for (connection_key, connection) in self.connections.iter_mut() {
-            if connection.final_goaway_sent {
-                continue;
-            }
-            let Some(http3) = connection.http3.as_mut() else {
-                continue;
-            };
-            // RFC 9114 §5.2: streams with the GOAWAY ID or greater are rejected.
-            // Advertise the first rejected client request stream (N+4), or 0
-            // when no request streams were accepted.
-            let goaway_id = match connection.last_request_stream_id {
-                Some(last) => last.saturating_add(4),
-                None => 0,
-            };
-            match http3.send_goaway(&mut connection.transport, goaway_id) {
-                Ok(()) => {
-                    self.send_ready.push(connection_key);
-                    connection.final_goaway_sent = true;
-                    connection.final_goaway_last_stream_id = Some(goaway_id);
-                }
-                Err(quiche::h3::Error::StreamBlocked | quiche::h3::Error::Done) => (),
-                Err(error) => return Err(error.into()),
-            }
+    fn queue_shutdown_goaways(&mut self) {
+        for key in self.connections.keys() {
+            self.goaway_ready.push(key);
         }
-        Ok(())
     }
 
     pub fn close_connections(&mut self) -> Result<(), QuicServerError> {
@@ -1052,7 +1037,6 @@ impl QuicServer {
             return Err(quiche::Error::Done.into());
         }
         self.drive_goaways()?;
-        self.drive_final_goaways()?;
         self.shutdown = ShutdownState::Closing;
         let mut first_error = None;
         let mut timeouts = Vec::new();
@@ -1155,6 +1139,7 @@ impl QuicServer {
         self.refresh_transport_timeout(&key);
         self.refresh_idle_timeout(&key);
         self.refresh_response_ready(&key);
+        self.refresh_goaway_ready(&key);
         if let Err(error) = received {
             self.reap_closed_connection(&key);
             return Err(error.into());
@@ -1225,6 +1210,7 @@ impl QuicServer {
         }
         self.refresh_idle_timeout(&key);
         self.refresh_response_ready(&key);
+        self.refresh_goaway_ready(&key);
         let Some(completed) = completed else {
             // CONNECTION_CLOSE is queued; keep the connection until send/drain
             // emits it and quiche reports the transport closed.
@@ -1266,24 +1252,68 @@ impl QuicServer {
         Ok(())
     }
 
-    fn drive_goaways(&mut self) -> Result<(), QuicServerError> {
+    fn refresh_goaway_ready(&mut self, key: &[u8]) {
         if self.shutdown < ShutdownState::Draining {
+            return;
+        }
+        let connection = &self.connections[key];
+        if self.shutdown < ShutdownState::Closing
+            && (!connection.goaway_sent
+                || (self.shutdown >= ShutdownState::Finishing && !connection.final_goaway_sent))
+        {
+            self.goaway_ready.push(key);
+        } else {
+            self.goaway_ready.remove(key);
+        }
+    }
+
+    fn drive_goaways(&mut self) -> Result<(), QuicServerError> {
+        if self.shutdown < ShutdownState::Draining || self.shutdown >= ShutdownState::Closing {
             return Ok(());
         }
-        for (connection_key, connection) in self.connections.iter_mut() {
-            if connection.goaway_sent {
-                continue;
+        let ready = self.goaway_ready.entries.len();
+        for _ in 0..ready {
+            let key = self.goaway_ready.pop().unwrap();
+            #[cfg(test)]
+            {
+                self.goaway_checks += 1;
             }
+            let connection = self.connections.get_mut(&key).unwrap();
             let Some(http3) = connection.http3.as_mut() else {
                 continue;
             };
-            match http3.send_goaway(&mut connection.transport, MAX_HTTP3_REQUEST_STREAM_ID) {
-                Ok(()) => {
-                    connection.goaway_sent = true;
-                    self.send_ready.push(connection_key);
+            if !connection.goaway_sent {
+                match http3.send_goaway(&mut connection.transport, MAX_HTTP3_REQUEST_STREAM_ID) {
+                    Ok(()) => {
+                        connection.goaway_sent = true;
+                        self.send_ready.push(&key);
+                    }
+                    Err(quiche::h3::Error::StreamBlocked | quiche::h3::Error::Done) => continue,
+                    Err(error) => {
+                        self.goaway_ready.push(&key);
+                        return Err(error.into());
+                    }
                 }
-                Err(quiche::h3::Error::StreamBlocked | quiche::h3::Error::Done) => (),
-                Err(error) => return Err(error.into()),
+            }
+            if self.shutdown >= ShutdownState::Finishing && !connection.final_goaway_sent {
+                // RFC 9114 §5.2: the final ID is the first rejected request, after
+                // the initial maximum ID was successfully queued.
+                let goaway_id = match connection.last_request_stream_id {
+                    Some(last) => last.saturating_add(4),
+                    None => 0,
+                };
+                match http3.send_goaway(&mut connection.transport, goaway_id) {
+                    Ok(()) => {
+                        connection.final_goaway_sent = true;
+                        connection.final_goaway_last_stream_id = Some(goaway_id);
+                        self.send_ready.push(&key);
+                    }
+                    Err(quiche::h3::Error::StreamBlocked | quiche::h3::Error::Done) => (),
+                    Err(error) => {
+                        self.goaway_ready.push(&key);
+                        return Err(error.into());
+                    }
+                }
             }
         }
         Ok(())
@@ -1310,6 +1340,7 @@ impl QuicServer {
         };
         self.send_ready.remove(connection_key);
         self.response_ready.remove(connection_key);
+        self.goaway_ready.remove(connection_key);
         if let Some(deadline) = connection.transport_deadline_at {
             self.transport_timeouts
                 .remove(&(deadline, connection_key.to_vec()));
@@ -1775,6 +1806,7 @@ impl QuicServer {
             cancel_http3_request(connection, stream_id, H3_EXCESSIVE_LOAD);
             self.request_routes.remove(&request_id);
             self.refresh_response_ready(&connection_key);
+            self.refresh_goaway_ready(&connection_key);
             return true;
         }
         let mut response_headers = Vec::with_capacity(headers.len() + 1);
@@ -1786,6 +1818,7 @@ impl QuicServer {
                 cancel_http3_request(connection, stream_id, H3_GENERAL_PROTOCOL_ERROR);
                 self.request_routes.remove(&request_id);
                 self.refresh_response_ready(&connection_key);
+                self.refresh_goaway_ready(&connection_key);
                 return true;
             };
             response_headers.push(quiche::h3::Header::new(&normalized, &value));
@@ -1913,9 +1946,6 @@ impl QuicServer {
     ) -> Result<Option<(usize, SendInfo)>, QuicServerError> {
         if self.shutdown < ShutdownState::Closing {
             self.drive_goaways()?;
-            if self.shutdown >= ShutdownState::Finishing {
-                self.drive_final_goaways()?;
-            }
             self.drive_responses()?;
         }
         while let Some(key) = self.send_ready.pop() {
@@ -2000,6 +2030,7 @@ impl QuicServer {
             self.refresh_transport_timeout(&key);
             self.refresh_idle_timeout(&key);
             self.refresh_response_ready(&key);
+            self.refresh_goaway_ready(&key);
         }
     }
 
@@ -2127,6 +2158,7 @@ impl QuicServer {
             self.send_ready.push(&key);
             self.refresh_transport_timeout(&key);
             self.refresh_response_ready(&key);
+            self.refresh_goaway_ready(&key);
             self.reap_closed_connection(&key);
         }
     }
@@ -2144,6 +2176,7 @@ impl QuicServer {
             self.refresh_transport_timeout(&key);
             self.refresh_idle_timeout(&key);
             self.refresh_response_ready(&key);
+            self.refresh_goaway_ready(&key);
         }
     }
 
@@ -2372,6 +2405,378 @@ mod tests {
             }
         }
         (body, finished)
+    }
+
+    fn drain_goaway_events(
+        client: &mut quiche::Connection,
+        h3: &mut quiche::h3::Connection,
+    ) -> Vec<u64> {
+        let mut ids = Vec::new();
+        loop {
+            match h3.poll(client) {
+                Ok((id, quiche::h3::Event::GoAway)) => ids.push(id),
+                Ok((id, quiche::h3::Event::Data)) => {
+                    while let Ok(length) = h3.recv_body(client, id, &mut [0; 4096]) {
+                        if length == 0 {
+                            break;
+                        }
+                    }
+                }
+                Ok(_) => (),
+                Err(quiche::h3::Error::Done) => break,
+                Err(error) => panic!("GOAWAY poll failed: {error:?}"),
+            }
+        }
+        ids
+    }
+
+    #[test]
+    fn goaway_ready_skips_sent_and_handshake_waiting_peers() {
+        let (mut server, mut client, mut h3, local, remote) = request_timer_peer();
+        completed_ready_request(&mut server, &mut client, &mut h3, local, remote);
+        let key = server.connections.keys().next().unwrap().clone();
+        insert_idle_transports(&mut server, 128);
+        server.begin_shutdown().unwrap();
+        assert!(server.connections[&key].goaway_sent);
+        for _ in 0..1000 {
+            server.refresh_goaway_ready(&key);
+        }
+        assert!(server.goaway_ready.entries.is_empty());
+        assert!(server.goaway_ready.queued.is_empty());
+        server.goaway_checks = 0;
+        for _ in 0..32 {
+            server.send(&mut [0; 65535]).unwrap();
+        }
+        assert_eq!(server.goaway_checks, 0);
+        server.finish_shutdown().unwrap();
+        assert!(server.connections[&key].final_goaway_sent);
+        server.goaway_checks = 0;
+        for _ in 0..32 {
+            server.send(&mut [0; 65535]).unwrap();
+        }
+        assert_eq!(server.goaway_checks, 0);
+    }
+
+    #[test]
+    fn goaway_ready_waits_for_shared_capacity_then_delivers_both_stages() {
+        let (mut server, mut client, mut h3, local, remote) = request_timer_peer();
+        let request = completed_ready_request(&mut server, &mut client, &mut h3, local, remote);
+        let key = server.connections.keys().next().unwrap().clone();
+        let other: SocketAddr = "127.0.0.1:30405".parse().unwrap();
+        let mut sibling = quiche::connect(
+            Some("localhost"),
+            &ConnectionId::from_ref(&[0x9c; 16]),
+            other,
+            local,
+            &mut stress_client_config(),
+        )
+        .unwrap();
+        establish_http3_in_memory(
+            &mut sibling,
+            &mut server,
+            &mut [0; 65535],
+            local,
+            other,
+            false,
+        );
+        let mut sibling_h3 = quiche::h3::Connection::with_transport(
+            &mut sibling,
+            &quiche::h3::Config::new().unwrap(),
+        )
+        .unwrap();
+        for _ in 0..32 {
+            pump_in_memory(
+                &mut sibling,
+                &mut server,
+                &mut [0; 65535],
+                local,
+                other,
+                false,
+                false,
+            );
+        }
+        assert_eq!(
+            server
+                .connections
+                .values()
+                .filter(|connection| connection.http3.is_some())
+                .count(),
+            2
+        );
+        assert!(server.enqueue_response(request.id, 200, Vec::new(), vec![42; 2_000_000]));
+        server.drive_responses().unwrap();
+        assert!(
+            server
+                .connections
+                .get_mut(&key)
+                .unwrap()
+                .transport
+                .stream_capacity(3)
+                .unwrap()
+                < 10
+        );
+        server.begin_shutdown().unwrap();
+        assert!(!server.connections[&key].goaway_sent);
+        for _ in 0..1000 {
+            server.refresh_goaway_ready(&key);
+        }
+        assert_eq!(server.goaway_ready.entries.len(), 1);
+        server.drive_goaways().unwrap();
+        assert!(server.goaway_ready.entries.is_empty());
+        server.goaway_checks = 0;
+        let mut held = Vec::new();
+        let mut packet = [0; 65535];
+        for _ in 0..32 {
+            if let Some((length, info)) = server.send(&mut packet).unwrap() {
+                if info.to == remote {
+                    held.push(packet[..length].to_vec());
+                } else {
+                    assert_eq!(info.to, other);
+                    sibling
+                        .recv(
+                            &mut packet[..length],
+                            RecvInfo {
+                                from: local,
+                                to: other,
+                            },
+                        )
+                        .unwrap();
+                }
+            }
+        }
+        assert_eq!(server.goaway_checks, 0);
+        assert_eq!(
+            drain_goaway_events(&mut sibling, &mut sibling_h3),
+            vec![super::MAX_HTTP3_REQUEST_STREAM_ID]
+        );
+        assert!(!held.is_empty());
+        for mut packet in held {
+            client
+                .recv(
+                    &mut packet,
+                    RecvInfo {
+                        from: local,
+                        to: remote,
+                    },
+                )
+                .unwrap();
+        }
+        assert!(drain_goaway_events(&mut client, &mut h3).is_empty());
+        let credit = collect_client_datagrams(&mut client, &mut packet);
+        assert!(!credit.is_empty());
+        for packet in credit {
+            deliver_client_datagram(&mut server, &packet, local, remote);
+        }
+        let mut ids = Vec::new();
+        for _ in 0..64 {
+            pump_in_memory(
+                &mut client,
+                &mut server,
+                &mut packet,
+                local,
+                remote,
+                false,
+                false,
+            );
+            ids.extend(drain_goaway_events(&mut client, &mut h3));
+            if !ids.is_empty() {
+                break;
+            }
+        }
+        assert_eq!(ids, vec![super::MAX_HTTP3_REQUEST_STREAM_ID]);
+        server.finish_shutdown().unwrap();
+        for _ in 0..64 {
+            pump_in_memory(
+                &mut client,
+                &mut server,
+                &mut packet,
+                local,
+                remote,
+                false,
+                false,
+            );
+            ids.extend(drain_goaway_events(&mut client, &mut h3));
+            if ids.len() == 2 {
+                break;
+            }
+        }
+        assert_eq!(
+            ids,
+            vec![super::MAX_HTTP3_REQUEST_STREAM_ID, request.stream_id + 4]
+        );
+        server.close_connections().unwrap();
+        for _ in 0..256 {
+            for packet in collect_client_datagrams(&mut client, &mut packet) {
+                deliver_client_datagram(&mut server, &packet, local, remote);
+            }
+            for packet in collect_client_datagrams(&mut sibling, &mut packet) {
+                deliver_client_datagram(&mut server, &packet, local, other);
+            }
+            while let Some((length, info)) = server.send(&mut packet).unwrap() {
+                if info.to == remote {
+                    client
+                        .recv(
+                            &mut packet[..length],
+                            RecvInfo {
+                                from: local,
+                                to: remote,
+                            },
+                        )
+                        .unwrap();
+                } else {
+                    sibling
+                        .recv(
+                            &mut packet[..length],
+                            RecvInfo {
+                                from: local,
+                                to: other,
+                            },
+                        )
+                        .unwrap();
+                }
+            }
+            if server.timeout().is_some_and(|timeout| timeout.is_zero()) {
+                server.on_timeout();
+            }
+            if server.shutdown_complete() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(server.shutdown_complete());
+        assert_eq!(server.buffered_response_bytes, 0);
+        assert!(server.routes.is_empty());
+        assert!(server.goaway_ready.entries.is_empty());
+        assert!(server.goaway_ready.queued.is_empty());
+    }
+
+    #[test]
+    fn goaway_ready_preserves_first_then_final_when_only_final_frame_fits() {
+        let mut config = stress_server_config();
+        config.grease(false);
+        let mut server = super::QuicServer::new(config).unwrap();
+        let local: SocketAddr = "127.0.0.1:4433".parse().unwrap();
+        let remote: SocketAddr = "127.0.0.1:30403".parse().unwrap();
+        let mut client_config = stress_client_config();
+        client_config.set_initial_max_stream_data_uni(17);
+        let mut client = quiche::connect(
+            Some("localhost"),
+            &ConnectionId::from_ref(&[0x9a; 16]),
+            remote,
+            local,
+            &mut client_config,
+        )
+        .unwrap();
+        let mut packet = [0; 65535];
+        establish_http3_in_memory(&mut client, &mut server, &mut packet, local, remote, false);
+        let mut h3 = quiche::h3::Connection::with_transport(
+            &mut client,
+            &quiche::h3::Config::new().unwrap(),
+        )
+        .unwrap();
+        let key = server.connections.keys().next().unwrap().clone();
+        let cap = server
+            .connections
+            .get_mut(&key)
+            .unwrap()
+            .transport
+            .stream_capacity(3)
+            .unwrap();
+        assert!(
+            cap >= 3 && cap < 10,
+            "small control credit must fit final but not first GOAWAY: {cap}"
+        );
+        server.finish_shutdown().unwrap();
+        assert!(!server.connections[&key].goaway_sent);
+        if let Err(error) = server.send(&mut packet) {
+            panic!("pending first GOAWAY must not become an increasing-ID error: {error:?}");
+        }
+        assert!(!server.connections[&key].final_goaway_sent);
+        for _ in 0..64 {
+            pump_in_memory(
+                &mut client,
+                &mut server,
+                &mut packet,
+                local,
+                remote,
+                false,
+                false,
+            );
+            let ids = drain_goaway_events(&mut client, &mut h3);
+            if !ids.is_empty() {
+                assert_eq!(ids, vec![super::MAX_HTTP3_REQUEST_STREAM_ID, 0]);
+                return;
+            }
+        }
+        panic!("real control credit did not deliver ordered GOAWAY stages");
+    }
+
+    #[test]
+    fn goaway_ready_resumes_after_an_existing_handshake_completes() {
+        let mut server = super::QuicServer::new(stress_server_config()).unwrap();
+        let local: SocketAddr = "127.0.0.1:4433".parse().unwrap();
+        let remote: SocketAddr = "127.0.0.1:30404".parse().unwrap();
+        let mut client = quiche::connect(
+            Some("localhost"),
+            &ConnectionId::from_ref(&[0x9b; 16]),
+            remote,
+            local,
+            &mut stress_client_config(),
+        )
+        .unwrap();
+        let mut packet = [0; 65535];
+        let (length, _) = client.send(&mut packet).unwrap();
+        deliver_client_datagram(&mut server, &packet[..length], local, remote);
+        let key = server.connections.keys().next().unwrap().clone();
+        assert!(server.connections[&key].http3.is_none());
+        server.begin_shutdown().unwrap();
+        establish_http3_in_memory(&mut client, &mut server, &mut packet, local, remote, false);
+        let mut h3 = quiche::h3::Connection::with_transport(
+            &mut client,
+            &quiche::h3::Config::new().unwrap(),
+        )
+        .unwrap();
+        let mut ids = Vec::new();
+        for _ in 0..32 {
+            pump_in_memory(
+                &mut client,
+                &mut server,
+                &mut packet,
+                local,
+                remote,
+                false,
+                false,
+            );
+            ids.extend(drain_goaway_events(&mut client, &mut h3));
+            if !ids.is_empty() {
+                break;
+            }
+        }
+        assert_eq!(ids, vec![super::MAX_HTTP3_REQUEST_STREAM_ID]);
+        assert!(server.connections[&key].goaway_sent);
+    }
+
+    #[test]
+    fn goaway_ready_drops_queued_membership_and_allows_key_reuse() {
+        let mut server = super::QuicServer::new(stress_server_config()).unwrap();
+        insert_idle_transports(&mut server, 1);
+        let key = 0_u16.to_be_bytes().repeat(8);
+        server.begin_shutdown().unwrap();
+        for _ in 0..1000 {
+            server.refresh_goaway_ready(&key);
+        }
+        assert_eq!(server.goaway_ready.entries.len(), 1);
+        assert_eq!(server.goaway_ready.queued.len(), 1);
+        server.force_drop_connection(&key);
+        assert!(server.goaway_ready.entries.is_empty());
+        assert!(server.goaway_ready.queued.is_empty());
+        insert_idle_transports(&mut server, 1);
+        server.refresh_goaway_ready(&key);
+        assert_eq!(server.goaway_ready.entries.len(), 1);
+        server.drive_goaways().unwrap();
+        assert!(server.goaway_ready.entries.is_empty());
+        assert!(server.goaway_ready.queued.is_empty());
+        assert!(!server.connections[&key].goaway_sent);
     }
 
     #[test]
