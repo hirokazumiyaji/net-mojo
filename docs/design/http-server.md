@@ -530,6 +530,10 @@ API の検証は `tests/test_http_api.mojo`で、handler trait、所有 Request�
 受信 pool の byte 上限は retained backing allocation、slot 上限は状態と fragment entry を数える。
 `total_buffer_budget` は server が計上する buffer 用の予算であり、native TLS、QUIC の送信状態、allocator overhead を含む全エンジンの RSS 上限を定めない。
 
+quiche の opt-in `Config::set_send_budget()` は、各送信 view の `AsRef` backing bytes と、owner および実際に確保された deque cell の数を、受信 pool と独立して計上する。
+ACK は破棄された backing を返却し、空になった deque の再利用可能な容量は reset、CRYPTO clear、Drop まで計上を保つ。
+この engine patch は provider の送信 pool 設定と TLS/H3 境界での quota エラー伝播を含まず、既定の送信上限は無制限のままである。任意の `BufFactory` が隠す追加の allocation は計上対象外である。
+
 ### borrow 寿命
 
 `Request` は、decode 済みの `String`、`Headers`、`List[Byte]` を所有する。

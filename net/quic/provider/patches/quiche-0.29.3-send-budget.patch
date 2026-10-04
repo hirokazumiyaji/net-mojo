@@ -1,0 +1,1635 @@
+--- a/src/error.rs
++++ b/src/error.rs
+@@ -108,6 +108,9 @@
+ 
+     /// Locally configured retained receive resources are exhausted.
+     ReceiveBufferExceeded,
++
++    /// Locally configured retained send resources are exhausted.
++    SendBufferExceeded,
+ 
+     /// The peer sent an ACK frame with an invalid range.
+     InvalidAckRange,
+@@ -188,7 +191,8 @@
+     pub(crate) fn to_wire(self) -> u64 {
+         match self {
+             Error::Done => WireErrorCode::NoError as u64,
+-            Error::ReceiveBufferExceeded => WireErrorCode::InternalError as u64,
++            Error::ReceiveBufferExceeded | Error::SendBufferExceeded =>
++                WireErrorCode::InternalError as u64,
+             Error::InvalidFrame => WireErrorCode::FrameEncodingError as u64,
+             Error::InvalidStreamState(..) =>
+                 WireErrorCode::StreamStateError as u64,
+@@ -232,6 +236,7 @@
+             Error::OptimisticAckDetected => -22,
+             Error::InvalidDcidInitialization => -23,
+             Error::ReceiveBufferExceeded => -24,
++            Error::SendBufferExceeded => -25,
+         }
+     }
+ }
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -599,6 +599,7 @@
+     max_stream_window: u64,
+ 
+     receive_budget: ReceiveBudget,
++    send_budget: SendBudget,
+ 
+     max_amplification_factor: usize,
+ 
+@@ -615,6 +616,11 @@
+ }
+ 
+ impl Config {
++    /// Uses immutable shared send capacities for future connections.
++    pub fn set_send_budget(&mut self, budget: SendBudget) {
++        self.send_budget = budget;
++    }
++
+     /// Uses immutable shared receive capacities for future connections.
+     pub fn set_receive_budget(&mut self, budget: ReceiveBudget) {
+         self.receive_budget = budget;
+@@ -684,6 +690,7 @@
+             max_connection_window: MAX_CONNECTION_WINDOW,
+             max_stream_window: stream::MAX_STREAM_WINDOW,
+             receive_budget: ReceiveBudget::default(),
++            send_budget: SendBudget::default(),
+ 
+             max_amplification_factor: MAX_AMPLIFICATION_FACTOR,
+ 
+@@ -2066,9 +2073,9 @@
+             ],
+ 
+             crypto_ctx: [
+-                packet::CryptoContext::new(config.receive_budget.clone())?,
+-                packet::CryptoContext::new(config.receive_budget.clone())?,
+-                packet::CryptoContext::new(config.receive_budget.clone())?,
++                packet::CryptoContext::new(config.receive_budget.clone(), config.send_budget.clone())?,
++                packet::CryptoContext::new(config.receive_budget.clone(), config.send_budget.clone())?,
++                packet::CryptoContext::new(config.receive_budget.clone(), config.send_budget.clone())?,
+             ],
+ 
+             next_pkt_num: 0,
+@@ -2131,6 +2138,7 @@
+                 config.local_transport_params.initial_max_streams_uni,
+                 config.max_stream_window,
+                 config.receive_budget.clone(),
++                config.send_budget.clone(),
+             ),
+ 
+             odcid: None,
+@@ -4142,7 +4150,10 @@
+             while let Some(lost) = p.recovery.next_lost_frame(epoch) {
+                 match lost {
+                     frame::Frame::CryptoHeader { offset, length } => {
+-                        crypto_ctx.crypto_stream.send.retransmit(offset, length);
++                        if is_closing {
++                            continue;
++                        }
++                        crypto_ctx.crypto_stream.send.retransmit(offset, length)?;
+ 
+                         self.stream_retrans_bytes += length as u64;
+                         p.stream_retrans_bytes += length as u64;
+@@ -4157,6 +4168,9 @@
+                         length,
+                         fin,
+                     } => {
++                        if is_closing {
++                            continue;
++                        }
+                         let stream = match self.streams.get_mut(stream_id) {
+                             // Only retransmit data if the stream is not closed
+                             // or stopped.
+@@ -4194,7 +4208,7 @@
+                         let empty_fin = length == 0 && fin;
+ 
+                         let retransmitted =
+-                            stream.send.retransmit(offset, length);
++                            stream.send.retransmit(offset, length)?;
+ 
+                         // If the stream is now flushable push it to the
+                         // flushable queue, but only if it wasn't already
+@@ -9542,7 +9556,9 @@
+ mod rand;
+ mod range_buf;
+ mod receive_budget;
++mod send_budget;
+ pub use receive_budget::{ReceiveBudget, ReceiveLimit, ReceiveLimits, ReceiveUsage};
++pub use send_budget::{SendBudget, SendLimit, SendLimits, SendUsage};
+ mod ranges;
+ mod recovery;
+ mod stream;
+--- a/src/packet.rs
++++ b/src/packet.rs
+@@ -921,7 +921,9 @@
+ }
+ 
+ impl CryptoContext {
+-    pub fn new(budget: crate::ReceiveBudget) -> Result<CryptoContext> {
++    pub fn new(
++        budget: crate::ReceiveBudget, send_budget: crate::SendBudget,
++    ) -> Result<CryptoContext> {
+         let crypto_stream = stream::Stream::new(
+             0, // dummy
+             u64::MAX,
+@@ -931,6 +933,7 @@
+             stream::MAX_STREAM_WINDOW,
+             budget,
+             crate::receive_budget::ReceiveClass::Crypto,
++            send_budget,
+         )?;
+         Ok(CryptoContext {
+             key_update: None,
+--- a/src/receive_budget.rs
++++ b/src/receive_budget.rs
+@@ -202,18 +202,19 @@
+             backing_bytes,
+             slots: 1,
+         };
++        self.release_amount(amount);
++    }
++    pub(crate) fn release_amount(&mut self, amount: ReceiveLimit) {
+         self.budget.release(self.class, amount);
+-        self.used.backing_bytes -= backing_bytes;
+-        self.used.slots -= 1;
++        self.used.backing_bytes -= amount.backing_bytes;
++        self.used.slots -= amount.slots;
+     }
+     pub(crate) fn clear_retained(&mut self) {
+         let amount = ReceiveLimit {
+             backing_bytes: self.used.backing_bytes,
+             slots: self.used.slots - 2,
+         };
+-        self.budget.release(self.class, amount);
+-        self.used.backing_bytes = 0;
+-        self.used.slots = 2;
++        self.release_amount(amount);
+     }
+ }
+ 
+--- a/src/stream/mod.rs
++++ b/src/stream/mod.rs
+@@ -227,12 +227,14 @@
+     tx_buffered: usize,
+ 
+     receive_budget: crate::ReceiveBudget,
++    send_budget: crate::SendBudget,
+ }
+ 
+ impl<F: BufFactory> StreamMap<F> {
+     pub fn new(
+         max_streams_bidi: u64, max_streams_uni: u64, max_stream_window: u64,
+         receive_budget: crate::ReceiveBudget,
++        send_budget: crate::SendBudget,
+     ) -> Self {
+         StreamMap {
+             local_max_streams_bidi: max_streams_bidi,
+@@ -245,6 +247,7 @@
+ 
+             max_stream_window,
+             receive_budget,
++            send_budget,
+ 
+             ..StreamMap::default()
+         }
+@@ -352,6 +355,7 @@
+                     self.max_stream_window,
+                     self.receive_budget.clone(),
+                     class,
++                    self.send_budget.clone(),
+                 )?;
+                 *opened = next;
+ 
+@@ -814,6 +818,7 @@
+         id: u64, max_rx_data: u64, max_tx_data: u64, local: bool,
+         initial_window: u64, max_window: u64, budget: crate::ReceiveBudget,
+         class: crate::receive_budget::ReceiveClass,
++        send_budget: crate::SendBudget,
+     ) -> Result<Self> {
+         let priority_key = Arc::new(StreamPriorityKey {
+             id,
+@@ -829,7 +834,7 @@
+         )?;
+         Ok(Stream {
+             recv,
+-            send: send_buf::SendBuf::new(max_tx_data),
++            send: send_buf::SendBuf::with_budget(max_tx_data, send_budget, class)?,
+             send_lowat: 1,
+             bidi: is_bidi(id),
+             local,
+@@ -841,7 +846,7 @@
+ 
+     pub(crate) fn clear_crypto(&mut self) {
+         self.recv.clear_crypto();
+-        self.send = send_buf::SendBuf::new(u64::MAX);
++        self.send.clear_crypto();
+         self.send_lowat = 1;
+         self.bidi = true;
+         self.local = true;
+@@ -1059,7 +1064,7 @@
+     use super::*;
+ 
+     fn stream_map(bidi: u64, uni: u64, window: u64) -> StreamMap {
+-        StreamMap::new(bidi, uni, window, crate::ReceiveBudget::default())
++        StreamMap::new(bidi, uni, window, crate::ReceiveBudget::default(), crate::SendBudget::default())
+     }
+ 
+     fn stream(id: u64, max_rx: u64, max_tx: u64, local: bool,
+@@ -1067,7 +1072,7 @@
+         let class = if is_bidi(id) { crate::receive_budget::ReceiveClass::Request }
+             else { crate::receive_budget::ReceiveClass::Control };
+         Stream::new(id, max_rx, max_tx, local, initial_window, max_window,
+-            crate::ReceiveBudget::default(), class).unwrap()
++            crate::ReceiveBudget::default(), class, crate::SendBudget::default()).unwrap()
+     }
+ 
+ 
+@@ -1555,7 +1560,7 @@
+         assert!(!fin);
+         assert_eq!(&buf[..written], b"");
+ 
+-        stream.send.retransmit(0, 15);
++        stream.send.retransmit(0, 15).unwrap();
+ 
+         assert_eq!(stream.send.off_front(), 0);
+ 
+@@ -1664,7 +1669,7 @@
+ 
+         stream.send.ack_and_drop(0, 5);
+ 
+-        stream.send.retransmit(0, 5);
++        stream.send.retransmit(0, 5).unwrap();
+ 
+         assert_eq!(stream.send.off_front(), 5);
+ 
+@@ -1702,8 +1707,8 @@
+         stream.send.ack_and_drop(5, 1);
+         stream.send.ack_and_drop(0, 5);
+ 
+-        stream.send.retransmit(0, 5);
+-        stream.send.retransmit(5, 1);
++        stream.send.retransmit(0, 5).unwrap();
++        stream.send.retransmit(5, 1).unwrap();
+ 
+         assert_eq!(stream.send.off_front(), 6);
+ 
+@@ -1958,7 +1963,7 @@
+         assert_eq!(stream.send.off_front(), 8);
+         assert_eq!(&buf[..4], b"owor");
+ 
+-        stream.send.retransmit(3, 3);
++        stream.send.retransmit(3, 3).unwrap();
+         assert_eq!(stream.send.off_front(), 3);
+ 
+         assert!(stream_send_ready(&stream));
+@@ -1973,7 +1978,7 @@
+ 
+         stream.send.ack_and_drop(7, 2);
+ 
+-        stream.send.retransmit(8, 2);
++        stream.send.retransmit(8, 2).unwrap();
+ 
+         assert!(stream_send_ready(&stream));
+         assert_eq!(stream.send.emit(&mut buf[..2]), Ok((2, false)));
+@@ -1990,7 +1995,7 @@
+         assert_eq!(stream.send.off_front(), 16);
+         assert_eq!(&buf[..5], b"llehd");
+ 
+-        stream.send.retransmit(12, 2);
++        stream.send.retransmit(12, 2).unwrap();
+ 
+         assert!(stream_send_ready(&stream));
+         assert_eq!(stream.send.emit(&mut buf[..2]), Ok((2, false)));
+@@ -2008,7 +2013,7 @@
+         assert_eq!(stream.send.emit(&mut buf[..5]), Ok((0, true)));
+         assert_eq!(stream.send.off_front(), 20);
+ 
+-        stream.send.retransmit(7, 12);
++        stream.send.retransmit(7, 12).unwrap();
+ 
+         assert!(stream_send_ready(&stream));
+         assert_eq!(stream.send.emit(&mut buf[..5]), Ok((5, false)));
+@@ -2027,7 +2032,7 @@
+ 
+         stream.send.ack_and_drop(12, 7);
+ 
+-        stream.send.retransmit(7, 12);
++        stream.send.retransmit(7, 12).unwrap();
+ 
+         assert!(stream_send_ready(&stream));
+         assert_eq!(stream.send.emit(&mut buf[..5]), Ok((5, false)));
+@@ -2237,7 +2242,7 @@
+             ..Default::default()
+         };
+ 
+-        let mut streams = StreamMap::new(100, 100, 100, crate::ReceiveBudget::default());
++        let mut streams = StreamMap::new(100, 100, 100, crate::ReceiveBudget::default(), crate::SendBudget::default());
+ 
+         for id in [0, 4, 8, 12] {
+             assert!(streams
+@@ -2273,7 +2278,7 @@
+             ..Default::default()
+         };
+ 
+-        let mut streams = StreamMap::new(100, 100, 100, crate::ReceiveBudget::default());
++        let mut streams = StreamMap::new(100, 100, 100, crate::ReceiveBudget::default(), crate::SendBudget::default());
+ 
+         // Inserting same-urgency incremental streams in a "random" order yields
+         // same order to start with.
+@@ -2411,7 +2416,7 @@
+             ..Default::default()
+         };
+ 
+-        let mut streams = StreamMap::new(100, 100, 100, crate::ReceiveBudget::default());
++        let mut streams = StreamMap::new(100, 100, 100, crate::ReceiveBudget::default(), crate::SendBudget::default());
+ 
+         // Streams that share some urgency level
+         let input = vec![
+@@ -2581,7 +2586,7 @@
+         assert_eq!(stream.send.buffered_bytes(), 0);
+ 
+         // Mark data for retransmission.
+-        let retransmitted = stream.send.retransmit(0, 5);
++        let retransmitted = stream.send.retransmit(0, 5).unwrap();
+         assert_eq!(retransmitted, 5);
+         assert_eq!(stream.send.buffered_bytes(), 5);
+ 
+@@ -2590,7 +2595,7 @@
+         assert_eq!(stream.send.buffered_bytes(), 0);
+ 
+         // Try to retransmit again - should return 0 since data is acked.
+-        let retransmitted = stream.send.retransmit(0, 5);
++        let retransmitted = stream.send.retransmit(0, 5).unwrap();
+         assert_eq!(retransmitted, 0);
+         assert_eq!(stream.send.buffered_bytes(), 0);
+     }
+@@ -2609,7 +2614,7 @@
+         assert_eq!(stream.send.buffered_bytes(), 0);
+ 
+         // Mark all data for retransmission.
+-        let retransmitted = stream.send.retransmit(0, 10);
++        let retransmitted = stream.send.retransmit(0, 10).unwrap();
+         assert_eq!(retransmitted, 10);
+         assert_eq!(stream.send.buffered_bytes(), 10);
+ 
+@@ -2620,7 +2625,7 @@
+ 
+         // Try to retransmit all 10 bytes - should return 5 since first 5 are
+         // acked.
+-        let retransmitted = stream.send.retransmit(0, 10);
++        let retransmitted = stream.send.retransmit(0, 10).unwrap();
+         assert_eq!(retransmitted, 0); // Already marked, so no change
+         assert_eq!(stream.send.buffered_bytes(), 5);
+     }
+@@ -2640,7 +2645,7 @@
+         assert_eq!(stream.send.buffered_bytes(), 0);
+ 
+         // Mark for retransmission.
+-        let retransmitted = stream.send.retransmit(0, 5);
++        let retransmitted = stream.send.retransmit(0, 5).unwrap();
+         assert_eq!(retransmitted, 5);
+         assert_eq!(stream.send.buffered_bytes(), 5);
+ 
+@@ -2665,7 +2670,7 @@
+         assert_eq!(stream.send.buffered_bytes(), 0);
+ 
+         // Mark both chunks for retransmission.
+-        let retransmitted = stream.send.retransmit(0, 10);
++        let retransmitted = stream.send.retransmit(0, 10).unwrap();
+         assert_eq!(retransmitted, 10);
+         assert_eq!(stream.send.buffered_bytes(), 10);
+ 
+@@ -2757,7 +2762,7 @@
+         // by actual amount retransmitted.
+         let retransmitted = {
+             let stream = streams.get_mut(stream_id).unwrap();
+-            stream.send.retransmit(0, 5)
++            stream.send.retransmit(0, 5).unwrap()
+         };
+         assert_eq!(retransmitted, 5);
+         streams.add_tx_buffered(retransmitted);
+@@ -2796,7 +2801,7 @@
+         assert_eq!(stream.send.buffered_bytes(), 0);
+ 
+         // After retransmit.
+-        let retransmitted = stream.send.retransmit(0, 5);
++        let retransmitted = stream.send.retransmit(0, 5).unwrap();
+         assert_eq!(retransmitted, 5);
+         assert_eq!(stream.send.buffered_bytes(), 5);
+ 
+@@ -2825,7 +2830,7 @@
+             ..ReceiveLimits::default()
+         });
+         let mut streams =
+-            StreamMap::<DefaultBufFactory>::new(2, 2, 100, budget.clone());
++            StreamMap::<DefaultBufFactory>::new(2, 2, 100, budget.clone(), crate::SendBudget::default());
+         let local = crate::TransportParams {
+             initial_max_stream_data_bidi_remote: 100,
+             ..Default::default()
+--- a/src/stream/recv_buf.rs
++++ b/src/stream/recv_buf.rs
+@@ -1795,7 +1795,7 @@
+             ..ReceiveLimits::default()
+         });
+         let mut context =
+-            crate::packet::CryptoContext::new(budget.clone()).unwrap();
++            crate::packet::CryptoContext::new(budget.clone(), crate::SendBudget::default()).unwrap();
+         context
+             .crypto_stream
+             .recv
+--- a/src/stream/send_buf.rs
++++ b/src/stream/send_buf.rs
+@@ -36,6 +36,7 @@
+ 
+ use crate::buffers::DefaultBufFactory;
+ use crate::ranges;
++use crate::send_budget::{SendBudget, SendCharge, SendClass};
+ 
+ #[cfg(test)]
+ const SEND_BUFFER_SIZE: usize = 5;
+@@ -88,7 +89,7 @@
+ /// By default, new data is appended at the end of the stream, but data can be
+ /// inserted at the start of the buffer (this is to allow data that needs to be
+ /// retransmitted to be re-buffered).
+-#[derive(Debug, Default)]
++#[derive(Debug)]
+ pub struct SendBuf<F = DefaultBufFactory>
+ where
+     F: BufFactory,
+@@ -130,20 +131,84 @@
+ 
+     /// The error code received via STOP_SENDING.
+     error: Option<u64>,
++
++    charge: SendCharge,
++}
++
++impl<F: BufFactory> Default for SendBuf<F> {
++    fn default() -> Self {
++        Self::new(0)
++    }
+ }
+ 
+ impl<F: BufFactory> SendBuf<F> {
+     /// Creates a new send buffer.
+     pub fn new(max_data: u64) -> SendBuf<F> {
+-        SendBuf {
++        Self::with_budget(max_data, SendBudget::default(), SendClass::Request)
++            .unwrap()
++    }
++
++    pub(crate) fn with_budget(
++        max_data: u64, budget: SendBudget, class: SendClass,
++    ) -> Result<Self> {
++        let charge = SendCharge::new(budget, class)?;
++        Ok(Self {
++            data: VecDeque::new(),
++            pos: 0,
++            off: 0,
++            emit_off: 0,
++            buffered_bytes: 0,
+             max_data,
+-            ..SendBuf::default()
+-        }
++            blocked_at: None,
++            fin_off: None,
++            shutdown: false,
++            acked: ranges::RangeSet::default(),
++            error: None,
++            charge,
++        })
++    }
++
++    fn admit(&mut self, backing_bytes: usize, views: usize) -> Result<()> {
++        let required = self.data.len().checked_add(views)
++            .ok_or(Error::SendBufferExceeded)?;
++        let old = self.data.capacity();
++        let target = if required > old {
++            required.checked_next_power_of_two()
++                .ok_or(Error::SendBufferExceeded)?.max(4)
++        } else {
++            0
++        };
++        // Old and replacement cells coexist during a possible moving realloc.
++        let reservation = self.charge.reserve(backing_bytes, target)?;
++        if target != 0 {
++            self.data.try_reserve_exact(target - self.data.len())
++                .map_err(|_| Error::SendBufferExceeded)?;
++        }
++        reservation.commit(&mut self.charge.0);
++        if target != 0 {
++            self.charge.release(0, old);
++        }
++        Ok(())
++    }
++
++    pub(crate) fn clear_crypto(&mut self) {
++        self.data = VecDeque::new();
++        self.charge.clear_retained();
++        self.pos = 0;
++        self.off = 0;
++        self.emit_off = 0;
++        self.buffered_bytes = 0;
++        self.max_data = u64::MAX;
++        self.blocked_at = None;
++        self.fin_off = None;
++        self.shutdown = false;
++        self.acked = ranges::RangeSet::default();
++        self.error = None;
+     }
+ 
+     /// Try to reserve the required number of bytes to be sent
+     fn reserve_for_write(
+-        &mut self, mut len: usize, mut fin: bool,
++        &mut self, mut len: usize, mut fin: bool, chunk_size: usize,
+     ) -> Result<SendReserve<'_, F>> {
+         let max_off = self.off + len as u64;
+ 
+@@ -166,12 +231,11 @@
+             }
+         }
+ 
+-        if fin {
+-            self.fin_off = Some(max_off);
+-        }
+-
+         // Don't queue data that was already fully acked.
+         if self.ack_off() >= max_off {
++            if fin {
++                self.fin_off = Some(max_off);
++            }
+             return Ok(SendReserve {
+                 inner: self,
+                 reserved: 0,
+@@ -179,6 +243,10 @@
+             });
+         }
+ 
++        self.admit(len, len.div_ceil(chunk_size))?;
++        if fin {
++            self.fin_off = Some(max_off);
++        }
+         Ok(SendReserve {
+             inner: self,
+             reserved: len,
+@@ -192,7 +260,7 @@
+     /// (this may be lower than the size of the input buffer, in case of partial
+     /// writes).
+     pub fn write(&mut self, data: &[u8], fin: bool) -> Result<usize> {
+-        let mut reserve = self.reserve_for_write(data.len(), fin)?;
++        let mut reserve = self.reserve_for_write(data.len(), fin, SEND_BUFFER_SIZE)?;
+ 
+         if reserve.reserved == 0 {
+             return Ok(0);
+@@ -221,7 +289,7 @@
+         F::Buf: BufSplit,
+     {
+         let len = data.as_ref().len();
+-        let mut reserve = self.reserve_for_write(cap.min(len), fin)?;
++        let mut reserve = self.reserve_for_write(cap.min(len), fin, usize::MAX)?;
+ 
+         if reserve.reserved == 0 {
+             return Ok((0, Some(data)));
+@@ -364,7 +432,10 @@
+                 (0..=drop).map(|i| self.data[i].len() as u64).sum();
+             self.buffered_bytes = self.buffered_bytes.saturating_sub(dropped_len);
+ 
+-            self.data.drain(..=drop);
++            let backing_bytes = self.data.iter().take(drop + 1)
++                .map(|b| b.data.as_ref().len()).sum();
++            std::mem::drop(self.data.drain(..=drop));
++            self.charge.release(backing_bytes, 0);
+ 
+             // When a buffer is marked for retransmission, but then acked before
+             // it could be retransmitted, we might end up decreasing the SendBuf
+@@ -377,18 +448,28 @@
+         }
+     }
+ 
+-    pub fn retransmit(&mut self, off: u64, len: usize) -> usize {
++    pub fn retransmit(&mut self, off: u64, len: usize) -> Result<usize> {
+         let max_off = off + len as u64;
+         let ack_off = self.ack_off();
+ 
+         if self.data.is_empty() {
+-            return 0;
++            return Ok(0);
+         }
+ 
+         if max_off <= ack_off {
+-            return 0;
+-        }
+-
++            return Ok(0);
++        }
++
++        let mut backing_bytes = 0usize;
++        let mut views = 0;
++        for buf in &self.data {
++            if buf.off < max_off && max_off < buf.max_off() {
++                backing_bytes = backing_bytes.checked_add(buf.data.as_ref().len())
++                    .ok_or(Error::SendBufferExceeded)?;
++                views += 1;
++            }
++        }
++        self.admit(backing_bytes, views)?;
+         let mut total_retransmitted = 0;
+ 
+         for i in 0..self.data.len() {
+@@ -431,7 +512,7 @@
+             }
+         }
+ 
+-        total_retransmitted as usize
++        Ok(total_retransmitted as usize)
+     }
+ 
+     /// Resets the stream at the current offset and clears all buffered data.
+@@ -442,7 +523,8 @@
+         self.fin_off = Some(unsent_off);
+ 
+         // Drop all buffered data.
+-        self.data.clear();
++        self.data = VecDeque::new();
++        self.charge.clear_retained();
+ 
+         // Mark relevant data as acked.
+         self.off = unsent_off;
+@@ -706,11 +788,11 @@
+         assert_eq!(send.buffered_bytes, 5);
+         assert_eq!(send.off_front(), 14);
+ 
+-        send.retransmit(4, 5);
++        send.retransmit(4, 5).unwrap();
+         assert_eq!(send.buffered_bytes, 10);
+         assert_eq!(send.off_front(), 4);
+ 
+-        send.retransmit(0, 4);
++        send.retransmit(0, 4).unwrap();
+         assert_eq!(send.buffered_bytes, 14);
+         assert_eq!(send.off_front(), 0);
+ 
+@@ -846,7 +928,7 @@
+         assert_eq!(send.buffered_bytes, 5);
+         assert_eq!(send.off_front(), 4);
+ 
+-        send.retransmit(3, 5);
++        send.retransmit(3, 5).unwrap();
+         assert_eq!(send.buffered_bytes, 6);
+         assert_eq!(send.off_front(), 3);
+     }
+@@ -866,7 +948,7 @@
+ 
+         // Server decides to retransmit the last 10 bytes. It's possible
+         // it's not actually lost and that the client did receive it.
+-        send.retransmit(40, 10);
++        send.retransmit(40, 10).unwrap();
+ 
+         // Server receives STOP_SENDING from client. The final_size we
+         // send in the RESET_STREAM should be 50. If we send anything less,
+@@ -876,3 +958,7 @@
+         assert_eq!(unsent, 0);
+     }
+ }
++
++#[cfg(test)]
++#[path = "send_budget_tests.rs"]
++mod send_budget_tests;
+--- /dev/null
++++ b/src/send_budget.rs
+@@ -0,0 +1,122 @@
++// Copyright (C) 2026, net-mojo contributors.
++// SPDX-License-Identifier: BSD-2-Clause
++
++use crate::receive_budget::{BufferCharge, ReceiveClass, Reservation};
++use crate::{Error, ReceiveBudget, ReceiveLimit, ReceiveLimits, Result};
++
++pub(crate) use crate::receive_budget::ReceiveClass as SendClass;
++
++/// Independent retained backing and allocated send-buffer population limits.
++#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
++pub struct SendLimit {
++    /// Full backing bytes conservatively charged per retained view.
++    pub backing_bytes: usize,
++    /// Owner tokens and actual allocated deque cells, not allocator bytes.
++    pub slots: usize,
++}
++
++/// Separate send resources for bidirectional, unidirectional and CRYPTO data.
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++pub struct SendLimits {
++    /// Bidirectional send resources.
++    pub request: SendLimit,
++    /// Unidirectional send resources.
++    pub control: SendLimit,
++    /// CRYPTO send resources across all packet epochs.
++    pub crypto: SendLimit,
++}
++
++impl Default for SendLimits {
++    fn default() -> Self {
++        let unlimited = SendLimit {
++            backing_bytes: usize::MAX,
++            slots: usize::MAX,
++        };
++        Self {
++            request: unlimited,
++            control: unlimited,
++            crypto: unlimited,
++        }
++    }
++}
++
++/// Conservative committed and in-progress send reservations.
++#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
++pub struct SendUsage {
++    /// Bidirectional send resources.
++    pub request: SendLimit,
++    /// Unidirectional send resources.
++    pub control: SendLimit,
++    /// CRYPTO send resources across all packet epochs.
++    pub crypto: SendLimit,
++}
++
++/// Immutable send capacities shared by configurations and connections.
++#[derive(Clone, Debug, Default)]
++pub struct SendBudget(ReceiveBudget);
++
++impl SendBudget {
++    /// Creates a send pool independent from all receive pools.
++    pub fn new(limits: SendLimits) -> Self {
++        Self(ReceiveBudget::new(ReceiveLimits {
++            request: limits.request.into(),
++            control: limits.control.into(),
++            crypto: limits.crypto.into(),
++        }))
++    }
++    /// Returns a consistent snapshot including in-progress admissions.
++    pub fn usage(&self) -> SendUsage {
++        let used = self.0.usage();
++        SendUsage {
++            request: used.request.into(),
++            control: used.control.into(),
++            crypto: used.crypto.into(),
++        }
++    }
++}
++
++impl From<SendLimit> for ReceiveLimit {
++    fn from(limit: SendLimit) -> Self {
++        Self {
++            backing_bytes: limit.backing_bytes,
++            slots: limit.slots,
++        }
++    }
++}
++
++impl From<ReceiveLimit> for SendLimit {
++    fn from(limit: ReceiveLimit) -> Self {
++        Self {
++            backing_bytes: limit.backing_bytes,
++            slots: limit.slots,
++        }
++    }
++}
++
++#[derive(Debug)]
++pub(crate) struct SendCharge(pub(crate) BufferCharge);
++
++impl SendCharge {
++    pub(crate) fn new(budget: SendBudget, class: ReceiveClass) -> Result<Self> {
++        BufferCharge::new(budget.0, class)
++            .map(Self)
++            .map_err(|_| Error::SendBufferExceeded)
++    }
++    pub(crate) fn reserve(&self, backing_bytes: usize, slots: usize) -> Result<Reservation> {
++        self.0
++            .reserve(ReceiveLimit {
++                backing_bytes,
++                slots,
++            })
++            .map_err(|_| Error::SendBufferExceeded)
++    }
++    pub(crate) fn release(&mut self, backing_bytes: usize, slots: usize) {
++        self.0.release_amount(ReceiveLimit {
++            backing_bytes,
++            slots,
++        });
++    }
++    pub(crate) fn clear_retained(&mut self) {
++        self.0.clear_retained();
++    }
++}
+--- /dev/null
++++ b/src/stream/send_budget_tests.rs
+@@ -0,0 +1,809 @@
++use super::*;
++use crate::receive_budget::ReceiveClass;
++use crate::send_budget::{SendBudget, SendClass, SendLimit, SendLimits, SendUsage};
++use std::cell::{Cell, RefCell};
++use std::mem::size_of;
++use std::sync::Arc;
++
++fn budget(bytes: usize, slots: usize) -> SendBudget {
++    SendBudget::new(SendLimits {
++        request: SendLimit {
++            backing_bytes: bytes,
++            slots,
++        },
++        control: SendLimit {
++            backing_bytes: 32,
++            slots: 10,
++        },
++        crypto: SendLimit {
++            backing_bytes: 32,
++            slots: 20,
++        },
++    })
++}
++
++fn buffer(budget: &SendBudget) -> SendBuf {
++    SendBuf::with_budget(u64::MAX, budget.clone(), SendClass::Request).unwrap()
++}
++
++fn snapshot(
++    send: &SendBuf,
++) -> (
++    usize,
++    u64,
++    u64,
++    u64,
++    Option<u64>,
++    Vec<(usize, usize, usize, usize, usize, u64, bool)>,
++) {
++    (
++        send.pos,
++        send.off,
++        send.emit_off,
++        send.buffered_bytes,
++        send.fin_off,
++        send.data
++            .iter()
++            .map(|b| {
++                (
++                    b as *const _ as usize,
++                    b.data.as_ref().as_ptr() as usize,
++                    b.start,
++                    b.pos,
++                    b.len,
++                    b.off,
++                    b.fin,
++                )
++            })
++            .collect(),
++    )
++}
++
++fn request_usage(budget: &SendBudget, bytes: usize, slots: usize) {
++    assert_eq!(
++        budget.usage().request,
++        SendLimit {
++            backing_bytes: bytes,
++            slots
++        }
++    );
++}
++
++thread_local! {
++    static COPIES: Cell<usize> = const { Cell::new(0) };
++    static FACTORY_BUDGET: RefCell<Option<SendBudget>> = const { RefCell::new(None) };
++    static DESTROYED_AT: RefCell<Vec<SendLimit>> = const { RefCell::new(Vec::new()) };
++}
++
++#[derive(Debug)]
++struct Backing {
++    bytes: Box<[u8]>,
++    budget: SendBudget,
++}
++
++impl Drop for Backing {
++    fn drop(&mut self) {
++        DESTROYED_AT.with(|seen| seen.borrow_mut().push(self.budget.usage().request));
++    }
++}
++
++#[derive(Clone, Debug)]
++struct TrackedBuf(Arc<Backing>);
++
++impl AsRef<[u8]> for TrackedBuf {
++    fn as_ref(&self) -> &[u8] {
++        &self.0.bytes
++    }
++}
++
++#[derive(Clone, Debug, Default)]
++struct TrackedFactory;
++
++impl BufFactory for TrackedFactory {
++    type Buf = TrackedBuf;
++    type DgramBuf = Vec<u8>;
++    fn buf_from_slice(bytes: &[u8]) -> TrackedBuf {
++        COPIES.with(|count| count.set(count.get() + 1));
++        let budget = FACTORY_BUDGET.with(|b| b.borrow().as_ref().unwrap().clone());
++        TrackedBuf(Arc::new(Backing {
++            bytes: bytes.into(),
++            budget,
++        }))
++    }
++    fn dgram_buf_from_slice(bytes: &[u8]) -> Vec<u8> {
++        bytes.into()
++    }
++}
++
++fn tracked(budget: &SendBudget) -> SendBuf<TrackedFactory> {
++    COPIES.with(|count| count.set(0));
++    DESTROYED_AT.with(|seen| seen.borrow_mut().clear());
++    FACTORY_BUDGET.with(|b| *b.borrow_mut() = Some(budget.clone()));
++    SendBuf::with_budget(u64::MAX, budget.clone(), SendClass::Request).unwrap()
++}
++
++#[test]
++fn send_budget_owner_admission_refuses_without_leaking_any_class() {
++    println!("SEND_LAYOUT RangeBuf={} SendBuf={} DefaultBuf={} SendBudget={} SendCharge={} BufferCharge={} Reservation={} SendLimit={} SendLimits={} SendUsage={}",
++        size_of::<RangeBuf>(), size_of::<SendBuf>(),
++        size_of::<crate::buffers::DefaultBuf>(), size_of::<SendBudget>(),
++        size_of::<SendCharge>(),
++        size_of::<crate::receive_budget::BufferCharge>(),
++        size_of::<crate::receive_budget::Reservation>(),
++        size_of::<SendLimit>(), size_of::<SendLimits>(),
++        size_of::<SendUsage>());
++    let limit = SendLimit {
++        backing_bytes: 32,
++        slots: 1,
++    };
++    let budget = SendBudget::new(SendLimits {
++        request: limit,
++        control: limit,
++        crypto: limit,
++    });
++    for class in [SendClass::Request, SendClass::Control, SendClass::Crypto] {
++        assert!(matches!(
++            SendBuf::<DefaultBufFactory>::with_budget(100, budget.clone(), class),
++            Err(Error::SendBufferExceeded)
++        ));
++    }
++    assert_eq!(budget.usage(), SendUsage::default());
++}
++
++#[test]
++fn send_budget_shared_exhaustion_preserves_control_crypto_and_receive_pools() {
++    let budget = budget(5, 8);
++    let mut first = buffer(&budget);
++    let mut sibling = buffer(&budget);
++    assert_eq!(first.write(b"abcde", false), Ok(5));
++    assert_eq!(sibling.write(b"x", false), Err(Error::SendBufferExceeded));
++    let mut control =
++        SendBuf::<DefaultBufFactory>::with_budget(100, budget.clone(), SendClass::Control).unwrap();
++    let mut crypto =
++        SendBuf::<DefaultBufFactory>::with_budget(100, budget.clone(), SendClass::Crypto).unwrap();
++    assert_eq!(control.write(b"ctl", false), Ok(3));
++    assert_eq!(crypto.write(b"tls", false), Ok(3));
++    let receive = crate::ReceiveBudget::default();
++    let recv = crate::stream::recv_buf::RecvBuf::new(
++        100,
++        100,
++        100,
++        receive.clone(),
++        ReceiveClass::Request,
++    )
++    .unwrap();
++    assert_eq!(receive.usage().request.slots, 2);
++    drop(first);
++    assert_eq!(sibling.write(b"y", false), Ok(1));
++    drop((sibling, control, crypto, recv));
++    assert_eq!(budget.usage(), SendUsage::default());
++    assert_eq!(receive.usage(), crate::ReceiveUsage::default());
++}
++
++#[test]
++fn send_budget_whole_copy_admission_fails_before_factory_offset_or_fin_mutation() {
++    let budget = budget(10, 20);
++    let mut send = tracked(&budget);
++    assert_eq!(
++        send.write(b"abcdefghijk", true),
++        Err(Error::SendBufferExceeded)
++    );
++    assert_eq!(COPIES.with(Cell::get), 0);
++    assert_eq!(send.off_back(), 0);
++    assert_eq!(send.fin_off, None);
++    assert_eq!(send.data.capacity(), 0);
++    request_usage(&budget, 0, 2);
++    assert_eq!(send.write(b"abcde", true), Ok(5));
++    assert_eq!(COPIES.with(Cell::get), 1);
++    assert_eq!(send.emit(&mut [0; 5]), Ok((5, true)));
++}
++
++#[test]
++fn send_budget_initial_cells_are_admitted_before_copy_and_growth() {
++    let budget = budget(32, 5);
++    let mut send = tracked(&budget);
++    assert_eq!(send.write(b"a", false), Err(Error::SendBufferExceeded));
++    assert_eq!(COPIES.with(Cell::get), 0);
++    assert_eq!(send.data.capacity(), 0);
++    request_usage(&budget, 0, 2);
++}
++
++#[test]
++fn send_budget_growth_prepays_old_plus_new_cells_and_rolls_back() {
++    for (slots, accepted) in [(13, false), (14, true)] {
++        let budget = budget(32, slots);
++        let mut send = tracked(&budget);
++        assert_eq!(send.write(b"abcdefghijklmnopqrst", false), Ok(20));
++        assert_eq!(send.data.capacity(), 4);
++        request_usage(&budget, 20, 6);
++        let result = send.write(b"u", true);
++        if accepted {
++            assert_eq!(result, Ok(1));
++            assert_eq!(COPIES.with(Cell::get), 5);
++            assert_eq!(send.data.capacity(), 8);
++            request_usage(&budget, 21, 10);
++        } else {
++            assert_eq!(result, Err(Error::SendBufferExceeded));
++            assert_eq!(COPIES.with(Cell::get), 4);
++            assert_eq!(send.data.capacity(), 4);
++            assert_eq!(send.off_back(), 20);
++            assert_eq!(send.fin_off, None);
++            request_usage(&budget, 20, 6);
++            assert_eq!(send.emit(&mut [0; 20]), Ok((20, false)));
++        }
++    }
++}
++
++#[test]
++fn send_budget_emitted_backing_stays_charged_until_whole_view_ack() {
++    let budget = budget(20, 10);
++    let mut send = buffer(&budget);
++    send.write(b"abcdefghijklmno", false).unwrap();
++    assert_eq!(send.emit(&mut [0; 15]), Ok((15, false)));
++    assert_eq!(send.buffered_bytes(), 0);
++    request_usage(&budget, 15, 6);
++    assert_eq!(send.ack_and_drop(0, 3), 0);
++    request_usage(&budget, 15, 6);
++    assert_eq!(send.ack_and_drop(3, 2), 0);
++    request_usage(&budget, 10, 6);
++    assert_eq!(send.ack_and_drop(5, 10), 0);
++    assert!(send.data.is_empty());
++    assert_eq!(send.data.capacity(), 4);
++    request_usage(&budget, 0, 6);
++    assert_eq!(send.write(b"p", false), Ok(1));
++    assert_eq!(send.data.capacity(), 4);
++    request_usage(&budget, 1, 6);
++    drop(send);
++    assert_eq!(budget.usage(), SendUsage::default());
++}
++
++#[test]
++fn send_budget_out_of_order_ack_does_not_refund_still_retained_backing() {
++    let budget = budget(20, 10);
++    let mut send = buffer(&budget);
++    send.write(b"abcdefghij", false).unwrap();
++    send.emit(&mut [0; 10]).unwrap();
++    assert_eq!(send.ack_and_drop(5, 5), 0);
++    request_usage(&budget, 10, 6);
++    assert_eq!(send.ack_and_drop(0, 5), 0);
++    request_usage(&budget, 0, 6);
++}
++
++#[test]
++fn send_budget_retransmit_charges_full_alias_backing_before_splitting() {
++    for (bytes, accepted) in [(19, false), (20, true)] {
++        let budget = budget(bytes, 10);
++        let mut send = buffer(&budget);
++        send.write(b"abcdefghijklmno", true).unwrap();
++        send.emit(&mut [0; 15]).unwrap();
++        let before = snapshot(&send);
++        let result = send.retransmit(1, 1);
++        if accepted {
++            assert_eq!(result, Ok(1));
++            assert_eq!(send.data.len(), 4);
++            request_usage(&budget, 20, 6);
++            assert_eq!(send.emit(&mut [0; 1]), Ok((1, false)));
++            send.ack_and_drop(0, 15);
++            request_usage(&budget, 0, 6);
++        } else {
++            assert_eq!(result, Err(Error::SendBufferExceeded));
++            assert_eq!(snapshot(&send), before);
++            assert_eq!(send.data.len(), 3);
++            assert_eq!(send.buffered_bytes(), 0);
++            assert_eq!(send.emit(&mut [0; 1]), Ok((0, true)));
++            request_usage(&budget, 15, 6);
++        }
++    }
++}
++
++#[test]
++fn send_budget_retransmit_growth_rejection_preserves_offsets_and_ready_bytes() {
++    let budget = budget(32, 13);
++    let mut send = buffer(&budget);
++    send.write(b"abcdefghijklmnopqrst", true).unwrap();
++    send.emit(&mut [0; 20]).unwrap();
++    let before = snapshot(&send);
++    assert_eq!(send.retransmit(1, 1), Err(Error::SendBufferExceeded));
++    assert_eq!(snapshot(&send), before);
++    assert_eq!(send.data.len(), 4);
++    assert_eq!(send.data.capacity(), 4);
++    assert_eq!(send.off_front(), 20);
++    assert_eq!(send.buffered_bytes(), 0);
++    request_usage(&budget, 20, 6);
++}
++
++#[test]
++fn send_budget_terminal_reset_destroys_backing_and_cells_before_refund() {
++    let budget = budget(32, 10);
++    let mut send = tracked(&budget);
++    send.write(b"abcde", false).unwrap();
++    send.emit(&mut [0; 5]).unwrap();
++    assert_eq!(send.reset(), (5, 0));
++    assert_eq!(send.data.capacity(), 0);
++    assert_eq!(
++        DESTROYED_AT.with(|seen| seen.borrow().clone()),
++        vec![SendLimit {
++            backing_bytes: 5,
++            slots: 6
++        }]
++    );
++    request_usage(&budget, 0, 2);
++    assert_eq!(send.write(b"f", false), Err(Error::FinalSize));
++    drop(send);
++    assert_eq!(budget.usage(), SendUsage::default());
++}
++
++#[test]
++fn send_budget_owner_drop_destroys_backing_before_returning_admission() {
++    let budget = budget(32, 10);
++    let mut send = tracked(&budget);
++    send.write(b"abcde", false).unwrap();
++    drop(send);
++    assert_eq!(
++        DESTROYED_AT.with(|seen| seen.borrow().clone()),
++        vec![SendLimit {
++            backing_bytes: 5,
++            slots: 6
++        }]
++    );
++    assert_eq!(budget.usage(), SendUsage::default());
++    assert_eq!(buffer(&budget).write(b"reuse", false), Ok(5));
++}
++
++#[test]
++fn send_budget_ack_destroys_backing_before_refund_but_keeps_cached_cells() {
++    let budget = budget(32, 10);
++    let mut send = tracked(&budget);
++    send.write(b"abcde", false).unwrap();
++    send.emit(&mut [0; 5]).unwrap();
++    send.ack_and_drop(0, 5);
++    assert_eq!(
++        DESTROYED_AT.with(|seen| seen.borrow().clone()),
++        vec![SendLimit {
++            backing_bytes: 5,
++            slots: 6
++        }]
++    );
++    request_usage(&budget, 0, 6);
++}
++
++#[test]
++fn send_budget_receive_only_uni_streams_still_admit_control_send_owners() {
++    let budget = budget(32, 10);
++    let receive = crate::ReceiveBudget::default();
++    let stream = crate::stream::Stream::<DefaultBufFactory>::new(
++        2,
++        100,
++        0,
++        false,
++        100,
++        100,
++        receive.clone(),
++        ReceiveClass::Control,
++        budget.clone(),
++    )
++    .unwrap();
++    assert_eq!(
++        budget.usage().control,
++        SendLimit {
++            backing_bytes: 0,
++            slots: 2
++        }
++    );
++    assert_eq!(receive.usage().control.slots, 2);
++    drop(stream);
++    assert_eq!(budget.usage(), SendUsage::default());
++    assert_eq!(receive.usage(), crate::ReceiveUsage::default());
++}
++
++#[test]
++fn send_budget_stream_constructor_failure_refunds_prior_receive_owner() {
++    let budget = budget(32, 1);
++    let receive = crate::ReceiveBudget::default();
++    assert!(matches!(
++        crate::stream::Stream::<DefaultBufFactory>::new(
++            0,
++            100,
++            100,
++            false,
++            100,
++            100,
++            receive.clone(),
++            ReceiveClass::Request,
++            budget.clone()
++        ),
++        Err(Error::SendBufferExceeded)
++    ));
++    assert_eq!(budget.usage(), SendUsage::default());
++    assert_eq!(receive.usage(), crate::ReceiveUsage::default());
++}
++
++#[test]
++fn send_budget_crypto_epochs_clear_in_place_without_re_admitting_owners() {
++    let limit = SendLimit {
++        backing_bytes: 10,
++        slots: 10,
++    };
++    let budget = SendBudget::new(SendLimits {
++        crypto: limit,
++        ..SendLimits::default()
++    });
++    let receive = crate::ReceiveBudget::default();
++    let mut contexts: Vec<_> = (0..3)
++        .map(|_| crate::packet::CryptoContext::new(receive.clone(), budget.clone()).unwrap())
++        .collect();
++    assert_eq!(
++        budget.usage().crypto,
++        SendLimit {
++            backing_bytes: 0,
++            slots: 6
++        }
++    );
++    contexts[0]
++        .crypto_stream
++        .send
++        .write(b"abcde", false)
++        .unwrap();
++    assert_eq!(
++        budget.usage().crypto,
++        SendLimit {
++            backing_bytes: 5,
++            slots: 10
++        }
++    );
++    contexts[0].clear();
++    assert_eq!(contexts[0].crypto_stream.send.data.capacity(), 0);
++    assert_eq!(
++        budget.usage().crypto,
++        SendLimit {
++            backing_bytes: 0,
++            slots: 6
++        }
++    );
++    assert_eq!(contexts[0].crypto_stream.send.write(b"fghij", false), Ok(5));
++    drop(contexts);
++    assert_eq!(budget.usage(), SendUsage::default());
++    assert_eq!(receive.usage(), crate::ReceiveUsage::default());
++}
++
++#[test]
++fn send_budget_partial_crypto_constructor_failure_refunds_on_drop() {
++    let limit = SendLimit {
++        backing_bytes: 10,
++        slots: 4,
++    };
++    let budget = SendBudget::new(SendLimits {
++        crypto: limit,
++        ..SendLimits::default()
++    });
++    let receive = crate::ReceiveBudget::default();
++    let first = crate::packet::CryptoContext::new(receive.clone(), budget.clone()).unwrap();
++    let second = crate::packet::CryptoContext::new(receive.clone(), budget.clone()).unwrap();
++    assert!(matches!(
++        crate::packet::CryptoContext::new(receive.clone(), budget.clone()),
++        Err(Error::SendBufferExceeded)
++    ));
++    assert_eq!(budget.usage().crypto.slots, 4);
++    assert_eq!(receive.usage().crypto.slots, 4);
++    drop((first, second));
++    assert_eq!(budget.usage(), SendUsage::default());
++    assert_eq!(receive.usage(), crate::ReceiveUsage::default());
++}
++
++#[test]
++fn send_budget_flow_credit_and_peer_errors_keep_existing_semantics() {
++    let budget = budget(3, 6);
++    let mut send =
++        SendBuf::<DefaultBufFactory>::with_budget(3, budget.clone(), SendClass::Request).unwrap();
++    assert_eq!(send.write(b"abcde", true), Ok(3));
++    assert_eq!(send.fin_off, None);
++    request_usage(&budget, 3, 6);
++    assert_eq!(send.stop(42), Ok((0, 3)));
++    request_usage(&budget, 0, 2);
++    assert_eq!(send.write(b"x", false), Err(Error::StreamStopped(42)));
++    assert_eq!(send.stop(42), Err(Error::Done));
++}
++
++#[test]
++fn send_budget_wrapped_queue_growth_preserves_unsent_payload_and_capacity_charge() {
++    let budget = budget(64, 14);
++    let mut send = buffer(&budget);
++    send.write(b"abcdefghijklmnopqrst", false).unwrap();
++    let mut prefix = [0; 10];
++    assert_eq!(send.emit(&mut prefix), Ok((10, false)));
++    assert_eq!(&prefix, b"abcdefghij");
++    send.ack_and_drop(0, 10);
++    send.write(b"uvwxyzABCD", false).unwrap();
++    assert!(!send.data.as_slices().1.is_empty());
++    assert_eq!(send.write(b"E", true), Ok(1));
++    assert_eq!(send.data.capacity(), 8);
++    request_usage(&budget, 21, 10);
++    let mut payload = [0; 21];
++    assert_eq!(send.emit(&mut payload), Ok((21, true)));
++    assert_eq!(&payload, b"klmnopqrstuvwxyzABCDE");
++}
++
++#[test]
++fn send_budget_empty_fin_requires_no_payload_or_cell_admission() {
++    let budget = budget(0, 2);
++    let mut send = buffer(&budget);
++    assert_eq!(send.write(b"", true), Ok(0));
++    assert_eq!(send.emit(&mut [0; 1]), Ok((0, true)));
++    assert_eq!(send.data.capacity(), 0);
++    request_usage(&budget, 0, 2);
++}
++
++#[test]
++fn send_budget_config_admits_three_crypto_owners_and_refunds_connection_drop() {
++    let budget = SendBudget::new(SendLimits {
++        crypto: SendLimit {
++            backing_bytes: 32,
++            slots: 6,
++        },
++        ..SendLimits::default()
++    });
++    let mut config = crate::Config::new(crate::PROTOCOL_VERSION).unwrap();
++    config.set_send_budget(budget.clone());
++    let cid = crate::ConnectionId::from_ref(b"sendquota");
++    let local = "127.0.0.1:10000".parse().unwrap();
++    let peer = "127.0.0.1:10001".parse().unwrap();
++    let connection = crate::accept(&cid, None, local, peer, &mut config).unwrap();
++    assert_eq!(
++        budget.usage().crypto,
++        SendLimit {
++            backing_bytes: 0,
++            slots: 6
++        }
++    );
++    drop(connection);
++    assert_eq!(budget.usage(), SendUsage::default());
++}
++
++#[test]
++fn send_budget_failed_connection_construction_refunds_partial_crypto_admission() {
++    let budget = SendBudget::new(SendLimits {
++        crypto: SendLimit {
++            backing_bytes: 32,
++            slots: 4,
++        },
++        ..SendLimits::default()
++    });
++    let mut config = crate::Config::new(crate::PROTOCOL_VERSION).unwrap();
++    config.set_send_budget(budget.clone());
++    let cid = crate::ConnectionId::from_ref(b"sendquota");
++    assert!(matches!(
++        crate::accept(
++            &cid,
++            None,
++            "127.0.0.1:10000".parse().unwrap(),
++            "127.0.0.1:10001".parse().unwrap(),
++            &mut config
++        ),
++        Err(Error::SendBufferExceeded)
++    ));
++    assert_eq!(budget.usage(), SendUsage::default());
++}
++
++fn ticket_pipe() -> (crate::test_utils::Pipe, SendBudget) {
++    let budget = SendBudget::new(SendLimits {
++        crypto: SendLimit {
++            backing_bytes: 65536,
++            slots: 524288,
++        },
++        ..SendLimits::default()
++    });
++    let mut config = crate::test_utils::Pipe::default_config("reno").unwrap();
++    config.set_send_budget(budget.clone());
++    let mut pipe = crate::test_utils::Pipe::with_server_config(&mut config).unwrap();
++    let flight = crate::test_utils::emit_flight(&mut pipe.client).unwrap();
++    crate::test_utils::process_flight(&mut pipe.server, flight).unwrap();
++    let flight = crate::test_utils::emit_flight(&mut pipe.server).unwrap();
++    crate::test_utils::process_flight(&mut pipe.client, flight).unwrap();
++    let flight = crate::test_utils::emit_flight(&mut pipe.client).unwrap();
++    crate::test_utils::process_flight(&mut pipe.server, flight).unwrap();
++    assert!(pipe.server.is_established());
++    assert!(pipe.client.is_established());
++    assert!(
++        pipe.server.crypto_ctx[crate::packet::Epoch::Application]
++            .crypto_stream
++            .send
++            .buffered_bytes()
++            > 0
++    );
++    (pipe, budget)
++}
++
++fn partial_ticket(pipe: &mut crate::test_utils::Pipe) -> (Vec<u8>, crate::SendInfo) {
++    for size in 55..80 {
++        let mut packet = vec![0; size];
++        let (len, info) = pipe.server.send(&mut packet).unwrap();
++        packet.truncate(len);
++        let frames = crate::test_utils::decode_pkt(&mut pipe.client, &mut packet.clone()).unwrap();
++        for frame in frames {
++            if let crate::frame::Frame::Crypto { data } = frame {
++                let end = data.max_off();
++                if pipe.server.crypto_ctx[crate::packet::Epoch::Application]
++                    .crypto_stream
++                    .send
++                    .data
++                    .iter()
++                    .any(|buf| buf.off < end && end < buf.max_off())
++                {
++                    return (packet, info);
++                }
++            }
++        }
++    }
++    panic!("no partial native TLS ticket frame");
++}
++
++#[test]
++fn send_budget_closing_lost_crypto_still_emits_connection_close_at_full_quota() {
++    use crate::recovery::RecoveryOps;
++    let (mut pipe, budget) = ticket_pipe();
++    let _lost = partial_ticket(&mut pipe);
++    crate::test_utils::trigger_ack_based_loss(&mut pipe.server, &mut pipe.client);
++    assert!(pipe
++        .server
++        .paths
++        .get_active()
++        .unwrap()
++        .recovery
++        .has_lost_frames(crate::packet::Epoch::Application));
++    let free = 65536 - budget.usage().crypto.backing_bytes;
++    let mut occupied =
++        SendBuf::<DefaultBufFactory>::with_budget(u64::MAX, budget.clone(), SendClass::Crypto)
++            .unwrap();
++    occupied.write(&vec![0; free], false).unwrap();
++    assert_eq!(budget.usage().crypto.backing_bytes, 65536);
++    assert_eq!(pipe.server.close(false, 1, b"quota"), Ok(()));
++    let mut packet = [0; 1500];
++    let (len, _) = pipe
++        .server
++        .send(&mut packet)
++        .expect("closing must skip lost CRYPTO allocation");
++    let frames = crate::test_utils::decode_pkt(&mut pipe.client, &mut packet[..len]).unwrap();
++    assert!(frames.iter().any(|f| matches!(
++        f,
++        crate::frame::Frame::ConnectionClose { error_code: 1, .. }
++    )));
++    assert!(!frames
++        .iter()
++        .any(|f| matches!(f, crate::frame::Frame::Crypto { .. })));
++}
++
++#[test]
++fn send_budget_native_ack_retires_real_ticket_backing() {
++    let (mut pipe, budget) = ticket_pipe();
++    let flight = crate::test_utils::emit_flight(&mut pipe.server).unwrap();
++    crate::test_utils::process_flight(&mut pipe.client, flight).unwrap();
++    pipe.client.send_ack_eliciting().unwrap();
++    let ack = crate::test_utils::emit_flight(&mut pipe.client).unwrap();
++    let before = budget.usage().crypto.backing_bytes;
++    assert!(before > 0);
++    crate::test_utils::process_flight(&mut pipe.server, ack).unwrap();
++    assert!(budget.usage().crypto.backing_bytes < before);
++}
++
++#[derive(Clone, Debug)]
++struct SplitBytes(bytes::Bytes);
++thread_local! { static SPLITS: Cell<usize> = const { Cell::new(0) }; }
++impl AsRef<[u8]> for SplitBytes {
++    fn as_ref(&self) -> &[u8] {
++        &self.0
++    }
++}
++impl BufSplit for SplitBytes {
++    fn split_at(&mut self, at: usize) -> Self {
++        SPLITS.with(|n| n.set(n.get() + 1));
++        Self(self.0.split_off(at))
++    }
++}
++#[derive(Clone, Debug, Default)]
++struct BytesFactory;
++impl BufFactory for BytesFactory {
++    type Buf = SplitBytes;
++    type DgramBuf = Vec<u8>;
++    fn buf_from_slice(bytes: &[u8]) -> SplitBytes {
++        SplitBytes(bytes::Bytes::copy_from_slice(bytes))
++    }
++    fn dgram_buf_from_slice(bytes: &[u8]) -> Vec<u8> {
++        bytes.into()
++    }
++}
++
++#[test]
++fn send_budget_zero_copy_split_admits_only_accepted_view_and_returns_remainder() {
++    SPLITS.with(|n| n.set(0));
++    let budget = budget(3, 6);
++    let mut send =
++        SendBuf::<BytesFactory>::with_budget(100, budget.clone(), SendClass::Request).unwrap();
++    let input = SplitBytes(bytes::Bytes::copy_from_slice(b"abcde"));
++    let pointer = input.as_ref().as_ptr();
++    let (accepted, remainder) = send.append_buf(input, 3, false).unwrap();
++    assert_eq!(accepted, 3);
++    assert_eq!(remainder.unwrap().as_ref(), b"de");
++    assert_eq!(send.data.front().unwrap().data.as_ref().as_ptr(), pointer);
++    assert_eq!(SPLITS.with(Cell::get), 1);
++    assert_eq!(send.data.capacity(), 4);
++    request_usage(&budget, 3, 6);
++    assert!(matches!(
++        send.append_buf(SplitBytes(bytes::Bytes::copy_from_slice(b"fg")), 1, true),
++        Err(Error::SendBufferExceeded)
++    ));
++    assert_eq!(SPLITS.with(Cell::get), 1);
++    assert_eq!(
++        (send.off_back(), send.fin_off, send.data.capacity()),
++        (3, None, 4)
++    );
++    request_usage(&budget, 3, 6);
++    let mut body = [0; 3];
++    assert_eq!(send.emit(&mut body), Ok((3, false)));
++    assert_eq!(&body, b"abc");
++    drop(send);
++    assert_eq!(budget.usage(), SendUsage::default());
++}
++
++#[test]
++fn send_budget_closing_lost_stream_still_emits_connection_close_at_full_quota() {
++    use crate::recovery::RecoveryOps;
++    let budget = SendBudget::new(SendLimits {
++        request: SendLimit {
++            backing_bytes: 15,
++            slots: 16,
++        },
++        ..SendLimits::default()
++    });
++    let mut config = crate::test_utils::Pipe::default_config("reno").unwrap();
++    config.set_send_budget(budget.clone());
++    let mut pipe = crate::test_utils::Pipe::with_server_config(&mut config).unwrap();
++    pipe.handshake().unwrap();
++    pipe.advance().unwrap();
++    pipe.server
++        .stream_send(1, b"abcdefghijklmno", true)
++        .unwrap();
++    let mut lost = [0; 47];
++    let (len, _) = pipe.server.send(&mut lost).unwrap();
++    let frames = crate::test_utils::decode_pkt(&mut pipe.client, &mut lost[..len]).unwrap();
++    assert!(frames.iter().any(|f| {
++        if let crate::frame::Frame::Stream { data, .. } = f {
++            let end = data.max_off();
++            data.len() > 0
++                && data.len() < 15
++                && pipe
++                    .server
++                    .streams
++                    .get_mut(1)
++                    .unwrap()
++                    .send
++                    .data
++                    .iter()
++                    .any(|buf| buf.off < end && end < buf.max_off())
++        } else {
++            false
++        }
++    }));
++    crate::test_utils::trigger_ack_based_loss(&mut pipe.server, &mut pipe.client);
++    assert!(pipe
++        .server
++        .paths
++        .get_active()
++        .unwrap()
++        .recovery
++        .has_lost_frames(crate::packet::Epoch::Application));
++    assert_eq!(budget.usage().request.backing_bytes, 15);
++    pipe.server.close(false, 1, b"quota").unwrap();
++    let mut packet = [0; 1500];
++    let (len, _) = pipe
++        .server
++        .send(&mut packet)
++        .expect("closing must skip lost STREAM allocation");
++    let frames = crate::test_utils::decode_pkt(&mut pipe.client, &mut packet[..len]).unwrap();
++    assert!(frames.iter().any(|f| matches!(
++        f,
++        crate::frame::Frame::ConnectionClose { error_code: 1, .. }
++    )));
++    assert!(!frames
++        .iter()
++        .any(|f| matches!(f, crate::frame::Frame::Stream { .. })));
++}
