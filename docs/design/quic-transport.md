@@ -65,7 +65,7 @@ Transport packet sends use a deduplicated ready-connection queue. Receive,
 response, timeout and shutdown work mark the affected connection; successful
 sends rotate it after one packet. Idle connections are not probed for every
 send, and terminal cleanup removes their queued keys. Response-stream driving
-and response/connection-idle deadlines still use scans pending separate scheduler work.
+still scans connections pending separate scheduler work.
 
 Transport deadlines use an ordered index with at most one absolute entry per
 live connection. Receive, send, transport timeout and close outcomes refresh the
@@ -76,9 +76,18 @@ Request deadlines use one indexed minimum per incomplete stream across header,
 body and request-idle phases. Receive processing refreshes only streams touched
 by readable headers or HTTP/3 events, including errors. Completion, reset,
 expiration and connection removal directly remove their entries; resets also
-clear incomplete-header state. Response/connection-idle deadlines and the
-terminal sweep still scan their state, so overall timeout work is not yet
-proportional only to due connections.
+clear incomplete-header state.
+
+Response write deadlines also use one immutable indexed entry per queued
+response. Completion, reset, expiry and connection removal delete it directly;
+expiry visits only due entries. Connection-idle deadlines are indexed only
+while no incomplete request, readable header or queued response exists. Busy
+connections retain their original idle timestamp without scheduling it; clearing
+the busy phase restores that timestamp, including an already expired deadline.
+This prevents expired idle timers from causing zero waits during active work.
+Deadline queries read index minima and idle expiry visits only due connections.
+Response driving and terminal sweeps still scan connections, so the full server
+loop is not yet proportional only to ready or due work.
 
 ### Canceled HTTP/3 request state
 
