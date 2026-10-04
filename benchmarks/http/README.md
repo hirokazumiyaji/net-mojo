@@ -120,11 +120,12 @@ go -C benchmarks/http_go build -o /tmp/http-load ./cmd/http-load
 Use identical arguments for the Go and Mojo endpoints and repeat each run at
 least five times. The loader accepts plain HTTP URLs for `/fixed`, `/json` and
 `/echo`; `-method` defaults to GET or POST for echo. Each worker has one active
-request. `-timeout` bounds each request (default 5s). Warmup stops starting work
-at its deadline and finishes outstanding requests before measurement, retaining
-keep-alive connections. All drained warmup responses are validated, including
-those completed after its deadline. Set `-warmup 0` only when warmup is
-intentionally omitted.
+request. `-timeout` bounds each request (default 5s). Closed-loop warmup stops
+starting work at its deadline. Fixed-arrival warmup offers every planned slot,
+even if the dispatcher resumes after the nominal deadline. Both modes finish
+outstanding requests before measurement, retaining keep-alive connections.
+All drained warmup responses are validated, including those completed after
+the nominal deadline. Set `-warmup 0` only when warmup is intentionally omitted.
 
 One JSON record reports configuration, warmup counts, measured `started`,
 `success`, `errors`, `cutoff`, `samples`, payload byte counts, requests/s,

@@ -124,7 +124,7 @@ func arrivalPhase(clients []*http.Client, c config, w workload, duration time.Du
 	var dropped uint64
 	for index := uint64(0); index < scheduled; index++ {
 		planned := begin.Add(arrivalOffset(index, c.Rate))
-		if !wait(planned) || !time.Now().Before(deadline) {
+		if !wait(planned) || (sample && !time.Now().Before(deadline)) {
 			break
 		}
 		select {
