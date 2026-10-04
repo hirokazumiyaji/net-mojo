@@ -44,3 +44,7 @@ cargo test --locked --release \
 cargo test --locked --release \
     --manifest-path "$task_quiche_source/Cargo.toml" \
     --target-dir build/quic/cargo stream::recv_buf::tests
+
+cargo test --locked --release \
+    --manifest-path "$task_quiche_source/Cargo.toml" \
+    --target-dir build/quic/cargo receive_budget

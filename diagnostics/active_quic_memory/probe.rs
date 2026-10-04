@@ -2,6 +2,7 @@
 mod active_receive_allocation_diagnostic {
     use super::*;
     use crate::range_buf::RangeBuf;
+    use crate::receive_budget::ReceiveClass;
     use crate::stream::RecvBuf;
     use std::alloc::{GlobalAlloc, Layout, System};
     use std::cell::Cell;
@@ -85,7 +86,14 @@ mod active_receive_allocation_diagnostic {
     fn low_level_equal_credit_different_retained_backing() {
         for body_len in SIZES {
             for pattern in PATTERNS {
-                let mut recv = RecvBuf::new(1_000_000, 1_000_000, 16 * 1024 * 1024);
+                let mut recv = RecvBuf::new(
+                    1_000_000,
+                    1_000_000,
+                    16 * 1024 * 1024,
+                    ReceiveBudget::default(),
+                    ReceiveClass::Request,
+                )
+                .unwrap();
                 fragments(pattern, body_len, |off, bytes, fin| {
                     recv.write(RangeBuf::from(bytes, off as u64, fin)).unwrap()
                 });
@@ -95,7 +103,14 @@ mod active_receive_allocation_diagnostic {
                 let dropped = dropped_bytes(recv);
                 println!("LOW size={body_len} pattern={pattern:?} state=held nodes={} unique_body={} backing={} rust_drop={dropped}", retained.0, retained.1, retained.2);
 
-                let mut recv = RecvBuf::new(1_000_000, 1_000_000, 16 * 1024 * 1024);
+                let mut recv = RecvBuf::new(
+                    1_000_000,
+                    1_000_000,
+                    16 * 1024 * 1024,
+                    ReceiveBudget::default(),
+                    ReceiveClass::Request,
+                )
+                .unwrap();
                 fragments(pattern, body_len, |off, bytes, fin| {
                     recv.write(RangeBuf::from(bytes, off as u64, fin)).unwrap()
                 });
@@ -108,7 +123,14 @@ mod active_receive_allocation_diagnostic {
                 assert_eq!(recv.diagnostic_retained(), (0, 0, 0));
                 println!("LOW size={body_len} pattern={pattern:?} state=read nodes=0 unique_body=0 backing=0 rust_drop={}", dropped_bytes(recv));
 
-                let mut recv = RecvBuf::new(1_000_000, 1_000_000, 16 * 1024 * 1024);
+                let mut recv = RecvBuf::new(
+                    1_000_000,
+                    1_000_000,
+                    16 * 1024 * 1024,
+                    ReceiveBudget::default(),
+                    ReceiveClass::Request,
+                )
+                .unwrap();
                 fragments(pattern, body_len, |off, bytes, fin| {
                     recv.write(RangeBuf::from(bytes, off as u64, fin)).unwrap()
                 });
@@ -338,7 +360,14 @@ mod active_receive_allocation_diagnostic {
 
     #[test]
     fn island_partial_duplicate_drain_and_terminal_conservation() {
-        let mut recv = RecvBuf::new(100, 100, 100);
+        let mut recv = RecvBuf::new(
+            100,
+            100,
+            100,
+            ReceiveBudget::default(),
+            ReceiveClass::Request,
+        )
+        .unwrap();
         assert_eq!(parts(&recv), (0, 0, 0, 0));
         recv.write(RangeBuf::from(b"cd", 2, false)).unwrap();
         recv.write(RangeBuf::from(b"gh", 6, false)).unwrap();
@@ -363,7 +392,14 @@ mod active_receive_allocation_diagnostic {
         assert_eq!(parts(&recv), (0, 0, 0, 0));
         println!("CONSERVATION islands_positive=3 novel_slots=4 duplicate_delta=0 partial_positive=6 partial_view=11 partial_backing=12 drained=0");
 
-        let mut terminal = RecvBuf::new(100, 100, 100);
+        let mut terminal = RecvBuf::new(
+            100,
+            100,
+            100,
+            ReceiveBudget::default(),
+            ReceiveClass::Request,
+        )
+        .unwrap();
         terminal.write(RangeBuf::from(b"", 5, true)).unwrap();
         assert_eq!(parts(&terminal), (0, 1, 0, 0));
         terminal.write(RangeBuf::from(b"", 5, true)).unwrap();
@@ -373,7 +409,14 @@ mod active_receive_allocation_diagnostic {
             dropped_bytes(terminal)
         );
 
-        let mut reset = RecvBuf::new(100, 100, 100);
+        let mut reset = RecvBuf::new(
+            100,
+            100,
+            100,
+            ReceiveBudget::default(),
+            ReceiveClass::Request,
+        )
+        .unwrap();
         reset.write(RangeBuf::from(b"cd", 2, false)).unwrap();
         assert_eq!(parts(&reset), (1, 0, 2, 2));
         reset.reset(0x10c, 5).unwrap();
@@ -390,7 +433,14 @@ mod active_receive_allocation_diagnostic {
     #[test]
     fn partial_front_backing_and_empty_container_are_distinct() {
         for state in ["partial", "read", "reset"] {
-            let mut recv = RecvBuf::new(10_000, 10_000, 10_000);
+            let mut recv = RecvBuf::new(
+                10_000,
+                10_000,
+                10_000,
+                ReceiveBudget::default(),
+                ReceiveClass::Request,
+            )
+            .unwrap();
             recv.write(RangeBuf::from(&[b'b'; CHUNK], 0, true)).unwrap();
             let mut prefix = [0; CHUNK - 1];
             assert_eq!(recv.emit(&mut prefix), Ok((CHUNK - 1, false)));

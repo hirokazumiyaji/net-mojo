@@ -229,9 +229,20 @@ can bound this object's population; full native byte accounting needs additional
 container/base/send/crypto counters. The 720-byte empty-map observation must not
 be lost when active entry counters reach zero.
 
-A future quota unit needs meaningful exhaustion/release regressions and the
-same interoperability proof. It must wait for separate review of the counter,
-quota and close contract; backing compaction alone does not establish it.
+The opt-in native receive-budget patch now provides independent backing and
+slot limits, with exhaustion, atomic rejection and release regressions in
+`quic-suite`. These diagnostics supply actual unlimited budgets to preserve
+their receive-allocation experiment. The provider still selects unlimited
+limits; finite provider policy remains separate work.
+
+With this fifth patch, the 16 KiB low-level held sizes are 19,088 bytes
+contiguous, 2,394,792 sparse and 2,246,552 overlap. The corresponding server
+transport sizes after H3 drop are 42,324, 2,418,028 and 2,269,788 bytes.
+Nodes, unique bytes and backing are unchanged. A partial one-byte view still
+retains 1,024 backing bytes; low-level Rust drop sizes are now 1,952 for that
+state, 912 after reading, and 192 after reset. The shared default ledger object
+adds measured overhead; historical figures in SCALING.md retain their recorded
+source attribution. These Rust sizes are not the budget's charged byte count.
 
 ## Limits of this evidence
 
