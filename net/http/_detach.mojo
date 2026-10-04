@@ -9,7 +9,7 @@ Architecture (Erlang-inspired Actor / Message-Passing):
   and reactor interests.
 - `ResponseSender` acts as a movable actor endpoint / proxy.
 - A copied budget capability charges state allocation until its last reference frees
-  it, and message arrays through queue/batch ownership. Payload and headers remain separate.
+  it, and message arrays/bodies through queue/batch ownership. Headers remain separate.
 - Data messages use a mutex-protected mailbox; ordered finish/abort state requires
   no additional message allocation.
 - A non-blocking wakeup file descriptor (via `socketpair`) notifies the reactor
@@ -47,6 +47,12 @@ struct _CapacityTicket(Movable):
         self.budget = budget^
         self.amount = amount
 
+    def _try_reserve(mut self, amount: Int) -> Bool:
+        if self.budget and not self.budget.value().try_reserve(amount):
+            return False
+        self.amount = amount
+        return True
+
     def release(mut self):
         if self.budget:
             self.budget.value().release(self.amount)
@@ -64,6 +70,7 @@ struct DetachMessage(Movable):
     var headers: Headers
     var body: List[Byte]
     var should_close: Bool
+    var body_ticket: _CapacityTicket
 
     def __init__(
         out self,
@@ -72,12 +79,14 @@ struct DetachMessage(Movable):
         var headers: Headers = Headers(),
         var body: List[Byte] = List[Byte](),
         should_close: Bool = False,
+        var body_ticket: _CapacityTicket = _CapacityTicket(),
     ):
         self.kind = kind
         self.status = status
         self.headers = headers^
         self.body = body^
         self.should_close = should_close
+        self.body_ticket = body_ticket^
 
     def __init__(out self, *, deinit move: Self):
         self.kind = move.kind
@@ -85,6 +94,11 @@ struct DetachMessage(Movable):
         self.headers = move.headers^
         self.body = move.body^
         self.should_close = move.should_close
+        self.body_ticket = move.body_ticket^
+
+    def __deinit__(deinit self):
+        _ = self.body^
+        self.body_ticket.release()
 
     @staticmethod
     def respond(
@@ -92,6 +106,7 @@ struct DetachMessage(Movable):
         var headers: Headers,
         var body: List[Byte],
         should_close: Bool,
+        var body_ticket: _CapacityTicket = _CapacityTicket(),
     ) -> Self:
         return Self(
             MSG_KIND_RESPOND,
@@ -99,6 +114,7 @@ struct DetachMessage(Movable):
             headers^,
             body^,
             should_close,
+            body_ticket^,
         )
 
     @staticmethod
@@ -112,13 +128,17 @@ struct DetachMessage(Movable):
         )
 
     @staticmethod
-    def chunk(var body: List[Byte]) -> Self:
+    def chunk(
+        var body: List[Byte],
+        var body_ticket: _CapacityTicket = _CapacityTicket(),
+    ) -> Self:
         return Self(
             MSG_KIND_CHUNK,
             200,
             Headers(),
             body^,
             False,
+            body_ticket^,
         )
 
 
@@ -406,9 +426,21 @@ struct ResponseSender(Movable):
             )
         s_ptr[].responded = True
         s_ptr[].finished = True
-        var admitted = _append_message(
-            s_ptr, DetachMessage.respond(status, headers^, body^, should_close)
-        )
+        var ticket = _CapacityTicket(s_ptr[].budget.copy())
+        var admitted = ticket._try_reserve(body.capacity())
+        if admitted:
+            admitted = _append_message(
+                s_ptr,
+                DetachMessage.respond(
+                    status, headers^, body^, should_close, ticket^
+                ),
+            )
+        else:
+            _ = body^
+            _ = headers^
+            s_ptr[].cancelled = True
+            s_ptr[].finished = True
+            s_ptr[].terminal_kind = MSG_KIND_ABORT
         var wakeup_fd = s_ptr[].wakeup_fd
         s_ptr[].mutex.unlock()
         signal_wakeup_fd(wakeup_fd)
@@ -417,7 +449,7 @@ struct ResponseSender(Movable):
                 NetErrorKind.invalid_argument(),
                 "respond",
                 None,
-                "mailbox capacity exceeds budget",
+                "response capacity exceeds budget",
             )
 
     def start(
@@ -523,11 +555,19 @@ struct ResponseSender(Movable):
                 None,
                 "stream queue limit exceeded",
             )
-        var chunk_bytes = List[Byte]()
-        chunk_bytes.reserve(len(data))
-        for i in range(len(data)):
-            chunk_bytes.append(data[i])
-        var admitted = _append_message(s_ptr, DetachMessage.chunk(chunk_bytes^))
+        var ticket = _CapacityTicket(s_ptr[].budget.copy())
+        var admitted = ticket._try_reserve(len(data))
+        if admitted:
+            var chunk_bytes = List[Byte](capacity=len(data))
+            for i in range(len(data)):
+                chunk_bytes.append(data[i])
+            admitted = _append_message(
+                s_ptr, DetachMessage.chunk(chunk_bytes^, ticket^)
+            )
+        else:
+            s_ptr[].cancelled = True
+            s_ptr[].finished = True
+            s_ptr[].terminal_kind = MSG_KIND_ABORT
         if admitted:
             s_ptr[].queued_bytes += len(data)
         var wakeup_fd = s_ptr[].wakeup_fd
@@ -538,7 +578,7 @@ struct ResponseSender(Movable):
                 NetErrorKind.invalid_argument(),
                 "send",
                 None,
-                "mailbox capacity exceeds budget",
+                "response capacity exceeds budget",
             )
         return True
 
