@@ -255,15 +255,16 @@ section records only the package-level boundaries.
   Synchronous HTTP/1 `write`/`write_string` reserve their writer-owned body
   capacity and full old + new growth peaks. Body storage is destroyed before
   its reservation is returned; direct body edits are reconciled without a
-  pre-growth guarantee. Buffered synchronous HTTP/1 wire capacity is
-  measured and reserved while its writer body remains charged, then
-  transferred to the pending queue. HTTP/1 detached state reserves its
+  pre-growth guarantee. Buffered synchronous and detached HTTP/1 wire
+  capacity is measured and reserved while its response body remains charged,
+  then transferred to the pending queue. HTTP/1 detached state reserves its
   requested malloc bytes through final free, and mailbox arrays retain their
   capacity reservations through drained-batch destruction. Detached `respond`
   adopts actual body capacity and `send` reserves exact chunk capacity before
   allocation. Each message keeps its body reservation through queue/batch and
   borrowed consumer ownership, releasing it after body destruction. Caller-owned
-  allocations before adoption, detached headers and wire remain accounting gaps.
+  allocations before adoption, detached headers and streaming wire remain
+  accounting gaps.
   Raw read scratch uses fixed stack arrays; TLS retains a charged retry buffer.
   Pending 100-continue bytes and HTTP/1 error wire reserve capacity before
   allocation. Header/String/parser scratch, other encoders, native provider
