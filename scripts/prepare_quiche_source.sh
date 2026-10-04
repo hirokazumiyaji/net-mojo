@@ -40,6 +40,7 @@ task_quiche_patches=(
     quiche-0.29.3-receive-budget.patch
     quiche-0.29.3-empty-stream-horizon.patch
     quiche-0.29.3-send-budget.patch
+    quiche-0.29.3-send-budget-propagation.patch
 )
 for task_quiche_patch in "${task_quiche_patches[@]}"; do
     GIT_CEILING_DIRECTORIES="$task_quiche_stage" \
