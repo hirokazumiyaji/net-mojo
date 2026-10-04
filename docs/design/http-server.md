@@ -137,7 +137,9 @@ budget を予約できない request は受信を継続せず、可能なら 503
 接続上限に達したら listener の受け入れを一時停止し、空きができたら再開する。
 
 deadline は単調時計による絶対時刻とし、byte を一つ受信するたびに延長しない。
-indexed min-heap などで一接続一 deadline を更新し、期限確認のために毎回全接続を走査しない。
+接続ごとの heap 位置を持つ indexed min-heap で、期限の登録、更新、削除を O(log N) で処理する。
+有効な deadline ごとに一要素だけ保持し、期限の延長や接続 slot の再利用で古い要素を蓄積しない。
+期限確認のために毎回全接続を走査しない。
 停止要求は accept を止め、idle 接続を閉じ、開始済み request の response を猶予内で送って閉じる。
 期限に達したら owner が残った接続を解除して close する。完了済みまたは pipeline 内の次 request は新規処理しない。
 handler の同期実行自体は強制中断できないため、停止期限も handler が制御を返すことを前提とする。

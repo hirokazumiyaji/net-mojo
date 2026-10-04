@@ -11,6 +11,7 @@ from net.http import (
     ServerConfig,
     ServerControl,
 )
+from net.http._deadline import NO_DEADLINE, now_ns
 from tests.support import _tick_n
 
 
@@ -1154,6 +1155,110 @@ def test_serve_with_control_uses_caller_handle() raises:
     server.serve_with_control(listener^, handler, control)
     assert_true(control.is_shutdown_requested())
     assert_equal(server.active_connections(), 0)
+
+
+def test_deadline_rearm_keeps_one_entry_per_connection() raises:
+    var server = Server(ServerConfig.default())
+    server.add_listener(listen_tcp("127.0.0.1:0"))
+    var handler = _HelloHandler()
+    var client = dial_tcp(
+        String("127.0.0.1:") + String(server.local_address().port),
+        Timeout.seconds(2),
+    )
+    _tick_n(server, handler, 2)
+    assert_equal(server.active_connections(), 1)
+    var base = now_ns()
+    for i in range(1000):
+        server._conns[0].idle_at = base + 1_000_000_000 + i
+        server._arm_deadline(0)
+    assert_equal(len(server._deadline_heap), 1)
+    server._conns[0].idle_at = NO_DEADLINE
+    server._arm_deadline(0)
+    assert_equal(len(server._deadline_heap), 0)
+    server._conns[0].idle_at = base + 2_000_000_000
+    server._arm_deadline(0)
+    assert_equal(len(server._deadline_heap), 1)
+    server._close_conn(0)
+    assert_equal(len(server._deadline_heap), 0)
+    client.close()
+
+
+def test_deadline_close_and_slot_reuse_removes_old_entries() raises:
+    var server = Server(ServerConfig.default())
+    server.add_listener(listen_tcp("127.0.0.1:0"))
+    var handler = _HelloHandler()
+    var address = String("127.0.0.1:") + String(server.local_address().port)
+    var base = now_ns()
+    for _ in range(20):
+        var client = dial_tcp(address, Timeout.seconds(2))
+        _tick_n(server, handler, 2)
+        assert_equal(len(server._conns), 1)
+        server._conns[0].idle_at = base + 10_000_000
+        server._arm_deadline(0)
+        server._conns[0].idle_at = base + 20_000_000
+        server._arm_deadline(0)
+        server._expire_deadlines(base + 10_000_000)
+        assert_equal(server.active_connections(), 1)
+        server._close_conn(0)
+        assert_equal(len(server._deadline_heap), 0)
+        client.close()
+
+
+def test_deadline_updates_preserve_order_and_expiration() raises:
+    var server = Server(ServerConfig.default())
+    server.add_listener(listen_tcp("127.0.0.1:0"))
+    var handler = _HelloHandler()
+    var address = String("127.0.0.1:") + String(server.local_address().port)
+    var clients = List[TCPConn]()
+    for _ in range(5):
+        clients.append(dial_tcp(address, Timeout.seconds(2)))
+    _tick_n(server, handler, 2)
+    assert_equal(server.active_connections(), 5)
+    var base = now_ns()
+    for i in range(5):
+        server._conns[i].idle_at = base + (i + 1) * 10_000_000
+        server._arm_deadline(i)
+    server._conns[0].idle_at = base + 60_000_000
+    server._arm_deadline(0)
+    server._conns[4].idle_at = base + 5_000_000
+    server._arm_deadline(4)
+    assert_equal(server._compute_timeout(base, None).value()._value, 5_000_000)
+    server._close_conn(2)
+    server._expire_deadlines(base + 5_000_000)
+    assert_false(server._conns[4].active)
+    assert_equal(server.active_connections(), 3)
+    assert_equal(server._compute_timeout(base, None).value()._value, 20_000_000)
+    server._expire_deadlines(base + 20_000_000)
+    assert_false(server._conns[1].active)
+    assert_true(server._conns[0].active)
+    assert_true(server._conns[3].active)
+    assert_equal(server._compute_timeout(base, None).value()._value, 40_000_000)
+    server._expire_deadlines(base + 60_000_000)
+    assert_equal(server.active_connections(), 0)
+    assert_equal(len(server._deadline_heap), 0)
+    for i in range(len(clients)):
+        clients[i].close()
+
+
+def test_expired_entry_rearms_current_connection_deadline() raises:
+    var server = Server(ServerConfig.default())
+    server.add_listener(listen_tcp("127.0.0.1:0"))
+    var handler = _HelloHandler()
+    var client = dial_tcp(
+        String("127.0.0.1:") + String(server.local_address().port),
+        Timeout.seconds(2),
+    )
+    _tick_n(server, handler, 2)
+    var base = now_ns()
+    server._conns[0].idle_at = base + 10_000_000
+    server._arm_deadline(0)
+    server._conns[0].idle_at = base + 20_000_000
+    server._expire_deadlines(base + 10_000_000)
+    assert_equal(server.active_connections(), 1)
+    assert_equal(server._compute_timeout(base, None).value()._value, 20_000_000)
+    server._expire_deadlines(base + 20_000_000)
+    assert_equal(server.active_connections(), 0)
+    client.close()
 
 
 def main() raises:

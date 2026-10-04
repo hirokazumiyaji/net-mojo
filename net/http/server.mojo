@@ -102,7 +102,6 @@ comptime _QUIC_CLOSE_DRAIN_NS: Int = 3_000_000_000
 struct _HeapEntry(Copyable, ImplicitlyCopyable, Movable):
     var deadline: Int
     var idx: Int
-    var seq: UInt64
 
 
 struct ServerControl(Movable):
@@ -163,8 +162,7 @@ struct Server(Movable):
     var _urgent: List[Int]
     var _urgent_flag: List[Bool]
     var _deadline_heap: List[_HeapEntry]
-    var _deadline_seq: List[UInt64]
-    var _armed_mark: List[Int]
+    var _deadline_pos: List[Int]
     var _wakeup_channel: WakeupChannel
     var _wakeup_token: ReactorToken
     var _detached_conns: List[Int]
@@ -194,8 +192,7 @@ struct Server(Movable):
         self._urgent = List[Int]()
         self._urgent_flag = List[Bool]()
         self._deadline_heap = List[_HeapEntry]()
-        self._deadline_seq = List[UInt64]()
-        self._armed_mark = List[Int]()
+        self._deadline_pos = List[Int]()
         self._wakeup_channel = WakeupChannel()
         var wtoken = self._reactor.register(self._wakeup_channel.read_fd())
         self._wakeup_token = wtoken.copy()
@@ -494,8 +491,7 @@ struct Server(Movable):
         while len(self._tick_seen) <= idx:
             self._tick_seen.append(-1)
             self._urgent_flag.append(False)
-            self._deadline_seq.append(1)
-            self._armed_mark.append(NO_DEADLINE)
+            self._deadline_pos.append(-1)
 
     def _push_urgent(mut self, idx: Int):
         if idx < 0 or idx >= len(self._urgent_flag):
@@ -553,66 +549,71 @@ struct Server(Movable):
         if idx < 0 or idx >= len(self._conns):
             return
         self._ensure_conn_arrays(idx)
-        if not self._conns[idx].active:
-            self._armed_mark[idx] = NO_DEADLINE
-            return
         var mark = self._next_deadline(idx)
-        if mark == self._armed_mark[idx]:
-            return
-        var seq = self._deadline_seq[idx] + 1
-        if seq == 0:
-            seq = 1
-        self._deadline_seq[idx] = seq
-        self._armed_mark[idx] = mark
+        var pos = self._deadline_pos[idx]
         if mark == NO_DEADLINE:
+            if pos != -1:
+                self._heap_remove(pos)
             return
-        self._heap_push(mark, idx, seq)
+        if pos == -1:
+            self._deadline_pos[idx] = len(self._deadline_heap)
+            self._deadline_heap.append(_HeapEntry(deadline=mark, idx=idx))
+            self._heap_repair(len(self._deadline_heap) - 1)
+        elif self._deadline_heap[pos].deadline != mark:
+            self._deadline_heap[pos].deadline = mark
+            self._heap_repair(pos)
 
-    def _heap_push(mut self, deadline: Int, idx: Int, seq: UInt64):
-        self._deadline_heap.append(
-            _HeapEntry(deadline=deadline, idx=idx, seq=seq)
-        )
-        var pos = len(self._deadline_heap) - 1
-        while pos > 0:
-            var parent = (pos - 1) // 2
+    def _heap_swap(mut self, left: Int, right: Int):
+        var tmp = self._deadline_heap[left]
+        self._deadline_heap[left] = self._deadline_heap[right]
+        self._deadline_heap[right] = tmp
+        self._deadline_pos[self._deadline_heap[left].idx] = left
+        self._deadline_pos[self._deadline_heap[right].idx] = right
+
+    def _heap_repair(mut self, pos: Int):
+        var current = pos
+        while current > 0:
+            var parent = (current - 1) // 2
             if (
                 self._deadline_heap[parent].deadline
-                <= self._deadline_heap[pos].deadline
+                <= self._deadline_heap[current].deadline
             ):
                 break
-            var tmp = self._deadline_heap[parent]
-            self._deadline_heap[parent] = self._deadline_heap[pos]
-            self._deadline_heap[pos] = tmp
-            pos = parent
+            self._heap_swap(parent, current)
+            current = parent
+        while True:
+            var left = current * 2 + 1
+            var right = left + 1
+            var smallest = current
+            if (
+                left < len(self._deadline_heap)
+                and self._deadline_heap[left].deadline
+                < self._deadline_heap[smallest].deadline
+            ):
+                smallest = left
+            if (
+                right < len(self._deadline_heap)
+                and self._deadline_heap[right].deadline
+                < self._deadline_heap[smallest].deadline
+            ):
+                smallest = right
+            if smallest == current:
+                break
+            self._heap_swap(current, smallest)
+            current = smallest
+
+    def _heap_remove(mut self, pos: Int):
+        var idx = self._deadline_heap[pos].idx
+        var last = self._deadline_heap.pop()
+        self._deadline_pos[idx] = -1
+        if pos < len(self._deadline_heap):
+            self._deadline_heap[pos] = last^
+            self._deadline_pos[self._deadline_heap[pos].idx] = pos
+            self._heap_repair(pos)
 
     def _heap_pop(mut self) -> _HeapEntry:
         var top = self._deadline_heap[0]
-        var last = self._deadline_heap.pop()
-        if len(self._deadline_heap) > 0:
-            self._deadline_heap[0] = last^
-            var pos = 0
-            while True:
-                var left = pos * 2 + 1
-                var right = left + 1
-                var smallest = pos
-                if (
-                    left < len(self._deadline_heap)
-                    and self._deadline_heap[left].deadline
-                    < self._deadline_heap[smallest].deadline
-                ):
-                    smallest = left
-                if (
-                    right < len(self._deadline_heap)
-                    and self._deadline_heap[right].deadline
-                    < self._deadline_heap[smallest].deadline
-                ):
-                    smallest = right
-                if smallest == pos:
-                    break
-                var tmp = self._deadline_heap[pos]
-                self._deadline_heap[pos] = self._deadline_heap[smallest]
-                self._deadline_heap[smallest] = tmp
-                pos = smallest
+        self._heap_remove(0)
         return top^
 
     def _expire_deadlines(mut self, now: Int) raises NetError:
@@ -645,20 +646,9 @@ struct Server(Movable):
                 break
             _ = self._heap_pop()
             var idx = top.idx
-            if idx < 0 or idx >= len(self._conns):
-                continue
-            if not self._conns[idx].active:
-                continue
-            if (
-                idx >= len(self._deadline_seq)
-                or self._deadline_seq[idx] != top.seq
-            ):
-                continue
-            # Recompute: only phases that can fire for the current state
-            # close. Stale timestamps from earlier phases must not kill a
-            # connection (e.g. an old header deadline during a long send).
             var mark = self._next_deadline(idx)
             if mark == NO_DEADLINE or mark > now:
+                self._arm_deadline(idx)
                 continue
             if self._conns[idx].state == STATE_DETACHED:
                 self._handle_detached_timeout(idx)
@@ -1056,13 +1046,10 @@ struct Server(Movable):
                 self._slot_map[token.slot] = -1
         if idx >= 0 and idx < len(self._urgent_flag):
             self._urgent_flag[idx] = False
-        if idx >= 0 and idx < len(self._deadline_seq):
-            var seq = self._deadline_seq[idx] + 1
-            if seq == 0:
-                seq = 1
-            self._deadline_seq[idx] = seq
-        if idx >= 0 and idx < len(self._armed_mark):
-            self._armed_mark[idx] = NO_DEADLINE
+        if idx < len(self._deadline_pos):
+            var pos = self._deadline_pos[idx]
+            if pos != -1:
+                self._heap_remove(pos)
         # Release the whole pending reservation, not just the unsent
         # suffix: bytes already written were charged when queued, and
         # leaving the sent prefix charged would leak budget on every
@@ -2570,28 +2557,11 @@ struct Server(Movable):
                 best = Int(left_ms)
         if self._quic_close_at != NO_DEADLINE:
             best = _sooner(best, self._quic_close_at, now)
-        # Heap peek only: no scan over idle connections. Stale entries are
-        # skipped without popping so a burst of invalidations never costs
-        # more than the live minimum.
         while len(self._deadline_heap) > 0:
             var top = self._deadline_heap[0]
-            var idx = top.idx
-            if (
-                idx < 0
-                or idx >= len(self._conns)
-                or not self._conns[idx].active
-            ):
-                _ = self._heap_pop()
-                continue
-            if (
-                idx >= len(self._deadline_seq)
-                or self._deadline_seq[idx] != top.seq
-            ):
-                _ = self._heap_pop()
-                continue
-            var mark = self._next_deadline(idx)
-            if mark == NO_DEADLINE or mark != top.deadline:
-                _ = self._heap_pop()
+            var mark = self._next_deadline(top.idx)
+            if mark != top.deadline:
+                self._arm_deadline(top.idx)
                 continue
             best = _sooner(best, mark, now)
             break
