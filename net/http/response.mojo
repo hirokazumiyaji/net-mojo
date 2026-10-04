@@ -211,6 +211,6 @@ def maybe_inject_alt_svc(
     """
     if alt_svc.byte_length() == 0:
         return
-    if writer.headers.get_first("Alt-Svc"):
+    if writer.headers._first_lower_index("alt-svc") >= 0:
         return
     writer.headers.add(String("Alt-Svc"), String(alt_svc))

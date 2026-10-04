@@ -283,6 +283,12 @@ struct Headers(Movable, Sized):
                 return String(from_utf8_lossy=Span(self._values[i]))
         return None
 
+    def _first_lower_index(self, lower_name: StringSlice) -> Int:
+        for i in range(len(self._lower_names)):
+            if self._lower_names[i] == lower_name:
+                return i
+        return -1
+
     def get_all(self, name: StringSlice) -> List[String]:
         var out = List[String]()
         var needle = String(name).lower()

@@ -602,5 +602,263 @@ def test_error_encoding_is_bounded() raises:
     assert_true(text.endswith("\r\n\r\n400 Bad Request"))
 
 
+def _assert_scratch_wire(
+    writer: ResponseWriter,
+    chunked: Bool,
+    is_head: Bool,
+    date: StringSlice,
+    expected: StringSlice,
+) raises:
+    var capacity = _measure_chunked_start(
+        writer, is_head, date, 100, 32768
+    ) if chunked else _measure_response(writer, is_head, date, 100, 32768)
+    assert_equal(capacity, expected.byte_length())
+    for admitted in [False, True]:
+        var budget = BufferBudget(5 + capacity - Int(not admitted))
+        assert_true(budget.try_reserve(5))
+        var rejected = False
+        var wire = List[Byte]()
+        try:
+            if chunked:
+                wire = _encode_chunked_start_budgeted(
+                    writer, is_head, date, 100, 32768, budget
+                )
+            else:
+                wire = _encode_response_budgeted(
+                    writer, is_head, date, 100, 32768, budget
+                )
+        except error:
+            assert_equal(error.kind, NetErrorKind.invalid_argument())
+            rejected = True
+        assert_equal(rejected, not admitted)
+        if admitted:
+            assert_equal(wire.capacity(), capacity)
+            assert_equal(budget.used, 5 + capacity)
+            assert_equal(_bytes_to_string(Span(wire)), expected)
+            _ = wire^
+            budget.release(capacity)
+        assert_equal(budget.used, 5)
+
+
+def test_long_mixed_case_name_and_date_preserve_exact_framing() raises:
+    var name = String("X-")
+    var date = String("date-")
+    for _ in range(256):
+        name += "Ab"
+        date += "d"
+    for chunked in [False, True]:
+        for is_head in [False, True]:
+            var writer = ResponseWriter(32)
+            writer.headers.add(name.copy(), String("value"))
+            writer.write_string("ok")
+            var expected = String("HTTP/1.1 200 OK\r\n")
+            expected += name + ": value\r\nDate: " + date + "\r\n"
+            expected += "Transfer-Encoding: chunked\r\n\r\n" if chunked else (
+                "Content-Length: 2\r\n\r\n"
+            )
+            if not chunked and not is_head:
+                expected += "ok"
+            _assert_scratch_wire(writer, chunked, is_head, date, expected)
+
+
+def test_empty_existing_date_preserves_presence_and_skips_unused_date() raises:
+    for chunked in [False, True]:
+        var writer = ResponseWriter(32)
+        writer.headers.add(String("dAtE"), String(""))
+        var expected = String("HTTP/1.1 200 OK\r\ndAtE: \r\n")
+        expected += "Transfer-Encoding: chunked\r\n\r\n" if chunked else (
+            "Content-Length: 0\r\n\r\n"
+        )
+        _assert_scratch_wire(writer, chunked, False, "unused\r\n", expected)
+
+
+def test_connection_first_raw_token_boundaries_preserve_close_decision() raises:
+    for variant in range(6):
+        var raw = List[Byte]()
+        var token: String
+        if variant == 0:
+            token = String("keep-alive, \tClOsE \t,,")
+        elif variant == 1:
+            token = String("x-close, close-ended")
+            for _ in range(256):
+                token += "x"
+        elif variant == 2:
+            raw.append(128)
+            token = String("close")
+        elif variant == 3:
+            token = String("keep-alive")
+        elif variant == 4:
+            token = String("close")
+        else:
+            token = String("CLOſE")
+        for byte in token.as_bytes():
+            raw.append(byte)
+        for chunked in [False, True]:
+            var writer = ResponseWriter(32)
+            writer.should_close = True
+            writer.headers.add_bytes(String("cOnNeCtIoN"), Span(raw))
+            if variant == 3:
+                writer.headers.add(String("Connection"), String("close"))
+            elif variant == 4:
+                writer.headers.add(String("Connection"), String("x-close"))
+            var expected = List[Byte]()
+            for byte in String("HTTP/1.1 200 OK\r\ncOnNeCtIoN: ").as_bytes():
+                expected.append(byte)
+            for byte in raw:
+                expected.append(byte)
+            var suffix = String("\r\n")
+            if variant == 3:
+                suffix += "Connection: close\r\n"
+            elif variant == 4:
+                suffix += "Connection: x-close\r\n"
+            suffix += "Date: date\r\n"
+            suffix += "Transfer-Encoding: chunked\r\n" if chunked else (
+                "Content-Length: 0\r\n"
+            )
+            if variant != 0 and variant != 4:
+                suffix += "Connection: close\r\n"
+            suffix += "\r\n"
+            for byte in suffix.as_bytes():
+                expected.append(byte)
+            var measured = _measure_chunked_start(
+                writer, False, "date", 100, 32768
+            ) if chunked else _measure_response(
+                writer, False, "date", 100, 32768
+            )
+            assert_equal(measured, len(expected))
+            var wire = encode_chunked_start(
+                writer, False, "date", 100, 32768
+            ) if chunked else encode_response(writer, False, "date", 100, 32768)
+            assert_equal(len(wire), len(expected))
+            for i in range(len(expected)):
+                assert_equal(wire[i], expected[i])
+
+
+def test_content_length_first_value_leading_zero_and_no_body_rules() raises:
+    var zeros = String("")
+    for _ in range(1024):
+        zeros += "0"
+    for is_head in [False, True]:
+        var writer = ResponseWriter(32)
+        writer.headers.add(String("cOnTeNt-LeNgTh"), zeros + "2")
+        writer.headers.add(String("Content-Length"), String("invalid later"))
+        writer.write_string("ok")
+        var expected = String(
+            "HTTP/1.1 200 OK\r\nDate: date\r\nContent-Length: 2\r\n\r\n"
+        )
+        if not is_head:
+            expected += "ok"
+        _assert_scratch_wire(writer, False, is_head, "date", expected)
+    var no_body = ResponseWriter(32)
+    no_body.status = 204
+    no_body.headers.add(String("Content-Length"), String("invalid first"))
+    _assert_scratch_wire(
+        no_body,
+        False,
+        False,
+        "date",
+        "HTTP/1.1 204 Unknown\r\nDate: date\r\n\r\n",
+    )
+
+
+def test_empty_presence_and_content_length_errors_preserve_validation_order() raises:
+    for variant in range(9):
+        var writer = ResponseWriter(32)
+        writer.write_string("ok")
+        var raw: Array[Byte, 1] = [255]
+        if variant == 0:
+            writer.headers.add(String("Content-Length"), String(""))
+        elif variant == 1:
+            writer.headers.add_bytes(String("Content-Length"), Span(raw))
+        elif variant == 2:
+            writer.headers.add(
+                String("Content-Length"), String("999999999999999999999999999")
+            )
+        elif variant == 8:
+            writer.headers.add(String("Content-Length"), String("bad"))
+            writer.headers.add(String("Content-Length"), String("2"))
+        else:
+            writer.headers.add(String("Content-Length"), String("bad"))
+            writer.headers.add(String("Transfer-Encoding"), String(""))
+        var expected = String("Content-Length is invalid")
+        var max_headers = 100
+        var max_bytes = 32768
+        var chunked = variant == 6 or variant == 7
+        if variant == 2:
+            expected = String("Content-Length does not match body")
+        elif variant == 3:
+            max_headers = 1
+            expected = String("too many response headers")
+        elif variant == 4:
+            max_bytes = 0
+            expected = String("response headers too large")
+        elif variant == 5:
+            expected = String("Transfer-Encoding is not supported on responses")
+        elif chunked:
+            if variant == 7:
+                writer.headers.clear()
+                writer.headers.add(String("Transfer-Encoding"), String(""))
+                expected = String(
+                    "Transfer-Encoding header is managed by chunked encoder"
+                )
+            else:
+                writer.headers.clear()
+                writer.headers.add(String("Content-Length"), String(""))
+                writer.headers.add(String("Transfer-Encoding"), String(""))
+                expected = String(
+                    "Content-Length is not permitted with chunked"
+                    " Transfer-Encoding"
+                )
+        var budget = BufferBudget(4096)
+        assert_true(budget.try_reserve(5))
+        var rejected = False
+        try:
+            if chunked:
+                _ = _encode_chunked_start_budgeted(
+                    writer, False, "date", max_headers, max_bytes, budget
+                )
+            else:
+                _ = _encode_response_budgeted(
+                    writer, False, "date", max_headers, max_bytes, budget
+                )
+        except error:
+            assert_equal(error.kind, NetErrorKind.invalid_argument())
+            assert_equal(error.message, expected)
+            rejected = True
+        assert_true(rejected)
+        assert_equal(budget.used, 5)
+
+
+def test_error_long_date_and_alt_svc_measure_exact_prepaid_head_wire() raises:
+    var date = String("date-")
+    var alt = String('h3=":8443"; note="')
+    for _ in range(512):
+        date += "d"
+        alt += "a"
+    alt += '"'
+    for is_head in [False, True]:
+        var expected = (
+            String(
+                "HTTP/1.1 503 Service Unavailable\r\nContent-Type:"
+                " text/plain\r\nDate: "
+            )
+            + date
+            + "\r\nContent-Length: 23\r\nConnection: close\r\nAlt-Svc: "
+            + alt
+            + "\r\n\r\n"
+        )
+        if not is_head:
+            expected += "503 Service Unavailable"
+        var capacity = _measure_error(503, True, date, is_head, alt)
+        assert_equal(capacity, expected.byte_length())
+        var prepaid = List[Byte](capacity=capacity)
+        var address = Int(prepaid.unsafe_ptr())
+        var byte_count = 0
+        _render_error[False](503, True, date, is_head, alt, prepaid, byte_count)
+        assert_equal(prepaid.capacity(), capacity)
+        assert_equal(Int(prepaid.unsafe_ptr()), address)
+        assert_equal(_bytes_to_string(Span(prepaid)), expected)
+
+
 def main() raises:
     TestSuite.discover_tests[__functions_in_module()]().run()
