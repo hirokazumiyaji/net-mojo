@@ -18,9 +18,14 @@ request : 1us 4us 2us 3us 4us 2us 1us 100%
 H3_RESULT = "req_s=100.000 p50_us=2 p95_us=3 p99_us=4 ok=100 failed=0 samples=100\n"
 
 
-def measurement_functions(protocol):
-    script = ROOT / f"benchmarks/http/run_http{protocol}_bench.sh"
-    names = ("to_us", "run_h2load") if protocol == 2 else ("run_load",)
+def measurement_functions(protocol, multiplex=False):
+    script = ROOT / (
+        "benchmarks/http/run_multiplex_matrix.sh"
+        if multiplex else f"benchmarks/http/run_http{protocol}_bench.sh"
+    )
+    names = ("run_h3_cell",) if multiplex else (
+        ("to_us", "run_h2load") if protocol == 2 else ("run_load",)
+    )
     source = script.read_text()
     return "\n".join(
         re.search(rf"^{name}\(\) \{{\n.*?^\}}", source, re.M | re.S)[0]
@@ -29,7 +34,9 @@ def measurement_functions(protocol):
 
 
 class BenchmarkHarnessTests(unittest.TestCase):
-    def run_measurement(self, protocol, output, loader_rc=0, sampler=True):
+    def run_measurement(
+        self, protocol, output, loader_rc=0, sampler=True, multiplex=False
+    ):
         with tempfile.TemporaryDirectory() as directory:
             work = Path(directory)
             fixture = work / "loader.out"
@@ -45,7 +52,9 @@ class BenchmarkHarnessTests(unittest.TestCase):
                 )
             loader.write_text("#!/usr/bin/env bash\n" + body)
             loader.chmod(0o755)
-            sample = work / "peer_c1_m1_r1.sample"
+            output_dir = work / "h3" if multiplex else work
+            output_dir.mkdir(exist_ok=True)
+            sample = output_dir / "peer_c1_m1_r1.sample"
             sample.write_text("cpu_pct=999 rss_kb=999 fd_count=999\n")
             sampler_body = (
                 'printf "cpu_pct=1 rss_kb=2 fd_count=3\\n" >"$2"'
@@ -53,22 +62,28 @@ class BenchmarkHarnessTests(unittest.TestCase):
                 else "return 0"
             )
             runner = work / "run.sh"
-            function = "run_h2load" if protocol == 2 else "run_load"
+            function = "run_h3_cell" if multiplex else (
+                "run_h2load" if protocol == 2 else "run_load"
+            )
+            failures = "MATRIX_FAILURES" if multiplex else "BENCH_FAILURES"
             runner.write_text(
                 "set -euo pipefail\n"
                 f"OUT_DIR={shlex.quote(directory)}\n"
-                "BENCH_FAILURES=0\nWARMUP_S=0\nMEASURE_S=0\nLOSS_PCT=0\n"
+                "BENCH_FAILURES=0\nMATRIX_FAILURES=0\n"
+                "WARMUP_S=0\nMEASURE_S=0\nLOSS_PCT=0\n"
                 f"PIXI_PYTHON={shlex.quote(str(loader))}\n"
+                f"PIXI_PYTHON_H3={shlex.quote(str(loader))}\n"
                 f"h2load() {{ {shlex.quote(str(loader))} \"$@\"; }}\n"
+                "sampler_delay() { printf '0'; }\n"
                 f"sample_server() {{ {sampler_body}; }}\n"
-                + measurement_functions(protocol)
+                + measurement_functions(protocol, multiplex)
                 + f"\n{function} peer https://unused/fixed 1 1 1 1\n"
-                + '[ "$BENCH_FAILURES" -eq 0 ]\n'
+                + f'[ "${failures}" -eq 0 ]\n'
             )
             result = subprocess.run(
                 ["bash", str(runner)], capture_output=True, text=True, timeout=10
             )
-            summary = work / "summary.tsv"
+            summary = output_dir / "summary.tsv"
             return result, summary.read_text() if summary.exists() else ""
 
     def test_accepts_valid_measurement_and_refreshes_sample(self):
@@ -100,6 +115,22 @@ class BenchmarkHarnessTests(unittest.TestCase):
             with self.subTest(protocol=protocol, output=output):
                 result, _ = self.run_measurement(protocol, output)
                 self.assertNotEqual(result.returncode, 0)
+
+    def test_h3_accepts_appended_phase_and_window_metadata(self):
+        output = H3_RESULT.rstrip() + (
+            " warmup_successes=7 late_responses=2"
+            " load_start_unix_s=1700000000.004000"
+            " measurement_start_unix_s=1700000010.004000"
+            " measurement_end_unix_s=1700000040.004000"
+            " clock_anchor_span_s=0.004 rate_denominator_s=30\n"
+        )
+        for multiplex, line in ((False, output), (True, H3_RESULT), (True, output)):
+            with self.subTest(multiplex=multiplex, line=line):
+                result, summary = self.run_measurement(3, line, multiplex=multiplex)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(len(summary.splitlines()), 1)
+                self.assertEqual(summary.count("\tok=100\tfailed=0\trc=0\t"), 1)
+                self.assertIn("p95_us=3\tp99_us=4", summary)
 
     def test_rejects_missing_or_invalid_percentiles(self):
         for protocol, output in ((2, H2_RESULT), (3, H3_RESULT)):

@@ -571,6 +571,26 @@ gitignored).
   streams `1` and `10`. Loader and server share the host (same caveat as
   PR 9). Mojo unpinned; aioquic is a single asyncio process.
 
+The H3 loader preserves its seven metric tokens and appends `warmup_successes`,
+`late_responses`, `load_start_unix_s`, `measurement_start_unix_s`,
+`measurement_end_unix_s`, `clock_anchor_span_s` and `rate_denominator_s`.
+The endpoints describe its scheduled completion window, including both
+boundaries. Quantiles contain successful responses completed in that window;
+a request begun during warmup retains its full latency. `late_responses` counts
+status200 completions after the deadline, before fixed-body validation. Failed
+counts cover all phases and connection errors; these are not conserved request
+counts. Existing exit gates and classification are unchanged.
+
+A wall-clock reading bracketed by two `perf_counter` readings maps the schedule
+through the bracket midpoint. Epoch fields have six decimal places; mapping
+uncertainty includes half the reported bracket span, clock precision and
+formatting. One anchor cannot detect later wall-clock steps or drift. For
+same-host resource clipping, select sample timestamps within the mapped window;
+interval CPU observations need both endpoints inside it. Handshakes use the
+scheduled warmup, and final drain can finish later. These fields do not establish
+client saturation, handshake timing or full-window resource evidence; historical
+mid-run samples still use their original startup-relative delays.
+
 ### Reproduce
 
 ```bash
