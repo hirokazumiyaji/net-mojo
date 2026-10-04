@@ -31,6 +31,45 @@ Verified Phase 0 (loopback, `GOMAXPROCS=1`):
   or a separate host.
 - Production measurements use optimized executables.
 
+## Process resource samples
+
+Monitor the actual server and load-generator PIDs on Linux or macOS with
+Python 3.9 or later. Linux requires kernel `pidfd_open` support:
+
+```bash
+python3 benchmarks/http/sample_resources.py --server-pid "$SERVER_PID" --loader-pid "$LOADER_PID" --interval 1 --samples 30 > resources.json
+python3 -m unittest discover -s benchmarks/http -p test_sample_resources.py
+```
+
+Both processes must outlive the requested samples. Sampling starts immediately;
+the last planned sample is at `(samples - 1) * interval`, followed by collection
+time. The command emits JSON and exits nonzero if either original process exits,
+is replaced, or cannot be inspected. Terminal observations omit CPU, RSS and FD
+metrics rather than reporting zero. A kernel process watch and initial start
+token preserve the original process identity.
+
+Each observation records wall and monotonic timestamps, cumulative CPU seconds,
+interval CPU percent, RSS bytes and numeric open FD count. CPU percent uses
+actual CPU capture times; 100% means one CPU core, and the first observation has
+no interval percent. Linux reads `/proc` directly, with CPU resolution of one
+clock tick. macOS reads cumulative `ps` TIME (0.01-second resolution) and counts
+numeric `lsof` FDs, excluding mappings such as `cwd` and `txt`.
+
+Linux also reports CPU affinity and the strictest visible cgroup v2 ancestor
+quota. `visible_limit` and `visible_unlimited` describe only that visible tree:
+outer ancestor quotas can be hidden by a cgroup namespace. `unavailable` means
+the relevant metadata could not be read. macOS reports affinity and quota as
+null with quota state `not_exposed`. Host logical CPU count is metadata, not a
+claim about the target's available CPU capacity.
+
+The artifact records actual schedule lag, per-sample collection wall time, and
+collector CPU time including its `ps`/`lsof` helpers. These costs quantify the
+collector's work; they do not establish its effect on benchmark results.
+Delayed samples retain their actual timestamps. Align samples with workload
+windows before drawing conclusions; this command does not yet receive loader
+window markers. Client start-lag diagnostics and resource samples still require
+controlled comparison runs to establish client capacity or server efficiency.
+
 ## Saturated HTTP/1 load
 
 Build the independent Go standard-library loader with Go 1.26.4:
