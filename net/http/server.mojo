@@ -70,7 +70,6 @@ from ._detach import (
 )
 from ._encoder import (
     current_http_date,
-    encode_100_continue,
     encode_chunk,
     encode_chunk_end,
     encode_chunked_start,
@@ -1854,7 +1853,8 @@ struct Server(Movable):
                 break
 
     def _send_100(mut self, idx: Int) raises NetError -> Bool:
-        var cont = encode_100_continue()
+        comptime CONTINUE: StaticString = "HTTP/1.1 100 Continue\r\n\r\n"
+        var cont = CONTINUE.as_bytes()
         # The interim send obeys the same per-tick allowance as every
         # other write: cap the slice and account for it, so a tiny
         # allowance cannot be overshot and later writes do not get a
@@ -1866,18 +1866,25 @@ struct Server(Movable):
             allowance = 0
         var first = len(cont) if len(cont) < allowance else allowance
         try:
-            var written = self._conns[idx].try_write_bytes(Span(cont)[0:first])
+            var written = 0
+            try:
+                written = self._conns[idx].try_write_bytes(cont[0:first])
+            except e:
+                if e.kind != NetErrorKind.timeout():
+                    raise e^
             if self._conns[idx].tls_write_closed:
                 self._close_conn(idx)
                 return False
             self._conns[idx].bytes_this_tick += written
             if written < len(cont):
-                var rest = List[Byte]()
-                for i in range(written, len(cont)):
-                    rest.append(cont[i])
-                if not self._conns[idx].set_pending(rest^, self._budget):
+                var capacity = len(cont) - written
+                if not self._budget.try_reserve(capacity):
                     self._close_conn(idx)
                     return False
+                var rest = List[Byte](capacity=capacity)
+                for i in range(written, len(cont)):
+                    rest.append(cont[i])
+                self._conns[idx]._set_reserved_pending(rest^, self._budget)
                 self._conns[idx].state = STATE_SENDING_100
                 self._conns[idx].write_at = deadline_from_now(
                     self.config.write_deadline
@@ -1885,16 +1892,7 @@ struct Server(Movable):
                 self._sync_interests(idx)
                 return False
         except e:
-            if e.kind == NetErrorKind.timeout():
-                if not self._conns[idx].set_pending(cont^, self._budget):
-                    self._close_conn(idx)
-                    return False
-                self._conns[idx].state = STATE_SENDING_100
-                self._conns[idx].write_at = deadline_from_now(
-                    self.config.write_deadline
-                )
-                self._sync_interests(idx)
-                return False
+            _ = e
             self._close_conn(idx)
             return False
         self._conns[idx].sent_100 = True
