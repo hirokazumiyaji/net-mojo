@@ -4,6 +4,39 @@ from net.http import ServerConfig
 from net.http._parser import HttpParser, parse_one
 
 
+def test_content_length_body_capacity_is_exact_and_owned() raises:
+    var config = ServerConfig.default()
+    for size in [0, 1, 5, 6000, 65536]:
+        var head = (
+            String("POST /echo HTTP/1.1\r\nHost: localhost\r\nContent-Length: ")
+            + String(size)
+            + String("\r\n\r\n")
+        )
+        var raw = head + String("b") * size
+        var buf = _to_bytes(
+            raw + String("GET /fixed HTTP/1.1\r\nHost: localhost\r\n\r\n")
+        )
+        var result = parse_one(Span(buf), config)
+        assert_true(result.is_complete())
+        assert_equal(result.consumed, raw.byte_length())
+        assert_equal(len(result.request.body), size)
+        assert_equal(result.request.body.capacity(), size)
+        if size > 0:
+            buf[head.byte_length()] = Byte(ord("x"))
+            assert_equal(result.request.body[0], Byte(ord("b")))
+
+
+def test_incomplete_content_length_does_not_allocate_body() raises:
+    var config = ServerConfig.default()
+    var buf = _to_bytes(
+        "POST /echo HTTP/1.1\r\nHost: localhost\r\nContent-Length:"
+        " 65536\r\n\r\npartial"
+    )
+    var result = parse_one(Span(buf), config)
+    assert_true(result.is_need_more())
+    assert_equal(result.request.body.capacity(), 0)
+
+
 def _to_bytes(data: StringSlice) -> List[Byte]:
     var out = List[Byte]()
     var bytes = data.as_bytes()
