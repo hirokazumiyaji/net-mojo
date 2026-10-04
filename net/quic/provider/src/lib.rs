@@ -304,6 +304,10 @@ pub unsafe extern "C" fn net_quic_server_recv(
     }
 }
 
+fn pacing_delay_ns(at: Instant, now: Instant) -> u64 {
+    u64::try_from(at.saturating_duration_since(now).as_nanos()).unwrap_or(u64::MAX)
+}
+
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn net_quic_server_send(
     server: *mut NetQuicServer,
@@ -311,15 +315,18 @@ pub unsafe extern "C" fn net_quic_server_send(
     packet_capacity: usize,
     remote_address: *mut c_char,
     address_capacity: usize,
+    send_delay_ns: *mut u64,
 ) -> i32 {
     if server.is_null()
         || packet.is_null()
         || packet_capacity == 0
         || remote_address.is_null()
         || address_capacity < 64
+        || send_delay_ns.is_null()
     {
         return -1;
     }
+    unsafe { *send_delay_ns = 0 };
     let packet = unsafe { slice::from_raw_parts_mut(packet, packet_capacity) };
     let (length, info) = match (unsafe { &mut *server })._inner.send(packet) {
         Ok(Some(packet)) => packet,
@@ -338,6 +345,7 @@ pub unsafe extern "C" fn net_quic_server_send(
             address_bytes.len(),
         );
         *remote_address.add(address_bytes.len()) = 0;
+        *send_delay_ns = pacing_delay_ns(info.at, Instant::now());
     }
     i32::try_from(length).unwrap_or(-1)
 }
@@ -1974,6 +1982,17 @@ mod tests {
     use quiche::h3::NameValue;
 
     #[test]
+    fn pacing_delay_preserves_future_send_and_saturates_past_send() {
+        let now = std::time::Instant::now();
+        let future = now + std::time::Duration::from_millis(4);
+        assert_eq!(super::pacing_delay_ns(future, now), 4_000_000);
+        assert_eq!(super::pacing_delay_ns(now, future), 0);
+        assert_eq!(super::pacing_delay_ns(now, now), 0);
+        let far_future = now + std::time::Duration::from_secs(20_000_000_000);
+        assert_eq!(super::pacing_delay_ns(far_future, now), u64::MAX);
+    }
+
+    #[test]
     fn request_memory_budget_rejects_aggregate_overflow_without_changing_usage() {
         let mut used = 0;
         let mut first = PendingRequest::default();
@@ -2414,6 +2433,7 @@ mod tests {
             }
             loop {
                 let mut destination = [0 as c_char; 64];
+                let mut send_delay_ns = u64::MAX;
                 let length = unsafe {
                     super::net_quic_server_send(
                         server,
@@ -2421,11 +2441,14 @@ mod tests {
                         packet.len(),
                         destination.as_mut_ptr(),
                         destination.len(),
+                        &mut send_delay_ns,
                     )
                 };
                 if length <= 0 {
                     break;
                 }
+                assert_ne!(send_delay_ns, u64::MAX);
+                std::thread::sleep(Duration::from_nanos(send_delay_ns));
                 if !dropped_server_packet {
                     dropped_server_packet = true;
                     continue;
@@ -2511,6 +2534,7 @@ mod tests {
             }
             loop {
                 let mut destination = [0 as c_char; 64];
+                let mut send_delay_ns = u64::MAX;
                 let length = unsafe {
                     super::net_quic_server_send(
                         server,
@@ -2518,11 +2542,14 @@ mod tests {
                         packet.len(),
                         destination.as_mut_ptr(),
                         destination.len(),
+                        &mut send_delay_ns,
                     )
                 };
                 if length <= 0 {
                     break;
                 }
+                assert_ne!(send_delay_ns, u64::MAX);
+                std::thread::sleep(Duration::from_nanos(send_delay_ns));
                 let destination = unsafe { CStr::from_ptr(destination.as_ptr()) }
                     .to_str()
                     .unwrap()
@@ -2636,6 +2663,7 @@ mod tests {
         for _ in 0..10 {
             loop {
                 let mut destination = [0 as c_char; 64];
+                let mut send_delay_ns = u64::MAX;
                 let length = unsafe {
                     super::net_quic_server_send(
                         server,
@@ -2643,11 +2671,14 @@ mod tests {
                         packet.len(),
                         destination.as_mut_ptr(),
                         destination.len(),
+                        &mut send_delay_ns,
                     )
                 };
                 if length <= 0 {
                     break;
                 }
+                assert_ne!(send_delay_ns, u64::MAX);
+                std::thread::sleep(Duration::from_nanos(send_delay_ns));
                 let destination = unsafe { CStr::from_ptr(destination.as_ptr()) }
                     .to_str()
                     .unwrap()
@@ -2745,6 +2776,7 @@ mod tests {
         for _ in 0..20 {
             loop {
                 let mut destination = [0 as c_char; 64];
+                let mut send_delay_ns = u64::MAX;
                 let length = unsafe {
                     super::net_quic_server_send(
                         server,
@@ -2752,11 +2784,14 @@ mod tests {
                         packet.len(),
                         destination.as_mut_ptr(),
                         destination.len(),
+                        &mut send_delay_ns,
                     )
                 };
                 if length <= 0 {
                     break;
                 }
+                assert_ne!(send_delay_ns, u64::MAX);
+                std::thread::sleep(Duration::from_nanos(send_delay_ns));
                 let destination = unsafe { CStr::from_ptr(destination.as_ptr()) }
                     .to_str()
                     .unwrap()

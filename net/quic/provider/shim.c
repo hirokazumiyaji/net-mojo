@@ -86,9 +86,9 @@ int32_t net_quic_receive(
 
 int32_t net_quic_send(
     struct NetQuicServer *server, uint8_t *packet, size_t packet_capacity,
-    char *remote_address, size_t address_capacity) {
+    char *remote_address, size_t address_capacity, uint64_t *send_delay_ns) {
     return net_quic_server_send(server, packet, packet_capacity,
-                                remote_address, address_capacity);
+                                remote_address, address_capacity, send_delay_ns);
 }
 
 uint64_t net_quic_timeout_micros(const struct NetQuicServer *server) {

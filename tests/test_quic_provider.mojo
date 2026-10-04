@@ -1,8 +1,10 @@
 from std.testing import assert_true, assert_false
+from std.time import perf_counter_ns
 
 from net._reactor import Reactor
 from net.address import SocketAddress
-from net.quic import QuicProvider, QuicUDPEndpoint
+from net.error import NetErrorKind
+from net.quic import QuicProvider, QuicUDPEndpoint, _send_at
 from net.http import Handler, Request, ResponseWriter, Server, ServerConfig
 from net.timeout import Timeout
 from net.udp import dial_udp, listen_udp
@@ -80,6 +82,93 @@ def test_udp_send_backpressure_preserves_pending_datagram() raises:
         assert_true(received[i] == Byte(0x40 + i))
 
 
+def test_pending_datagram_waits_for_pacing_due_time() raises:
+    var provider = QuicProvider("build/quic/libnet_quic_provider")
+    var config = provider.server_config(
+        "build/tls/test-cert.pem", "build/tls/test-key.pem"
+    )
+    var listener = listen_udp("127.0.0.1:0")
+    var endpoint = QuicUDPEndpoint(provider.server(config^), listener^)
+    var receiver = listen_udp("127.0.0.1:0")
+    var payload = Array[Byte, 1](fill=Byte(42))
+    var due = Int(perf_counter_ns()) + 10_000_000_000
+    endpoint.stage_outgoing_datagram(
+        Span(payload), receiver.local_address(), due
+    )
+    assert_false(endpoint._try_send_at(due - 1))
+    assert_false(endpoint.wants_write())
+    var incoming = Array[Byte, 1](fill=0)
+    var received_early = False
+    try:
+        _ = receiver.try_recv_from(Span[mut=True](incoming))
+        received_early = True
+    except error:
+        assert_true(error.kind == NetErrorKind.timeout())
+    assert_false(received_early)
+    assert_true(endpoint._try_send_at(due))
+    var received = receiver.recv_from(
+        Span[mut=True](incoming), Timeout.seconds(1)
+    )
+    assert_true(received.count == 1)
+    assert_true(incoming[0] == Byte(42))
+
+
+def test_pending_pacing_timer_rounds_up_to_next_microsecond() raises:
+    var provider = QuicProvider("build/quic/libnet_quic_provider")
+    var config = provider.server_config(
+        "build/tls/test-cert.pem", "build/tls/test-key.pem"
+    )
+    var listener = listen_udp("127.0.0.1:0")
+    var endpoint = QuicUDPEndpoint(provider.server(config^), listener^)
+    var payload = Array[Byte, 1](fill=Byte(42))
+    endpoint.stage_outgoing_datagram(
+        Span(payload), SocketAddress.parse("127.0.0.1:1234"), 10_000
+    )
+    assert_true(endpoint._timeout_micros_at(8_999, UInt64.MAX) == 2)
+    assert_true(endpoint._timeout_micros_at(9_000, UInt64.MAX) == 1)
+    assert_true(endpoint._timeout_micros_at(9_999, UInt64.MAX) == 1)
+    assert_true(endpoint._timeout_micros_at(10_000, UInt64.MAX) == 0)
+    assert_true(endpoint._timeout_micros_at(0, UInt64(5)) == 5)
+    assert_true(endpoint._timeout_micros_at(0, UInt64(20)) == 10)
+
+
+def test_udp_would_block_retains_pacing_due_and_bytes() raises:
+    var provider = QuicProvider("build/quic/libnet_quic_provider")
+    var config = provider.server_config(
+        "build/tls/test-cert.pem", "build/tls/test-key.pem"
+    )
+    var listener = listen_udp("127.0.0.1:0")
+    var endpoint = QuicUDPEndpoint(provider.server(config^), listener^)
+    var receiver = listen_udp("127.0.0.1:0")
+    var payload = Array[Byte, 2](fill=Byte(42))
+    endpoint.stage_outgoing_datagram(
+        Span(payload), receiver.local_address(), 10_000
+    )
+    endpoint.inject_send_would_block_once()
+    assert_false(endpoint._try_send_at(10_000))
+    assert_true(endpoint._pending_send_at == 10_000)
+    assert_true(endpoint._pending_length == 2)
+    assert_true(endpoint._pending_waiting_write)
+    assert_true(endpoint.wants_write())
+    assert_true(endpoint._timeout_micros_at(10_000, UInt64.MAX) == UInt64.MAX)
+    assert_true(endpoint._try_send_at(10_001))
+    assert_true(endpoint._pending_send_at == 0)
+    assert_false(endpoint.wants_write())
+    var incoming = Array[Byte, 2](fill=0)
+    var received = receiver.recv_from(
+        Span[mut=True](incoming), Timeout.seconds(1)
+    )
+    assert_true(received.count == 2)
+    assert_true(incoming[0] == Byte(42))
+    assert_true(incoming[1] == Byte(42))
+
+
+def test_pacing_delay_conversion_saturates_monotonic_deadline() raises:
+    assert_true(_send_at(UInt64.MAX, 100) == Int.MAX)
+    assert_true(_send_at(UInt64(42), 100) == 142)
+    assert_true(_send_at(UInt64(0), 100) == 100)
+
+
 def main() raises:
     var provider = QuicProvider("build/quic/libnet_quic_provider")
     assert_true(provider.version() == "0.29.3")
@@ -131,5 +220,9 @@ def main() raises:
             break
     assert_false(running)
 
+    test_pacing_delay_conversion_saturates_monotonic_deadline()
+    test_pending_datagram_waits_for_pacing_due_time()
+    test_pending_pacing_timer_rounds_up_to_next_microsecond()
+    test_udp_would_block_retains_pacing_due_and_bytes()
     test_udp_send_backpressure_preserves_pending_datagram()
     print("QUIC provider Mojo FFI: ok")
