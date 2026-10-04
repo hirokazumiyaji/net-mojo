@@ -9,7 +9,7 @@ from std.ffi import c_long, external_call
 
 from net.error import NetError, NetErrorKind
 
-from ._buffer import BufferBudget
+from ._buffer import _CapacityBudget
 from .error import _status_reason
 from .response import ResponseWriter, has_body_for_status
 
@@ -385,13 +385,15 @@ def _measure_response(
     return byte_count
 
 
-def _encode_response_budgeted(
+def _encode_response_budgeted[
+    B: _CapacityBudget
+](
     writer: ResponseWriter,
     is_head: Bool,
     date: StringSlice,
     max_headers: Int,
     max_bytes: Int,
-    mut budget: BufferBudget,
+    mut budget: B,
 ) raises NetError -> List[Byte]:
     var capacity = _measure_response(
         writer, is_head, date, max_headers, max_bytes

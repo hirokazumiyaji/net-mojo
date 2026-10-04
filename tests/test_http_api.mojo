@@ -1,6 +1,9 @@
+from std.ffi import c_int, external_call
 from std.testing import assert_equal, assert_false, assert_true, TestSuite
+from std.time import perf_counter_ns
 
 from net import Timeout
+from net._actor import PthreadMutex
 from net.error import NetErrorKind
 from net.http import (
     Handler,
@@ -18,7 +21,148 @@ from net.http import (
     split_path_query,
 )
 from net.http._encoder import encode_response
-from net.http._buffer import BufferBudget, _reserve_capacity
+from net.http._buffer import BufferBudget, SharedBufferBudget, _reserve_capacity
+from tests.support import _join_thread
+
+
+def test_shared_budget_copy_keeps_one_exact_admission_counter() raises:
+    var owner = SharedBufferBudget(16)
+    var handle = owner.copy()
+    assert_true(owner.try_reserve(7))
+    assert_false(handle.try_reserve(10))
+    assert_false(handle.try_reserve(-1))
+    assert_equal(handle.used(), 7)
+    assert_equal(handle.remaining(), 9)
+    assert_true(handle.try_reserve(9))
+    assert_equal(owner.used(), 16)
+    handle.release(9)
+    assert_equal(owner.remaining(), 9)
+    owner.release(7)
+    assert_equal(handle.used(), 0)
+    assert_equal(handle.total(), 16)
+
+
+def _surviving_budget_handle() -> SharedBufferBudget:
+    var owner = SharedBufferBudget(16)
+    _ = owner.try_reserve(7)
+    return owner.copy()
+
+
+def test_shared_budget_handle_survives_creator_destruction() raises:
+    var handle = _surviving_budget_handle()
+    assert_equal(handle.used(), 7)
+    handle.release(7)
+    assert_true(handle.try_reserve(16))
+    assert_false(handle.try_reserve(1))
+    handle.release(16)
+    assert_equal(handle.remaining(), 16)
+
+
+def test_shared_budget_growth_preserves_foreign_charge_and_peak() raises:
+    for total in [21, 25]:
+        var budget = SharedBufferBudget(total)
+        var foreign = budget.copy()
+        assert_true(foreign.try_reserve(5))
+        var bytes = List[Byte]()
+        var reservation = 0
+        assert_true(_reserve_capacity(bytes, budget, 8, reservation))
+        bytes.append(42)
+        if total == 21:
+            assert_false(_reserve_capacity(bytes, budget, 9, reservation))
+            assert_equal(bytes.capacity(), 8)
+            assert_equal(foreign.used(), 13)
+        else:
+            assert_true(_reserve_capacity(bytes, budget, 9, reservation))
+            assert_equal(bytes.capacity(), 12)
+            assert_equal(foreign.used(), 17)
+        assert_equal(bytes[0], 42)
+        var capacity = bytes.capacity()
+        _ = bytes^
+        budget.release(capacity)
+        assert_equal(foreign.used(), 5)
+        foreign.release(5)
+        assert_equal(budget.used(), 0)
+
+
+struct _BudgetWorker:
+    var budget: SharedBufferBudget
+    var gate: PthreadMutex
+    var ready: Bool
+    var start: Bool
+    var admitted: Int
+    var timed_out: Bool
+
+    def __init__(out self, var budget: SharedBufferBudget):
+        self.budget = budget^
+        self.gate = PthreadMutex._uninitialized()
+        self.ready = False
+        self.start = False
+        self.admitted = 0
+        self.timed_out = False
+
+    def __deinit__(deinit self):
+        self.gate.destroy()
+
+
+def _wait_budget_flag(mut worker: _BudgetWorker, start: Bool) -> Bool:
+    var deadline = perf_counter_ns() + 2_000_000_000
+    while True:
+        worker.gate.lock()
+        var ready = worker.ready
+        if start:
+            ready = worker.start
+        worker.gate.unlock()
+        if ready:
+            return True
+        if perf_counter_ns() >= deadline:
+            return False
+
+
+def _budget_worker(
+    arg: Pointer[Byte, MutUntrackedOrigin]
+) -> Pointer[Byte, MutUntrackedOrigin]:
+    var worker = arg.unsafe_bitcast[_BudgetWorker]()
+    worker[].gate.lock()
+    worker[].ready = True
+    worker[].gate.unlock()
+    if not _wait_budget_flag(worker[], True):
+        worker[].timed_out = True
+        return arg
+    for _ in range(8192):
+        if worker[].budget.try_reserve(1):
+            worker[].admitted += 1
+    return arg
+
+
+def test_shared_budget_pthread_and_owner_cannot_over_admit() raises:
+    var owner = SharedBufferBudget(97)
+    var worker = _BudgetWorker(owner.copy())
+    worker.gate._initialize()
+    var thread: UInt64 = 0
+    var result = external_call["pthread_create", c_int](
+        Pointer(to=thread),
+        Optional[Pointer[Byte, MutUntrackedOrigin]](None),
+        _budget_worker,
+        Pointer(to=worker).unsafe_bitcast[Byte](),
+    )
+    assert_equal(Int(result), 0)
+    var ready = _wait_budget_flag(worker, False)
+    worker.gate.lock()
+    worker.start = True
+    worker.gate.unlock()
+    var admitted = 0
+    for _ in range(8192):
+        if owner.try_reserve(1):
+            admitted += 1
+    _join_thread(thread)
+    assert_true(ready)
+    assert_false(worker.timed_out)
+    assert_equal(admitted + worker.admitted, 97)
+    assert_equal(owner.used(), 97)
+    assert_false(owner.try_reserve(1))
+    owner.release(admitted)
+    worker.budget.release(worker.admitted)
+    assert_equal(owner.used(), 0)
 
 
 def test_writer_body_workspace_clamps_capacity_to_growth_peak() raises:
