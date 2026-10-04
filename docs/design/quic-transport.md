@@ -61,6 +61,12 @@ use the earlier of the pacing time and the transport timeout; only the transport
 timeout drives quiche's `on_timeout`. UDP would-block retains the bytes and
 original send time, then waits for writable readiness without a zero-timer spin.
 
+Transport packet sends use a deduplicated ready-connection queue. Receive,
+response, timeout and shutdown work mark the affected connection; successful
+sends rotate it after one packet. Idle connections are not probed for every
+send, and terminal cleanup removes their queued keys. Response-stream driving
+and global deadline selection still use scans pending separate scheduler work.
+
 Still deferred: enabling 0-RTT and full path migration. macOS Mojo end-to-end
 HTTP/3 is covered in CI (`http3` job on `macos-14`, `http3-client-test` against
 the Mojo fixture); only packaged-artifact distribution verification remains

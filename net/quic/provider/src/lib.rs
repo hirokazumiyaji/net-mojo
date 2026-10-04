@@ -1,4 +1,4 @@
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::ffi::{CStr, c_char};
 use std::fs::File;
 use std::io::{self, Read};
@@ -779,10 +779,36 @@ fn authority_equals_ignore_ascii_case(left: &[u8], right: &[u8]) -> bool {
     left.eq_ignore_ascii_case(right)
 }
 
+#[derive(Default)]
+struct SendReadyQueue {
+    entries: VecDeque<Vec<u8>>,
+    queued: HashSet<Vec<u8>>,
+}
+
+impl SendReadyQueue {
+    fn push(&mut self, key: &[u8]) {
+        if self.queued.insert(key.to_vec()) {
+            self.entries.push_back(key.to_vec());
+        }
+    }
+
+    fn pop(&mut self) -> Option<Vec<u8>> {
+        let key = self.entries.pop_front()?;
+        self.queued.remove(&key);
+        Some(key)
+    }
+
+    fn remove(&mut self, key: &[u8]) {
+        self.queued.remove(key);
+        self.entries.retain(|entry| entry.as_slice() != key);
+    }
+}
+
 pub struct QuicServer {
     config: quiche::Config,
     http3_config: quiche::h3::Config,
     connections: HashMap<Vec<u8>, QuicConnection>,
+    send_ready: SendReadyQueue,
     routes: HashMap<Vec<u8>, Vec<u8>>,
     requests: VecDeque<CompletedRequest>,
     request_routes: HashMap<u64, (Vec<u8>, u64)>,
@@ -930,6 +956,7 @@ impl QuicServer {
             config,
             http3_config,
             connections: HashMap::new(),
+            send_ready: SendReadyQueue::default(),
             routes: HashMap::new(),
             requests: VecDeque::new(),
             request_routes: HashMap::new(),
@@ -971,7 +998,7 @@ impl QuicServer {
     }
 
     fn drive_final_goaways(&mut self) -> Result<(), QuicServerError> {
-        for connection in self.connections.values_mut() {
+        for (connection_key, connection) in self.connections.iter_mut() {
             if connection.final_goaway_sent {
                 continue;
             }
@@ -987,6 +1014,7 @@ impl QuicServer {
             };
             match http3.send_goaway(&mut connection.transport, goaway_id) {
                 Ok(()) => {
+                    self.send_ready.push(connection_key);
                     connection.final_goaway_sent = true;
                     connection.final_goaway_last_stream_id = Some(goaway_id);
                 }
@@ -1005,10 +1033,11 @@ impl QuicServer {
         self.drive_final_goaways()?;
         self.shutdown = ShutdownState::Closing;
         let mut first_error = None;
-        for connection in self.connections.values_mut() {
+        for (connection_key, connection) in self.connections.iter_mut() {
             if connection.transport.is_closed() || connection.transport.is_draining() {
                 continue;
             }
+            self.send_ready.push(connection_key);
             if let Err(error) = connection.transport.close(true, 0x100, b"") {
                 first_error.get_or_insert(error);
             }
@@ -1079,6 +1108,7 @@ impl QuicServer {
             None => return Err(quiche::Error::Done.into()),
         };
 
+        self.send_ready.push(&key);
         {
             let connection = self.connections.get_mut(&key).unwrap();
             connection.transport.recv(
@@ -1176,7 +1206,7 @@ impl QuicServer {
         if self.shutdown < ShutdownState::Draining {
             return Ok(());
         }
-        for connection in self.connections.values_mut() {
+        for (connection_key, connection) in self.connections.iter_mut() {
             if connection.goaway_sent {
                 continue;
             }
@@ -1184,7 +1214,10 @@ impl QuicServer {
                 continue;
             };
             match http3.send_goaway(&mut connection.transport, MAX_HTTP3_REQUEST_STREAM_ID) {
-                Ok(()) => connection.goaway_sent = true,
+                Ok(()) => {
+                    connection.goaway_sent = true;
+                    self.send_ready.push(connection_key);
+                }
                 Err(quiche::h3::Error::StreamBlocked | quiche::h3::Error::Done) => (),
                 Err(error) => return Err(error.into()),
             }
@@ -1207,6 +1240,7 @@ impl QuicServer {
         let Some(connection) = self.connections.remove(connection_key) else {
             return;
         };
+        self.send_ready.remove(connection_key);
         let in_flight_bytes: usize = connection
             .requests
             .values()
@@ -1631,6 +1665,7 @@ impl QuicServer {
         {
             return false;
         }
+        self.send_ready.push(&connection_key);
         let status_value = status.to_string();
         let buffered_bytes = body.len()
             + b":status".len()
@@ -1708,7 +1743,10 @@ impl QuicServer {
                         &response.headers,
                         response.body.is_empty(),
                     ) {
-                        Ok(()) => response.headers_sent = true,
+                        Ok(()) => {
+                            response.headers_sent = true;
+                            self.send_ready.push(connection_key);
+                        }
                         Err(quiche::h3::Error::Done | quiche::h3::Error::StreamBlocked) => continue,
                         Err(error) => return Err(error.into()),
                     }
@@ -1724,6 +1762,9 @@ impl QuicServer {
                     true,
                 ) {
                     Ok(written) => {
+                        if written > 0 {
+                            self.send_ready.push(connection_key);
+                        }
                         response.body_offset += written;
                         if response.body_offset == response.body.len() {
                             completed.push((
@@ -1741,6 +1782,7 @@ impl QuicServer {
         for (connection_key, stream_id, request_id, buffered_bytes) in expired {
             if let Some(connection) = self.connections.get_mut(&connection_key) {
                 connection.responses.remove(&stream_id);
+                self.send_ready.push(&connection_key);
                 let _ = connection.transport.stream_shutdown(
                     stream_id,
                     quiche::Shutdown::Write,
@@ -1775,11 +1817,23 @@ impl QuicServer {
             }
             self.drive_responses()?;
         }
-        for connection in self.connections.values_mut() {
-            match connection.transport.send(packet) {
-                Ok((length, info)) => return Ok(Some((length, info))),
-                Err(quiche::Error::Done) => {}
-                Err(error) => return Err(error.into()),
+        while let Some(key) = self.send_ready.pop() {
+            let result = self
+                .connections
+                .get_mut(&key)
+                .unwrap()
+                .transport
+                .send(packet);
+            match result {
+                Ok((length, info)) => {
+                    self.send_ready.push(&key);
+                    return Ok(Some((length, info)));
+                }
+                Err(quiche::Error::Done) => self.reap_closed_connection(&key),
+                Err(error) => {
+                    self.send_ready.push(&key);
+                    return Err(error.into());
+                }
             }
         }
         Ok(None)
@@ -1842,13 +1896,14 @@ impl QuicServer {
         self.expire_idle_connections();
         let _ = self.drive_responses();
         let mut closed = Vec::new();
-        for connection in self.connections.values_mut() {
+        for (key, connection) in self.connections.iter_mut() {
             if connection
                 .transport
                 .timeout()
                 .is_some_and(|timeout| timeout.is_zero())
             {
                 connection.transport.on_timeout();
+                self.send_ready.push(key);
             }
         }
         for (connection_key, connection) in &self.connections {
@@ -1863,7 +1918,7 @@ impl QuicServer {
 
     fn expire_incomplete_requests(&mut self) {
         let now = Instant::now();
-        for connection in self.connections.values_mut() {
+        for (key, connection) in self.connections.iter_mut() {
             let expired: Vec<u64> = connection
                 .requests
                 .iter()
@@ -1880,6 +1935,7 @@ impl QuicServer {
                 })
                 .collect();
             for stream_id in expired {
+                self.send_ready.push(key);
                 connection.header_deadlines.remove(&stream_id);
                 if let Some(rejected) = connection.requests.remove(&stream_id) {
                     self.buffered_request_bytes =
@@ -1904,6 +1960,7 @@ impl QuicServer {
                 })
                 .collect();
             for stream_id in expired_headers {
+                self.send_ready.push(key);
                 connection.header_deadlines.remove(&stream_id);
                 let _ = connection.transport.stream_shutdown(
                     stream_id,
@@ -1980,6 +2037,134 @@ mod tests {
         reserve_response_bytes,
     };
     use quiche::h3::NameValue;
+
+    fn insert_idle_transports(server: &mut super::QuicServer, count: u16) {
+        let local: SocketAddr = "127.0.0.1:4433".parse().unwrap();
+        for index in 0..count {
+            let key = index.to_be_bytes().repeat(8);
+            let remote = SocketAddr::new(local.ip(), 20000 + index);
+            let transport = quiche::accept(
+                &ConnectionId::from_ref(&key),
+                None,
+                local,
+                remote,
+                &mut server.config,
+            )
+            .unwrap();
+            server.connections.insert(
+                key,
+                super::QuicConnection {
+                    transport,
+                    http3: None,
+                    requests: Default::default(),
+                    header_deadlines: Default::default(),
+                    responses: Default::default(),
+                    goaway_sent: false,
+                    final_goaway_sent: false,
+                    last_request_stream_id: None,
+                    final_goaway_last_stream_id: None,
+                    idle_deadline_at: None,
+                },
+            );
+        }
+    }
+
+    #[test]
+    fn send_ready_marks_deduplicate_rotate_and_allow_removed_key_reuse() {
+        let mut ready = super::SendReadyQueue::default();
+        for _ in 0..1000 {
+            ready.push(b"first");
+            ready.push(b"second");
+        }
+        assert_eq!(ready.entries.len(), 2);
+        assert_eq!(ready.pop().unwrap(), b"first");
+        ready.push(b"first");
+        assert_eq!(ready.pop().unwrap(), b"second");
+        ready.push(b"second");
+        ready.remove(b"first");
+        assert_eq!(ready.pop().unwrap(), b"second");
+        assert!(ready.pop().is_none());
+        ready.push(b"first");
+        assert_eq!(ready.pop().unwrap(), b"first");
+        assert!(ready.queued.is_empty());
+    }
+
+    #[test]
+    fn send_failure_retains_work_until_terminal_drop_and_key_reuse() {
+        let mut server = super::QuicServer::new(stress_server_config()).unwrap();
+        insert_idle_transports(&mut server, 128);
+        let key = [0; 16];
+        server.send_ready.push(&key);
+        assert!(matches!(
+            server.send(&mut []),
+            Err(super::QuicServerError::Quiche(
+                quiche::Error::BufferTooShort
+            ))
+        ));
+        assert_eq!(server.send_ready.entries.len(), 1);
+        server.force_drop_connection(&key);
+        assert_eq!(server.connections.len(), 127);
+        assert!(server.send_ready.entries.is_empty());
+        assert!(server.send(&mut []).unwrap().is_none());
+        insert_idle_transports(&mut server, 1);
+        server.send_ready.push(&key);
+        assert!(matches!(
+            server.send(&mut []),
+            Err(super::QuicServerError::Quiche(
+                quiche::Error::BufferTooShort
+            ))
+        ));
+        assert!(server.send(&mut [0; 65535]).unwrap().is_none());
+        assert!(server.send_ready.entries.is_empty());
+        assert!(server.send_ready.queued.is_empty());
+    }
+
+    #[test]
+    fn send_skips_idle_transports_instead_of_attempting_every_connection() {
+        let mut server = super::QuicServer::new(stress_server_config()).unwrap();
+        insert_idle_transports(&mut server, 128);
+        assert_eq!(server.connections.len(), 128);
+        assert!(server.send(&mut []).unwrap().is_none());
+    }
+
+    #[test]
+    fn send_rotates_one_packet_between_active_response_connections() {
+        let mut server = super::QuicServer::new(stress_server_config()).unwrap();
+        let local: SocketAddr = "127.0.0.1:4433".parse().unwrap();
+        let mut packet = [0; 65535];
+        let mut request_ids = Vec::new();
+        for index in 0..2u8 {
+            let remote = SocketAddr::new(local.ip(), 30000 + u16::from(index));
+            let mut client = quiche::connect(
+                Some("localhost"),
+                &ConnectionId::from_ref(&[0x80 + index; 16]),
+                remote,
+                local,
+                &mut stress_client_config(),
+            )
+            .unwrap();
+            establish_http3_in_memory(&mut client, &mut server, &mut packet, local, remote, false);
+            let request = complete_post_request_in_memory(
+                &mut client,
+                &mut server,
+                &mut packet,
+                local,
+                remote,
+                false,
+                false,
+            );
+            request_ids.push(request.id);
+        }
+        for request_id in request_ids {
+            assert!(server.enqueue_response(request_id, 200, Vec::new(), vec![42; 65536]));
+        }
+        let first = server.send(&mut packet).unwrap().unwrap().1.to;
+        let second = server.send(&mut packet).unwrap().unwrap().1.to;
+        assert_ne!(
+            first, second,
+            "one active connection must not monopolize packet sends"
+        );
+    }
 
     #[test]
     fn pacing_delay_preserves_future_send_and_saturates_past_send() {
