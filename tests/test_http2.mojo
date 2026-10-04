@@ -2188,5 +2188,148 @@ def test_http2_peer_stream_limit_does_not_set_local_admission_limit() raises:
     assert_true(streams.receive_headers(UInt32(1), False).is_accepted())
 
 
+def test_http2_dispatcher_new_stream_flood_is_independent_of_resets() raises:
+    var dispatcher = Http2FrameDispatcher(
+        Http2PeerSettings().snapshot(), max_new_streams_per_second=2
+    )
+    var empty = List[Byte]()
+    for stream_id in [UInt32(1), UInt32(3)]:
+        var headers = FrameParseResult.complete(Byte(1), Byte(5), stream_id, 0)
+        assert_true(dispatcher.accept(headers, Span(empty)).is_ignored())
+        var reset_payload: List[Byte] = [Byte(0), Byte(0), Byte(0), Byte(8)]
+        var reset = FrameParseResult.complete(Byte(3), Byte(0), stream_id, 4)
+        assert_true(dispatcher.accept(reset, Span(reset_payload)).is_reset())
+    var extra = FrameParseResult.complete(Byte(1), Byte(5), UInt32(5), 0)
+    _assert_enhance_your_calm_goaway(dispatcher.accept(extra, Span(empty)))
+    assert_true(dispatcher.is_failed())
+
+
+def test_http2_dispatcher_stream_rate_window_reopens_after_one_second() raises:
+    var dispatcher = Http2FrameDispatcher(
+        Http2PeerSettings().snapshot(), max_new_streams_per_second=2
+    )
+    assert_false(dispatcher._new_stream_exceeded(100))
+    assert_false(dispatcher._new_stream_exceeded(999_999_999))
+    assert_true(dispatcher._new_stream_exceeded(1_000_000_099))
+    assert_false(dispatcher._new_stream_exceeded(1_000_000_100))
+    assert_false(dispatcher._new_stream_exceeded(1_000_000_100))
+    assert_true(dispatcher._new_stream_exceeded(1_000_000_100))
+
+
+def test_http2_dispatcher_continuation_and_trailers_do_not_create_streams() raises:
+    var dispatcher = Http2FrameDispatcher(
+        Http2PeerSettings().snapshot(), max_new_streams_per_second=1
+    )
+    var empty = List[Byte]()
+    var headers = FrameParseResult.complete(Byte(1), Byte(0), UInt32(1), 0)
+    assert_true(dispatcher.accept(headers, Span(empty)).is_ignored())
+    var continued = FrameParseResult.complete(Byte(9), Byte(4), UInt32(1), 0)
+    assert_true(dispatcher.accept(continued, Span(empty)).is_ignored())
+    var trailers = FrameParseResult.complete(Byte(1), Byte(5), UInt32(1), 0)
+    assert_true(dispatcher.accept(trailers, Span(empty)).is_ignored())
+    assert_false(dispatcher.is_failed())
+    var next_stream = FrameParseResult.complete(Byte(1), Byte(5), UInt32(3), 0)
+    _assert_enhance_your_calm_goaway(
+        dispatcher.accept(next_stream, Span(empty))
+    )
+
+
+def test_http2_dispatcher_even_stream_id_is_protocol_error_before_rate_check() raises:
+    var dispatcher = Http2FrameDispatcher(
+        Http2PeerSettings().snapshot(), max_new_streams_per_second=0
+    )
+    var empty = List[Byte]()
+    var headers = FrameParseResult.complete(Byte(1), Byte(5), UInt32(2), 0)
+    var result = dispatcher.accept(headers, Span(empty))
+    assert_true(result.is_error())
+    assert_false(result.is_flood())
+
+
+def _stream_rate_bootstrap(mut session: Http2RequestSession) raises:
+    var wire = List[Byte]()
+    var preface = "PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n".as_bytes()
+    for i in range(len(preface)):
+        wire.append(preface[i])
+    var empty = List[Byte]()
+    var settings = _frame(4, 0, 0, empty)
+    for i in range(len(settings)):
+        wire.append(settings[i])
+    assert_true(session.consume(Span(wire)).is_pending())
+
+
+def test_http2_new_stream_flood_sends_goaway_and_isolates_sibling() raises:
+    var flooded = Http2RequestSession(
+        "build/http2/libnet_hpack", 4, 1024, max_new_streams_per_second=1
+    )
+    var healthy = Http2RequestSession(
+        "build/http2/libnet_hpack", 4, 1024, max_new_streams_per_second=1
+    )
+    _stream_rate_bootstrap(flooded)
+    _stream_rate_bootstrap(healthy)
+    var compressed: List[Byte] = [0x82, 0x86, 0x84, 0x01, 0x01, Byte(ord("x"))]
+    var first = _frame(1, 5, 1, compressed)
+    assert_true(flooded.consume(Span(first)).is_request())
+    flooded.finish_response(UInt32(1))
+    var extra = _frame(1, 5, 3, compressed)
+    var result = flooded.consume(Span(extra))
+    assert_true(result.is_pending())
+    assert_true(flooded.is_failed())
+    var goaway_at = _find_goaway_offset(result.output)
+    assert_true(goaway_at >= 0)
+    var frame = parse_frame(Span(result.output)[goaway_at:])
+    var goaway = parse_goaway_frame(frame, Span(result.output)[goaway_at + 9 :])
+    assert_equal(goaway.error_code, UInt32(11))
+    assert_equal(goaway.last_stream_id, UInt32(1))
+    assert_true(healthy.consume(Span(first)).is_request())
+    assert_false(healthy.is_failed())
+    assert_false(flooded.consume(Span(first)).is_request())
+
+
+def test_http2_duplicate_stream_id_remains_protocol_error_at_rate_limit() raises:
+    var session = Http2RequestSession(
+        "build/http2/libnet_hpack", 4, 1024, max_new_streams_per_second=1
+    )
+    _stream_rate_bootstrap(session)
+    var compressed: List[Byte] = [0x82, 0x86, 0x84, 0x01, 0x01, Byte(ord("x"))]
+    var headers = _frame(1, 5, 1, compressed)
+    assert_true(session.consume(Span(headers)).is_request())
+    session.finish_response(UInt32(1))
+    var duplicate = session.consume(Span(headers))
+    assert_true(duplicate.is_error())
+    assert_equal(_find_goaway_offset(duplicate.output), -1)
+
+
+def test_http2_refused_stream_creation_counts_toward_rate_limit() raises:
+    var session = Http2RequestSession(
+        "build/http2/libnet_hpack", 0, 1024, max_new_streams_per_second=1
+    )
+    _stream_rate_bootstrap(session)
+    var compressed: List[Byte] = [0x82, 0x86, 0x84, 0x01, 0x01, Byte(ord("x"))]
+    var first = _frame(1, 5, 1, compressed)
+    var refused = session.consume(Span(first))
+    assert_true(refused.is_pending())
+    assert_false(session.is_failed())
+    var extra = _frame(1, 5, 3, compressed)
+    var overflow = session.consume(Span(extra))
+    assert_true(session.is_failed())
+    var goaway_at = _find_goaway_offset(overflow.output)
+    assert_true(goaway_at >= 0)
+    var frame = parse_frame(Span(overflow.output)[goaway_at:])
+    var goaway = parse_goaway_frame(
+        frame, Span(overflow.output)[goaway_at + 9 :]
+    )
+    assert_equal(goaway.error_code, UInt32(11))
+    assert_equal(goaway.last_stream_id, UInt32(1))
+
+
+def test_http2_zero_stream_creation_limit_rejects_first_new_headers() raises:
+    var dispatcher = Http2FrameDispatcher(
+        Http2PeerSettings().snapshot(), max_new_streams_per_second=0
+    )
+    var empty = List[Byte]()
+    var headers = FrameParseResult.complete(Byte(1), Byte(5), UInt32(1), 0)
+    _assert_enhance_your_calm_goaway(dispatcher.accept(headers, Span(empty)))
+
+
 def main() raises:
     TestSuite.discover_tests[__functions_in_module()]().run()

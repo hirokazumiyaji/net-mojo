@@ -248,6 +248,50 @@ def test_https_alt_svc_advertisement():
         raise
 
 
+def test_http2_new_stream_flood_isolates_connections():
+    process = subprocess.Popen(
+        ["mojo", "run", "--Werror", "-I", ".", "tests/https_flood_fixture.mojo"],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    try:
+        ready = process.stdout.readline().strip()
+        if not ready.startswith("READY "):
+            raise RuntimeError(f"stream-rate fixture did not start: {ready}")
+        port = int(ready.split()[1])
+        context = _h2_context()
+        with context.wrap_socket(
+            socket.create_connection(("127.0.0.1", port), timeout=5),
+            server_hostname="localhost",
+        ) as client_a, context.wrap_socket(
+            socket.create_connection(("127.0.0.1", port), timeout=5),
+            server_hostname="localhost",
+        ) as client_b:
+            _h2_bootstrap(client_a)
+            _h2_bootstrap(client_b)
+            for stream_id in (1, 3):
+                client_a.sendall(_h2_headers_frame(stream_id))
+                body = _read_response_body(client_a, stream_id)
+                if body != b"flood-ok":
+                    raise RuntimeError(f"unexpected stream-rate response: {body!r}")
+            client_a.sendall(_h2_headers_frame(5))
+            last_stream_id, _ = _read_until_goaway(client_a, expect_error_code=11)
+            if last_stream_id != 3:
+                raise RuntimeError(f"stream-rate GOAWAY last ID: {last_stream_id}")
+            client_b.sendall(_h2_headers_frame(1))
+            body = _read_response_body(client_b, 1)
+            if body != b"flood-ok":
+                raise RuntimeError(f"stream-rate flood affected sibling: {body!r}")
+        if process.wait(timeout=10) != 0:
+            raise RuntimeError(process.stderr.read())
+    except Exception:
+        process.kill()
+        process.wait()
+        sys.stderr.write(process.stderr.read())
+        raise
+
+
 def test_http2_reset_flood_isolates_connections():
     """RST storm on connection A; connection B still completes a request."""
     flood_process = subprocess.Popen(
@@ -562,6 +606,7 @@ try:
         raise RuntimeError(process.stderr.read())
     test_http2_shutdown_goaway()
     test_http2_reset_flood_isolates_connections()
+    test_http2_new_stream_flood_isolates_connections()
     print("HTTP/2 bootstrap and HTTPS roundtrips succeeded")
 except Exception:
     process.kill()
