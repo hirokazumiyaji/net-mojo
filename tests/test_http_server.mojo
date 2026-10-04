@@ -20,6 +20,104 @@ from net.http._deadline import NO_DEADLINE, now_ns
 from tests.support import _socket_pair, _tick_n
 
 
+struct _HeadErrorHandler(Handler):
+    var completed: Int
+
+    def __init__(out self):
+        self.completed = 0
+
+    def handle(mut self, req: Request, mut writer: ResponseWriter) raises:
+        if req.path == "/raise":
+            writer.write_string("discarded")
+            raise Error("test handler error")
+        elif req.path == "/bad-frame":
+            writer.headers.add(String("Transfer-Encoding"), String("chunked"))
+        elif req.path == "/abort":
+            var sender = writer.detach()
+            sender.abort()
+        else:
+            writer.set_should_close(True)
+            writer.write_string("alive")
+        self.completed += 1
+
+
+def _drain_head_error_to_eof[
+    H: Handler
+](mut server: Server, mut handler: H, mut client: TCPConn) raises -> List[Byte]:
+    var out = List[Byte]()
+    var scratch = Array[Byte, 8192](fill=0)
+    var expires = Int(perf_counter_ns()) + 2_000_000_000
+    var eof = False
+    while not eof and Int(perf_counter_ns()) < expires:
+        _ = server.tick(handler, Timeout.nanoseconds(0))
+        try:
+            var count = client.try_read(Span(scratch))
+            if count == 0:
+                eof = True
+            else:
+                out.extend(Span(scratch)[0:count])
+        except e:
+            assert_equal(e.kind, NetErrorKind.timeout())
+    assert_true(eof)
+    return out^
+
+
+def _check_completed_head_error(path: String) raises:
+    for is_head in [True, False]:
+        var config = ServerConfig.default()
+        config.max_bytes_per_tick = 17
+        var server = Server(config^)
+        server.add_listener(listen_tcp("127.0.0.1:0"))
+        var address = String("127.0.0.1:") + String(server.local_address().port)
+        var handler = _HeadErrorHandler()
+        var client = dial_tcp(address, Timeout.seconds(1))
+        var request = String("HEAD ") if is_head else String("GET ")
+        request += path + String(" HTTP/1.1\r\nHost: x\r\n\r\n")
+        client.write_all(request.as_bytes(), Timeout.seconds(1))
+        var response = _drain_head_error_to_eof(server, handler, client)
+        var wire = String(from_utf8_lossy=Span(response))
+        assert_true(wire.startswith("HTTP/1.1 500 Internal Server Error\r\n"))
+        assert_true(wire.find("\r\nContent-Length: 25\r\n") >= 0)
+        assert_true(wire.find("\r\nConnection: close\r\n") >= 0)
+        var header_end = wire.find("\r\n\r\n") + 4
+        assert_true(header_end >= 4)
+        assert_equal(handler.completed, 0 if path == "/raise" else 1)
+        var body = String(from_utf8_lossy=wire.as_bytes()[header_end:])
+        assert_equal(
+            body,
+            String("") if is_head else String("500 Internal Server Error"),
+        )
+        assert_equal(server.active_connections(), 0)
+        assert_equal(server._budget.used, 0)
+        client.close()
+
+        var sibling = dial_tcp(address, Timeout.seconds(1))
+        sibling.write_all(
+            "GET /sibling HTTP/1.1\r\nHost: x\r\n\r\n".as_bytes(),
+            Timeout.seconds(1),
+        )
+        var next = _drain_head_error_to_eof(server, handler, sibling)
+        var sibling_wire = String(from_utf8_lossy=Span(next))
+        assert_true(sibling_wire.startswith("HTTP/1.1 200 OK\r\n"))
+        assert_true(sibling_wire.find("\r\nContent-Length: 5\r\n") >= 0)
+        assert_true(sibling_wire.endswith("\r\n\r\nalive"))
+        assert_equal(server.active_connections(), 0)
+        assert_equal(server._budget.used, 0)
+        sibling.close()
+
+
+def test_completed_head_handler_error_closes_without_body_and_keeps_sibling() raises:
+    _check_completed_head_error(String("/raise"))
+
+
+def test_completed_head_encoder_error_closes_without_body_and_keeps_sibling() raises:
+    _check_completed_head_error(String("/bad-frame"))
+
+
+def test_completed_head_detached_abort_closes_without_body_and_keeps_sibling() raises:
+    _check_completed_head_error(String("/abort"))
+
+
 def test_error_wire_exact_peak_denial_partial_close_and_reuse_preserve_foreign() raises:
     for scenario in range(4):
         var config = ServerConfig.default()
