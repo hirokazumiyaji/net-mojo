@@ -56,10 +56,11 @@ struct HttpVersion(Copyable, Equatable, Writable):
 
 
 struct Request(Movable):
-    """Borrowed request views, valid only for the handler call.
+    """Owned decoded request fields, borrowed by the handler.
 
-    The server owns the receive buffer and never moves, grows, or
-    reuses it while the handler runs. Copy out anything to keep.
+    Copy fields that must outlive the handler call so retained data
+    does not depend on the server's request lifetime. StringSlice and
+    Span views borrow their source field storage.
     The full bounded body is received before the handler runs; there
     is no request streaming in this phase.
     """
