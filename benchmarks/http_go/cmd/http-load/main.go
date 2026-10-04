@@ -20,16 +20,18 @@ import (
 )
 
 type config struct {
-	URL         string        `json:"url"`
-	Connections int           `json:"connections"`
-	Warmup      time.Duration `json:"warmup_ns"`
-	Duration    time.Duration `json:"duration_ns"`
-	Method      string        `json:"method"`
-	BodySize    int           `json:"body_size"`
-	Chunked     bool          `json:"chunked"`
-	KeepAlive   bool          `json:"keepalive"`
-	Timeout     time.Duration `json:"request_timeout_ns"`
-	Rate        int           `json:"rate_requests_per_second"`
+	URL             string        `json:"url"`
+	Connections     int           `json:"connections"`
+	Warmup          time.Duration `json:"warmup_ns"`
+	Duration        time.Duration `json:"duration_ns"`
+	Method          string        `json:"method"`
+	BodySize        int           `json:"body_size"`
+	Chunked         bool          `json:"chunked"`
+	KeepAlive       bool          `json:"keepalive"`
+	Timeout         time.Duration `json:"request_timeout_ns"`
+	Rate            int           `json:"rate_requests_per_second"`
+	IdleConnections int           `json:"idle_connections"`
+	SetupTimeout    time.Duration `json:"connection_check_timeout_ns"`
 }
 
 type counts struct {
@@ -61,6 +63,7 @@ type result struct {
 	WarmupCounts           counts        `json:"warmup_counts"`
 	MeasurementWindow      *phaseWindow  `json:"measurement_window,omitempty"`
 	WarmupWindow           *phaseWindow  `json:"warmup_window,omitempty"`
+	Idle                   *idleStats    `json:"idle_connections,omitempty"`
 	ElapsedSeconds         float64       `json:"elapsed_seconds"`
 	Samples                uint64        `json:"samples"`
 	RequestBodyBytes       uint64        `json:"request_body_bytes"`
@@ -90,6 +93,9 @@ func prepare(c config) (workload, error) {
 	}
 	if c.Rate < 0 {
 		return workload{}, errors.New("rate must be nonnegative")
+	}
+	if c.IdleConnections < 0 || c.IdleConnections > math.MaxInt-c.Connections || (c.IdleConnections > 0 && (!c.KeepAlive || c.SetupTimeout <= 0 || u.Path != "/fixed")) {
+		return workload{}, errors.New("idle mode requires nonnegative bounded count, keepalive, positive connection-check timeout and /fixed")
 	}
 	if c.Rate > 0 {
 		if _, err := arrivalCount(c.Duration, c.Rate); err != nil {
@@ -139,6 +145,10 @@ func request(ctx context.Context, client *http.Client, c config, w workload) err
 	if err != nil {
 		return err
 	}
+	return validateResponse(response, w)
+}
+
+func validateResponse(response *http.Response, w workload) error {
 	defer response.Body.Close()
 	if response.StatusCode != 200 || response.Proto != "HTTP/1.1" || response.ContentLength != int64(len(w.expected)) || response.Header.Get("Content-Length") == "" {
 		return fmt.Errorf("unexpected response: status=%d proto=%s content-length=%d", response.StatusCode, response.Proto, response.ContentLength)
@@ -159,9 +169,10 @@ type phaseResult struct {
 	error    string
 	arrivals *arrivalStats
 	window   *phaseWindow
+	deadline time.Time
 }
 
-func phase(client *http.Client, c config, w workload, duration time.Duration, sample bool) phaseResult {
+func phase(clients []*http.Client, c config, w workload, duration time.Duration, sample bool) phaseResult {
 	start := make(chan struct{})
 	results := make(chan phaseResult, c.Connections)
 	var ready sync.WaitGroup
@@ -169,6 +180,7 @@ func phase(client *http.Client, c config, w workload, duration time.Duration, sa
 	var deadline time.Time
 	var ctx context.Context
 	for i := 0; i < c.Connections; i++ {
+		client := clients[i]
 		go func() {
 			ready.Done()
 			<-start
@@ -209,7 +221,7 @@ func phase(client *http.Client, c config, w workload, duration time.Duration, sa
 	}
 	defer cancel()
 	close(start)
-	total := phaseResult{window: newPhaseWindow(begin, deadline)}
+	total := phaseResult{window: newPhaseWindow(begin, deadline), deadline: deadline}
 	for i := 0; i < c.Connections; i++ {
 		r := <-results
 		total.merge(r)
@@ -246,8 +258,23 @@ func run(c config) (result, error) {
 	defer transport.CloseIdleConnections()
 	client := &http.Client{Transport: transport, Timeout: c.Timeout,
 		CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
+	clients := make([]*http.Client, c.Connections)
+	for i := range clients {
+		clients[i] = client
+	}
+	var held *idleSockets
+	if c.IdleConnections > 0 {
+		held = &idleSockets{stats: &idleStats{RequestedTotal: c.IdleConnections + c.Connections}}
+		r.Idle = held.stats
+		defer held.close()
+		if err := held.setup(c, w); err != nil {
+			r.FirstError = err.Error()
+			return r, err
+		}
+		clients = held.clients
+	}
 	if c.Warmup > 0 {
-		warm := runPhase(client, c, w, c.Warmup, false)
+		warm := runPhase(clients, c, w, c.Warmup, false)
 		r.WarmupCounts, r.FirstError = warm.counts, warm.error
 		r.WarmupArrivals = warm.arrivals
 		r.WarmupWindow = warm.window
@@ -255,7 +282,10 @@ func run(c config) (result, error) {
 			return r, errors.New("warmup failed validation, lost arrivals, or completed no valid requests")
 		}
 	}
-	measured := runPhase(client, c, w, c.Duration, true)
+	if held != nil {
+		held.beginMeasurement()
+	}
+	measured := runPhase(clients, c, w, c.Duration, true)
 	r.counts, r.FirstError = measured.counts, measured.error
 	r.Arrivals = measured.arrivals
 	r.MeasurementWindow = measured.window
@@ -267,6 +297,17 @@ func run(c config) (result, error) {
 	r.ResponseBytesPerSecond = float64(r.ResponseBytes) / r.ElapsedSeconds
 	r.LatencyMS = latencies(measured.samples)
 	r.Valid = r.Samples > 0 && r.Errors == 0 && !measured.lostArrivals()
+	if held != nil {
+		held.finishActive(measured.deadline)
+		r.Valid = r.Valid && held.stats.MeasuredActive == c.Connections && held.stats.Replacements == 0 && held.stats.EarlyActiveClosed == 0
+		if r.Valid {
+			if err := held.postflight(c, w); err != nil {
+				r.Valid = false
+				r.FirstError = err.Error()
+				return r, err
+			}
+		}
+	}
 	if !r.Valid {
 		return r, errors.New("measurement failed validation, lost arrivals, or completed no valid requests")
 	}
@@ -285,6 +326,8 @@ func main() {
 	flag.BoolVar(&c.KeepAlive, "keepalive", true, "reuse connections")
 	flag.DurationVar(&c.Timeout, "timeout", 5*time.Second, "maximum individual request duration")
 	flag.IntVar(&c.Rate, "rate", 0, "fixed requests/second (0 uses saturated closed loop)")
+	flag.IntVar(&c.IdleConnections, "idle-connections", 0, "additional original idle keepalive sockets (/fixed only)")
+	flag.DurationVar(&c.SetupTimeout, "connection-check-timeout", 2*time.Minute, "deadline for each idle setup/postflight phase")
 	flag.Parse()
 	r, err := run(c)
 	if outputErr := json.NewEncoder(os.Stdout).Encode(r); outputErr != nil {
