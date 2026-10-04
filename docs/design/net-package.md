@@ -268,14 +268,19 @@ section records only the package-level boundaries.
   and no-body statuses skip chunk/end allocation. Caller-owned allocations
   before adoption remain accounting gaps. Synchronous HTTP/1 response Headers
   and detached START/RESPOND admit three array backing capacities and raw value
-  capacities. Supported add/add_bytes reserve grouped full new array targets
-  and the raw value before growth; this conservative admission includes all old
-  capacities rather than claiming a minimum sequential allocation peak.
-  clear retains the array charge. Whole Headers moves retain their ticket through
-  queue/batch/consumer ownership, and storage drops before refund. Pre-owned
-  caller Headers and direct public writer.headers replacement are admitted after
-  allocation; String backing/refcounts and request/parser Header admission remain
-  separate.
+  capacities. Stored original/lowercase name references also charge their public
+  String capacity plus refcount prefix per reference; inline/static/shared storage
+  is conservatively overcharged, without tracking unique heap allocations.
+  Supported add/add_bytes reserve grouped full new array targets, raw values and
+  name references before growth; fresh ASCII lowercase names are materialized
+  only after admission. This includes all old capacities rather than claiming a
+  minimum sequential allocation peak. clear drops internal name references and raw
+  values before refunding, retaining the array charge. Whole Headers moves retain
+  their ticket through queue/batch/consumer ownership. Pre-owned caller Headers
+  and direct public writer.headers replacement are admitted after allocation.
+  Escaped caller String copies can retain shared storage after internal references
+  drop and remain outside this reservation; request/parser Header admission and
+  other String scratch remain separate.
   Raw read scratch uses fixed stack arrays; TLS retains a charged retry buffer.
   Pending 100-continue bytes reserve capacity before allocation. HTTP/1 admission
   prepays a 256-byte error List from the shared budget; TLS adds 11 bytes plus

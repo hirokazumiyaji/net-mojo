@@ -11,9 +11,11 @@ decode lossily for convenience; framing paths must use the byte
 accessors so an encoded message round-trips byte-identically.
 
 HTTP/1 response ownership charges the three List arrays and raw value capacities.
-Clear retains the arrays' charge; destruction frees storage before refunding.
-Incoming caller storage is admitted after allocation. String backing, lookup
-scratch and request/parser admission remain separate.
+Clear retains the arrays' charge and drops internal references before refunding.
+Stored name references conservatively charge public capacity plus refcount prefix
+per reference, including inline/static/shared storage. Incoming caller storage is
+admitted after allocation; escaped caller copies, lookup scratch and request/parser
+admission remain separate.
 """
 
 from net.error import NetError, NetErrorKind
@@ -65,8 +67,10 @@ def _is_tchar(byte: Byte) -> Bool:
     return False
 
 
-def _reject_bad_name(name: StringSlice, operation: String) raises NetError:
-    var bytes = name.as_bytes()
+def _reject_bad_name[
+    origin: Origin
+](name: Span[Byte, origin], operation: String) raises NetError:
+    var bytes = name
     if len(bytes) == 0:
         raise NetError(
             NetErrorKind.invalid_argument(),
@@ -142,6 +146,14 @@ struct Headers(Movable, Sized):
         _ = self._lower_names^
         self._capacity_ticket.release()
 
+    def _string_reference_capacity(self) -> Int:
+        var capacity = 0
+        for name in self._names:
+            capacity += name.capacity_bytes() + String.REF_COUNT_SIZE
+        for name in self._lower_names:
+            capacity += name.capacity_bytes() + String.REF_COUNT_SIZE
+        return capacity
+
     def _known_capacity(self) -> Int:
         var capacity = (
             self._names.capacity() * size_of[String]()
@@ -150,7 +162,7 @@ struct Headers(Movable, Sized):
         )
         for value in self._values:
             capacity += value.capacity()
-        return capacity
+        return capacity + self._string_reference_capacity()
 
     def _adopt_capacity_budget(
         mut self, var budget: Optional[SharedBufferBudget]
@@ -171,7 +183,9 @@ struct Headers(Movable, Sized):
         self._capacity_ticket = _CapacityTicket(budget^, capacity)
         return True
 
-    def _prepare_append(mut self, value_length: Int) raises NetError:
+    def _prepare_append(
+        mut self, value_length: Int, reference_capacity: Int
+    ) raises NetError:
         if not self._capacity_ticket.budget:
             return
         var needed = len(self) + 1
@@ -189,7 +203,7 @@ struct Headers(Movable, Sized):
             reservation += (
                 max(needed, self._values.capacity() * 2) * size_of[List[Byte]]()
             )
-        var admission = reservation + value_length
+        var admission = reservation + value_length + reference_capacity
         if not self._capacity_ticket.budget.value().try_reserve(admission):
             raise NetError(
                 NetErrorKind.invalid_argument(),
@@ -214,17 +228,32 @@ struct Headers(Movable, Sized):
     def _append_validated[
         origin: ImmOrigin
     ](mut self, var name: String, value: Span[Byte, origin]) raises NetError:
-        self._prepare_append(len(value))
+        var name_length = name.byte_length()
+        var lower_capacity = String.INLINE_CAPACITY
+        if name_length > String.INLINE_CAPACITY:
+            lower_capacity = ((name_length + 7) // 8) * 8
+        self._prepare_append(
+            len(value),
+            name.capacity_bytes() + lower_capacity + 2 * String.REF_COUNT_SIZE,
+        )
         var raw = List[Byte](capacity=len(value))
         for i in range(len(value)):
             raw.append(value[i])
-        var lowered = name.lower()
+        var lowered = String(capacity_bytes=name_length)
+        lowered.resize(name_length)
+        var lower_bytes = lowered.unsafe_as_bytes_mut()
+        var name_bytes = name.as_bytes()
+        for i in range(name_length):
+            var byte = name_bytes[i]
+            if Byte(ord("A")) <= byte and byte <= Byte(ord("Z")):
+                byte += Byte(ord("a") - ord("A"))
+            lower_bytes[i] = byte
         self._names.append(name^)
         self._values.append(raw^)
         self._lower_names.append(lowered^)
 
     def add(mut self, var name: String, var value: String) raises NetError:
-        _reject_bad_name(name, "add header")
+        _reject_bad_name(name.as_bytes(), "add header")
         _reject_bad_value(value, "add header")
         var bytes = value.as_bytes()
         self._append_validated(name^, bytes)
@@ -232,20 +261,20 @@ struct Headers(Movable, Sized):
     def add_bytes[
         origin: ImmOrigin
     ](mut self, var name: String, value: Span[Byte, origin]) raises NetError:
-        _reject_bad_name(name, "add header")
+        _reject_bad_name(name.as_bytes(), "add header")
         _check_value_bytes(value, "add header")
         self._append_validated(name^, value)
 
     def clear(mut self):
-        var raw_capacity = 0
+        var released_capacity = self._string_reference_capacity()
         for value in self._values:
-            raw_capacity += value.capacity()
+            released_capacity += value.capacity()
         self._names.clear()
         self._values.clear()
         self._lower_names.clear()
         if self._capacity_ticket.budget:
-            self._capacity_ticket.budget.value().release(raw_capacity)
-            self._capacity_ticket.amount -= raw_capacity
+            self._capacity_ticket.budget.value().release(released_capacity)
+            self._capacity_ticket.amount -= released_capacity
 
     def get_first(self, name: StringSlice) -> Optional[String]:
         var needle = String(name).lower()

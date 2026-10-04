@@ -10,7 +10,8 @@ Architecture (Erlang-inspired Actor / Message-Passing):
 - `ResponseSender` acts as a movable actor endpoint / proxy.
 - A copied budget capability charges state allocation until its last reference frees
   it, and message arrays/bodies through queue/batch ownership. Headers retain their
-  known array/raw value ticket; String backing and scratch remain separate.
+  array/raw value and conservative name-reference ticket. String scratch and
+  escaped caller copies remain separate.
 - Data messages use a mutex-protected mailbox; ordered finish/abort state requires
   no additional message allocation.
 - A non-blocking wakeup file descriptor (via `socketpair`) notifies the reactor
