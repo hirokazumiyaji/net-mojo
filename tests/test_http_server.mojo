@@ -5,7 +5,7 @@ from net import TCPConn, Timeout, dial_tcp, listen_tcp
 from net.error import NetErrorKind
 from net._reactor import ReactorToken
 from net._sys.common import _OwnedFD, _set_no_sigpipe
-from net.http._buffer import BufferBudget
+from net.http._buffer import BufferBudget, SharedBufferBudget
 from net.http._connection import HttpConnection, STATE_SENDING_100
 from net.http._deadline import now_ns
 from net.http import (
@@ -761,7 +761,7 @@ struct _WorkspaceHandler(Handler):
         self.workspace = 0
 
     def handle(mut self, req: Request, mut writer: ResponseWriter) raises:
-        self.workspace = writer._body_budget.value().total
+        self.workspace = writer._body_budget.value().remaining()
         writer.write_string(String("a") * 64)
         if self.action == 1:
             raise Error("after body allocation")
@@ -771,6 +771,52 @@ struct _WorkspaceHandler(Handler):
         if self.action == 3:
             writer.headers.add(String("Content-Length"), String("999"))
         writer.write_string(String("b") * 64)
+
+
+struct _SharedBodyHandler(Handler):
+    var budget: SharedBufferBudget
+    var available: Int
+    var with_body: Int
+    var foreign_admitted: Bool
+
+    def __init__(out self, var budget: SharedBufferBudget):
+        self.budget = budget^
+        self.available = -1
+        self.with_body = -1
+        self.foreign_admitted = False
+
+    def handle(mut self, req: Request, mut writer: ResponseWriter) raises:
+        self.available = self.budget.remaining()
+        self.foreign_admitted = self.budget.try_reserve(7)
+        writer.write_string("body1234")
+        self.with_body = self.budget.used()
+        if self.foreign_admitted:
+            self.budget.release(7)
+
+
+def test_handler_writer_charges_only_its_body_and_allows_foreign_admission() raises:
+    var config = ServerConfig.default()
+    config.total_buffer_budget = 512
+    var server = Server(config^)
+    server.add_listener(listen_tcp("127.0.0.1:0"))
+    var handler = _SharedBodyHandler(server._budget.copy())
+    var client = dial_tcp(
+        String("127.0.0.1:") + String(server.local_address().port),
+        Timeout.seconds(1),
+    )
+    var out = _exchange(
+        server,
+        handler,
+        client,
+        "GET / HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n",
+    )
+    client.close()
+    assert_equal(_status_of(out), 200)
+    _assert_body(out, "body1234")
+    assert_equal(handler.available, 512)
+    assert_true(handler.foreign_admitted)
+    assert_equal(handler.with_body, 15)
+    assert_equal(server._budget.used(), 0)
 
 
 struct _RequestWorkspaceHandler(Handler):
@@ -783,7 +829,7 @@ struct _RequestWorkspaceHandler(Handler):
 
     def handle(mut self, req: Request, mut writer: ResponseWriter) raises:
         assert_equal(req.body.capacity(), 5)
-        self.workspace = writer._body_budget.value().total
+        self.workspace = writer._body_budget.value().remaining()
         writer.write_string("reply")
         if self.action == 1:
             raise Error("after borrowed request")

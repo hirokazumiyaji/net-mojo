@@ -165,19 +165,19 @@ def test_shared_budget_pthread_and_owner_cannot_over_admit() raises:
     assert_equal(owner.used(), 0)
 
 
-def test_writer_body_workspace_clamps_capacity_to_growth_peak() raises:
+def test_writer_body_budget_clamps_capacity_to_growth_peak() raises:
     var writer = ResponseWriter(32)
-    writer._set_body_budget(20)
+    writer._set_body_budget(SharedBufferBudget(20))
     writer.write_string("12345678")
     writer.write_string("9")
     assert_equal(writer.body.capacity(), 12)
-    assert_equal(writer._body_budget.value().used, 12)
+    assert_equal(writer._body_budget.value().used(), 12)
     assert_equal(len(writer.body), 9)
 
 
-def test_writer_body_workspace_rejects_peak_without_changing_body() raises:
+def test_writer_body_budget_rejects_peak_without_changing_body() raises:
     var writer = ResponseWriter(32)
-    writer._set_body_budget(16)
+    writer._set_body_budget(SharedBufferBudget(16))
     writer.write_string("12345678")
     var rejected = False
     try:
@@ -188,42 +188,42 @@ def test_writer_body_workspace_rejects_peak_without_changing_body() raises:
     assert_true(rejected)
     writer.write_string("")
     assert_equal(writer.body.capacity(), 8)
-    assert_equal(writer._body_budget.value().used, 8)
+    assert_equal(writer._body_budget.value().used(), 8)
     assert_equal(len(writer.body), 8)
     assert_equal(writer.body[7], Byte(ord("8")))
 
 
-def test_writer_span_move_and_drop_preserve_workspace_accounting() raises:
+def test_writer_span_move_and_drop_preserve_owned_capacity() raises:
     var writer = ResponseWriter(32)
-    writer._set_body_budget(24)
+    writer._set_body_budget(SharedBufferBudget(24))
     writer.write_string("12345678")
     var moved = writer^
     moved.write(String("9").as_bytes())
-    assert_equal(moved._body_budget.value().total, 24)
-    assert_equal(moved._body_budget.value().used, 16)
+    assert_equal(moved._body_budget.value().total(), 24)
+    assert_equal(moved._body_budget.value().used(), 16)
     assert_equal(moved.body.capacity(), 16)
     moved._drop_body()
     assert_equal(moved.body.capacity(), 0)
-    assert_equal(moved._body_budget.value().used, 0)
+    assert_equal(moved._body_budget.value().used(), 0)
 
 
 def test_writer_reconciles_direct_capacity_before_supported_growth() raises:
     var writer = ResponseWriter(32)
-    writer._set_body_budget(24)
+    writer._set_body_budget(SharedBufferBudget(24))
     writer.body = List[Byte](length=8, fill=42)
     writer.write_string("9")
-    assert_equal(writer._body_budget.value().used, 16)
+    assert_equal(writer._body_budget.value().used(), 16)
     writer.body = List[Byte](length=4, fill=43)
     assert_true(writer._reconcile_body_budget())
-    assert_equal(writer._body_budget.value().used, 4)
+    assert_equal(writer._body_budget.value().used(), 4)
 
 
-def test_writer_rejects_direct_capacity_outside_workspace() raises:
+def test_writer_rejects_direct_capacity_outside_budget() raises:
     var writer = ResponseWriter(32)
-    writer._set_body_budget(16)
+    writer._set_body_budget(SharedBufferBudget(16))
     writer.body.reserve(20)
     assert_false(writer._reconcile_body_budget())
-    assert_equal(writer._body_budget.value().used, 0)
+    assert_equal(writer._body_budget.value().used(), 0)
     writer._drop_body()
     assert_equal(writer.body.capacity(), 0)
 
@@ -234,6 +234,109 @@ def test_standalone_writer_keeps_exact_reserve_behavior() raises:
     writer.write_string("9")
     assert_false(Bool(writer._body_budget))
     assert_equal(writer.body.capacity(), 9)
+
+
+def test_writer_owned_capacity_preserves_foreign_charge_through_growth_and_drop() raises:
+    var budget = SharedBufferBudget(25)
+    assert_true(budget.try_reserve(5))
+    var writer = ResponseWriter(32)
+    writer._set_body_budget(budget.copy())
+    writer.write_string("12345678")
+    assert_equal(budget.used(), 13)
+    writer.write_string("9")
+    assert_equal(writer.body.capacity(), 12)
+    assert_equal(budget.used(), 17)
+    writer.body = List[Byte](length=4, fill=42)
+    assert_true(writer._reconcile_body_budget())
+    assert_equal(budget.used(), 9)
+    writer._drop_body()
+    assert_equal(budget.used(), 5)
+    budget.release(5)
+
+
+def _write_body_then_raise(var budget: SharedBufferBudget) raises:
+    var writer = ResponseWriter(32)
+    writer._set_body_budget(budget^)
+    writer.write_string("12345678")
+    raise Error("after response body allocation")
+
+
+def test_writer_error_destruction_refunds_only_its_owned_body() raises:
+    var budget = SharedBufferBudget(24)
+    assert_true(budget.try_reserve(5))
+    var raised = False
+    try:
+        _write_body_then_raise(budget.copy())
+    except:
+        raised = True
+    assert_true(raised)
+    assert_equal(budget.used(), 5)
+    budget.release(5)
+
+
+@fieldwise_init
+struct _WriterWorker:
+    var writer: ResponseWriter
+    var written: Bool
+    var denied: Bool
+
+
+def _writer_worker(
+    arg: Pointer[Byte, MutUntrackedOrigin]
+) -> Pointer[Byte, MutUntrackedOrigin]:
+    var worker = arg.unsafe_bitcast[_WriterWorker]()
+    try:
+        worker[].writer.write_string("12345678")
+        worker[].written = True
+        try:
+            worker[].writer.write_string("9")
+        except e:
+            worker[].denied = e.kind == NetErrorKind.invalid_argument()
+    except:
+        worker[].written = False
+    return arg
+
+
+def test_pthread_writer_bodies_share_peak_bound_and_refund_independently() raises:
+    var budget = SharedBufferBudget(21)
+    assert_true(budget.try_reserve(5))
+    var threaded = ResponseWriter(32)
+    threaded._set_body_budget(budget.copy())
+    var worker = _WriterWorker(threaded^, False, False)
+    var writer = ResponseWriter(32)
+    writer._set_body_budget(budget.copy())
+    var thread: UInt64 = 0
+    var rc = external_call["pthread_create", c_int](
+        Pointer(to=thread),
+        Optional[Pointer[Byte, MutUntrackedOrigin]](None),
+        _writer_worker,
+        Pointer(to=worker).unsafe_bitcast[Byte](),
+    )
+    assert_equal(Int(rc), 0)
+    var written: Bool
+    var denied = False
+    try:
+        writer.write_string("12345678")
+        written = True
+        try:
+            writer.write_string("9")
+        except e:
+            denied = e.kind == NetErrorKind.invalid_argument()
+    except:
+        written = False
+    _join_thread(thread)
+    assert_true(written)
+    assert_true(worker.written)
+    assert_true(worker.denied)
+    assert_true(denied)
+    assert_equal(worker.writer.body.capacity(), 8)
+    assert_equal(writer.body.capacity(), 8)
+    assert_equal(budget.used(), 21)
+    worker.writer._drop_body()
+    assert_equal(budget.used(), 13)
+    _ = writer^
+    assert_equal(budget.used(), 5)
+    budget.release(5)
 
 
 def test_receive_growth_charges_capacity_and_old_new_peak() raises:

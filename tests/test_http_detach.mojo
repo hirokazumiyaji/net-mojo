@@ -6,6 +6,7 @@ from std.time import sleep
 from net import TCPConn, Timeout, dial_tcp, listen_tcp
 from net._sys.common import EINTR
 from net.error import NetErrorKind
+from net.http._buffer import SharedBufferBudget
 from net.http import (
     Handler,
     Headers,
@@ -922,18 +923,25 @@ def _worker_respond_thread(
 
 struct _BudgetedWorkerHandler(Handler):
     var context: Pointer[_WorkerRespondContext, MutUntrackedOrigin]
+    var budget: SharedBufferBudget
+    var body_charge: Int
     var thread: UInt64
     var started: Bool
 
     def __init__(
-        out self, context: Pointer[_WorkerRespondContext, MutUntrackedOrigin]
+        out self,
+        context: Pointer[_WorkerRespondContext, MutUntrackedOrigin],
+        var budget: SharedBufferBudget,
     ):
         self.context = context
+        self.budget = budget^
+        self.body_charge = -1
         self.thread = 0
         self.started = False
 
     def handle(mut self, req: Request, mut writer: ResponseWriter) raises:
         writer.write_string("handler-local body")
+        self.body_charge = self.budget.used()
         var sender = writer.detach()
         self.context[].sender_addr = sender._take()
         var rc = external_call["pthread_create", c_int](
@@ -946,7 +954,7 @@ struct _BudgetedWorkerHandler(Handler):
         self.started = True
 
 
-def test_writer_workspace_returns_when_handler_starts_detached_worker() raises:
+def test_writer_body_charge_returns_when_handler_starts_detached_worker() raises:
     var config = ServerConfig.default()
     config.total_buffer_budget = 512
     var server = Server(config^)
@@ -960,7 +968,7 @@ def test_writer_workspace_returns_when_handler_starts_detached_worker() raises:
     ](c_size_t(size_of[_WorkerRespondContext]()))
     assert_true(Int(context) != 0)
     context.unsafe_write(_WorkerRespondContext(sender_addr=0, done=False))
-    var handler = _BudgetedWorkerHandler(context)
+    var handler = _BudgetedWorkerHandler(context, server._budget.copy())
     client.write_all(
         "GET / HTTP/1.1\r\nHost: x\r\n\r\n".as_bytes(), Timeout.seconds(1)
     )
@@ -977,6 +985,7 @@ def test_writer_workspace_returns_when_handler_starts_detached_worker() raises:
     assert_equal(server._budget.used(), 0)
     client.close()
     external_call["free", NoneType](context)
+    assert_equal(handler.body_charge, 18)
 
 
 def test_cross_thread_worker_respond_and_wakeup() raises:
