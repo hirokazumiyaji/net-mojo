@@ -74,6 +74,47 @@ visited for quiche timeout dispatch. Application deadline selection/expiration
 and the terminal sweep still scan their state, so overall timeout work is not
 yet proportional only to due connections.
 
+### Canceled HTTP/3 request state
+
+Transport shutdown alone does not release incomplete request state in quiche
+0.29.3. The provider uses a focused source patch with an explicit
+`h3::Connection::cancel_request()` API: shut down both request directions,
+remove partial field/body parsing state and queued Finished events, and ignore
+priority updates that could recreate canceled state before peer final size.
+Peer resets consumed by either `poll()` or `recv_body()`, header/body deadlines
+and response aborts share this cleanup. Unexpected cancellation errors propagate
+or close the connection; they are not treated as an already-canceled request.
+QPACK table capacity and blocked-stream limits remain explicitly zero.
+
+`scripts/prepare_quiche_source.sh` verifies the exact Cargo.lock version and
+public crate SHA-256, stages fresh source, and applies the small patch before
+both build and test entry points. Cargo's same-graph `paths` override preserves
+the upstream lockfile. The generated source retains the upstream BSD license;
+[patch maintenance notes](../../net/quic/provider/patches/README.md) record the
+checksum, license copy and upstream issue. Dependency updates must replace the
+pin and checksum together, rebase or retire the patch against a supported
+upstream API, and rerun its reset/body-read/Finished/priority contracts. Do not
+reuse staged source as an alternative pin.
+
+Run `pixi run -e tls-http3 quic-suite` to reproduce the API contracts and the
+10,000-reset allocation regression, plus header/body/response deadline churn.
+The real live scenario can be repeated after building and starting
+`benchmarks/http3_server.mojo` with its generated test certificate:
+
+```sh
+pixi run -e tls-http3 mojo build --Werror -I . benchmarks/http3_server.mojo -o build/quic/http3-cancel-check
+./build/quic/http3-cancel-check
+# In another terminal:
+pixi run -e tls-http3 python3 benchmarks/http/http3_scenarios.py --url https://127.0.0.1:18453/fixed --scenario cancel --siblings 8
+```
+
+The allocation test measures live Rust allocation sizes freed by dropping only
+the server H3 engine, separately from application byte counters. It does not
+bound total allocator or RSS usage: normal QUIC collected-stream IDs still grow
+until connection drop and require separate lifetime/accounting work. A scheduler
+that indexes transport deadlines must refresh its entry whenever cancellation
+closes a connection outside the receive/send paths.
+
 Still deferred: enabling 0-RTT and full path migration. macOS Mojo end-to-end
 HTTP/3 is covered in CI (`http3` job on `macos-14`, `http3-client-test` against
 the Mojo fixture); only packaged-artifact distribution verification remains

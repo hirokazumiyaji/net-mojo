@@ -1,0 +1,154 @@
+--- a/src/h3/mod.rs
++++ b/src/h3/mod.rs
+@@ -1561,6 +1561,35 @@
+         Ok(())
+     }
+ 
++    /// Cancels both directions of an HTTP/3 request and releases its state.
++    ///
++    /// This can also be called for an incomplete field section, or after a
++    /// reset was reported by `poll()` or `recv_body()`. Already shut down or
++    /// collected request streams can be cancelled again. Control and QPACK
++    /// streams cannot be cancelled through this method.
++    pub fn cancel_request<F: BufFactory>(
++        &mut self, conn: &mut super::Connection<F>, stream_id: u64,
++        error_code: u64,
++    ) -> Result<()> {
++        if !stream_id.is_multiple_of(4) {
++            return Err(Error::FrameUnexpected);
++        }
++        if conn.streams.get(stream_id).is_none() &&
++            !conn.stream_closed(stream_id)
++        {
++            return Err(crate::Error::InvalidStreamState(stream_id).into());
++        }
++        for direction in [crate::Shutdown::Read, crate::Shutdown::Write] {
++            match conn.stream_shutdown(stream_id, direction, error_code) {
++                Ok(()) | Err(crate::Error::Done) => (),
++                Err(error) => return Err(error.into()),
++            }
++        }
++        self.streams.remove(&stream_id);
++        self.finished_streams.retain(|id| *id != stream_id);
++        Ok(())
++    }
++
+     /// Sends an HTTP/3 body chunk on the given stream.
+     ///
+     /// On success the number of bytes written is returned, or [`Done`] if no
+@@ -3271,11 +3300,13 @@
+                     return Err(Error::IdError);
+                 }
+ 
+-                // PRIORITY_UPDATE can arrive before the request stream exists,
+-                // so a missing transport stream is allowed. Ignore updates only
+-                // once the transport stream was collected or both transport
+-                // directions are finished.
+-                if conn.stream_closed(prioritized_element_id) {
++                // PRIORITY_UPDATE can precede a request, but must not recreate
++                // state after cancellation while waiting for the peer's FIN.
++                if conn.stream_closed(prioritized_element_id) ||
++                    conn.streams.get(prioritized_element_id).is_some_and(
++                        |stream| stream.send.is_shutdown() && stream.recv.is_draining(),
++                    )
++                {
+                     return Err(Error::Done);
+                 }
+ 
+@@ -8154,7 +8185,7 @@
+     }
+ 
+     #[test]
+-    fn reset_finished_at_server_with_data_pending() {
++    fn request_cancellation_after_poll_reset() {
+         let mut s = Session::new().unwrap();
+         s.handshake().unwrap();
+ 
+@@ -8188,12 +8219,21 @@
+         // but polls and receives the reset and there are no more
+         // readable streams.
+         assert_eq!(s.poll_server(), Ok((stream, Event::Reset(0))));
++
++        assert!(s.server.streams.contains_key(&stream));
++        assert_eq!(
++            s.server.cancel_request(&mut s.pipe.server, stream, 0),
++            Ok(())
++        );
++        assert!(!s.server.streams.contains_key(&stream));
++        assert!(!s.server.finished_streams.contains(&stream));
++
+         assert_eq!(s.poll_server(), Err(Error::Done));
+         assert_eq!(s.pipe.server.readable().len(), 0);
+     }
+ 
+     #[test]
+-    fn reset_finished_at_server_with_data_pending_2() {
++    fn request_cancellation_after_recv_body_reset() {
+         let mut s = Session::new().unwrap();
+         s.handshake().unwrap();
+ 
+@@ -8230,9 +8270,64 @@
+             Err(Error::TransportError(crate::Error::StreamReset(0)))
+         );
+ 
++        assert!(s.server.streams.contains_key(&stream));
++        assert_eq!(
++            s.server.cancel_request(&mut s.pipe.server, stream, 0),
++            Ok(())
++        );
++        assert!(!s.server.streams.contains_key(&stream));
++        assert!(!s.server.finished_streams.contains(&stream));
++
+         // No more events and there are no more readable streams.
+         assert_eq!(s.poll_server(), Err(Error::Done));
+         assert_eq!(s.pipe.server.readable().len(), 0);
++    }
++
++    #[test]
++    fn request_cancellation_ignores_priority_update_before_peer_reset() {
++        let mut s = Session::new().unwrap();
++        s.handshake().unwrap();
++        let (stream, req) = s.send_request(false).unwrap();
++        s.send_body_client(stream, false).unwrap();
++        s.pipe.advance().unwrap();
++        assert_eq!(s.poll_server(), Ok((stream, Event::Headers {
++            list: req, more_frames: true,
++        })));
++        assert_eq!(s.poll_server(), Ok((stream, Event::Data)));
++        s.server.cancel_request(&mut s.pipe.server, stream, 0).unwrap();
++        assert!(!s.pipe.server.stream_closed(stream));
++        s.client.send_priority_update_for_request(
++            &mut s.pipe.client, stream, &Priority::default(),
++        ).unwrap();
++        let flight = crate::test_utils::emit_flight(&mut s.pipe.client).unwrap();
++        crate::test_utils::process_flight(&mut s.pipe.server, flight).unwrap();
++        assert!(!s.pipe.server.stream_closed(stream));
++        assert_eq!(s.poll_server(), Err(Error::Done));
++        assert!(!s.server.streams.contains_key(&stream));
++
++        s.client.send_priority_update_for_request(
++            &mut s.pipe.client, 4, &Priority::default(),
++        ).unwrap();
++        s.pipe.advance().unwrap();
++        assert_eq!(s.poll_server(), Ok((4, Event::PriorityUpdate)));
++    }
++
++    #[test]
++    fn request_cancellation_removes_pending_finished_event() {
++        let mut s = Session::new().unwrap();
++        s.handshake().unwrap();
++        let (stream, req) = s.send_request(false).unwrap();
++        s.send_body_client(stream, true).unwrap();
++        s.pipe.advance().unwrap();
++        assert_eq!(s.poll_server(), Ok((stream, Event::Headers {
++            list: req, more_frames: true,
++        })));
++        assert_eq!(s.poll_server(), Ok((stream, Event::Data)));
++        assert!(s.recv_body_server(stream, &mut [0; 100]).is_ok());
++        assert!(s.server.finished_streams.contains(&stream));
++        s.server.cancel_request(&mut s.pipe.server, stream, 0).unwrap();
++        assert!(!s.server.finished_streams.contains(&stream));
++        assert_eq!(s.poll_server(), Err(Error::Done));
+     }
+ 
+     #[test]

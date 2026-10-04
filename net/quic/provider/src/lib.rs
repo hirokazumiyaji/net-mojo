@@ -954,6 +954,8 @@ impl QuicServer {
     pub fn new(config: quiche::Config) -> io::Result<Self> {
         let mut http3_config = quiche::h3::Config::new().unwrap();
         http3_config.set_max_field_section_size(32_768);
+        http3_config.set_qpack_max_table_capacity(0);
+        http3_config.set_qpack_blocked_streams(0);
         Ok(Self {
             config,
             http3_config,
@@ -1322,16 +1324,11 @@ impl QuicServer {
                         .final_goaway_last_stream_id
                         .is_some_and(|last| stream_id >= last)
                     {
-                        let _ = connection.transport.stream_shutdown(
+                        http3.cancel_request(
+                            &mut connection.transport,
                             stream_id,
-                            quiche::Shutdown::Read,
                             H3_REQUEST_REJECTED,
-                        );
-                        let _ = connection.transport.stream_shutdown(
-                            stream_id,
-                            quiche::Shutdown::Write,
-                            H3_REQUEST_REJECTED,
-                        );
+                        )?;
                         continue;
                     }
                     if let Some(request) = connection.requests.get_mut(&stream_id) {
@@ -1370,11 +1367,11 @@ impl QuicServer {
                             } else {
                                 0x10e
                             };
-                            let _ = connection.transport.stream_shutdown(
+                            http3.cancel_request(
+                                &mut connection.transport,
                                 stream_id,
-                                quiche::Shutdown::Read,
                                 code,
-                            );
+                            )?;
                             if let Some(rejected) = connection.requests.remove(&stream_id) {
                                 release_pending_request_bytes(buffered_request_bytes, &rejected);
                             }
@@ -1387,11 +1384,11 @@ impl QuicServer {
                                     delta,
                                     MAX_HTTP3_BUFFERED_REQUEST_BYTES,
                                 ) {
-                                    let _ = connection.transport.stream_shutdown(
+                                    http3.cancel_request(
+                                        &mut connection.transport,
                                         stream_id,
-                                        quiche::Shutdown::Read,
                                         H3_EXCESSIVE_LOAD,
-                                    );
+                                    )?;
                                     if let Some(rejected) =
                                         connection.requests.remove(&stream_id)
                                     {
@@ -1520,11 +1517,11 @@ impl QuicServer {
                         } else {
                             0x10e
                         };
-                        let _ = connection.transport.stream_shutdown(
+                        http3.cancel_request(
+                            &mut connection.transport,
                             stream_id,
-                            quiche::Shutdown::Read,
                             code,
-                        );
+                        )?;
                         continue;
                     }
                     let now = Instant::now();
@@ -1538,11 +1535,11 @@ impl QuicServer {
                         retained,
                         MAX_HTTP3_BUFFERED_REQUEST_BYTES,
                     ) {
-                        let _ = connection.transport.stream_shutdown(
+                        http3.cancel_request(
+                            &mut connection.transport,
                             stream_id,
-                            quiche::Shutdown::Read,
                             H3_EXCESSIVE_LOAD,
-                        );
+                        )?;
                         continue;
                     }
                     request.retained_bytes = retained;
@@ -1561,16 +1558,11 @@ impl QuicServer {
                         continue;
                     }
                     let Some(request) = connection.requests.get_mut(&stream_id) else {
-                        let _ = connection.transport.stream_shutdown(
+                        http3.cancel_request(
+                            &mut connection.transport,
                             stream_id,
-                            quiche::Shutdown::Read,
                             H3_FRAME_UNEXPECTED,
-                        );
-                        let _ = connection.transport.stream_shutdown(
-                            stream_id,
-                            quiche::Shutdown::Write,
-                            H3_FRAME_UNEXPECTED,
-                        );
+                        )?;
                         continue;
                     };
                     let now = Instant::now();
@@ -1586,11 +1578,11 @@ impl QuicServer {
                                     MAX_HTTP3_BUFFERED_REQUEST_BYTES,
                                     max_request_body_bytes,
                                 ) {
-                                    let _ = connection.transport.stream_shutdown(
+                                    http3.cancel_request(
+                                        &mut connection.transport,
                                         stream_id,
-                                        quiche::Shutdown::Read,
                                         H3_EXCESSIVE_LOAD,
-                                    );
+                                    )?;
                                     if let Some(rejected) = connection.requests.remove(&stream_id) {
                                         release_pending_request_bytes(
                                             buffered_request_bytes,
@@ -1601,6 +1593,18 @@ impl QuicServer {
                                 }
                             }
                             Err(quiche::h3::Error::Done) => break,
+                            Err(quiche::h3::Error::TransportError(quiche::Error::StreamReset(error))) => {
+                                http3.cancel_request(
+                                    &mut connection.transport,
+                                    stream_id,
+                                    error,
+                                )?;
+                                if let Some(reset) = connection.requests.remove(&stream_id) {
+                                    release_pending_request_bytes(buffered_request_bytes, &reset);
+                                }
+                                connection.header_deadlines.remove(&stream_id);
+                                break;
+                            }
                             Err(error) => return Err(error.into()),
                         }
                     }
@@ -1609,16 +1613,11 @@ impl QuicServer {
                     if let Some(request) = connection.requests.remove(&stream_id) {
                         if !content_length_matches_body(&request.headers, request.body.len()) {
                             release_pending_request_bytes(buffered_request_bytes, &request);
-                            let _ = connection.transport.stream_shutdown(
+                            http3.cancel_request(
+                                &mut connection.transport,
                                 stream_id,
-                                quiche::Shutdown::Read,
                                 H3_GENERAL_PROTOCOL_ERROR,
-                            );
-                            let _ = connection.transport.stream_shutdown(
-                                stream_id,
-                                quiche::Shutdown::Write,
-                                H3_GENERAL_PROTOCOL_ERROR,
-                            );
+                            )?;
                             continue;
                         }
                         completed.push(CompletedRequest {
@@ -1635,11 +1634,12 @@ impl QuicServer {
                     }
                 }
                 Ok((stream_id, quiche::h3::Event::Reset(error))) => {
-                    let _ = connection.transport.stream_shutdown(
+                    connection.header_deadlines.remove(&stream_id);
+                    http3.cancel_request(
+                        &mut connection.transport,
                         stream_id,
-                        quiche::Shutdown::Write,
                         error,
-                    );
+                    )?;
                     if let Some(reset) = connection.requests.remove(&stream_id) {
                         release_pending_request_bytes(buffered_request_bytes, &reset);
                     }
@@ -1695,11 +1695,7 @@ impl QuicServer {
                 .sum::<usize>();
         if !reserve_response_bytes(&mut self.buffered_response_bytes, buffered_bytes) {
             let connection = self.connections.get_mut(&connection_key).unwrap();
-            let _ = connection.transport.stream_shutdown(
-                stream_id,
-                quiche::Shutdown::Write,
-                H3_EXCESSIVE_LOAD,
-            );
+            cancel_http3_request(connection, stream_id, H3_EXCESSIVE_LOAD);
             self.request_routes.remove(&request_id);
             return true;
         }
@@ -1709,11 +1705,7 @@ impl QuicServer {
             let Some(normalized) = normalize_http3_response_header_name(&name) else {
                 self.buffered_response_bytes -= buffered_bytes;
                 let connection = self.connections.get_mut(&connection_key).unwrap();
-                let _ = connection.transport.stream_shutdown(
-                    stream_id,
-                    quiche::Shutdown::Write,
-                    H3_GENERAL_PROTOCOL_ERROR,
-                );
+                cancel_http3_request(connection, stream_id, H3_GENERAL_PROTOCOL_ERROR);
                 self.request_routes.remove(&request_id);
                 return true;
             };
@@ -1802,11 +1794,7 @@ impl QuicServer {
             if let Some(connection) = self.connections.get_mut(&connection_key) {
                 connection.responses.remove(&stream_id);
                 self.send_ready.push(&connection_key);
-                let _ = connection.transport.stream_shutdown(
-                    stream_id,
-                    quiche::Shutdown::Write,
-                    H3_REQUEST_REJECTED,
-                );
+                cancel_http3_request(connection, stream_id, H3_REQUEST_REJECTED);
             }
             self.buffered_response_bytes -= buffered_bytes;
             self.request_routes.remove(&request_id);
@@ -1990,16 +1978,7 @@ impl QuicServer {
                 if let Some(rejected) = connection.requests.remove(&stream_id) {
                     self.buffered_request_bytes =
                         self.buffered_request_bytes.saturating_sub(rejected.retained_bytes);
-                    let _ = connection.transport.stream_shutdown(
-                        stream_id,
-                        quiche::Shutdown::Read,
-                        H3_REQUEST_REJECTED,
-                    );
-                    let _ = connection.transport.stream_shutdown(
-                        stream_id,
-                        quiche::Shutdown::Write,
-                        H3_REQUEST_REJECTED,
-                    );
+                    cancel_http3_request(connection, stream_id, H3_REQUEST_REJECTED);
                 }
             }
             let expired_headers: Vec<u64> = connection
@@ -2012,16 +1991,7 @@ impl QuicServer {
             for stream_id in expired_headers {
                 self.send_ready.push(key);
                 connection.header_deadlines.remove(&stream_id);
-                let _ = connection.transport.stream_shutdown(
-                    stream_id,
-                    quiche::Shutdown::Read,
-                    H3_REQUEST_REJECTED,
-                );
-                let _ = connection.transport.stream_shutdown(
-                    stream_id,
-                    quiche::Shutdown::Write,
-                    H3_REQUEST_REJECTED,
-                );
+                cancel_http3_request(connection, stream_id, H3_REQUEST_REJECTED);
             }
         }
     }
@@ -2068,6 +2038,58 @@ impl QuicServer {
                 .entry(stream_id)
                 .or_insert_with(|| now + header_deadline);
         }
+    }
+}
+
+fn cancel_http3_request(connection: &mut QuicConnection, stream_id: u64, error_code: u64) {
+    if connection
+        .http3
+        .as_mut()
+        .unwrap()
+        .cancel_request(&mut connection.transport, stream_id, error_code)
+        .is_err()
+    {
+        let _ = connection.transport.close(
+            true,
+            H3_GENERAL_PROTOCOL_ERROR,
+            b"request cancellation failed",
+        );
+    }
+}
+
+#[cfg(test)]
+mod allocation_probe {
+    use std::alloc::{GlobalAlloc, Layout, System};
+    use std::cell::Cell;
+    thread_local! { static LIVE: Cell<isize> = const { Cell::new(0) }; }
+    struct Counting;
+    #[global_allocator]
+    static ALLOCATOR: Counting = Counting;
+    fn account(delta: isize) {
+        let _ = LIVE.try_with(|live| live.set(live.get() + delta));
+    }
+    unsafe impl GlobalAlloc for Counting {
+        unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+            let ptr = unsafe { System.alloc(layout) };
+            if !ptr.is_null() {
+                account(layout.size() as isize);
+            }
+            ptr
+        }
+        unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+            account(-(layout.size() as isize));
+            unsafe { System.dealloc(ptr, layout) };
+        }
+        unsafe fn realloc(&self, ptr: *mut u8, old: Layout, size: usize) -> *mut u8 {
+            let new_ptr = unsafe { System.realloc(ptr, old, size) };
+            if !new_ptr.is_null() {
+                account(size as isize - old.size() as isize);
+            }
+            new_ptr
+        }
+    }
+    pub fn live() -> isize {
+        LIVE.with(Cell::get)
     }
 }
 
@@ -3586,112 +3608,307 @@ mod tests {
             .expect("HTTP/3 request should complete under packet stress")
     }
 
-    #[test]
-    fn cancelled_request_streams_return_bidirectional_credit() {
-        let mut server = super::QuicServer::new(stress_server_config()).unwrap();
-        let local = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 4433);
-        let remote = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 54321);
-        let mut config = stress_client_config();
-        let mut client = quiche::connect(
-            Some("localhost"),
-            &ConnectionId::from_ref(&[0x73; 16]),
-            remote,
-            local,
-            &mut config,
-        )
-        .unwrap();
-        let mut packet = [0; 65535];
-        establish_http3_in_memory(&mut client, &mut server, &mut packet, local, remote, false);
-        let mut h3 = quiche::h3::Connection::with_transport(
-            &mut client,
-            &quiche::h3::Config::new().unwrap(),
-        )
-        .unwrap();
-        let headers = [
-            quiche::h3::Header::new(b":method", b"POST"),
-            quiche::h3::Header::new(b":scheme", b"https"),
-            quiche::h3::Header::new(b":authority", b"localhost"),
-            quiche::h3::Header::new(b":path", b"/echo"),
-            quiche::h3::Header::new(b"content-length", b"8"),
-        ];
-        for _ in 0..105 {
-            let id = h3
-                .send_request(&mut client, &headers, false)
-                .expect("cancelled streams must return credit for new requests");
-            h3.send_body(&mut client, id, b"ping", false).unwrap();
+    enum Cancellation {
+        PeerReset,
+        IncompleteDataReset,
+        BodyTimeout,
+    }
+
+    struct H3ResetFixture {
+        server: super::QuicServer,
+        client: quiche::Connection,
+        http3: quiche::h3::Connection,
+        packet: [u8; 65535],
+        local: SocketAddr,
+        remote: SocketAddr,
+    }
+
+    impl H3ResetFixture {
+        fn new() -> Self {
+            let mut server = super::QuicServer::new(stress_server_config()).unwrap();
+            let local = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 4433);
+            let remote = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 54321);
+            let mut config = stress_client_config();
+            let mut client = quiche::connect(
+                Some("localhost"),
+                &ConnectionId::from_ref(&[0x73; 16]),
+                remote,
+                local,
+                &mut config,
+            )
+            .unwrap();
+            let mut packet = [0; 65535];
+            establish_http3_in_memory(&mut client, &mut server, &mut packet, local, remote, false);
+            let http3 = quiche::h3::Connection::with_transport(
+                &mut client,
+                &quiche::h3::Config::new().unwrap(),
+            )
+            .unwrap();
+            Self {
+                server,
+                client,
+                http3,
+                packet,
+                local,
+                remote,
+            }
+        }
+
+        fn pump_until(&mut self, ready: impl Fn(&super::QuicServer) -> bool) {
             for _ in 0..64 {
                 pump_in_memory(
-                    &mut client,
-                    &mut server,
-                    &mut packet,
-                    local,
-                    remote,
+                    &mut self.client,
+                    &mut self.server,
+                    &mut self.packet,
+                    self.local,
+                    self.remote,
                     false,
                     false,
                 );
-                while h3.poll(&mut client).is_ok() {}
-                if server
-                    .connections
-                    .values()
-                    .any(|c| c.requests.contains_key(&id))
-                {
-                    break;
+                while self.http3.poll(&mut self.client).is_ok() {}
+                if ready(&self.server) {
+                    return;
                 }
                 std::thread::sleep(Duration::from_millis(2));
             }
-            assert!(
+            panic!("HTTP/3 fixture did not reach the expected request state");
+        }
+
+        fn headers(padding: &[u8]) -> [quiche::h3::Header; 6] {
+            [
+                quiche::h3::Header::new(b":method", b"POST"),
+                quiche::h3::Header::new(b":scheme", b"https"),
+                quiche::h3::Header::new(b":authority", b"localhost"),
+                quiche::h3::Header::new(b":path", b"/echo"),
+                quiche::h3::Header::new(b"content-length", b"8"),
+                quiche::h3::Header::new(b"x-retained", padding),
+            ]
+        }
+
+        fn churn(&mut self, cycles: usize, padding_bytes: usize, method: Cancellation) {
+            let padding = vec![b'x'; padding_bytes];
+            let headers = Self::headers(&padding);
+            for _ in 0..cycles {
+                let id = self
+                    .http3
+                    .send_request(&mut self.client, &headers, false)
+                    .expect("cancelled streams must return credit for new requests");
+                match method {
+                    Cancellation::IncompleteDataReset => {
+                        self.client.stream_send(id, b"\x00\x08ping", false).unwrap();
+                    }
+                    _ => {
+                        self.http3
+                            .send_body(&mut self.client, id, b"ping", false)
+                            .unwrap();
+                    }
+                }
+                self.pump_until(|server| {
+                    server
+                        .connections
+                        .values()
+                        .any(|c| c.requests.get(&id).is_some_and(|r| r.body == b"ping"))
+                });
+                match method {
+                    Cancellation::BodyTimeout => {
+                        let connection = self.server.connections.values_mut().next().unwrap();
+                        connection.requests.get_mut(&id).unwrap().body_deadline_at =
+                            Some(std::time::Instant::now());
+                        self.server.expire_incomplete_requests();
+                    }
+                    _ => {
+                        self.client
+                            .stream_shutdown(id, quiche::Shutdown::Write, 0x10c)
+                            .unwrap();
+                    }
+                }
+                self.pump_until(|server| {
+                    server
+                        .connections
+                        .values()
+                        .all(|c| !c.requests.contains_key(&id))
+                });
+                assert_eq!(self.server.connections.len(), 1);
+                assert_eq!(self.server.buffered_request_bytes, 0);
+                assert!(self.server.requests.is_empty());
+            }
+        }
+
+        fn probe(&mut self) {
+            let id = self
+                .http3
+                .send_request(&mut self.client, &Self::headers(&[]), false)
+                .expect("a full request must remain usable after cancellation churn");
+            self.http3
+                .send_body(&mut self.client, id, b"complete", true)
+                .unwrap();
+            self.pump_until(|server| !server.requests.is_empty());
+            assert_eq!(self.server.next_request().unwrap().body, b"complete");
+        }
+
+        fn retained_engine_bytes(&mut self) -> isize {
+            let http3 = self
+                .server
+                .connections
+                .values_mut()
+                .next()
+                .unwrap()
+                .http3
+                .take()
+                .unwrap();
+            let before_drop = super::allocation_probe::live();
+            drop(http3);
+            before_drop - super::allocation_probe::live()
+        }
+    }
+
+    #[test]
+    fn cancelled_request_streams_return_bidirectional_credit() {
+        let mut fixture = H3ResetFixture::new();
+        fixture.churn(105, 0, Cancellation::PeerReset);
+        fixture.probe();
+    }
+
+    #[test]
+    fn cancellation_churn_releases_http3_engine_allocations() {
+        let mut fixture = H3ResetFixture::new();
+        fixture.churn(10_000, 4096, Cancellation::PeerReset);
+        let retained = fixture.retained_engine_bytes();
+        eprintln!("10000 cancellations: retained server H3 Rust allocations {retained} bytes");
+        assert!(
+            retained <= 64 * 1024,
+            "HTTP/3 state retained {retained} bytes after cancelled requests"
+        );
+    }
+
+    #[test]
+    fn reset_during_incomplete_data_frame_keeps_connection_usable() {
+        let mut fixture = H3ResetFixture::new();
+        fixture.churn(1, 0, Cancellation::IncompleteDataReset);
+        fixture.probe();
+    }
+
+    #[test]
+    fn body_timeout_releases_http3_engine_allocations() {
+        let mut fixture = H3ResetFixture::new();
+        fixture.churn(1000, 4096, Cancellation::BodyTimeout);
+        let retained = fixture.retained_engine_bytes();
+        assert!(
+            retained <= 64 * 1024,
+            "HTTP/3 state retained {retained} bytes after body timeouts"
+        );
+    }
+
+    #[test]
+    fn incomplete_field_section_timeout_releases_http3_engine_allocations() {
+        let mut fixture = H3ResetFixture::new();
+        for index in 1..=1000 {
+            let id = index * 4;
+            fixture
+                .client
+                .stream_send(id, b"\x01\x40\x80\x00", false)
+                .unwrap();
+            fixture.pump_until(|server| {
                 server
                     .connections
                     .values()
-                    .any(|c| c.requests.contains_key(&id))
-            );
-            client
-                .stream_shutdown(id, quiche::Shutdown::Write, 0x10c)
-                .unwrap();
-            for _ in 0..64 {
-                pump_in_memory(
-                    &mut client,
-                    &mut server,
-                    &mut packet,
-                    local,
-                    remote,
-                    false,
-                    false,
-                );
-                while h3.poll(&mut client).is_ok() {}
-                if server
+                    .any(|c| c.header_deadlines.contains_key(&id))
+            });
+            let connection = fixture.server.connections.values_mut().next().unwrap();
+            connection
+                .header_deadlines
+                .insert(id, std::time::Instant::now());
+            fixture.server.expire_incomplete_requests();
+            fixture.pump_until(|server| {
+                server
                     .connections
                     .values()
-                    .all(|c| !c.requests.contains_key(&id))
-                {
-                    break;
-                }
-                std::thread::sleep(Duration::from_millis(2));
-            }
-            assert_eq!(server.buffered_request_bytes, 0);
-            assert!(server.requests.is_empty());
+                    .all(|c| !c.header_deadlines.contains_key(&id))
+            });
+            assert_eq!(fixture.server.buffered_request_bytes, 0);
         }
-        let id = h3
-            .send_request(&mut client, &headers, false)
-            .expect("a full request must remain usable after cancellation churn");
-        h3.send_body(&mut client, id, b"complete", true).unwrap();
-        for _ in 0..64 {
-            pump_in_memory(
-                &mut client,
-                &mut server,
-                &mut packet,
-                local,
-                remote,
-                false,
-                false,
-            );
-            if !server.requests.is_empty() {
-                break;
-            }
-            std::thread::sleep(Duration::from_millis(2));
-        }
-        assert_eq!(server.next_request().unwrap().body, b"complete");
+        fixture.probe();
+        let retained = fixture.retained_engine_bytes();
+        assert!(
+            retained <= 64 * 1024,
+            "HTTP/3 state retained {retained} bytes after partial field timeouts"
+        );
     }
+    #[test]
+    fn response_timeout_releases_http3_engine_allocations() {
+        let mut fixture = H3ResetFixture::new();
+        let headers = H3ResetFixture::headers(&vec![b'x'; 4096]);
+        for _ in 0..1000 {
+            let id = fixture
+                .http3
+                .send_request(&mut fixture.client, &headers, false)
+                .unwrap();
+            fixture
+                .http3
+                .send_body(&mut fixture.client, id, b"complete", true)
+                .unwrap();
+            fixture.pump_until(|server| !server.requests.is_empty());
+            let request = fixture.server.next_request().unwrap();
+            assert!(
+                fixture
+                    .server
+                    .enqueue_response(request.id, 200, Vec::new(), vec![0; 32])
+            );
+            fixture
+                .server
+                .connections
+                .values_mut()
+                .next()
+                .unwrap()
+                .responses
+                .get_mut(&id)
+                .unwrap()
+                .write_deadline_at = std::time::Instant::now();
+            fixture.server.drive_responses().unwrap();
+            fixture.pump_until(|server| {
+                server
+                    .connections
+                    .values()
+                    .all(|c| !c.responses.contains_key(&id))
+            });
+            assert_eq!(fixture.server.buffered_response_bytes, 0);
+            assert_eq!(fixture.server.buffered_request_bytes, 0);
+        }
+        fixture.probe();
+        let retained = fixture.retained_engine_bytes();
+        assert!(
+            retained <= 64 * 1024,
+            "HTTP/3 state retained {retained} bytes after response timeouts"
+        );
+    }
+
+    #[test]
+    fn cancellation_api_is_idempotent_and_preserves_critical_streams() {
+        let mut fixture = H3ResetFixture::new();
+        fixture.churn(1, 0, Cancellation::PeerReset);
+        let connection = fixture.server.connections.values_mut().next().unwrap();
+        let http3 = connection.http3.as_mut().unwrap();
+        assert_eq!(
+            http3.cancel_request(&mut connection.transport, 0, 0x10c),
+            Ok(())
+        );
+        assert_eq!(
+            http3.cancel_request(&mut connection.transport, 0, 0x10c),
+            Ok(())
+        );
+        assert_eq!(
+            http3.cancel_request(&mut connection.transport, 2, 0x10c),
+            Err(quiche::h3::Error::FrameUnexpected)
+        );
+        assert_eq!(
+            http3.cancel_request(&mut connection.transport, 4, 0x10c),
+            Err(quiche::h3::Error::TransportError(
+                quiche::Error::InvalidStreamState(4)
+            ))
+        );
+        fixture.probe();
+    }
+
     #[test]
     fn tolerates_duplicate_client_datagrams_and_completes_request() {
         let mut server = super::QuicServer::new(stress_server_config()).unwrap();
