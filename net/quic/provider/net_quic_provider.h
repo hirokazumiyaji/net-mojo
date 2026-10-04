@@ -43,7 +43,7 @@ int32_t net_quic_server_recv(
     const char *local_address, const char *remote_address);
 int32_t net_quic_server_send(
     struct NetQuicServer *server, uint8_t *packet, size_t packet_capacity,
-    char *remote_address, size_t address_capacity);
+    char *remote_address, size_t address_capacity, uint64_t *send_delay_ns);
 uint64_t net_quic_server_timeout_micros(
     const struct NetQuicServer *server);
 void net_quic_server_on_timeout(struct NetQuicServer *server);
@@ -81,7 +81,7 @@ int32_t net_quic_receive(
     const char *local_address, const char *remote_address);
 int32_t net_quic_send(
     struct NetQuicServer *server, uint8_t *packet, size_t packet_capacity,
-    char *remote_address, size_t address_capacity);
+    char *remote_address, size_t address_capacity, uint64_t *send_delay_ns);
 uint64_t net_quic_timeout_micros(const struct NetQuicServer *server);
 void net_quic_on_timeout(struct NetQuicServer *server);
 int32_t net_quic_next_request(

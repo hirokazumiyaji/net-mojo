@@ -18,6 +18,14 @@ int main(int argc, char **argv) {
     if (server == NULL) {
         return 3;
     }
+    uint8_t packet[1200];
+    char destination[64];
+    uint64_t send_delay_ns = UINT64_MAX;
+    if (net_quic_send(server, packet, sizeof(packet), destination,
+                      sizeof(destination), &send_delay_ns) != 0 ||
+        send_delay_ns != 0) {
+        return 4;
+    }
     net_quic_free(server);
     net_quic_config_free(config);
     puts("QUIC provider server ownership: ok");

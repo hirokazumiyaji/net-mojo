@@ -768,7 +768,7 @@ struct Server(Movable):
             if not self._quic_endpoint.value().try_receive():
                 break
             received += 1
-        var remaining = self._quic_endpoint.value().timeout_micros()
+        var remaining = self._quic_endpoint.value().transport_timeout_micros()
         if remaining == 0:
             self._quic_endpoint.value().on_timeout()
         self._flush_quic()
