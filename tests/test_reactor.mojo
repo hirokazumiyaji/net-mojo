@@ -306,10 +306,10 @@ def test_paused_readable_direction_stays_quiet() raises:  # Disabling reads whil
     assert_true(quiet[0].writable)
 
     assert_true(reactor.modify(token, True, True))
-    # The byte was already in flight; collect until readability shows
-    # (a wait may return first on the always-ready writable side).
+    # Writable readiness must not exhaust the budget before the byte arrives.
     var seen_readable = False
-    for _ in range(20):
+    var expires = Int(perf_counter_ns()) + 1_000_000_000
+    while Int(perf_counter_ns()) < expires:
         var events = reactor.wait(Timeout.milliseconds(100))
         for i in range(len(events)):
             if events[i].token == token and events[i].readable:
