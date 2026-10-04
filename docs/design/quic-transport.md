@@ -43,6 +43,14 @@ drive an in-memory quiche client against `QuicServer::recv_datagram` / `send` /
   serving or idle/timeout-clean without leaking CID `routes` or connection maps.
   Full path migration beyond quiche’s built-in behavior is out of scope.
 
+The provider consumes unused quiche path notifications after each native receive,
+send and timeout operation, including error outcomes. Path validation and active
+path selection remain engine-owned. The regression completes one 128-byte request
+and a 200 response after 64 switches between two validated paths, then requires no
+pending notifications. Retained events are limited to one native-operation batch;
+the deque can keep its high-water capacity. This does not define an allocator-byte
+or RSS limit, and the provider does not expose a path-event callback.
+
 ### Transport memory and UDP send backpressure
 
 Soft transport-memory admission
