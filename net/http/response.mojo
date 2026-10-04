@@ -126,6 +126,7 @@ struct ResponseWriter(Movable, Sized):
             generation=self._generation,
             wakeup_fd=self._wakeup_fd,
             queue_limit=self._queue_limit,
+            budget=self._body_budget.copy(),
         )
         self._detach_state_addr = addr
         return ResponseSender(addr)

@@ -339,6 +339,25 @@ def test_pthread_writer_bodies_share_peak_bound_and_refund_independently() raise
     budget.release(5)
 
 
+def test_element_growth_rounds_bytes_and_preserves_admission_on_denial() raises:
+    for total in [28, 29]:
+        var budget = BufferBudget(total)
+        assert_true(budget.try_reserve(5))
+        assert_true(budget.try_reserve(15))
+        var values = List[Int]()
+        var admission = 15
+        assert_true(_reserve_capacity(values, budget, 1, admission))
+        values.append(42)
+        assert_equal(admission, 7)
+        assert_equal(budget.used, 20)
+        var grew = _reserve_capacity(values, budget, 2, admission)
+        assert_equal(grew, total == 29)
+        assert_equal(values.capacity(), 2 if grew else 1)
+        assert_equal(admission, 0 if grew else 7)
+        assert_equal(budget.used, 21 if grew else 20)
+        assert_equal(values[0], 42)
+
+
 def test_receive_growth_charges_capacity_and_old_new_peak() raises:
     var budget = BufferBudget(24)
     var bytes = List[Byte]()
