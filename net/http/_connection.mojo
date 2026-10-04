@@ -261,11 +261,17 @@ struct HttpConnection(Movable):
     def append_pending[
         B: _CapacityBudget
     ](mut self, var bytes: List[Byte], mut budget: B) -> Bool:
-        if self.pending_offset >= len(self.pending):
-            return self._adopt_pending(bytes^, budget)
-        var incoming_capacity = bytes.capacity()
-        if not budget.try_reserve(incoming_capacity):
+        if not budget.try_reserve(bytes.capacity()):
             return False
+        return self._append_reserved_pending(bytes^, budget)
+
+    def _append_reserved_pending[
+        B: _CapacityBudget
+    ](mut self, var bytes: List[Byte], mut budget: B) -> Bool:
+        if self.pending_offset >= len(self.pending):
+            self._adopt_reserved_pending(bytes^, budget)
+            return True
+        var incoming_capacity = bytes.capacity()
         var remaining = self.pending_remaining()
         var reservation = 0
         if not _reserve_capacity(

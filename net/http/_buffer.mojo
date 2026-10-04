@@ -2,8 +2,8 @@
 
 Receive and adopted pending buffers charge retained capacity and growth
 peaks. Pending growth also charges its incoming wire allocation. Synchronous
-and detached buffered HTTP/1 response wire and HTTP/1 error wire are reserved
-before allocation. Other encoding, parser scratch and provider allocations
+and detached buffered HTTP/1 response wire, detached streaming wire, and HTTP/1
+error wire are reserved before allocation. Other encoding, parser scratch and provider allocations
 remain separate. Decoded
 HTTP/1 body copies reserve their exact capacity before materialization and remain
 charged through the handler call. Synchronous HTTP/1 writer bodies own their
@@ -14,8 +14,10 @@ The global counter uses a mutex-protected shared capability. Detached message
 arrays charge their retained capacity through drained-batch destruction. HTTP/1
 detached state reserves its requested malloc payload until final free. Detached
 message bodies retain adopted capacity reservations through their destruction;
-send reserves exact chunk capacity before allocation. Header and detached
-streaming wire allocations remain separate.
+send reserves exact chunk capacity before allocation. Streaming wire reserves
+exact start/chunk/end capacity before allocation and transfers its charge into
+pending storage, retaining old + incoming + new growth peaks. Header and String
+allocations remain separate.
 """
 
 from std.memory import ArcPointer

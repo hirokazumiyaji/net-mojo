@@ -1556,6 +1556,106 @@ def test_pthread_response_body_charge_survives_batch_and_server_drop() raises:
     assert_equal(batch_charge, size_of[DetachMessage]() + 64 + 17)
 
 
+def test_stream_start_admits_exact_wire_capacity_and_refunds_on_denial() raises:
+    for admitted in [True, False]:
+        var config = ServerConfig.default()
+        config.total_buffer_budget = (
+            size_of[_SharedDetachState]()
+            + size_of[DetachMessage]()
+            + 5
+            + 103
+            - Int(not admitted)
+        )
+        var server = Server(config^)
+        server.add_listener(listen_tcp("127.0.0.1:0"))
+        var handler = _MailboxHandler()
+        var client = dial_tcp(
+            String("127.0.0.1:") + String(server.local_address().port),
+            Timeout.seconds(1),
+        )
+        client.write_all(
+            "GET / HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n".as_bytes(),
+            Timeout.seconds(1),
+        )
+        _wait_mailbox_handler(server, handler)
+        assert_true(server._budget.try_reserve(5))
+        var sender = ResponseSender(handler.addr)
+        sender.start()
+        var header = _tick_and_read(
+            server, handler, client, max_ticks=50, expect_body=False
+        )
+        var active = server.active_connections() > 0
+        var end = List[Byte]()
+        if active:
+            sender.finish()
+            end = _tick_and_read_chunked(server, handler, client)
+        client.close()
+        server._close_conn(0)
+        _ = sender^
+        assert_equal(server._budget.used(), 5)
+        assert_equal(active, admitted)
+        if admitted:
+            assert_equal(_status_of(header), 200)
+            assert_equal(len(header), 103)
+            assert_equal(String(from_utf8_lossy=Span(end)), "0\r\n\r\n")
+        else:
+            assert_equal(len(header), 0)
+            assert_equal(len(end), 0)
+
+
+def test_stream_wire_denial_after_headers_closes_without_second_response() raises:
+    for chunk in [True, False]:
+        var config = ServerConfig.default()
+        config.total_buffer_budget = (
+            size_of[_SharedDetachState]() + size_of[DetachMessage]() + 5 + 103
+        )
+        var server = Server(config^)
+        server.add_listener(listen_tcp("127.0.0.1:0"))
+        var handler = _MailboxHandler()
+        var client = dial_tcp(
+            String("127.0.0.1:") + String(server.local_address().port),
+            Timeout.seconds(1),
+        )
+        client.write_all(
+            "GET / HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n".as_bytes(),
+            Timeout.seconds(1),
+        )
+        _wait_mailbox_handler(server, handler)
+        assert_true(server._budget.try_reserve(5))
+        var sender = ResponseSender(handler.addr)
+        sender.start()
+        var header = _tick_and_read(
+            server, handler, client, max_ticks=50, expect_body=False
+        )
+        assert_equal(_status_of(header), 200)
+        assert_equal(server._budget.used(), size_of[_SharedDetachState]() + 5)
+        var foreign = 5
+        if chunk:
+            var data = Array[Byte, 64](fill=42)
+            assert_true(sender.send(Span(data)))
+            assert_equal(
+                server._budget.used(),
+                size_of[_SharedDetachState]()
+                + size_of[DetachMessage]()
+                + 64
+                + 5,
+            )
+        else:
+            var extra = server._budget.remaining() - 4
+            assert_true(server._budget.try_reserve(extra))
+            foreign += extra
+            sender.finish()
+        var after = _drain_head_error_to_eof(server, handler, client)
+        assert_equal(len(after), 0)
+        assert_true(sender.is_cancelled())
+        assert_equal(
+            server._budget.used(), size_of[_SharedDetachState]() + foreign
+        )
+        client.close()
+        _ = sender^
+        assert_equal(server._budget.used(), foreign)
+
+
 def test_borrowed_respond_message_keeps_body_charge_through_consumer_returns() raises:
     for mode in [0, 1, 2]:
         for is_head in [False, True]:
