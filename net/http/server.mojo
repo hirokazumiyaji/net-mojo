@@ -242,6 +242,14 @@ struct Server(Movable):
         endpoint.set_transport_memory_limit(
             self.config.quic_max_transport_memory_bytes
         )
+        endpoint.set_receive_limits(
+            self.config.quic_receive_request_bytes,
+            self.config.quic_receive_request_slots,
+            self.config.quic_receive_control_bytes,
+            self.config.quic_receive_control_slots,
+            self.config.quic_receive_crypto_bytes,
+            self.config.quic_receive_crypto_slots,
+        )
         endpoint.set_request_limits(
             self.config.max_body_bytes,
             self.config.max_headers_bytes,

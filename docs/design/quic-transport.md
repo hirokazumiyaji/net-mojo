@@ -227,6 +227,43 @@ application reads retain their existing behavior. `quic-suite` runs the 38
 existing RecvBuf contracts and eight new compaction/overlap/FIN contracts;
 the live client verifies a full 1 MiB echo plus connection reuse.
 
+The fifth pinned patch accounts receive backing and fragment slots in three
+immutable pools shared by every transport of one provider server. Finite
+provider defaults are:
+
+| Pool | Retained backing | Slots |
+| --- | ---: | ---: |
+| Request (all bidi receive state) | 64 MiB | 65,536 |
+| Control (all uni receive state) | 4 MiB | 131,072 |
+| CRYPTO | 16 MiB | 131,072 |
+
+`QuicServer.set_receive_limits` and `QuicUDPEndpoint.set_receive_limits` accept
+these six nonnegative capacities before the first successful native accept.
+Zero disables positive retention in that pool. Successful accept permanently
+freezes the settings, including after all connections drain; constructor
+failure refunds partial reservations and permits retry. HTTP attachment applies
+`ServerConfig.quic_receive_{request,control,crypto}_{bytes,slots}` before adopting
+the endpoint. Separate endpoints have separate pools.
+
+Each receive buffer reserves two metadata/terminal slots. Novel fragments
+reserve their retained backing and one slot before committing bytes, FIN,
+offset or connection-byte accounting. Covered duplicates need no new charge;
+partial reads keep the full backing charge until release. Filling a held gap
+still needs positive reservation headroom before the old fragment is consumed.
+Incoming STREAM exhaustion uses transport error 0x1; incoming CRYPTO exhaustion
+uses 0xd. At the first failing Initial, quiche immediately closes without a
+wire close because no packet has been successfully processed. Failed local H3
+critical-stream construction keeps upstream's application-close mapping 0xff.
+
+`quic-suite` covers two authenticated clients sharing a full request pool,
+control and new TLS progress, rejection/queued close/drain/refunds, frozen
+settings and actual C/Mojo/HTTP configuration forwarding. Finite defaults keep
+the 1 MiB echo, cancellation/sibling/reuse and slow upload contracts. These
+84 MiB of backing capacities exclude allocator overhead, send/retransmission,
+TLS and other engine state; slot capacities count entries rather than bytes.
+They do not guarantee 10,000 simultaneous full handshakes. Flow-control windows
+and MAX_DATA are unchanged; independent control flow credit remains open.
+
 These patches do not establish an allocator cap. The independent 64 MiB
 request/response counters count logical field/body bytes rather than Vec
 capacity, container entries or allocation overhead. Transport admission still

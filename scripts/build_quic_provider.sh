@@ -40,6 +40,7 @@ fi
 
 cc -O2 -Wall -Wextra -Werror \
     -Inet/quic/provider \
+    -I"$task_quiche_source/include" \
     tests/test_quic_provider.c \
     net/quic/provider/shim.c \
     build/quic/cargo/release/libnet_quic_provider.a \
