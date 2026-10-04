@@ -1,4 +1,5 @@
 from std.ffi import c_int, external_call
+from std.sys import size_of
 from std.testing import assert_equal, assert_false, assert_true, TestSuite
 from std.time import perf_counter_ns
 
@@ -586,6 +587,130 @@ def test_headers_are_case_insensitive_with_duplicates() raises:
     # Values are enumerated separately, never comma-joined.
     assert_equal(all[0], "text/plain")
     assert_equal(all[1], "charset=x")
+
+
+def test_header_known_capacity_growth_denial_clear_and_drop() raises:
+    comptime arrays = 2 * size_of[String]() + size_of[List[Byte]]()
+    var raw = Array[Byte, 64](fill=97)
+    for allowance in [5 + 65 + 3 * arrays, 4 + 65 + 3 * arrays]:
+        var budget = SharedBufferBudget(allowance)
+        assert_true(budget.try_reserve(5))
+        var headers = Headers()
+        assert_true(headers._adopt_capacity_budget(Optional(budget.copy())))
+        headers.add_bytes(String("X-One"), Span(raw))
+        var original = Int(headers._values[0].unsafe_ptr())
+        var rejected = False
+        try:
+            headers.add(String("X-Two"), String("b"))
+        except error:
+            assert_equal(error.kind, NetErrorKind.invalid_argument())
+            rejected = True
+        var retained_arrays = arrays
+        if allowance == 5 + 65 + 3 * arrays:
+            assert_false(rejected)
+            assert_equal(len(headers), 2)
+            assert_equal(budget.used(), 5 + 65 + 2 * arrays)
+            assert_equal(headers._names.capacity(), 2)
+            retained_arrays = 2 * arrays
+        else:
+            assert_true(rejected)
+            assert_equal(len(headers), 1)
+            assert_equal(budget.used(), 5 + 64 + arrays)
+            assert_equal(headers._names.capacity(), 1)
+        assert_equal(Int(headers._values[0].unsafe_ptr()), original)
+        headers.clear()
+        assert_equal(budget.used(), 5 + retained_arrays)
+        headers.add(String("X-Again"), String("q"))
+        assert_equal(budget.used(), 6 + retained_arrays)
+        assert_equal(headers._names.capacity(), retained_arrays // arrays)
+        _ = headers^
+        assert_equal(budget.used(), 5)
+
+
+def test_header_denied_growth_does_not_allocate_arrays_or_raw_value() raises:
+    var budget = SharedBufferBudget(68)
+    assert_true(budget.try_reserve(5))
+    var headers = Headers()
+    assert_true(headers._adopt_capacity_budget(Optional(budget.copy())))
+    var raw = Array[Byte, 64](fill=97)
+    var rejected = False
+    try:
+        headers.add_bytes(String("X-One"), Span(raw))
+    except error:
+        assert_equal(error.kind, NetErrorKind.invalid_argument())
+        rejected = True
+    assert_true(rejected)
+    assert_equal(len(headers), 0)
+    assert_equal(headers._names.capacity(), 0)
+    assert_equal(headers._values.capacity(), 0)
+    assert_equal(headers._lower_names.capacity(), 0)
+    assert_equal(budget.used(), 5)
+
+
+def test_header_adoption_same_capability_and_cross_budget_failure_preserve_storage() raises:
+    comptime known = 64 + 2 * size_of[String]() + size_of[List[Byte]]()
+    var source = SharedBufferBudget(known + 5)
+    assert_true(source.try_reserve(5))
+    var target = SharedBufferBudget(known + 5)
+    assert_true(target.try_reserve(5))
+    var denied = SharedBufferBudget(known + 4)
+    assert_true(denied.try_reserve(5))
+    var headers = Headers()
+    var raw = Array[Byte, 64](fill=97)
+    headers.add_bytes(String("X-One"), Span(raw))
+    var address = Int(headers._values[0].unsafe_ptr())
+    assert_true(headers._adopt_capacity_budget(Optional(source.copy())))
+    assert_true(headers._adopt_capacity_budget(Optional(source.copy())))
+    assert_equal(source.used(), known + 5)
+    assert_false(headers._adopt_capacity_budget(Optional(denied.copy())))
+    assert_equal(source.used(), known + 5)
+    assert_equal(denied.used(), 5)
+    assert_true(headers._adopt_capacity_budget(Optional(target.copy())))
+    assert_equal(source.used(), 5)
+    assert_equal(target.used(), known + 5)
+    assert_equal(Int(headers._values[0].unsafe_ptr()), address)
+    var observer = target.copy()
+    _ = target^
+    _ = headers^
+    assert_equal(observer.used(), 5)
+
+
+def test_reconstructed_headers_hold_independent_known_capacity_and_caller_copy() raises:
+    comptime known = 64 + 2 * size_of[String]() + size_of[List[Byte]]()
+    for allowance in [5 + 2 * known, 4 + 2 * known]:
+        var budget = SharedBufferBudget(allowance)
+        assert_true(budget.try_reserve(5))
+        var source = Headers()
+        assert_true(source._adopt_capacity_budget(Optional(budget.copy())))
+        var raw = Array[Byte, 64](fill=97)
+        source.add_bytes(String("X-One"), Span(raw))
+        var clone = Headers()
+        assert_true(clone._adopt_capacity_budget(Optional(budget.copy())))
+        var copy = source.value_bytes_at(0)
+        var rejected = False
+        try:
+            clone.add_bytes(source.name_at(0), source._value_bytes_span(0))
+        except error:
+            assert_equal(error.kind, NetErrorKind.invalid_argument())
+            rejected = True
+        if allowance == 5 + 2 * known:
+            assert_false(rejected)
+            assert_true(
+                Int(clone._values[0].unsafe_ptr())
+                != Int(source._values[0].unsafe_ptr())
+            )
+            assert_equal(budget.used(), 5 + 2 * known)
+        else:
+            assert_true(rejected)
+            assert_equal(clone._names.capacity(), 0)
+            assert_equal(budget.used(), 5 + known)
+        _ = source^
+        assert_equal(copy[0], 97)
+        if not rejected:
+            assert_equal(clone.value_byte_length(0), 64)
+            assert_equal(budget.used(), 5 + known)
+        _ = clone^
+        assert_equal(budget.used(), 5)
 
 
 def test_header_injection_is_rejected() raises:

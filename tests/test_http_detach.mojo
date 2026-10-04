@@ -1497,7 +1497,10 @@ def _body_respond_thread(
     var body = List[Byte](capacity=64)
     body.append(Byte(ord("a")))
     try:
-        sender.respond(200, Headers(), body^)
+        var headers = Headers()
+        var raw = Array[Byte, 64](fill=97)
+        headers.add_bytes(String("X-Owned"), Span(raw))
+        sender.respond(200, headers^, body^)
         ctx[].submitted = True
     except:
         ctx[].submitted = False
@@ -1505,7 +1508,7 @@ def _body_respond_thread(
     return arg
 
 
-def test_pthread_response_body_charge_survives_batch_and_server_drop() raises:
+def test_pthread_response_body_and_headers_survive_batch_and_server_drop() raises:
     var config = ServerConfig.default()
     config.total_buffer_budget = 4096
     var server = Server(config^)
@@ -1537,6 +1540,9 @@ def test_pthread_response_body_charge_survives_batch_and_server_drop() raises:
         unsafe_from_address=handler.addr
     )
     var original = Int(state[].messages[0].body.unsafe_ptr())
+    var original_header = Int(
+        state[].messages[0].headers._values[0].unsafe_ptr()
+    )
     var queued_charge = observer.used()
     var batch = _take_batch(state)
     client.close()
@@ -1547,13 +1553,26 @@ def test_pthread_response_body_charge_survives_batch_and_server_drop() raises:
     var batch_charge = observer.used()
     assert_equal(Int(batch.messages[0].body.unsafe_ptr()), original)
     assert_equal(batch.messages[0].body[0], Byte(ord("a")))
+    assert_equal(
+        Int(batch.messages[0].headers._values[0].unsafe_ptr()), original_header
+    )
+    assert_equal(batch.messages[0].headers.value_byte_length(0), 64)
     _ = batch^
     assert_equal(observer.used(), 17)
+    comptime header_capacity = 64 + 2 * size_of[String]() + size_of[
+        List[Byte]
+    ]()
     assert_equal(
         queued_charge,
-        size_of[_SharedDetachState]() + size_of[DetachMessage]() + 64 + 17,
+        size_of[_SharedDetachState]()
+        + size_of[DetachMessage]()
+        + 64
+        + header_capacity
+        + 17,
     )
-    assert_equal(batch_charge, size_of[DetachMessage]() + 64 + 17)
+    assert_equal(
+        batch_charge, size_of[DetachMessage]() + 64 + header_capacity + 17
+    )
 
 
 def test_stream_start_admits_exact_wire_capacity_and_refunds_on_denial() raises:
@@ -1731,6 +1750,116 @@ def _mailbox_refill_thread(
         ctx[].failed = True
     ctx[].sender_addr = sender._take()
     return arg
+
+
+@fieldwise_init
+struct _HeaderSubmitContext:
+    var sender_addr: Int
+    var streaming: Bool
+    var submitted: Bool
+    var raw_address: Int
+
+
+def _header_submit_thread(
+    arg: Pointer[Byte, MutUntrackedOrigin]
+) -> Pointer[Byte, MutUntrackedOrigin]:
+    var ctx = arg.unsafe_bitcast[_HeaderSubmitContext]()
+    var sender = ResponseSender(ctx[].sender_addr)
+    try:
+        var headers = Headers()
+        var raw = Array[Byte, 256](fill=97)
+        headers.add_bytes(String("X-Owned"), Span(raw))
+        ctx[].raw_address = Int(headers._values[0].unsafe_ptr())
+        if ctx[].streaming:
+            sender.start(200, headers^)
+        else:
+            var body = List[Byte](capacity=2)
+            body.extend("ok".as_bytes())
+            sender.respond(200, headers^, body^)
+        ctx[].submitted = True
+    except:
+        ctx[].submitted = False
+    ctx[].sender_addr = sender._take()
+    return arg
+
+
+def test_pthread_header_admission_and_batch_lifetime_keep_actual_capacity() raises:
+    comptime state_size = size_of[_SharedDetachState]()
+    comptime element = size_of[DetachMessage]()
+    comptime known = 256 + 2 * size_of[String]() + size_of[List[Byte]]()
+    for streaming in [False, True]:
+        var body_capacity = 0 if streaming else 2
+        for available in [
+            known - 1,
+            known + element + body_capacity - 1,
+            known + element + body_capacity,
+        ]:
+            var admitted = available == known + element + body_capacity
+            var budget = SharedBufferBudget(state_size + 5 + available)
+            assert_true(budget.try_reserve(5))
+            var addr = _create_detach_state(
+                slot=0, generation=1, budget=budget.copy()
+            )
+            var ctx = _HeaderSubmitContext(addr, streaming, False, 0)
+            var thread: UInt64 = 0
+            var rc = external_call["pthread_create", c_int](
+                Pointer(to=thread),
+                Optional[Pointer[Byte, MutUntrackedOrigin]](None),
+                _header_submit_thread,
+                Pointer(to=ctx).unsafe_bitcast[Byte](),
+            )
+            assert_equal(Int(rc), 0)
+            _join_thread(thread)
+            var sender = ResponseSender(ctx.sender_addr)
+            var state = Pointer[_SharedDetachState, MutUntrackedOrigin](
+                unsafe_from_address=addr
+            )
+            var batch = _take_batch(state)
+            var held = budget.used()
+            var refill_denied = True
+            if admitted and streaming:
+                var refill = _MailboxRefillContext(sender._take(), False, False)
+                rc = external_call["pthread_create", c_int](
+                    Pointer(to=thread),
+                    Optional[Pointer[Byte, MutUntrackedOrigin]](None),
+                    _mailbox_refill_thread,
+                    Pointer(to=refill).unsafe_bitcast[Byte](),
+                )
+                assert_equal(Int(rc), 0)
+                _join_thread(thread)
+                sender = ResponseSender(refill.sender_addr)
+                refill_denied = refill.failed and not refill.sent
+            state[].mutex.lock()
+            state[].cancelled = True
+            state[].mutex.unlock()
+            _release_detach_state(addr, from_sender=False)
+            var cancelled = sender.is_cancelled()
+            _ = sender^
+            var after_state = budget.used()
+            var same_address = True
+            var raw_size = 0
+            if admitted:
+                same_address = (
+                    Int(batch.messages[0].headers._values[0].unsafe_ptr())
+                    == ctx.raw_address
+                )
+                raw_size = batch.messages[0].headers.value_byte_length(0)
+            _ = batch^
+            var after_batch = budget.used()
+            assert_equal(ctx.submitted, admitted)
+            assert_true(refill_denied)
+            assert_true(cancelled)
+            assert_true(same_address)
+            assert_equal(after_batch, 5)
+            if admitted:
+                assert_equal(
+                    held, state_size + element + known + body_capacity + 5
+                )
+                assert_equal(after_state, element + known + body_capacity + 5)
+                assert_equal(raw_size, 256)
+            else:
+                assert_equal(held, state_size + 5)
+                assert_equal(after_state, 5)
 
 
 def test_drained_batch_keeps_array_charge_while_pthread_refills() raises:
