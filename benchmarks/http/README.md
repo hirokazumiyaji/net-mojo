@@ -231,6 +231,52 @@ separately, together with timestamped server/client CPU, RSS and FD samples.
 Short functional probes do not satisfy the exact 10,000-connection or 30-minute
 soak evidence requirements.
 
+For a mixed slow-header/slow-body probe, add explicit cohorts to ordinary
+`/fixed` clients. Both counts default to zero; this mode requires keepalive and
+cannot combine with the idle mode:
+
+```bash
+/tmp/http-load -url http://127.0.0.1:18081/fixed -connections 64 -slow-headers 8 -slow-bodies 8 -warmup 10s -duration 30s
+/tmp/http-load -url http://127.0.0.1:18080/fixed -connections 64 -slow-headers 8 -slow-bodies 8 -rate 1000 -warmup 10s -duration 30s
+```
+
+Use identical flags for both servers and the matched server deadlines above.
+`-slow-interval` defaults to 250ms: headers remain incomplete through eight
+one-byte ticks, then validate the exact 64-byte reply; bodies require a strict
+HTTP/1.1 `100 Continue`, send 65536 bytes at 1024 bytes per tick, then validate
+that exact echo. Nominal request phases are 2s and 16s; configurations reaching
+the existing 5s header or 30s body deadline fail. Tick lag is recorded;
+I/O deadline and response errors invalidate the row. Server deadlines remain
+unchanged.
+
+Every cohort slot owns one socket, strictly probes `/fixed` before the workload,
+reuses it for all cycles, and probes it again afterward. No connection is
+replaced. At workload end, workers finish the finite current request promptly,
+validate its response and the original socket, then close and join. Individual
+I/O uses `-timeout`, and original-socket probes also use the separate
+`-connection-check-timeout`; cleanup remains bounded on error paths.
+
+`slow_clients.headers` and `.bodies` each record requested and confirmed
+initial/final counts, closed owned sockets and slots with measured
+incomplete-phase drip traffic. The object also records profile constants,
+loader FD limits and setup/postflight time. Per-kind `warmup` and `measurement` entries
+use exactly the ordinary half-open phase windows. `incomplete_ns` is summed
+connection time, so it can exceed one window when multiple sockets overlap.
+`request_bytes_written` counts accepted client writes completed inside the
+window; `drip_bytes_written` counts only the scheduled one-byte/1024-byte
+ticks, excluding prefixes and final completion. `validated_cycles` and
+`validated_response_payload_bytes` count complete strict response validations
+inside it. Total profile bytes/cycles retain events
+outside the windows. These are client I/O/validation timestamps, not peer ACK or
+packet timings. Postflight cannot inflate ordinary success, throughput or
+latency. Every configured slot must have measured incomplete overlap and actual
+drip writes, and complete a validated cycle plus postflight to make the row valid.
+
+Ordinary cutoff, response checks and dropped/unstarted arrival gates apply
+unchanged. Tick lag and arrival diagnostics expose scheduling pressure; record
+actual loader/server CPU, RSS and FD evidence separately before claiming client
+capacity. Slow readers and formal five-trial comparison results remain separate.
+
 | Scenario | Conditions |
 | --- | --- |
 | Small fixed response | GET 64 B body, connections 1 / 64 / 1024 |

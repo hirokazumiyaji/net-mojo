@@ -42,14 +42,14 @@ func arrivalOffset(index uint64, rate int) time.Duration {
 	return time.Duration(n)
 }
 
-func runPhase(clients []*http.Client, c config, w workload, duration time.Duration, sample bool) phaseResult {
+func runPhase(clients []*http.Client, c config, w workload, duration time.Duration, sample bool, observe func(time.Duration, bool) (time.Time, time.Time)) phaseResult {
 	if c.Rate == 0 {
-		return phase(clients, c, w, duration, sample)
+		return phase(clients, c, w, duration, sample, observe)
 	}
-	return arrivalPhase(clients, c, w, duration, sample)
+	return arrivalPhase(clients, c, w, duration, sample, observe)
 }
 
-func arrivalPhase(clients []*http.Client, c config, w workload, duration time.Duration, sample bool) phaseResult {
+func arrivalPhase(clients []*http.Client, c config, w workload, duration time.Duration, sample bool, observe func(time.Duration, bool) (time.Time, time.Time)) phaseResult {
 	scheduled, _ := arrivalCount(duration, c.Rate)
 	jobs := make(chan time.Time, c.Connections)
 	start := make(chan struct{})
@@ -98,8 +98,8 @@ func arrivalPhase(clients []*http.Client, c config, w workload, duration time.Du
 		}()
 	}
 	ready.Wait()
-	begin := time.Now()
-	deadline = begin.Add(duration)
+	begin, end := observe(duration, sample)
+	deadline = end
 	var cancel context.CancelFunc
 	if sample {
 		ctx, cancel = context.WithDeadline(context.Background(), deadline)

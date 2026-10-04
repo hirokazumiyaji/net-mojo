@@ -32,6 +32,9 @@ type config struct {
 	Rate            int           `json:"rate_requests_per_second"`
 	IdleConnections int           `json:"idle_connections"`
 	SetupTimeout    time.Duration `json:"connection_check_timeout_ns"`
+	SlowHeaders     int           `json:"slow_headers"`
+	SlowBodies      int           `json:"slow_bodies"`
+	SlowInterval    time.Duration `json:"slow_interval_ns"`
 }
 
 type counts struct {
@@ -64,6 +67,7 @@ type result struct {
 	MeasurementWindow      *phaseWindow  `json:"measurement_window,omitempty"`
 	WarmupWindow           *phaseWindow  `json:"warmup_window,omitempty"`
 	Idle                   *idleStats    `json:"idle_connections,omitempty"`
+	Slow                   *slowStats    `json:"slow_clients,omitempty"`
 	ElapsedSeconds         float64       `json:"elapsed_seconds"`
 	Samples                uint64        `json:"samples"`
 	RequestBodyBytes       uint64        `json:"request_body_bytes"`
@@ -96,6 +100,12 @@ func prepare(c config) (workload, error) {
 	}
 	if c.IdleConnections < 0 || c.IdleConnections > math.MaxInt-c.Connections || (c.IdleConnections > 0 && (!c.KeepAlive || c.SetupTimeout <= 0 || u.Path != "/fixed")) {
 		return workload{}, errors.New("idle mode requires nonnegative bounded count, keepalive, positive connection-check timeout and /fixed")
+	}
+	if c.SlowHeaders < 0 || c.SlowBodies < 0 || c.SlowHeaders > math.MaxInt-c.Connections || c.SlowBodies > math.MaxInt-c.Connections-c.SlowHeaders {
+		return workload{}, errors.New("slow counts must be nonnegative and bounded")
+	}
+	if c.SlowHeaders+c.SlowBodies > 0 && (!c.KeepAlive || c.IdleConnections != 0 || c.SetupTimeout <= 0 || u.Path != "/fixed" || c.SlowInterval <= 0 || (c.SlowHeaders > 0 && c.SlowInterval >= 5*time.Second/8) || (c.SlowBodies > 0 && c.SlowInterval >= 30*time.Second/64)) {
+		return workload{}, errors.New("slow mode requires /fixed keepalive, no idle cohort, positive check/interval and profile phases below 5s/30s")
 	}
 	if c.Rate > 0 {
 		if _, err := arrivalCount(c.Duration, c.Rate); err != nil {
@@ -172,7 +182,7 @@ type phaseResult struct {
 	deadline time.Time
 }
 
-func phase(clients []*http.Client, c config, w workload, duration time.Duration, sample bool) phaseResult {
+func phase(clients []*http.Client, c config, w workload, duration time.Duration, sample bool, observe func(time.Duration, bool) (time.Time, time.Time)) phaseResult {
 	start := make(chan struct{})
 	results := make(chan phaseResult, c.Connections)
 	var ready sync.WaitGroup
@@ -211,8 +221,8 @@ func phase(clients []*http.Client, c config, w workload, duration time.Duration,
 		}()
 	}
 	ready.Wait()
-	begin := time.Now()
-	deadline = begin.Add(duration)
+	begin, end := observe(duration, sample)
+	deadline = end
 	var cancel context.CancelFunc
 	if sample {
 		ctx, cancel = context.WithDeadline(context.Background(), deadline)
@@ -273,8 +283,24 @@ func run(c config) (result, error) {
 		}
 		clients = held.clients
 	}
+	observe := func(duration time.Duration, _ bool) (time.Time, time.Time) {
+		begin := time.Now()
+		return begin, begin.Add(duration)
+	}
+	var slow *slowSockets
+	if c.SlowHeaders+c.SlowBodies > 0 {
+		slow = &slowSockets{stats: &slowStats{HeaderTicks: 8, BodyBytes: 65536, BodyChunkBytes: 1024,
+			Headers: slowCohort{Requested: c.SlowHeaders}, Bodies: slowCohort{Requested: c.SlowBodies}}}
+		r.Slow = slow.stats
+		defer slow.close()
+		if err := slow.setup(c, w); err != nil {
+			r.FirstError = err.Error()
+			return r, err
+		}
+		observe = slow.observe
+	}
 	if c.Warmup > 0 {
-		warm := runPhase(clients, c, w, c.Warmup, false)
+		warm := runPhase(clients, c, w, c.Warmup, false, observe)
 		r.WarmupCounts, r.FirstError = warm.counts, warm.error
 		r.WarmupArrivals = warm.arrivals
 		r.WarmupWindow = warm.window
@@ -285,7 +311,7 @@ func run(c config) (result, error) {
 	if held != nil {
 		held.beginMeasurement()
 	}
-	measured := runPhase(clients, c, w, c.Duration, true)
+	measured := runPhase(clients, c, w, c.Duration, true, observe)
 	r.counts, r.FirstError = measured.counts, measured.error
 	r.Arrivals = measured.arrivals
 	r.MeasurementWindow = measured.window
@@ -297,6 +323,13 @@ func run(c config) (result, error) {
 	r.ResponseBytesPerSecond = float64(r.ResponseBytes) / r.ElapsedSeconds
 	r.LatencyMS = latencies(measured.samples)
 	r.Valid = r.Samples > 0 && r.Errors == 0 && !measured.lostArrivals()
+	if slow != nil {
+		if err := slow.finish(); err != nil {
+			r.Valid = false
+			r.FirstError = err.Error()
+			return r, err
+		}
+	}
 	if held != nil {
 		held.finishActive(measured.deadline)
 		r.Valid = r.Valid && held.stats.MeasuredActive == c.Connections && held.stats.Replacements == 0 && held.stats.EarlyActiveClosed == 0
@@ -327,7 +360,10 @@ func main() {
 	flag.DurationVar(&c.Timeout, "timeout", 5*time.Second, "maximum individual request duration")
 	flag.IntVar(&c.Rate, "rate", 0, "fixed requests/second (0 uses saturated closed loop)")
 	flag.IntVar(&c.IdleConnections, "idle-connections", 0, "additional original idle keepalive sockets (/fixed only)")
-	flag.DurationVar(&c.SetupTimeout, "connection-check-timeout", 2*time.Minute, "deadline for each idle setup/postflight phase")
+	flag.DurationVar(&c.SetupTimeout, "connection-check-timeout", 2*time.Minute, "deadline for original-socket setup/postflight checks")
+	flag.IntVar(&c.SlowHeaders, "slow-headers", 0, "additional original slow-header sockets (/fixed keepalive only)")
+	flag.IntVar(&c.SlowBodies, "slow-bodies", 0, "additional original slow-body sockets (/fixed keepalive only)")
+	flag.DurationVar(&c.SlowInterval, "slow-interval", 250*time.Millisecond, "slow profile tick interval (8 header/64 body ticks)")
 	flag.Parse()
 	r, err := run(c)
 	if outputErr := json.NewEncoder(os.Stdout).Encode(r); outputErr != nil {
