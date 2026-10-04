@@ -45,10 +45,22 @@ type latencyStats struct {
 	P99 float64 `json:"p99"`
 }
 
+type phaseWindow struct {
+	StartUnixNS int64 `json:"start_unix_ns"`
+	EndUnixNS   int64 `json:"end_unix_ns"`
+	ElapsedNS   int64 `json:"elapsed_ns"`
+}
+
+func newPhaseWindow(begin, deadline time.Time) *phaseWindow {
+	return &phaseWindow{begin.UnixNano(), deadline.UnixNano(), int64(deadline.Sub(begin))}
+}
+
 type result struct {
 	Config config `json:"config"`
 	counts
 	WarmupCounts           counts        `json:"warmup_counts"`
+	MeasurementWindow      *phaseWindow  `json:"measurement_window,omitempty"`
+	WarmupWindow           *phaseWindow  `json:"warmup_window,omitempty"`
 	ElapsedSeconds         float64       `json:"elapsed_seconds"`
 	Samples                uint64        `json:"samples"`
 	RequestBodyBytes       uint64        `json:"request_body_bytes"`
@@ -146,6 +158,7 @@ type phaseResult struct {
 	samples  []time.Duration
 	error    string
 	arrivals *arrivalStats
+	window   *phaseWindow
 }
 
 func phase(client *http.Client, c config, w workload, duration time.Duration, sample bool) phaseResult {
@@ -186,7 +199,8 @@ func phase(client *http.Client, c config, w workload, duration time.Duration, sa
 		}()
 	}
 	ready.Wait()
-	deadline = time.Now().Add(duration)
+	begin := time.Now()
+	deadline = begin.Add(duration)
 	var cancel context.CancelFunc
 	if sample {
 		ctx, cancel = context.WithDeadline(context.Background(), deadline)
@@ -195,7 +209,7 @@ func phase(client *http.Client, c config, w workload, duration time.Duration, sa
 	}
 	defer cancel()
 	close(start)
-	var total phaseResult
+	total := phaseResult{window: newPhaseWindow(begin, deadline)}
 	for i := 0; i < c.Connections; i++ {
 		r := <-results
 		total.merge(r)
@@ -236,6 +250,7 @@ func run(c config) (result, error) {
 		warm := runPhase(client, c, w, c.Warmup, false)
 		r.WarmupCounts, r.FirstError = warm.counts, warm.error
 		r.WarmupArrivals = warm.arrivals
+		r.WarmupWindow = warm.window
 		if warm.Errors > 0 || warm.Success == 0 || warm.lostArrivals() {
 			return r, errors.New("warmup failed validation, lost arrivals, or completed no valid requests")
 		}
@@ -243,7 +258,8 @@ func run(c config) (result, error) {
 	measured := runPhase(client, c, w, c.Duration, true)
 	r.counts, r.FirstError = measured.counts, measured.error
 	r.Arrivals = measured.arrivals
-	r.ElapsedSeconds = c.Duration.Seconds()
+	r.MeasurementWindow = measured.window
+	r.ElapsedSeconds = float64(measured.window.ElapsedNS) / float64(time.Second)
 	r.Samples = uint64(len(measured.samples))
 	r.RequestBodyBytes = r.Success * uint64(len(w.body))
 	r.ResponseBytes = r.Success * uint64(len(w.expected))

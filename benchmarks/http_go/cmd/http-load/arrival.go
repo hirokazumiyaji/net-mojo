@@ -134,7 +134,7 @@ func arrivalPhase(client *http.Client, c config, w workload, duration time.Durat
 	}
 	wait(deadline)
 	close(jobs)
-	var total phaseResult
+	total := phaseResult{window: newPhaseWindow(begin, deadline)}
 	var service, lag []time.Duration
 	for i := 0; i < c.Connections; i++ {
 		r := <-results

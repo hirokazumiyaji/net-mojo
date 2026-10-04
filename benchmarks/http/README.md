@@ -100,6 +100,23 @@ and reported as `cutoff`; `started = success + errors + cutoff` and
 `samples = success`. Rates always use the configured measurement duration.
 Warmup, worker startup and final cancellation time are excluded.
 
+`measurement_window` records `start_unix_ns`, `end_unix_ns` and `elapsed_ns`
+from the actual shared start/deadline after workers are ready, in both saturated
+and fixed-arrival modes. The Unix nanosecond epoch boundaries describe the
+scheduled half-open interval `[start, end)`; `end` is the exclusive cutoff, not
+the time the phase returns after cancellation/drain. `elapsed_ns` uses Go's
+same-process monotonic time subtraction and supplies `elapsed_seconds` and the
+rate denominator. Align external resource samples using their wall-clock epoch,
+not an assumed shared monotonic clock. Preserve integer nanosecond precision
+when reading JSON.
+
+A distinct `warmup_window` is emitted only when warmup runs. It describes its
+scheduled interval; outstanding warmup responses may finish later, before the
+measuring interval begins. Invalid measured trials still emit their actual
+`measurement_window`. If configuration is rejected or warmup aborts before
+measurement, that window is omitted; a failed warmup retains its own window.
+Neither worker startup nor warmup/final drain is added to the measuring window.
+
 Every success requires HTTP/1.1 status 200, explicit matching Content-Length and
 the exact benchmark body; compression and redirects are disabled. Invalid
 configuration, warmup failure, measured errors or zero successful measured
