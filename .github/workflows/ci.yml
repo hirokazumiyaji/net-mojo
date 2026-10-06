@@ -120,6 +120,8 @@ jobs:
         run: pixi run test-reactor
       - name: Test HTTP API probe
         run: pixi run test-http-api
+      - name: Test HTTP control
+        run: pixi run test-http-control
       - name: Test HTTP parser
         run: pixi run test-http-parser
       - name: Test HTTP response
