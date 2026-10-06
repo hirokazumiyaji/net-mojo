@@ -112,3 +112,48 @@ func TestFixedArrivalWarmupValidatesLateDrain(t *testing.T) {
 		t.Fatalf("late warmup invalid response hidden: %+v arrivals=%+v %v", r, r.WarmupArrivals, err)
 	}
 }
+
+func TestFixedArrivalDelayedDispatcherPhaseBoundary(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		sample    bool
+		started   uint64
+		unstarted uint64
+	}{
+		{"warmup_drains_all_planned_slots", false, 3, 0},
+		{"measurement_preserves_cutoff", true, 0, 3},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var calls atomic.Uint64
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				calls.Add(1)
+				fmt.Fprint(w, strings.Repeat("a", 64))
+			}))
+			defer server.Close()
+			c := testConfig(server.URL + "/fixed")
+			c.Rate, c.Connections = 1000, 3
+			work, err := prepare(c)
+			if err != nil {
+				t.Fatal(err)
+			}
+			clients := []*http.Client{server.Client(), server.Client(), server.Client()}
+			const duration = 3 * time.Millisecond
+			var end time.Time
+			observe := func(d time.Duration, _ bool) (time.Time, time.Time) {
+				begin := time.Now().Add(-d - time.Millisecond)
+				end = begin.Add(d)
+				return begin, end
+			}
+			r := arrivalPhase(clients, c, work, duration, tc.sample, observe)
+			if r.Started != tc.started || r.Success != tc.started || r.Errors != 0 || r.Cutoff != 0 || calls.Load() != tc.started {
+				t.Fatalf("delayed phase request accounting: %+v calls=%d", r, calls.Load())
+			}
+			if r.arrivals.Scheduled != 3 || r.arrivals.Dropped != 0 || r.arrivals.Unstarted != tc.unstarted || r.lostArrivals() != tc.sample {
+				t.Fatalf("planned slots omitted or cutoff hidden: %+v", r.arrivals)
+			}
+			if len(r.samples) != 0 || r.arrivals.ServiceSamples != 0 || r.arrivals.StartLagSamples != 0 || r.window.ElapsedNS != int64(duration) || r.window.EndUnixNS != end.UnixNano() {
+				t.Fatalf("late work changed the nominal interval or measured samples: %+v", r)
+			}
+		})
+	}
+}

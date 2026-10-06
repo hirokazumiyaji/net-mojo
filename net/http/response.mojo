@@ -9,6 +9,8 @@ of borrowed into a send queue.
 The synchronous HTTP/1 writer owns its body capacity in the shared budget;
 standalone writers enforce their body length limit. Direct body edits are
 reconciled separately and do not have the supported writes' growth guarantee.
+HTTP/1 response Headers reserve known array/raw value growth and retained
+capacity; direct public Headers replacement is admitted after allocation.
 """
 
 from net.error import NetError, NetErrorKind
@@ -79,7 +81,11 @@ struct ResponseWriter(Movable, Sized):
         self._drop_body()
 
     def _set_body_budget(mut self, var budget: SharedBufferBudget):
+        _ = self.headers._adopt_capacity_budget(Optional(budget.copy()))
         self._body_budget = budget^
+
+    def _drop_headers(mut self):
+        self.headers = Headers()
 
     def _reconcile_body_budget(mut self) -> Bool:
         var capacity = self.body.capacity()
@@ -118,16 +124,18 @@ struct ResponseWriter(Movable, Sized):
                 None,
                 "response already detached",
             )
-        self._detached = True
         if self._detach_state_addr != 0:
+            self._detached = True
             return ResponseSender(self._detach_state_addr)
         var addr = _create_detach_state(
             slot=self._slot,
             generation=self._generation,
             wakeup_fd=self._wakeup_fd,
             queue_limit=self._queue_limit,
+            budget=self._body_budget.copy(),
         )
         self._detach_state_addr = addr
+        self._detached = True
         return ResponseSender(addr)
 
     def __len__(self) -> Int:
@@ -203,6 +211,6 @@ def maybe_inject_alt_svc(
     """
     if alt_svc.byte_length() == 0:
         return
-    if writer.headers.get_first("Alt-Svc"):
+    if writer.headers._first_lower_index("alt-svc") >= 0:
         return
     writer.headers.add(String("Alt-Svc"), String(alt_svc))

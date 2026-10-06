@@ -2,18 +2,32 @@
 
 Receive and adopted pending buffers charge retained capacity and growth
 peaks. Pending growth also charges its incoming wire allocation. Synchronous
-HTTP/1 buffered response and error wire are reserved before allocation. Other encoding,
-parser scratch and provider allocations remain separate. Decoded
+and detached buffered HTTP/1 response wire, detached streaming wire, and HTTP/1
+error wire are reserved before allocation. Other encoding, parser scratch and provider allocations
+remain separate. Decoded
 HTTP/1 body copies reserve their exact capacity before materialization and remain
 charged through the handler call. Synchronous HTTP/1 writer bodies own their
 capacity reservation directly; other writer paths and other reservations still
 need separate capacity accounting.
 
-The global counter uses a mutex-protected shared capability. Detached allocation
-accounting is separate.
+The global counter uses a mutex-protected shared capability. Detached message
+arrays charge their retained capacity through drained-batch destruction. HTTP/1
+detached state reserves its requested malloc payload until final free. Detached
+message bodies retain adopted capacity reservations through their destruction;
+send reserves exact chunk capacity before allocation. Streaming wire reserves
+exact start/chunk/end capacity before allocation and transfers its charge into
+pending storage, retaining old + incoming + new growth peaks. Response Headers
+charge their three List arrays and raw value capacities through owned tickets;
+grouped growth reserves full new arrays while the old storage stays charged.
+Stored name references conservatively charge public String capacity and refcount
+prefix per reference, including inline/static/shared storage. Fresh ASCII lowercase
+names are reserved before construction. Internal references drop before refund;
+escaped caller copies, String scratch and request/parser Header admission remain
+separate.
 """
 
 from std.memory import ArcPointer
+from std.sys import size_of
 
 from net._actor import PthreadMutex
 
@@ -102,11 +116,41 @@ struct SharedBufferBudget(Copyable, _CapacityBudget):
         self._state[].budget.release(amount)
         self._state[].mutex.unlock()
 
+    def _shares_storage(self, other: Self) -> Bool:
+        return self._state.ptr() == other._state.ptr()
+
+
+struct _CapacityTicket(Movable):
+    var budget: Optional[SharedBufferBudget]
+    var amount: Int
+
+    def __init__(
+        out self,
+        var budget: Optional[SharedBufferBudget] = None,
+        amount: Int = 0,
+    ):
+        self.budget = budget^
+        self.amount = amount
+
+    def _try_reserve(mut self, amount: Int) -> Bool:
+        if self.budget and not self.budget.value().try_reserve(amount):
+            return False
+        self.amount = amount
+        return True
+
+    def release(mut self):
+        if self.budget:
+            self.budget.value().release(self.amount)
+        self.amount = 0
+
+    def __deinit__(deinit self):
+        self.release()
+
 
 def _reserve_capacity[
-    B: _CapacityBudget
+    T: Movable, B: _CapacityBudget
 ](
-    mut bytes: List[Byte],
+    mut bytes: List[T],
     mut budget: B,
     needed: Int,
     mut reservation: Int,
@@ -114,16 +158,18 @@ def _reserve_capacity[
     var old_capacity = bytes.capacity()
     if needed <= old_capacity:
         return True
-    var available = reservation + budget.remaining()
+    comptime element_size = size_of[T]()
+    var available = (reservation + budget.remaining()) // element_size
     var target = max(needed, old_capacity * 2)
     target = min(target, available)
     if target < needed:
         return False
-    var covered = min(target, reservation)
-    if not budget.try_reserve(target - covered):
+    var target_bytes = target * element_size
+    var covered = min(target_bytes, reservation)
+    if not budget.try_reserve(target_bytes - covered):
         return False
     # Keep the old allocation charged until reserve replaces it.
     bytes.reserve(target)
     reservation -= covered
-    budget.release(old_capacity)
+    budget.release(old_capacity * element_size)
     return True

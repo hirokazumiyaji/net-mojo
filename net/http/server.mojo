@@ -14,8 +14,9 @@ Ownership and resources:
   including growth peaks and owned synchronous HTTP/1 writer bodies.
   Decoded HTTP/1 body copies reserve capacity before materialization and hold
   that reservation until the borrowed request is dropped after its handler.
-  Buffered HTTP/1 and error wire are reserved before encoding; other encoding remains
-  separate.
+  Buffered HTTP/1 wire is reserved before encoding. HTTP/1 error wire is
+  prepaid at connection admission and transferred into the same pending owner;
+  other encoding remains separate.
   Read scratch uses a caller-owned stack array; TLS retains its charged
   retry buffer until connection close.
   Request admission and the `ResponseWriter` cap derive from the remaining
@@ -56,32 +57,34 @@ from ._connection import (
     STATE_STREAMING,
     STATE_TLS_SHUTDOWN,
     READ_BUFFER_SIZE,
+    H1_ERROR_CAPACITY,
 )
 from ._deadline import NO_DEADLINE, deadline_from_now, now_ns
 from ._detach import (
     MSG_KIND_ABORT,
     MSG_KIND_CHUNK,
     MSG_KIND_FINISH,
+    MSG_KIND_NONE,
     MSG_KIND_RESPOND,
     MSG_KIND_START,
     _release_detach_state,
+    _take_batch,
     _SharedDetachState,
     DetachMessage,
 )
 from ._encoder import (
     current_http_date,
-    encode_chunk,
-    encode_chunk_end,
-    encode_chunked_start,
-    _encode_error_exact,
+    _encode_chunk_budgeted,
+    _encode_chunk_end_budgeted,
+    _encode_chunked_start_budgeted,
+    _render_error,
     _measure_error,
-    encode_response,
     _encode_response_budgeted,
 )
 from ._parser import ParseResult, parse_head, parse_one, _scan_chunked
 from .config import ServerConfig
 from .handler import Handler
-from .headers import Headers
+from .headers import Headers, _check_value_bytes
 from .response import (
     ResponseWriter,
     has_body_for_status,
@@ -193,6 +196,13 @@ struct Server(Movable):
                 s_ptr[].cancelled = True
                 s_ptr[].mutex.unlock()
                 _release_detach_state(addr, from_sender=False)
+            var wire_capacity = (
+                self._conns[idx].buf.capacity()
+                + self._conns[idx].pending.capacity()
+            )
+            self._conns[idx].buf = List[Byte]()
+            self._conns[idx].pending = List[Byte]()
+            self._budget.release(wire_capacity)
 
     def is_shutdown_requested(self) -> Bool:
         return self.control.is_shutdown_requested()
@@ -241,6 +251,22 @@ struct Server(Movable):
         endpoint.set_connection_limit(self.config.max_connections)
         endpoint.set_transport_memory_limit(
             self.config.quic_max_transport_memory_bytes
+        )
+        endpoint.set_receive_limits(
+            self.config.quic_receive_request_bytes,
+            self.config.quic_receive_request_slots,
+            self.config.quic_receive_control_bytes,
+            self.config.quic_receive_control_slots,
+            self.config.quic_receive_crypto_bytes,
+            self.config.quic_receive_crypto_slots,
+        )
+        endpoint.set_send_limits(
+            self.config.quic_send_request_bytes,
+            self.config.quic_send_request_slots,
+            self.config.quic_send_control_bytes,
+            self.config.quic_send_control_slots,
+            self.config.quic_send_crypto_bytes,
+            self.config.quic_send_crypto_slots,
         )
         endpoint.set_request_limits(
             self.config.max_body_bytes,
@@ -998,6 +1024,21 @@ struct Server(Movable):
                         NO_DEADLINE,
                         NO_DEADLINE,
                     )
+                var error_capacity = H1_ERROR_CAPACITY
+                if entry.is_tls() and self.config.alt_svc.byte_length() > 0:
+                    error_capacity += 11 + self.config.alt_svc.byte_length()
+                if not entry._reserve_error_wire(
+                    self._budget.copy(), error_capacity
+                ):
+                    var tls_capacity = entry.tls_read_buffer.capacity()
+                    try:
+                        entry.close()
+                    except e:
+                        _ = e
+                    self._budget.release(tls_capacity)
+                    _ = self._reactor.remove(token)
+                    accepted += 1
+                    continue
                 self._ensure_slot_map(token.slot)
                 var idx: Int
                 if len(self._conn_free) > 0:
@@ -1046,9 +1087,10 @@ struct Server(Movable):
         # leaving the sent prefix charged would leak budget on every
         # partial-send close until unrelated requests see 503s. Any
         # admission reservation still held is released the same way.
-        self._budget.release(
+        var wire_capacity = (
             self._conns[idx].buf.capacity()
             + self._conns[idx].pending.capacity()
+            + self._conns[idx].tls_read_buffer.capacity()
         )
         self._budget.release(self._conns[idx].reserved)
         self._conns[idx].reserved = 0
@@ -1057,12 +1099,11 @@ struct Server(Movable):
         self._conns[idx].http2_body_reserved = 0
         self._budget.release(self._conns[idx].http2_response_bytes_reserved)
         self._conns[idx].http2_response_bytes_reserved = 0
-        if self._conns[idx].is_tls():
-            self._budget.release(READ_BUFFER_SIZE)
         try:
             self._conns[idx].close()
         except e:
             _ = e
+        self._budget.release(wire_capacity)
         self._conn_free.append(idx)
         self._active_conns -= 1
         if (
@@ -1087,17 +1128,28 @@ struct Server(Movable):
         # matching the handler path (_inject_alt_svc_for_tls).
         var alt_svc = String("")
         if self._conns[idx].is_tls() and self.config.alt_svc.byte_length() > 0:
+            try:
+                _check_value_bytes(
+                    self.config.alt_svc.as_bytes(), "encode error Alt-Svc"
+                )
+            except e:
+                _ = e
+                self._close_conn(idx)
+                return
             alt_svc = self.config.alt_svc.copy()
         var capacity = _measure_error(
             status, True, self._tick_date, is_head, alt_svc
         )
-        if not self._budget.try_reserve(capacity):
+        if capacity > self._conns[idx]._error_wire.capacity():
             self._close_conn(idx)
             return
-        var wire = _encode_error_exact(
-            status, True, self._tick_date, capacity, is_head, alt_svc
+        var wire = self._conns[idx]._take_error_wire()
+        var byte_count = 0
+        _render_error[False](
+            status, True, self._tick_date, is_head, alt_svc, wire, byte_count
         )
         self._conns[idx]._set_reserved_pending(wire^, self._budget)
+        self._conns[idx]._error_ticket.amount = 0
         self._conns[idx].should_close = True
         self._conns[idx].write_at = deadline_from_now(
             self.config.write_deadline
@@ -1135,6 +1187,7 @@ struct Server(Movable):
             if progress.is_complete():
                 var protocol = self._conns[idx].tls.value().selected_alpn()
                 if protocol == "h2":
+                    self._conns[idx]._drop_error_wire()
                     self._conns[idx].protocol = PROTOCOL_HTTP2
                     self._conns[idx].http2_session = Optional(
                         Http2RequestSession(
@@ -1910,6 +1963,8 @@ struct Server(Movable):
         mut handler: H,
     ) raises:
         var req = result.take_request()
+        if self._conns[idx].is_tls():
+            req.scheme = String("https")
         var is_head = req.method == "HEAD"
         self._conns[idx].is_head = is_head
         # Keep a framing margin when advertising the body limit.
@@ -1951,6 +2006,7 @@ struct Server(Movable):
                     _release_detach_state(addr, from_sender=False)
                     writer._detach_state_addr = 0
             writer._drop_body()
+            writer._drop_headers()
             self._send_error(idx, 500, is_head=is_head)
             return
 
@@ -1958,6 +2014,7 @@ struct Server(Movable):
         self._release_http1_body(idx)
         if writer.is_detached():
             writer._drop_body()
+            writer._drop_headers()
             var addr = writer._detach_state_addr
             if addr == 0:
                 self._send_error(idx, 500, is_head=is_head)
@@ -1982,8 +2039,15 @@ struct Server(Movable):
             self._sync_interests(idx)
             return
 
-        if len(writer.body) > cap or not writer._reconcile_body_budget():
+        if (
+            len(writer.body) > cap
+            or not writer._reconcile_body_budget()
+            or not writer.headers._adopt_capacity_budget(
+                writer._body_budget.copy()
+            )
+        ):
             writer._drop_body()
+            writer._drop_headers()
             self._send_error(idx, 500, is_head=is_head)
             return
         # Header count/bytes are enforced inside the encoder, the single
@@ -1993,6 +2057,7 @@ struct Server(Movable):
         except e:
             _ = e
             writer._drop_body()
+            writer._drop_headers()
             self._send_error(idx, 500, is_head=is_head)
             return
         var wire: List[Byte]
@@ -2008,6 +2073,7 @@ struct Server(Movable):
         except e:
             _ = e
             writer._drop_body()
+            writer._drop_headers()
             self._send_error(idx, 500, is_head=is_head)
             return
         writer._drop_body()
@@ -2174,6 +2240,11 @@ struct Server(Movable):
             var s_ptr = ptr.unsafe_bitcast[_SharedDetachState]()
             s_ptr[].mutex.lock()
             s_ptr[].cancelled = True
+            s_ptr[].finished = True
+            s_ptr[].messages = List[DetachMessage]()
+            s_ptr[].array_ticket.release()
+            s_ptr[].queued_bytes = 0
+            s_ptr[].terminal_kind = MSG_KIND_NONE
             s_ptr[].mutex.unlock()
 
     def _cleanup_detached_state(mut self, idx: Int):
@@ -2251,27 +2322,22 @@ struct Server(Movable):
                 unsafe_from_address=addr
             )
             var s_ptr = ptr.unsafe_bitcast[_SharedDetachState]()
-            s_ptr[].mutex.lock()
-            if len(s_ptr[].messages) == 0:
-                s_ptr[].mutex.unlock()
+            var batch = _take_batch(s_ptr)
+            if (
+                len(batch.messages) == 0
+                and batch.terminal_kind == MSG_KIND_NONE
+            ):
                 i += 1
                 continue
-            var msgs = List[DetachMessage]()
-            while len(s_ptr[].messages) > 0:
-                msgs.append(s_ptr[].messages.pop(0))
-            s_ptr[].queued_bytes = 0
-            s_ptr[].mutex.unlock()
 
-            while len(msgs) > 0:
-                var msg = msgs.pop(0)
+            while len(batch.messages) > 0:
+                var msg = batch.messages.pop(0)
                 if not self._conns[idx].active:
                     break
                 if self._conns[idx].detach_state_addr != addr:
                     break
-                if self._conns[idx].token.generation != s_ptr[].generation:
-                    s_ptr[].mutex.lock()
-                    s_ptr[].cancelled = True
-                    s_ptr[].mutex.unlock()
+                if self._conns[idx].token.generation != batch.generation:
+                    self._mark_detached_cancelled(idx)
                     if self._conns[idx].detach_state_addr == addr:
                         self._cleanup_detached_state(idx)
                     break
@@ -2282,14 +2348,20 @@ struct Server(Movable):
                     self._handle_detached_start(idx, msg)
                 elif msg.kind == MSG_KIND_CHUNK:
                     self._handle_detached_chunk(idx, msg)
-                elif msg.kind == MSG_KIND_FINISH:
-                    self._handle_detached_finish(idx)
-                elif msg.kind == MSG_KIND_ABORT:
-                    self._handle_detached_abort(idx)
-                    break
                 else:
                     self._handle_detached_abort(idx)
                     break
+
+            if (
+                batch.terminal_kind != MSG_KIND_NONE
+                and self._conns[idx].active
+                and self._conns[idx].detach_state_addr == addr
+                and self._conns[idx].token.generation == batch.generation
+            ):
+                if batch.terminal_kind == MSG_KIND_FINISH:
+                    self._handle_detached_finish(idx)
+                else:
+                    self._handle_detached_abort(idx)
 
             if not self._conns[idx].active:
                 if (
@@ -2339,6 +2411,7 @@ struct Server(Movable):
         if len(rw.body) > self.config.max_response_body:
             self._mark_detached_cancelled(idx)
             self._cleanup_detached_state(idx)
+            rw._drop_headers()
             self._send_error(idx, 500, is_head=is_head)
             self._arm_deadline(idx)
             return
@@ -2349,33 +2422,31 @@ struct Server(Movable):
             _ = e
             self._mark_detached_cancelled(idx)
             self._cleanup_detached_state(idx)
+            rw._drop_headers()
             self._send_error(idx, 500, is_head=is_head)
             self._arm_deadline(idx)
             return
 
         var wire: List[Byte]
         try:
-            wire = encode_response(
+            wire = _encode_response_budgeted(
                 rw,
                 is_head,
                 self._tick_date,
                 self.config.max_response_headers_count,
                 self.config.max_response_headers_bytes,
+                self._budget,
             )
         except e:
             _ = e
             self._mark_detached_cancelled(idx)
             self._cleanup_detached_state(idx)
+            rw._drop_headers()
             self._send_error(idx, 500, is_head=is_head)
             self._arm_deadline(idx)
             return
 
-        if not self._conns[idx].set_pending(wire^, self._budget):
-            self._mark_detached_cancelled(idx)
-            self._cleanup_detached_state(idx)
-            self._send_error(idx, 500, is_head=is_head)
-            self._arm_deadline(idx)
-            return
+        self._conns[idx]._set_reserved_pending(wire^, self._budget)
 
         self._cleanup_detached_state(idx)
         self._conns[idx].should_close = (
@@ -2418,30 +2489,34 @@ struct Server(Movable):
             _ = e
             self._mark_detached_cancelled(idx)
             self._cleanup_detached_state(idx)
+            rw._drop_headers()
             self._send_error(idx, 500, is_head=is_head)
             self._arm_deadline(idx)
             return
 
         var wire: List[Byte]
         try:
-            wire = encode_chunked_start(
+            wire = _encode_chunked_start_budgeted(
                 rw,
                 is_head,
                 self._tick_date,
                 self.config.max_response_headers_count,
                 self.config.max_response_headers_bytes,
+                self._budget,
             )
         except e:
             _ = e
             self._mark_detached_cancelled(idx)
             self._cleanup_detached_state(idx)
+            rw._drop_headers()
             self._send_error(idx, 500, is_head=is_head)
             self._arm_deadline(idx)
             return
 
-        if not self._conns[idx].append_pending(wire^, self._budget):
+        if not self._conns[idx]._append_reserved_pending(wire^, self._budget):
             self._mark_detached_cancelled(idx)
             self._cleanup_detached_state(idx)
+            rw._drop_headers()
             self._send_error(idx, 500, is_head=is_head)
             self._arm_deadline(idx)
             return
@@ -2480,8 +2555,14 @@ struct Server(Movable):
         if not self._conns[idx].stream_has_body:
             return
 
-        var wire = encode_chunk(Span(msg.body))
-        if not self._conns[idx].append_pending(wire^, self._budget):
+        var wire: List[Byte]
+        try:
+            wire = _encode_chunk_budgeted(Span(msg.body), self._budget)
+        except e:
+            _ = e
+            self._handle_detached_abort(idx)
+            return
+        if not self._conns[idx]._append_reserved_pending(wire^, self._budget):
             self._mark_detached_cancelled(idx)
             self._cleanup_detached_state(idx)
             self._remove_detached_conn(idx)
@@ -2506,8 +2587,14 @@ struct Server(Movable):
         if not self._conns[idx].stream_has_body:
             return
 
-        var wire = encode_chunk_end()
-        if not self._conns[idx].append_pending(wire^, self._budget):
+        var wire: List[Byte]
+        try:
+            wire = _encode_chunk_end_budgeted(self._budget)
+        except e:
+            _ = e
+            self._handle_detached_abort(idx)
+            return
+        if not self._conns[idx]._append_reserved_pending(wire^, self._budget):
             self._mark_detached_cancelled(idx)
             self._cleanup_detached_state(idx)
             self._remove_detached_conn(idx)

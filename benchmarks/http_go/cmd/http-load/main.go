@@ -33,6 +33,7 @@ type config struct {
 	IdleConnections int           `json:"idle_connections"`
 	SetupTimeout    time.Duration `json:"connection_check_timeout_ns"`
 	SlowHeaders     int           `json:"slow_headers"`
+	SlowReaders     int           `json:"slow_readers"`
 	SlowBodies      int           `json:"slow_bodies"`
 	SlowInterval    time.Duration `json:"slow_interval_ns"`
 }
@@ -104,7 +105,10 @@ func prepare(c config) (workload, error) {
 	if c.SlowHeaders < 0 || c.SlowBodies < 0 || c.SlowHeaders > math.MaxInt-c.Connections || c.SlowBodies > math.MaxInt-c.Connections-c.SlowHeaders {
 		return workload{}, errors.New("slow counts must be nonnegative and bounded")
 	}
-	if c.SlowHeaders+c.SlowBodies > 0 && (!c.KeepAlive || c.IdleConnections != 0 || c.SetupTimeout <= 0 || u.Path != "/fixed" || c.SlowInterval <= 0 || (c.SlowHeaders > 0 && c.SlowInterval >= 5*time.Second/8) || (c.SlowBodies > 0 && c.SlowInterval >= 30*time.Second/64)) {
+	if c.SlowReaders < 0 || c.SlowReaders > math.MaxInt-c.Connections-c.SlowHeaders-c.SlowBodies {
+		return workload{}, errors.New("slow reader count must be nonnegative and bounded")
+	}
+	if c.SlowHeaders+c.SlowBodies+c.SlowReaders > 0 && (!c.KeepAlive || c.IdleConnections != 0 || c.SetupTimeout <= 0 || u.Path != "/fixed" || c.SlowInterval <= 0 || (c.SlowHeaders > 0 && c.SlowInterval >= 5*time.Second/8) || (c.SlowBodies > 0 && c.SlowInterval >= 30*time.Second/64) || (c.SlowReaders > 0 && c.SlowInterval >= 30*time.Second/16)) {
 		return workload{}, errors.New("slow mode requires /fixed keepalive, no idle cohort, positive check/interval and profile phases below 5s/30s")
 	}
 	if c.Rate > 0 {
@@ -250,6 +254,10 @@ func latencies(samples []time.Duration) latencyStats {
 	return latencyStats{percentile(.50), percentile(.95), percentile(.99)}
 }
 
+func benchmarkDialer(timeout time.Duration) *net.Dialer {
+	return &net.Dialer{Timeout: timeout, KeepAlive: -1}
+}
+
 func run(c config) (result, error) {
 	r := result{Config: c}
 	w, err := prepare(c)
@@ -263,7 +271,7 @@ func run(c config) (result, error) {
 	transport := &http.Transport{
 		Protocols: protocols, DisableCompression: true, DisableKeepAlives: !c.KeepAlive,
 		MaxConnsPerHost: c.Connections, MaxIdleConns: c.Connections, MaxIdleConnsPerHost: c.Connections,
-		DialContext: (&net.Dialer{Timeout: c.Timeout}).DialContext,
+		DialContext: benchmarkDialer(c.Timeout).DialContext,
 	}
 	defer transport.CloseIdleConnections()
 	client := &http.Client{Transport: transport, Timeout: c.Timeout,
@@ -288,9 +296,11 @@ func run(c config) (result, error) {
 		return begin, begin.Add(duration)
 	}
 	var slow *slowSockets
-	if c.SlowHeaders+c.SlowBodies > 0 {
+	if c.SlowHeaders+c.SlowBodies+c.SlowReaders > 0 {
 		slow = &slowSockets{stats: &slowStats{HeaderTicks: 8, BodyBytes: 65536, BodyChunkBytes: 1024,
-			Headers: slowCohort{Requested: c.SlowHeaders}, Bodies: slowCohort{Requested: c.SlowBodies}}}
+			Headers: slowCohort{Requested: c.SlowHeaders}, Bodies: slowCohort{Requested: c.SlowBodies}, Readers: slowCohort{Requested: c.SlowReaders},
+			ReaderBatchRequests: 8, ReaderBodyBytes: 1 << 20, ReaderChunkBytes: 1 << 16,
+			ReaderIOBudgetNS: int64(30 * time.Second), ReaderBatchCapNS: int64(c.SetupTimeout), ReaderPressure: "unverified"}}
 		r.Slow = slow.stats
 		defer slow.close()
 		if err := slow.setup(c, w); err != nil {
@@ -360,8 +370,9 @@ func main() {
 	flag.DurationVar(&c.Timeout, "timeout", 5*time.Second, "maximum individual request duration")
 	flag.IntVar(&c.Rate, "rate", 0, "fixed requests/second (0 uses saturated closed loop)")
 	flag.IntVar(&c.IdleConnections, "idle-connections", 0, "additional original idle keepalive sockets (/fixed only)")
-	flag.DurationVar(&c.SetupTimeout, "connection-check-timeout", 2*time.Minute, "deadline for original-socket setup/postflight checks")
+	flag.DurationVar(&c.SetupTimeout, "connection-check-timeout", 2*time.Minute, "deadline for original-socket checks and finite reader batches")
 	flag.IntVar(&c.SlowHeaders, "slow-headers", 0, "additional original slow-header sockets (/fixed keepalive only)")
+	flag.IntVar(&c.SlowReaders, "slow-readers", 0, "additional original slow-reader sockets (/fixed keepalive only)")
 	flag.IntVar(&c.SlowBodies, "slow-bodies", 0, "additional original slow-body sockets (/fixed keepalive only)")
 	flag.DurationVar(&c.SlowInterval, "slow-interval", 250*time.Millisecond, "slow profile tick interval (8 header/64 body ticks)")
 	flag.Parse()

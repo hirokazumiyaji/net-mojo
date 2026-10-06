@@ -142,11 +142,11 @@ def _reject_response_injection(
             )
 
 
-def _has_close_token(value: StringSlice) -> Bool:
+def _has_close_token[origin: ImmOrigin](value: Span[Byte, origin]) -> Bool:
     # `Connection` is a comma-separated token list: only a whole,
     # case-insensitive `close` token counts, so `x-close` or
     # `close-ended` must not suppress the real header.
-    var bytes = value.as_bytes()
+    var bytes = value
     var start = 0
     for i in range(len(bytes) + 1):
         if i == len(bytes) or bytes[i] == Byte(ord(",")):
@@ -161,8 +161,17 @@ def _has_close_token(value: StringSlice) -> Bool:
                 or bytes[hi - 1] == Byte(ord("\t"))
             ):
                 hi -= 1
-            if String(from_utf8_lossy=bytes[lo:hi]).lower() == "close":
-                return True
+            if hi - lo == 5:
+                var matches = True
+                for k in range(5):
+                    var byte = bytes[lo + k]
+                    if byte >= Byte(ord("A")) and byte <= Byte(ord("Z")):
+                        byte += Byte(32)
+                    if byte != "close".as_bytes()[k]:
+                        matches = False
+                        break
+                if matches:
+                    return True
             start = i + 1
     return False
 
@@ -210,7 +219,7 @@ def _render_response[
         )
     var header_bytes = 0
     for i in range(len(writer.headers)):
-        header_bytes += writer.headers.name_at(i).byte_length()
+        header_bytes += writer.headers._names[i].byte_length()
         header_bytes += writer.headers.value_byte_length(i)
         header_bytes += 4
     if header_bytes > max_bytes:
@@ -238,18 +247,17 @@ def _render_response[
     # A caller-supplied Transfer-Encoding is always rejected: this server
     # sends buffered responses with a known length, so emitting both
     # would create a request/response smuggling vector (RFC 9112 6.1).
-    if writer.headers.get_first("Transfer-Encoding"):
+    if writer.headers._first_lower_index("transfer-encoding") >= 0:
         raise NetError(
             NetErrorKind.invalid_argument(),
             "encode response",
             None,
             "Transfer-Encoding is not supported on responses",
         )
-    var declared = writer.headers.get_first("Content-Length")
-    if declared and wire_length >= 0:
-        var text = declared.value()
+    var declared = writer.headers._first_lower_index("content-length")
+    if declared >= 0 and wire_length >= 0:
         var parsed = 0
-        var digits = text.as_bytes()
+        var digits = writer.headers._value_bytes_span(declared)
         if len(digits) == 0:
             raise NetError(
                 NetErrorKind.invalid_argument(),
@@ -291,16 +299,15 @@ def _render_response[
         byte_count,
     )
     for i in range(len(writer.headers)):
-        var name = writer.headers.name_at(i)
         var value_bytes = writer.headers._value_bytes_span(i)
         # Skip a caller Content-Length on no-body responses; it is
         # re-derived below for framed bodies only.
-        if name.lower() == "content-length":
+        if writer.headers._lower_names[i] == "content-length":
             continue
         # Values were validated at ingress, but the encoder is the last
         # line before the wire: reject CR/LF here on the exact bytes
         # being emitted (names are ASCII tokens by construction).
-        var name_bytes = name.as_bytes()
+        var name_bytes = writer.headers._names[i].as_bytes()
         for k in range(len(name_bytes)):
             if name_bytes[k] == Byte(ord("\r")) or name_bytes[k] == Byte(
                 ord("\n")
@@ -321,14 +328,15 @@ def _render_response[
                     None,
                     "response header contains CR or LF",
                 )
-        _append_response_string[measure](out, name + String(": "), byte_count)
+        _append_response_bytes[measure](out, name_bytes, byte_count)
+        _append_response_string[measure](out, ": ", byte_count)
         _append_response_bytes[measure](out, value_bytes, byte_count)
         _append_response_string[measure](out, String("\r\n"), byte_count)
-    if not writer.headers.get_first("Date"):
+    if writer.headers._first_lower_index("date") < 0:
         _reject_response_injection("Date", date)
-        _append_response_string[measure](
-            out, String("Date: ") + String(date) + String("\r\n"), byte_count
-        )
+        _append_response_string[measure](out, "Date: ", byte_count)
+        _append_response_string[measure](out, date, byte_count)
+        _append_response_string[measure](out, "\r\n", byte_count)
     if wire_length >= 0:
         _append_response_string[measure](
             out,
@@ -336,10 +344,12 @@ def _render_response[
             byte_count,
         )
     if writer.should_close:
-        var connection = writer.headers.get_first("Connection")
+        var connection = writer.headers._first_lower_index("connection")
         var has_close = False
-        if connection:
-            has_close = _has_close_token(connection.value())
+        if connection >= 0:
+            has_close = _has_close_token(
+                writer.headers._value_bytes_span(connection)
+            )
         if not has_close:
             _append_response_string[measure](
                 out, String("Connection: close\r\n"), byte_count
@@ -449,9 +459,9 @@ def _render_error[
     _append_response_string[measure](
         out, "Content-Type: text/plain\r\n", byte_count
     )
-    _append_response_string[measure](
-        out, String("Date: ") + String(date) + String("\r\n"), byte_count
-    )
+    _append_response_string[measure](out, "Date: ", byte_count)
+    _append_response_string[measure](out, date, byte_count)
+    _append_response_string[measure](out, "\r\n", byte_count)
     _append_response_string[measure](
         out,
         String("Content-Length: ")
@@ -464,11 +474,9 @@ def _render_error[
             out, "Connection: close\r\n", byte_count
         )
     if alt_svc.byte_length() > 0:
-        _append_response_string[measure](
-            out,
-            String("Alt-Svc: ") + String(alt_svc) + String("\r\n"),
-            byte_count,
-        )
+        _append_response_string[measure](out, "Alt-Svc: ", byte_count)
+        _append_response_string[measure](out, alt_svc, byte_count)
+        _append_response_string[measure](out, "\r\n", byte_count)
     _append_response_string[measure](out, "\r\n", byte_count)
     if not is_head:
         _append_response_string[measure](out, body, byte_count)
@@ -539,22 +547,17 @@ def _append_hex(mut out: List[Byte], val: Int):
             out.append(Byte(ord("a") + rem - 10))
 
 
-def encode_chunked_start(
+def _render_chunked_start[
+    measure: Bool
+](
     writer: ResponseWriter,
     is_head: Bool,
     date: StringSlice,
     max_headers: Int,
     max_bytes: Int,
-) raises NetError -> List[Byte]:
-    """Renders the status line and headers for a chunked response.
-
-    Framing rules:
-    - Status must be a 3-digit code (100-999).
-    - Content-Length is prohibited with chunked transfer coding (RFC 9112 §6.1).
-    - Transfer-Encoding header is managed by this encoder; caller-supplied is rejected.
-    - Status 1xx, 204, 205, 304 omit Transfer-Encoding: chunked.
-    - HEAD advertises Transfer-Encoding: chunked (if status allows body) but omits chunk bodies.
-    """
+    mut out: List[Byte],
+    mut byte_count: Int,
+) raises NetError:
     if writer.status < 100 or writer.status > 999:
         raise NetError(
             NetErrorKind.invalid_argument(),
@@ -571,7 +574,7 @@ def encode_chunked_start(
         )
     var header_bytes = 0
     for i in range(len(writer.headers)):
-        header_bytes += writer.headers.name_at(i).byte_length()
+        header_bytes += writer.headers._names[i].byte_length()
         header_bytes += writer.headers.value_byte_length(i)
         header_bytes += 4
     if header_bytes > max_bytes:
@@ -581,14 +584,14 @@ def encode_chunked_start(
             None,
             "response headers too large",
         )
-    if writer.headers.get_first("Content-Length"):
+    if writer.headers._first_lower_index("content-length") >= 0:
         raise NetError(
             NetErrorKind.invalid_argument(),
             "encode chunked start",
             None,
             "Content-Length is not permitted with chunked Transfer-Encoding",
         )
-    if writer.headers.get_first("Transfer-Encoding"):
+    if writer.headers._first_lower_index("transfer-encoding") >= 0:
         raise NetError(
             NetErrorKind.invalid_argument(),
             "encode chunked start",
@@ -605,19 +608,18 @@ def encode_chunked_start(
     ):
         emit_transfer_encoding = False
 
-    var out = List[Byte]()
-    _append_string(
+    _append_response_string[measure](
         out,
         String("HTTP/1.1 ")
         + String(writer.status)
         + String(" ")
         + _status_reason(writer.status)
         + String("\r\n"),
+        byte_count,
     )
     for i in range(len(writer.headers)):
-        var name = writer.headers.name_at(i)
         var value_bytes = writer.headers._value_bytes_span(i)
-        var name_bytes = name.as_bytes()
+        var name_bytes = writer.headers._names[i].as_bytes()
         for k in range(len(name_bytes)):
             if name_bytes[k] == Byte(ord("\r")) or name_bytes[k] == Byte(
                 ord("\n")
@@ -638,39 +640,131 @@ def encode_chunked_start(
                     None,
                     "response header contains CR or LF",
                 )
-        _append_string(out, name + String(": "))
-        for k in range(len(value_bytes)):
-            out.append(value_bytes[k])
-        _append_string(out, String("\r\n"))
+        _append_response_bytes[measure](out, name_bytes, byte_count)
+        _append_response_string[measure](out, ": ", byte_count)
+        _append_response_bytes[measure](out, value_bytes, byte_count)
+        _append_response_string[measure](out, "\r\n", byte_count)
 
-    if not writer.headers.get_first("Date"):
+    if writer.headers._first_lower_index("date") < 0:
         _reject_response_injection("Date", date)
-        _append_string(out, String("Date: ") + String(date) + String("\r\n"))
+        _append_response_string[measure](out, "Date: ", byte_count)
+        _append_response_string[measure](out, date, byte_count)
+        _append_response_string[measure](out, "\r\n", byte_count)
 
     if emit_transfer_encoding:
-        _append_string(out, String("Transfer-Encoding: chunked\r\n"))
+        _append_response_string[measure](
+            out, "Transfer-Encoding: chunked\r\n", byte_count
+        )
 
     if writer.should_close:
-        var connection = writer.headers.get_first("Connection")
+        var connection = writer.headers._first_lower_index("connection")
         var has_close = False
-        if connection:
-            has_close = _has_close_token(connection.value())
+        if connection >= 0:
+            has_close = _has_close_token(
+                writer.headers._value_bytes_span(connection)
+            )
         if not has_close:
-            _append_string(out, String("Connection: close\r\n"))
+            _append_response_string[measure](
+                out, "Connection: close\r\n", byte_count
+            )
 
-    _append_string(out, String("\r\n"))
+    _append_response_string[measure](out, "\r\n", byte_count)
+
+
+def _measure_chunked_start(
+    writer: ResponseWriter,
+    is_head: Bool,
+    date: StringSlice,
+    max_headers: Int,
+    max_bytes: Int,
+) raises NetError -> Int:
+    var scratch = List[Byte]()
+    var byte_count = 0
+    _render_chunked_start[True](
+        writer, is_head, date, max_headers, max_bytes, scratch, byte_count
+    )
+    return byte_count
+
+
+def encode_chunked_start(
+    writer: ResponseWriter,
+    is_head: Bool,
+    date: StringSlice,
+    max_headers: Int,
+    max_bytes: Int,
+) raises NetError -> List[Byte]:
+    """Renders the status line and headers for a chunked response.
+
+    Framing rules:
+    - Status must be a 3-digit code (100-999).
+    - Content-Length is prohibited with chunked transfer coding (RFC 9112 §6.1).
+    - Transfer-Encoding header is managed by this encoder; caller-supplied is rejected.
+    - Status 1xx, 204, 205, 304 omit Transfer-Encoding: chunked.
+    - HEAD advertises Transfer-Encoding: chunked (if status allows body) but omits chunk bodies.
+    """
+    var capacity = _measure_chunked_start(
+        writer, is_head, date, max_headers, max_bytes
+    )
+    var out = List[Byte](capacity=capacity)
+    var byte_count = 0
+    _render_chunked_start[False](
+        writer, is_head, date, max_headers, max_bytes, out, byte_count
+    )
     return out^
+
+
+def _encode_chunked_start_budgeted[
+    B: _CapacityBudget
+](
+    writer: ResponseWriter,
+    is_head: Bool,
+    date: StringSlice,
+    max_headers: Int,
+    max_bytes: Int,
+    mut budget: B,
+) raises NetError -> List[Byte]:
+    var capacity = _measure_chunked_start(
+        writer, is_head, date, max_headers, max_bytes
+    )
+    if not budget.try_reserve(capacity):
+        raise NetError(
+            NetErrorKind.invalid_argument(),
+            "encode chunked start",
+            None,
+            "stream wire capacity exceeds budget",
+        )
+    var out = List[Byte](capacity=capacity)
+    var byte_count = 0
+    try:
+        _render_chunked_start[False](
+            writer, is_head, date, max_headers, max_bytes, out, byte_count
+        )
+    except e:
+        _ = out^
+        budget.release(capacity)
+        raise e^
+    return out^
+
+
+def _chunk_wire_size(length: Int) -> Int:
+    if length == 0:
+        return 0
+    var digits = 1
+    var remaining = length >> 4
+    while remaining > 0:
+        digits += 1
+        remaining >>= 4
+    return digits + 2 + length + 2
 
 
 def encode_chunk[origin: ImmOrigin](data: Span[Byte, origin]) -> List[Byte]:
     """Encodes a single chunk with hex length prefix and CRLF delimiters."""
-    var out = List[Byte]()
+    var out = List[Byte](capacity=_chunk_wire_size(len(data)))
     if len(data) == 0:
         return out^
     _append_hex(out, len(data))
     out.append(Byte(ord("\r")))
     out.append(Byte(ord("\n")))
-    out.reserve(len(out) + len(data) + 2)
     for i in range(len(data)):
         out.append(data[i])
     out.append(Byte(ord("\r")))
@@ -688,3 +782,30 @@ def encode_chunk_end() -> List[Byte]:
     out.append(Byte(ord("\r")))
     out.append(Byte(ord("\n")))
     return out^
+
+
+def _encode_chunk_budgeted[
+    B: _CapacityBudget, origin: ImmOrigin
+](data: Span[Byte, origin], mut budget: B) raises NetError -> List[Byte]:
+    var capacity = _chunk_wire_size(len(data))
+    if not budget.try_reserve(capacity):
+        raise NetError(
+            NetErrorKind.invalid_argument(),
+            "encode chunk",
+            None,
+            "stream wire capacity exceeds budget",
+        )
+    return encode_chunk(data)
+
+
+def _encode_chunk_end_budgeted[
+    B: _CapacityBudget
+](mut budget: B) raises NetError -> List[Byte]:
+    if not budget.try_reserve(5):
+        raise NetError(
+            NetErrorKind.invalid_argument(),
+            "encode chunk end",
+            None,
+            "stream wire capacity exceeds budget",
+        )
+    return encode_chunk_end()

@@ -39,6 +39,8 @@ import time
 from typing import Dict, List, Optional
 from urllib.parse import urlparse
 
+from sibling_metrics import begin_sibling_window, sibling_metrics
+
 from h2.config import H2Configuration
 from h2.connection import H2Connection
 from h2.errors import ErrorCodes
@@ -202,6 +204,7 @@ class H2ScenarioClient:
                     event.stream_id,
                     {"status": None, "body": bytearray(), "ended": False},
                 )
+                record["done_at"] = time.perf_counter()
                 record["ended"] = True
                 if event.stream_id in self.withheld:
                     self._conn.acknowledge_received_data(0, event.stream_id)
@@ -289,8 +292,15 @@ class H2ScenarioClient:
         """Drop local interest after RST_STREAM without returning window credit."""
         self.withheld.discard(stream_id)
 
+    def _start_response(self, stream_id: int) -> None:
+        self.responses[stream_id] = {
+            "status": None, "body": bytearray(), "ended": False,
+            "start": time.perf_counter(), "done_at": None,
+        }
+
     def get(self, path: bytes = FIXED_PATH) -> int:
         stream_id = self._conn.get_next_available_stream_id()
+        self._start_response(stream_id)
         self._conn.send_headers(
             stream_id,
             [
@@ -313,6 +323,7 @@ class H2ScenarioClient:
         larger than the initial per-stream window stalls mid-response.
         """
         stream_id = self._conn.get_next_available_stream_id()
+        self._start_response(stream_id)
         if withhold:
             self.withheld.add(stream_id)
         self._conn.send_headers(
@@ -411,12 +422,13 @@ def connect_h2(host: str, port: int, timeout: float) -> ssl.SSLSocket:
     if sock.selected_alpn_protocol() != "h2":
         sock.close()
         raise ScenarioError("server did not negotiate h2")
+    sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
     return sock
 
 
 def _target_and_siblings(
     client: H2ScenarioClient, siblings: int, deadline: float
-) -> tuple[int, List[int], bytes]:
+) -> tuple[int, List[int], bytes, tuple]:
     """Open the held upload, then dispatch the siblings immediately.
 
     Both live on the same connection, and no await happens between them, so
@@ -426,8 +438,9 @@ def _target_and_siblings(
     target = client.open_upload(
         ECHO_BODY_LEN, body[:ECHO_PREFIX_LEN], deadline
     )
+    window = begin_sibling_window()
     sib_ids = [client.get() for _ in range(siblings)]
-    return target, sib_ids, body
+    return target, sib_ids, body, window
 
 
 def run_slow(url: str, siblings: int) -> dict:
@@ -441,10 +454,15 @@ def run_slow(url: str, siblings: int) -> dict:
     with connect_h2(host, port, REQUEST_TIMEOUT_S) as sock:
         client = H2ScenarioClient(sock, authority)
         deadline = time.perf_counter() + REQUEST_TIMEOUT_S
-        target, sib_ids, body = _target_and_siblings(
+        target, sib_ids, body, window = _target_and_siblings(
             client, siblings, deadline
         )
         siblings_done = client.wait_siblings(sib_ids, deadline)
+        metrics = sibling_metrics(
+            (client.responses.get(sid) for sid in sib_ids),
+            lambda record: record["status"] == b"200" and bytes(record["body"]) == FIXED_BODY,
+            window, time.perf_counter(),
+        )
         # The target must still be incomplete at sibling completion: a
         # server that serialized (or answered) it first cannot pass.
         target_unfinished = not client.ended(target)
@@ -490,6 +508,7 @@ def run_slow(url: str, siblings: int) -> dict:
         "target_body_ok": int(target_body_ok),
         "elapsed_ms": elapsed_ms,
         "siblings": siblings,
+        **metrics,
     }
 
 
@@ -539,6 +558,7 @@ def run_cancel(url: str, siblings: int) -> dict:
 
         # Phase 2: RST a queued mid-response while siblings are also
         # FC-blocked, then release siblings only after the reset.
+        window = begin_sibling_window()
         target = client.post_echo(body, deadline, withhold=True)
         target_blocked = client.wait_flow_blocked([target], deadline)
         target_bytes_at_reset = len(client.body(target))
@@ -564,6 +584,11 @@ def run_cancel(url: str, siblings: int) -> dict:
         for sid in sib_ids:
             client.release(sid)
         siblings_done = client.wait_siblings(sib_ids, deadline)
+        metrics = sibling_metrics(
+            (client.responses.get(sid) for sid in sib_ids),
+            lambda record: record["status"] == b"200" and bytes(record["body"]) == body,
+            window, time.perf_counter(),
+        )
         # RFC 7540 5.1: the receiver of RST_STREAM may answer with its own
         # RST_STREAM but need not, so this is recorded, not required.
         peer_reset = client.resets.get(target)
@@ -614,6 +639,7 @@ def run_cancel(url: str, siblings: int) -> dict:
         "post_reset_ok": int(after_ok),
         "elapsed_ms": elapsed_ms,
         "siblings": siblings,
+        **metrics,
     }
 
 

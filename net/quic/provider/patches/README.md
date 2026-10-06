@@ -100,8 +100,8 @@ allocations, retransmission and native TLS/RSS costs remain separate work.
 The fifth patch adds an opt-in native `ReceiveBudget` shared by clones installed
 with `Config::set_receive_budget()`. Its immutable capacities separately limit
 bidirectional receive data, all unidirectional receive data, and CRYPTO data.
-The existing provider still uses the actual unlimited default budget. Selecting
-finite server policy and exposing provider settings remain separate work.
+The native default remains unlimited; the provider selects finite shared
+limits described in `docs/design/quic-transport.md`.
 
 Each live receive object reserves two metadata/terminal tokens. Each positive
 fragment additionally reserves one token and its full retained backing length.
@@ -136,3 +136,31 @@ allocator bytes per node. Backing charges conservatively count each retained
 view; map capacity, Arc/node overhead, transient input/copies, H3/application
 state, send state, native TLS and RSS are outside the byte ledger. This native
 opt-in facility does not establish a whole-engine or default server memory cap.
+
+The sixth patch backports only the receive side of merged upstream
+[PR #2697](https://github.com/cloudflare/quiche/pull/2697), merge commit
+`a64d972144803ed2db22aaeeca76ed07cfe5c138`. An empty non-FIN STREAM frame
+advances the existing largest-received-offset horizon without retaining a
+fragment. A draining stream consumes that horizon immediately. This preserves
+connection accounting on duplicates, later gap filling and RESET final size.
+Sender packing changes from that upstream PR are outside this patch.
+
+With connection credit 30 and stream credit 15, the old receiver charges the
+same empty offset 10 three times, exhausting MAX_DATA while the stream horizon
+stays zero. An authenticated subsequent three-byte uni STREAM fails with
+FLOW_CONTROL_ERROR (0x3), despite available control backing. The repaired
+receiver records offset 10 once; this is receive-counter evidence, not a
+control/QPACK progress or recovery benchmark.
+
+The upstream receive tests cover gap filling, Read shutdown and RESET under
+both congestion algorithms, and correct the former oracle that accepted FIN
+below an empty-frame horizon. Finite-budget tests additionally verify duplicate
+and below-consumed offsets, full-quota empty input, exact reset consumption,
+unchanged retained backing/slots, final-size rejection and atomic failed payload
+admission. The unchanged archive checksum, lockfile, license and ordered staging
+apply to all six patches. Fresh `quic-suite` exercises these contracts together
+with existing provider, buffer and budget tests.
+
+This fixes receive accounting. It does not reserve independent connection flow
+credit for critical control streams, increase MAX_DATA, change receive limits
+or establish a whole-engine memory bound. Those requirements remain separate.

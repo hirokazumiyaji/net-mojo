@@ -15,6 +15,10 @@ import (
 )
 
 type slowActivity struct {
+	ValidatedResponses    uint64 `json:"validated_responses,omitempty"`
+	ReadBytes             uint64 `json:"response_bytes_read,omitempty"`
+	PacedReadBytes        uint64 `json:"paced_response_bytes_read,omitempty"`
+	ReadQuanta            uint64 `json:"paced_read_quanta,omitempty"`
 	IncompleteNS          int64  `json:"incomplete_ns"`
 	DripBytes             uint64 `json:"drip_bytes_written"`
 	WrittenBytes          uint64 `json:"request_bytes_written"`
@@ -25,6 +29,7 @@ type slowActivity struct {
 
 type slowWindow struct {
 	Window     *phaseWindow `json:"window"`
+	Readers    slowActivity `json:"readers"`
 	Headers    slowActivity `json:"headers"`
 	Bodies     slowActivity `json:"bodies"`
 	begin, end time.Time
@@ -39,37 +44,51 @@ type slowCohort struct {
 }
 
 type slowStats struct {
-	HeaderTicks       int         `json:"header_ticks"`
-	BodyBytes         int         `json:"body_bytes"`
-	BodyChunkBytes    int         `json:"body_chunk_bytes"`
-	Headers           slowCohort  `json:"headers"`
-	Bodies            slowCohort  `json:"bodies"`
-	FDSoft            uint64      `json:"loader_fd_limit_soft"`
-	FDHard            uint64      `json:"loader_fd_limit_hard"`
-	TotalWritten      uint64      `json:"profile_request_bytes_written_total"`
-	TotalCycles       uint64      `json:"validated_profile_cycles_total"`
-	SetupSeconds      float64     `json:"setup_seconds"`
-	PostflightSeconds float64     `json:"postflight_seconds"`
-	Warmup            *slowWindow `json:"warmup,omitempty"`
-	Measured          *slowWindow `json:"measurement,omitempty"`
-	Error             string      `json:"first_profile_error,omitempty"`
+	ReaderBatchRequests  int                `json:"reader_batch_requests"`
+	ReaderBodyBytes      int                `json:"reader_body_bytes"`
+	ReaderChunkBytes     int                `json:"reader_chunk_bytes"`
+	ReaderIOBudgetNS     int64              `json:"reader_io_budget_ns"`
+	ReaderBatchCapNS     int64              `json:"reader_batch_cap_ns"`
+	ReaderPressure       string             `json:"reader_server_send_pressure"`
+	ReaderBuffers        []readerSocketInfo `json:"reader_sockets,omitempty"`
+	ReaderReadTotal      uint64             `json:"reader_response_bytes_read_total"`
+	ReaderResponsesTotal uint64             `json:"reader_validated_responses_total"`
+	ReaderWritesTotal    uint64             `json:"reader_request_bodies_written_total"`
+	HeaderTicks          int                `json:"header_ticks"`
+	BodyBytes            int                `json:"body_bytes"`
+	BodyChunkBytes       int                `json:"body_chunk_bytes"`
+	Readers              slowCohort         `json:"readers"`
+	Headers              slowCohort         `json:"headers"`
+	Bodies               slowCohort         `json:"bodies"`
+	FDSoft               uint64             `json:"loader_fd_limit_soft"`
+	FDHard               uint64             `json:"loader_fd_limit_hard"`
+	TotalWritten         uint64             `json:"profile_request_bytes_written_total"`
+	TotalCycles          uint64             `json:"validated_profile_cycles_total"`
+	SetupSeconds         float64            `json:"setup_seconds"`
+	PostflightSeconds    float64            `json:"postflight_seconds"`
+	Warmup               *slowWindow        `json:"warmup,omitempty"`
+	Measured             *slowWindow        `json:"measurement,omitempty"`
+	Error                string             `json:"first_profile_error,omitempty"`
 }
 
 type slowSocket struct {
 	heldSocket
 	body              bool
+	isReader          bool
+	batchEnd          time.Time
 	cohort            *slowCohort
 	measuredDripBytes uint64
 	measuredOverlap   int64
 }
 
 type slowSockets struct {
-	mu      sync.Mutex
-	stats   *slowStats
-	sockets []*slowSocket
-	ctx     context.Context
-	cancel  context.CancelFunc
-	workers sync.WaitGroup
+	mu            sync.Mutex
+	stats         *slowStats
+	sockets       []*slowSocket
+	ctx           context.Context
+	cancel        context.CancelFunc
+	workers       sync.WaitGroup
+	readerPayload []byte
 }
 
 func (g *slowSockets) setup(c config, w workload) error {
@@ -81,7 +100,7 @@ func (g *slowSockets) setup(c config, w workload) error {
 		return err
 	}
 	g.stats.FDSoft, g.stats.FDHard = limit.Cur, limit.Max
-	if uint64(c.Connections+c.SlowHeaders+c.SlowBodies) > limit.Cur {
+	if uint64(c.Connections+c.SlowHeaders+c.SlowBodies+c.SlowReaders) > limit.Cur {
 		return errors.New("requested sockets exceed loader FD limit")
 	}
 	ctx, cancel := context.WithTimeout(g.ctx, c.SetupTimeout)
@@ -91,18 +110,31 @@ func (g *slowSockets) setup(c config, w workload) error {
 	if port == "" {
 		port = "80"
 	}
-	dialer := net.Dialer{Timeout: c.Timeout}
-	for i := 0; i < c.SlowHeaders+c.SlowBodies; i++ {
+	dialer := benchmarkDialer(c.Timeout)
+	if c.SlowReaders > 0 {
+		g.readerPayload = bytes.Repeat([]byte("b"), 1<<20)
+	}
+	for i := 0; i < c.SlowHeaders+c.SlowBodies+c.SlowReaders; i++ {
 		conn, err := dialer.DialContext(ctx, "tcp", net.JoinHostPort(u.Hostname(), port))
 		if err != nil {
 			return err
 		}
-		s := &slowSocket{heldSocket: heldSocket{conn, bufio.NewReader(conn)}, body: i >= c.SlowHeaders}
+		s := &slowSocket{heldSocket: heldSocket{conn, bufio.NewReader(conn)}, body: i >= c.SlowHeaders && i < c.SlowHeaders+c.SlowBodies, isReader: i >= c.SlowHeaders+c.SlowBodies}
 		s.cohort = &g.stats.Headers
 		if s.body {
 			s.cohort = &g.stats.Bodies
 		}
+		if s.isReader {
+			s.cohort = &g.stats.Readers
+		}
 		g.sockets = append(g.sockets, s)
+		if s.isReader {
+			info, err := configureReaderSocket(conn.(*net.TCPConn))
+			if err != nil {
+				return err
+			}
+			g.stats.ReaderBuffers = append(g.stats.ReaderBuffers, info)
+		}
 		if err := s.probe(ctx, c, w); err != nil {
 			return err
 		}
@@ -143,6 +175,8 @@ func (g *slowSockets) visit(s *slowSocket, at time.Time, fn func(*slowWindow, *s
 			a := &w.Headers
 			if s.body {
 				a = &w.Bodies
+			} else if s.isReader {
+				a = &w.Readers
 			}
 			fn(w, a)
 		}
@@ -169,6 +203,8 @@ func (g *slowSockets) overlap(s *slowSocket, begin, end time.Time) {
 		a := &w.Headers
 		if s.body {
 			a = &w.Bodies
+		} else if s.isReader {
+			a = &w.Readers
 		}
 		ns := int64(last.Sub(first))
 		a.IncompleteNS += ns
@@ -179,7 +215,11 @@ func (g *slowSockets) overlap(s *slowSocket, begin, end time.Time) {
 }
 
 func (g *slowSockets) write(s *slowSocket, c config, data []byte, drip bool) error {
-	if err := s.SetWriteDeadline(time.Now().Add(c.Timeout)); err != nil {
+	deadline := time.Now().Add(c.Timeout)
+	if s.isReader && s.batchEnd.Before(deadline) {
+		deadline = s.batchEnd
+	}
+	if err := s.SetWriteDeadline(deadline); err != nil {
 		return err
 	}
 	n, err := s.Write(data)
@@ -312,7 +352,11 @@ func (g *slowSockets) worker(s *slowSocket, c config, w workload, ready chan err
 		if ended {
 			break
 		}
-		err = g.cycle(s, c, payload, ready, first)
+		if s.isReader {
+			err = g.readerCycle(s, c, ready, first, 30*time.Second)
+		} else {
+			err = g.cycle(s, c, payload, ready, first)
+		}
 		if err != nil || g.ctx.Err() != nil {
 			break
 		}
@@ -346,7 +390,7 @@ func (g *slowSockets) finish() error {
 	if g.stats.Error != "" {
 		return errors.New(g.stats.Error)
 	}
-	if g.stats.Headers.MeasuredUsed != g.stats.Headers.Requested || g.stats.Bodies.MeasuredUsed != g.stats.Bodies.Requested {
+	if g.stats.Headers.MeasuredUsed != g.stats.Headers.Requested || g.stats.Bodies.MeasuredUsed != g.stats.Bodies.Requested || g.stats.Readers.MeasuredUsed != g.stats.Readers.Requested {
 		return errors.New("slow sockets lack measured incomplete-phase traffic")
 	}
 	return nil
