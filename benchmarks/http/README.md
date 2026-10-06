@@ -4,6 +4,14 @@ Phase 0 pins the measurement setup. Numbers are recorded here from
 Phase 3 onward; this document fixes the procedure so Mojo and Go runs
 stay comparable.
 
+## Recorded Linux results
+
+- [HTTP/1 results](H1_RESULTS.md): current matched TCP keepalive OFF comparison, separately retained historical results and maintained-cohort status.
+- [Current HTTP/2 results](H2_RESULTS.md): matched-policy numerical and wire comparisons, resource/counter limits and provenance.
+- [HTTP/2 and HTTP/3 epochs](MULTIPLEX_RESULTS.md): current H2 and retained original H3/historical H2 evidence without pooling epochs.
+
+The current full-precision tables are [H1_RESULTS.tables.json](H1_RESULTS.tables.json) and [H2_RESULTS.tables.json](H2_RESULTS.tables.json). Recorded conditions, verdicts and limitations remain distinct from illustrative entrypoint defaults; the separately identified maintained-cohort result does not replace historical failures or establish whole-Issue completion.
+
 ## Baseline
 
 - Go toolchain: `go1.26.4 darwin/arm64` (local). CI re-records its own
