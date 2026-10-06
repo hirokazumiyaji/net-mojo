@@ -10,6 +10,7 @@ import platform
 import signal
 import subprocess
 import sys
+import time
 
 
 def tc_state():
@@ -72,16 +73,30 @@ def main():
     finally:
         signal.pthread_sigmask(signal.SIG_BLOCK, {signal.SIGTERM, signal.SIGINT})
         try:
-            if process is not None and process.poll() is None:
+            if process is not None:
                 try:
                     os.killpg(process.pid, signal.SIGTERM)
                 except ProcessLookupError:
                     pass
-                try:
-                    process.wait(timeout=5)
-                except subprocess.TimeoutExpired:
-                    os.killpg(process.pid, signal.SIGKILL)
-                    process.wait()
+                deadline = time.monotonic() + 5
+                while True:
+                    try:
+                        os.killpg(process.pid, 0)
+                    except ProcessLookupError:
+                        break
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        try:
+                            os.killpg(process.pid, signal.SIGKILL)
+                        except ProcessLookupError:
+                            pass
+                        break
+                    try:
+                        process.wait(timeout=min(0.1, remaining))
+                    except subprocess.TimeoutExpired:
+                        continue
+                    time.sleep(min(0.1, remaining))
+                process.wait()
         finally:
             try:
                 if installed:
