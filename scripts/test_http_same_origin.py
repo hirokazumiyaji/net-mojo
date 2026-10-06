@@ -1,6 +1,7 @@
 import asyncio
 import http.client
 import os
+from pathlib import Path
 import select
 import socket
 import ssl
@@ -88,19 +89,19 @@ async def dual_requests(client, port, authority):
             raise RuntimeError(f"expected graceful H3_NO_ERROR, got {code}")
 
 
-def run_mode(mode):
+def run_mode(binary, mode):
     context = ssl.create_default_context(cafile="build/tls/test-cert.pem")
     context.set_alpn_protocols(["http/1.1"])
     with tempfile.TemporaryFile(mode="w+") as errors:
         process = subprocess.Popen(
-            ["mojo", "run", "--Werror", "-I", ".", "tests/http_same_origin_fixture.mojo"],
+            [str(binary)],
             env={**os.environ, "NET_SAME_ORIGIN_MODE": mode},
             stdout=subprocess.PIPE,
             stderr=errors,
             text=True,
         )
         try:
-            if not select.select([process.stdout], [], [], 315)[0]:
+            if not select.select([process.stdout], [], [], 15)[0]:
                 raise RuntimeError("same-origin fixture readiness timed out")
             ready = process.stdout.readline().strip()
             if not ready.startswith("READY "):
@@ -150,8 +151,24 @@ def run_mode(mode):
 
 
 def main():
-    for mode in ["dual", "https-only"]:
-        run_mode(mode)
+    with tempfile.TemporaryDirectory(prefix="net-same-origin-") as directory:
+        binary = Path(directory) / "fixture"
+        subprocess.run(
+            [
+                "mojo",
+                "build",
+                "--Werror",
+                "-I",
+                ".",
+                "tests/http_same_origin_fixture.mojo",
+                "-o",
+                str(binary),
+            ],
+            check=True,
+            timeout=300,
+        )
+        for mode in ["dual", "https-only"]:
+            run_mode(binary, mode)
 
 
 if __name__ == "__main__":
