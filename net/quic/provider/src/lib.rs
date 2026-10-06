@@ -1556,8 +1556,21 @@ impl QuicServer {
     }
 
     fn terminate_send_quota(&mut self, connection_key: &[u8]) {
-        let connection = self.connections.get_mut(connection_key).unwrap();
-        let _ = connection.transport.close(false, 0x1, b"send buffer limit");
+        let close_result = self
+            .connections
+            .get_mut(connection_key)
+            .unwrap()
+            .transport
+            .close(false, 0x1, b"send buffer limit");
+        if close_result.is_err()
+            && self.connections[connection_key]
+                .transport
+                .local_error()
+                .is_none()
+        {
+            self.force_drop_connection(connection_key);
+            return;
+        }
         self.clear_connection_requests(connection_key);
         self.send_ready.push(connection_key);
         self.refresh_transport_timeout(connection_key);
