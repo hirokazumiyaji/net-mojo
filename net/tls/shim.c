@@ -176,9 +176,14 @@ void *net_tls_context_server(const char *certificate, const char *private_key,
         OPENSSL_free(context);
         return NULL;
     }
-    BIO_meth_set_read_ex(context->write_filter, net_tls_bio_read);
-    BIO_meth_set_write_ex(context->write_filter, net_tls_bio_write);
-    BIO_meth_set_ctrl(context->write_filter, net_tls_bio_ctrl);
+    if (BIO_meth_set_read_ex(context->write_filter, net_tls_bio_read) != 1 ||
+        BIO_meth_set_write_ex(context->write_filter, net_tls_bio_write) != 1 ||
+        BIO_meth_set_ctrl(context->write_filter, net_tls_bio_ctrl) != 1) {
+        BIO_meth_free(context->write_filter);
+        SSL_CTX_free(context->ssl);
+        OPENSSL_free(context);
+        return NULL;
+    }
 #endif
 
     atomic_init(&context->references, 1);
