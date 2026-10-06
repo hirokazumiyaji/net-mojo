@@ -110,7 +110,7 @@ func (g *slowSockets) setup(c config, w workload) error {
 	if port == "" {
 		port = "80"
 	}
-	dialer := net.Dialer{Timeout: c.Timeout}
+	dialer := benchmarkDialer(c.Timeout)
 	if c.SlowReaders > 0 {
 		g.readerPayload = bytes.Repeat([]byte("b"), 1<<20)
 	}
