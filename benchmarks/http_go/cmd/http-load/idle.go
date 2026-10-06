@@ -122,7 +122,7 @@ func (g *idleSockets) setup(c config, w workload) error {
 		port = "80"
 	}
 	addr := net.JoinHostPort(u.Hostname(), port)
-	dialer := net.Dialer{Timeout: c.Timeout}
+	dialer := benchmarkDialer(c.Timeout)
 	for i := 0; i < c.IdleConnections; i++ {
 		conn, err := dialer.DialContext(ctx, "tcp", addr)
 		if err != nil {
