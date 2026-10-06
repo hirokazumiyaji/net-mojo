@@ -118,6 +118,11 @@ func withBodyDeadline(next http.Handler) http.Handler {
 	})
 }
 
+func listenBenchmark(address string) (net.Listener, error) {
+	lc := net.ListenConfig{KeepAlive: -1}
+	return lc.Listen(context.Background(), "tcp", address)
+}
+
 func main() {
 	addr := flag.String("addr", "127.0.0.1:18080", "listen address")
 	idleTimeout := flag.Duration("idle-timeout", 60*time.Second, "keepalive idle timeout (positive)")
@@ -161,7 +166,7 @@ func main() {
 		},
 	}
 
-	ln, err := net.Listen("tcp", *addr)
+	ln, err := listenBenchmark(*addr)
 	if err != nil {
 		log.Fatalf("listen: %v", err)
 	}

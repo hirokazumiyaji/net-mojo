@@ -254,6 +254,10 @@ func latencies(samples []time.Duration) latencyStats {
 	return latencyStats{percentile(.50), percentile(.95), percentile(.99)}
 }
 
+func benchmarkDialer(timeout time.Duration) *net.Dialer {
+	return &net.Dialer{Timeout: timeout, KeepAlive: -1}
+}
+
 func run(c config) (result, error) {
 	r := result{Config: c}
 	w, err := prepare(c)
@@ -267,7 +271,7 @@ func run(c config) (result, error) {
 	transport := &http.Transport{
 		Protocols: protocols, DisableCompression: true, DisableKeepAlives: !c.KeepAlive,
 		MaxConnsPerHost: c.Connections, MaxIdleConns: c.Connections, MaxIdleConnsPerHost: c.Connections,
-		DialContext: (&net.Dialer{Timeout: c.Timeout}).DialContext,
+		DialContext: benchmarkDialer(c.Timeout).DialContext,
 	}
 	defer transport.CloseIdleConnections()
 	client := &http.Client{Transport: transport, Timeout: c.Timeout,

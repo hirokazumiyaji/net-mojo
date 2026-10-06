@@ -33,6 +33,16 @@ Verified Phase 0 (loopback, `GOMAXPROCS=1`):
   or a separate host.
 - Production measurements use optimized executables.
 
+The current Go baseline listener and all Go `http-load` dial paths disable
+TCP keepalive probes, matching the Mojo accepted-socket default. This is
+independent of HTTP keep-alive: `-keepalive` still controls HTTP connection
+reuse, and the existing idle/deadline settings are unchanged. Record this
+policy with source/binary revisions. Earlier results used Go's default
+TCP keepalive (15 s idle, 15 s interval, nine probes) and Mojo's accepted
+TCP keepalive OFF; those results retain their original policy and verdicts.
+Disabling probes establishes aligned settings, not the cause of earlier
+idle-socket failures or a claim that a new maintained-cohort trial passes.
+
 ## Process resource samples
 
 Monitor the actual server and load-generator PIDs on Linux or macOS with
