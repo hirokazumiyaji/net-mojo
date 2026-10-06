@@ -43,6 +43,14 @@ drive an in-memory quiche client against `QuicServer::recv_datagram` / `send` /
   serving or idle/timeout-clean without leaking CID `routes` or connection maps.
   Full path migration beyond quiche’s built-in behavior is out of scope.
 
+The provider consumes unused quiche path notifications after each native receive,
+send and timeout operation, including error outcomes. Path validation and active
+path selection remain engine-owned. The regression completes one 128-byte request
+and a 200 response after 64 switches between two validated paths, then requires no
+pending notifications. Retained events are limited to one native-operation batch;
+the deque can keep its high-water capacity. This does not define an allocator-byte
+or RSS limit, and the provider does not expose a path-event callback.
+
 ### Transport memory and UDP send backpressure
 
 Soft transport-memory admission
@@ -99,6 +107,12 @@ delivery retains ownership until response completion, cancellation, rejection
 or expiry. Connection teardown removes only those IDs from the global route
 map; the set holds one entry per live route.
 
+The completed-request FIFO stores each queued request once in a map with
+arrival-order links. Delivery removes its head; connection teardown directly
+removes owned queued IDs and releases their retained header/body bytes.
+Already delivered IDs release no queued bytes. Numeric ID wrap does not change
+arrival order, and removals retain no request tombstones.
+
 Each initial shutdown stage broadcasts to live connections once. Subsequent
 GOAWAY driving uses a bounded deduplicated queue of connections with unfinished
 flags, refreshed by receive, native timeout and local cancellation events.
@@ -133,8 +147,8 @@ stopped transport stream and send errors remove HTTP/3 stream state when the
 request receive side has finished; queued provider responses satisfy that
 completed-request condition. Sibling streams and subsequent requests continue.
 
-Initial shutdown broadcasts still visit every live connection, and actual
-connection teardown still scans the completed-request FIFO. The
+Initial shutdown broadcasts still visit every live connection, and response
+driving visits active streams within each affected connection. The
 full server loop is not yet proportional only to ready or due work.
 
 ### Canceled HTTP/3 request state
@@ -221,22 +235,101 @@ application reads retain their existing behavior. `quic-suite` runs the 38
 existing RecvBuf contracts and eight new compaction/overlap/FIN contracts;
 the live client verifies a full 1 MiB echo plus connection reuse.
 
+The fifth pinned patch accounts receive backing and fragment slots in three
+immutable pools shared by every transport of one provider server. Finite
+provider defaults are:
+
+| Pool | Retained backing | Slots |
+| --- | ---: | ---: |
+| Request (all bidi receive state) | 64 MiB | 65,536 |
+| Control (all uni receive state) | 4 MiB | 131,072 |
+| CRYPTO | 16 MiB | 131,072 |
+
+`QuicServer.set_receive_limits` and `QuicUDPEndpoint.set_receive_limits` accept
+these six nonnegative capacities before the first successful native accept.
+Zero disables positive retention in that pool. Successful accept permanently
+freezes the settings, including after all connections drain; constructor
+failure refunds partial reservations and permits retry. HTTP attachment applies
+`ServerConfig.quic_receive_{request,control,crypto}_{bytes,slots}` before adopting
+the endpoint. Separate endpoints have separate pools.
+
+Each receive buffer reserves two metadata/terminal slots. Novel fragments
+reserve their retained backing and one slot before committing bytes, FIN,
+offset or connection-byte accounting. Covered duplicates need no new charge;
+partial reads keep the full backing charge until release. Filling a held gap
+still needs positive reservation headroom before the old fragment is consumed.
+Incoming STREAM exhaustion uses transport error 0x1; incoming CRYPTO exhaustion
+uses 0xd. At the first failing Initial, quiche immediately closes without a
+wire close because no packet has been successfully processed. Failed local H3
+critical-stream construction keeps upstream's application-close mapping 0xff.
+
+`quic-suite` covers two authenticated clients sharing a full request pool,
+control and new TLS progress, rejection/queued close/drain/refunds, frozen
+settings and actual C/Mojo/HTTP configuration forwarding. Finite defaults keep
+the 1 MiB echo, cancellation/sibling/reuse and slow upload contracts. These
+84 MiB of backing capacities exclude allocator overhead, send/retransmission,
+TLS and other engine state; slot capacities count entries rather than bytes.
+They do not guarantee 10,000 simultaneous full handshakes. Retained-byte pools
+are separate from the connection flow-credit policy below.
+
 These patches do not establish an allocator cap. The independent 64 MiB
 request/response counters count logical field/body bytes rather than Vec
 capacity, container entries or allocation overhead. Transport admission still
 uses the soft 256 KiB per-connection estimate; default admission budget is
-2,621,440,000 bytes. Initial receive credit is 10,000,000 connection bytes and
-1,000,000 bytes per stream, with quiche's default autotuned maxima of 24 MiB
-per connection and 16 MiB per stream. Out-of-order fragment metadata, native
+2,621,440,000 bytes. Initial connection credit and its maximum window are
+3,456,106,496 bytes (3.21875 GiB of offset credit), with 1,000,000 initial bytes
+per stream and a 16 MiB maximum stream window. Out-of-order fragment metadata, native
 response/retransmission copies and active H3 field buffers are outside those
 application counts. Three peer uni streams permit control/QPACK, but share
-connection MAX_DATA with requests; reserving control byte credit and measuring
-actual allocated capacities remain separate design units.
+connection MAX_DATA with requests; the connection envelope preserves allowance
+for their advertised windows. Whole-engine allocated capacities remain separate.
 
 Still deferred: enabling 0-RTT and full path migration. macOS Mojo end-to-end
 HTTP/3 is covered in CI (`http3` job on `macos-14`, `http3-client-test` against
 the Mojo fixture); only packaged-artifact distribution verification remains
 optional.
+
+## Connection credit for critical streams
+
+The provider keeps 100 peer bidi streams and three peer uni streams. With a
+16 MiB maximum stream window, total possible unconsumed offset exposure is
+R=(100+3)*16 MiB. Initial connection credit and its maximum receive window are
+C=2R=3,456,106,496 bytes. Per-stream credit, stream counts, body/field limits and
+finite shared receive pools are unchanged.
+
+After a connection update M=U0+C. Before the organic half-window update threshold,
+M-U>=R. Received but unconsumed request and uni exposure E_b+E_u is bounded by R.
+Connection remainder M-rx therefore covers at least R_u-E_u, the remaining allowed
+uni exposure. Once consumption crosses the threshold, control can queue MAX_DATA
+without reading held request bodies. Completed/reset stream retirement consumes
+its remaining horizon before replacement MAX_STREAMS credit, preserving the bound.
+Lost MAX_DATA may transiently block an older peer limit; ordinary recovery resends
+it. This is eventual progress under finite loss, not progress under permanent loss.
+
+The real TLS/H3 regression leaves eleven partial 1 MiB POST bodies unread after
+HEADERS. The former 10,000,000 connection limit rejects a valid 9-byte priority
+update despite available control stream and congestion allowance. The envelope
+permits that control update without request-body reads and preserves complete
+echoes, connection reuse and refunds. Pure source algebra covers the default
+window, prior consumption, strict half boundary and autotuning clamp. Separate
+genuine QUIC component tests use two bidi/one uni streams with 4096-byte maximum
+windows. They withhold an actually emitted MAX_DATA, deliver the later stream
+update, then reorder the original packet or drop it and recover via real PING,
+ACK and timer records. They preserve held request exposure through RESET and
+replacement. This reduced profile proves counter/recovery behavior, rather than
+default HTTP/3 throughput. A separate zero-table/zero-blocked HTTP/3 case
+legally delays the peer's QPACK streams until bodies are held. It proves the
+encoder type (one byte), decoder type plus a correctly encoded cancellation
+(two bytes), and one decoder instruction byte reach the parser without body
+reads. The cancellation refers to a separately abandoned unfinished response,
+with actual STOP_SENDING observed. This proves critical-stream byte progress,
+rather than dynamic QPACK instruction conformance.
+
+This is advertised offset credit, not allocated memory. The independent backing
+capacities total 84 MiB and exclude node/Arc overhead, send state, native TLS and
+RSS. Record the connection and stream flow settings with benchmark source revision;
+historical measurements used the earlier connection defaults. Formal memory and
+performance acceptance remains separate from this transport policy.
 
 ## Source material
 

@@ -207,7 +207,11 @@ async def run_load(
 
     latencies: List[float] = []
     counters = {"ok": 0, "failed": 0, "warmup_ok": 0}
+    anchor_before = time.perf_counter()
+    anchor_unix_s = time.time()
     start = time.perf_counter()
+    anchor_span_s = start - anchor_before
+    load_start_unix_s = anchor_unix_s + anchor_span_s / 2
     warmup_until = start + warmup_s
     stop_at = warmup_until + duration_s
 
@@ -246,6 +250,12 @@ async def run_load(
         "ok": counters["ok"],
         "failed": counters["failed"],
         "warmup_ok": counters["warmup_ok"],
+        "late": counters.get("late", 0),
+        "load_start_unix_s": load_start_unix_s,
+        "measurement_start_unix_s": load_start_unix_s + warmup_s,
+        "measurement_end_unix_s": load_start_unix_s + warmup_s + duration_s,
+        "clock_anchor_span_s": anchor_span_s,
+        "rate_denominator_s": measure_s,
         "p50_us": _percentile(latencies, 50),
         "p95_us": _percentile(latencies, 95),
         "p99_us": _percentile(latencies, 99),
@@ -275,7 +285,13 @@ def main() -> None:
     # Machine-readable one-liner for the shell harness.
     print(
         "req_s={req_s:.3f} p50_us={p50_us:.0f} p95_us={p95_us:.0f} "
-        "p99_us={p99_us:.0f} ok={ok} failed={failed} samples={samples}".format(
+        "p99_us={p99_us:.0f} ok={ok} failed={failed} samples={samples} "
+        "warmup_successes={warmup_ok} late_responses={late} "
+        "load_start_unix_s={load_start_unix_s:.6f} "
+        "measurement_start_unix_s={measurement_start_unix_s:.6f} "
+        "measurement_end_unix_s={measurement_end_unix_s:.6f} "
+        "clock_anchor_span_s={clock_anchor_span_s:.9g} "
+        "rate_denominator_s={rate_denominator_s:.9g}".format(
             **stats
         )
     )

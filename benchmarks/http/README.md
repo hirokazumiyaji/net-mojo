@@ -4,13 +4,23 @@ Phase 0 pins the measurement setup. Numbers are recorded here from
 Phase 3 onward; this document fixes the procedure so Mojo and Go runs
 stay comparable.
 
+## Recorded Linux results
+
+- [HTTP/1 results](H1_RESULTS.md): current matched TCP keepalive OFF comparison, separately retained historical results and maintained-cohort status.
+- [Current HTTP/2 results](H2_RESULTS.md): matched-policy numerical and wire comparisons, resource/counter limits and provenance.
+- [HTTP/2 and HTTP/3 epochs](MULTIPLEX_RESULTS.md): current H2 and retained original H3/historical H2 evidence without pooling epochs.
+
+The current full-precision tables are [H1_RESULTS.tables.json](H1_RESULTS.tables.json) and [H2_RESULTS.tables.json](H2_RESULTS.tables.json). Recorded conditions, verdicts and limitations remain distinct from illustrative entrypoint defaults; the separately identified maintained-cohort result does not replace historical failures or establish whole-Issue completion.
+
 ## Baseline
 
 - Go toolchain: `go1.26.4 darwin/arm64` (local). CI re-records its own
   `go version` output with each measurement.
 - Go baseline: `benchmarks/http_go/main.go` (`go.mod` pins `go 1.26` and
   `golang.org/x/net` for HTTPS+HTTP/2).
-- Mojo toolchain: `pixi.toml` pinned `mojo >=1.0.0,<2` (local `1.0.0`).
+- Current Mojo toolchain: `pixi.toml` requires `mojo >=1.1.0,<1.2`;
+  `pixi.lock` resolves Mojo `1.1.0`. Record the actual `mojo --version`
+  for each run; historical results retain their recorded toolchain.
 - Build: Go `go -C benchmarks/http_go build -o /tmp/http_go_baseline .` (run from the repository root; `benchmarks/http_go` is its own module);
   Mojo optimized executable (`mojo build`), compile and startup time
   excluded from the measurement window.
@@ -30,6 +40,16 @@ Verified Phase 0 (loopback, `GOMAXPROCS=1`):
   equivalent CPU limit for Mojo). Load generator runs on separate CPUs
   or a separate host.
 - Production measurements use optimized executables.
+
+The current Go baseline listener and all Go `http-load` dial paths disable
+TCP keepalive probes, matching the Mojo accepted-socket default. This is
+independent of HTTP keep-alive: `-keepalive` still controls HTTP connection
+reuse, and the existing idle/deadline settings are unchanged. Record this
+policy with source/binary revisions. Earlier results used Go's default
+TCP keepalive (15 s idle, 15 s interval, nine probes) and Mojo's accepted
+TCP keepalive OFF; those results retain their original policy and verdicts.
+Disabling probes establishes aligned settings, not the cause of earlier
+idle-socket failures or a claim that a new maintained-cohort trial passes.
 
 ## Process resource samples
 
@@ -118,11 +138,12 @@ go -C benchmarks/http_go build -o /tmp/http-load ./cmd/http-load
 Use identical arguments for the Go and Mojo endpoints and repeat each run at
 least five times. The loader accepts plain HTTP URLs for `/fixed`, `/json` and
 `/echo`; `-method` defaults to GET or POST for echo. Each worker has one active
-request. `-timeout` bounds each request (default 5s). Warmup stops starting work
-at its deadline and finishes outstanding requests before measurement, retaining
-keep-alive connections. All drained warmup responses are validated, including
-those completed after its deadline. Set `-warmup 0` only when warmup is
-intentionally omitted.
+request. `-timeout` bounds each request (default 5s). Closed-loop warmup stops
+starting work at its deadline. Fixed-arrival warmup offers every planned slot,
+even if the dispatcher resumes after the nominal deadline. Both modes finish
+outstanding requests before measurement, retaining keep-alive connections.
+All drained warmup responses are validated, including those completed after
+the nominal deadline. Set `-warmup 0` only when warmup is intentionally omitted.
 
 One JSON record reports configuration, warmup counts, measured `started`,
 `success`, `errors`, `cutoff`, `samples`, payload byte counts, requests/s,
@@ -231,6 +252,100 @@ separately, together with timestamped server/client CPU, RSS and FD samples.
 Short functional probes do not satisfy the exact 10,000-connection or 30-minute
 soak evidence requirements.
 
+For a mixed slow-header/slow-body probe, add explicit cohorts to ordinary
+`/fixed` clients. Both counts default to zero; this mode requires keepalive and
+cannot combine with the idle mode:
+
+```bash
+/tmp/http-load -url http://127.0.0.1:18081/fixed -connections 64 -slow-headers 8 -slow-bodies 8 -warmup 10s -duration 30s
+/tmp/http-load -url http://127.0.0.1:18080/fixed -connections 64 -slow-headers 8 -slow-bodies 8 -rate 1000 -warmup 10s -duration 30s
+```
+
+Use identical flags for both servers and the matched server deadlines above.
+`-slow-interval` defaults to 250ms: headers remain incomplete through eight
+one-byte ticks, then validate the exact 64-byte reply; bodies require a strict
+HTTP/1.1 `100 Continue`, send 65536 bytes at 1024 bytes per tick, then validate
+that exact echo. Nominal request phases are 2s and 16s; configurations reaching
+the existing 5s header or 30s body deadline fail. Tick lag is recorded;
+I/O deadline and response errors invalidate the row. Server deadlines remain
+unchanged.
+
+Every cohort slot owns one socket, strictly probes `/fixed` before the workload,
+reuses it for all cycles, and probes it again afterward. No connection is
+replaced. At workload end, workers finish the finite current request promptly,
+validate its response and the original socket, then close and join. Individual
+I/O uses `-timeout`, and original-socket probes also use the separate
+`-connection-check-timeout`; cleanup remains bounded on error paths.
+
+`slow_clients.headers` and `.bodies` each record requested and confirmed
+initial/final counts, closed owned sockets and slots with measured
+incomplete-phase drip traffic. The object also records profile constants,
+loader FD limits and setup/postflight time. Per-kind `warmup` and `measurement` entries
+use exactly the ordinary half-open phase windows. `incomplete_ns` is summed
+connection time, so it can exceed one window when multiple sockets overlap.
+`request_bytes_written` counts accepted client writes completed inside the
+window; `drip_bytes_written` counts only the scheduled one-byte/1024-byte
+ticks, excluding prefixes and final completion. `validated_cycles` and
+`validated_response_payload_bytes` count complete strict response validations
+inside it. Total profile bytes/cycles retain events
+outside the windows. These are client I/O/validation timestamps, not peer ACK or
+packet timings. Postflight cannot inflate ordinary success, throughput or
+latency. Every configured slot must have measured incomplete overlap and actual
+drip writes, and complete a validated cycle plus postflight to make the row valid.
+
+Ordinary cutoff, response checks and dropped/unstarted arrival gates apply
+unchanged. Tick lag and arrival diagnostics expose scheduling pressure; record
+actual loader/server CPU, RSS and FD evidence separately before claiming client
+capacity. Reader behavior is described below; formal five-trial comparison results remain separate.
+
+Add `-slow-readers 8` to the same mixed `/fixed` keepalive commands to include
+slow readers (default zero). Each reader owns one original socket, requests a
+65536-byte receive buffer and records its actual raw `SO_RCVBUF` plus original
+local/remote addresses. Set/query failures invalidate setup; the reported raw
+value can differ across operating systems.
+
+A finite reader batch sends eight pipelined 1 MiB `/echo` bodies and validates
+eight exact HTTP/1.1 200 replies in order. The first byte of response i must be
+`b+i`, with the remaining bytes all `b`; one shared immutable payload supplies
+the uploads. The writer proceeds concurrently with 65536-byte paced reads,
+using one validation buffer per reader. At the 250 ms default, each response
+has sixteen read quanta (4 s nominal) and a full batch takes 32 s. Uploads do
+not wait for previous replies; accepted uploads can themselves block.
+
+Reader directional I/O uses a fresh 30 s budget clamped to an absolute finite
+batch cap from `-connection-check-timeout` (2 min default), recorded separately
+from ordinary `-timeout`. This cap starts at each batch admission. A caller's
+shorter cap can invalidate the batch. Pacing waits also stop at the finite cap,
+and an expired batch is rejected before reading buffered body bytes. Nominal
+response pacing reaching 30 s is
+rejected. Server 5/30/30 s deadlines and ordinary requests remain unchanged;
+a single aggregate 30 s cap would incorrectly reject the default 32 s batch.
+At workload end, stop starting batches and pacing, finish the finite concurrent
+uploads/reads, confirm the original socket, close and join. Errors close that
+owned socket before joining its blocked writer.
+
+`slow_clients.readers` has the same per-kind connection gates. `reader_sockets`
+records actual socket buffer values and tuples; reader profile constants and
+I/O/batch budgets are explicit. Reader windows record returned payload bytes,
+actual scheduled `paced_response_bytes_read` and `paced_read_quanta`, tick lag,
+validated responses/payloads and batches. `incomplete_ns` for readers measures
+known unread response time after strict headers until body consumption, clipped
+to the identical ordinary windows. Header prefetch, upload writes and sleep
+duration cannot qualify a reader as measured; actual paced reads and known
+unread overlap plus all eight strict replies/postflight are required. Totals
+retain events outside the workload windows. No profile work inflates ordinary
+success, throughput or latency, and ordinary overload remains invalid.
+
+`reader_server_send_pressure` reports `unverified`: client unread state or
+slower reads do not establish that a server application send blocked. The real
+TCP test fixture proves a large server Write remains pending with an owned
+small send buffer while ordinary siblings progress, then completes after read
+credit is released. This fixture does not change benchmark socket settings.
+Unchanged actual Go/Mojo server pressure requires separate independent evidence.
+Do not treat a sleeping socket, a blocked client upload or functional reader
+validation as that proof. Formal five-trial comparisons and capacity evidence
+remain separate from short functional checks and instrumented pressure trials.
+
 | Scenario | Conditions |
 | --- | --- |
 | Small fixed response | GET 64 B body, connections 1 / 64 / 1024 |
@@ -308,6 +423,13 @@ curl -k --http2 https://127.0.0.1:18442/fixed -o /tmp/fixed.h2.body
   `/json`/`/echo` vs a pinned aioquic 1.3.0 server using
   `benchmarks/http3_load.py` (aioquic client; Homebrew `h2load` lacks
   ngtcp2/nghttp3).
+
+## macOS stack diagnostic
+
+The [2026-10-04 HTTP/1 stack diagnostic](MACOS_CPU_DIAGNOSTIC.md) records
+separate sampled/control trials, source and tool provenance, observed sampling
+perturbation and stack-occupancy limits. It is independent of the formal Linux
+throughput/latency targets and provides no allocation-count evidence.
 
 ## Phase 3 poll baseline (preliminary, same host)
 
@@ -475,6 +597,26 @@ gitignored).
   streams `1` and `10`. Loader and server share the host (same caveat as
   PR 9). Mojo unpinned; aioquic is a single asyncio process.
 
+The H3 loader preserves its seven metric tokens and appends `warmup_successes`,
+`late_responses`, `load_start_unix_s`, `measurement_start_unix_s`,
+`measurement_end_unix_s`, `clock_anchor_span_s` and `rate_denominator_s`.
+The endpoints describe its scheduled completion window, including both
+boundaries. Quantiles contain successful responses completed in that window;
+a request begun during warmup retains its full latency. `late_responses` counts
+status200 completions after the deadline, before fixed-body validation. Failed
+counts cover all phases and connection errors; these are not conserved request
+counts. Existing exit gates and classification are unchanged.
+
+A wall-clock reading bracketed by two `perf_counter` readings maps the schedule
+through the bracket midpoint. Epoch fields have six decimal places; mapping
+uncertainty includes half the reported bracket span, clock precision and
+formatting. One anchor cannot detect later wall-clock steps or drift. For
+same-host resource clipping, select sample timestamps within the mapped window;
+interval CPU observations need both endpoints inside it. Handshakes use the
+scheduled warmup, and final drain can finish later. These fields do not establish
+client saturation, handshake timing or full-window resource evidence; historical
+mid-run samples still use their original startup-relative delays.
+
 ### Reproduce
 
 ```bash
@@ -582,6 +724,25 @@ Mojo c16m1 32,618–32,671; Go c16m10 44,768–45,046; Mojo c16m10
 All runs: 0 failed, rc=0.
 
 ### Special scenarios
+
+The slow/cancel drivers also report timing for the existing sibling batch.
+`sibling_samples` counts only exact successful bodies/statuses with actual
+dispatch and completion timestamps; `sibling_completed` and
+`sibling_missing_timing` disclose usable and missing/out-of-window timings.
+`sibling_req_s` divides successes by the interval beginning just before phase
+dispatch and ending at the last actual sibling completion, excluding idle polls,
+target drain, deliberate sleep and reuse. Latencies include upload and withheld
+credit waits. `sibling_p50_us`, `sibling_p95_us` and `sibling_p99_us` use sorted
+index `floor(fraction * (samples - 1))`; empty quantiles are `None`.
+Failures preserve the existing verdict and use the actual observation endpoint
+with `sibling_window_scope=failed_phase_observation`. Window epochs use one
+bracketed wall-clock anchor; its span and half-span uncertainty are reported.
+These small batches are not 30-second saturated throughput or population tail
+estimates. Keep each trial separate and retain full-fixture `elapsed_ms`.
+
+The hyper-h2 client enables `TCP_NODELAY` before its first HTTP/2 frame.
+Both baseline and Mojo trials use this socket policy to avoid client buffering
+extending upload-credit waits.
 
 Both HTTP/2 special scenarios run over a **single** HTTP/2 connection
 (`benchmarks/http/http2_scenarios.py`, hyper-h2): the target stream and its

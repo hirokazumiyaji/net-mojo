@@ -4,6 +4,11 @@
 #include <stdatomic.h>
 #include <string.h>
 
+#ifdef __linux__
+#include <errno.h>
+#include <sys/socket.h>
+#endif
+
 #include <openssl/err.h>
 #include <openssl/ssl.h>
 
@@ -15,6 +20,9 @@
 
 struct net_tls_context {
     SSL_CTX *ssl;
+#ifdef __linux__
+    BIO_METHOD *write_filter;
+#endif
     atomic_uint references;
     unsigned char alpn[255];
     unsigned int alpn_length;
@@ -25,9 +33,70 @@ struct net_tls_connection {
     SSL *ssl;
 };
 
+#ifdef __linux__
+static int net_tls_bio_read(BIO *bio, char *buffer, size_t length,
+                            size_t *read_length) {
+    BIO_clear_retry_flags(bio);
+    int result = BIO_read_ex(BIO_next(bio), buffer, length, read_length);
+    int saved_errno = errno;
+    BIO_copy_next_retry(bio);
+    errno = saved_errno;
+    return result;
+}
+
+static int net_tls_bio_write(BIO *bio, const char *buffer, size_t length,
+                             size_t *written_length) {
+    BIO_clear_retry_flags(bio);
+    *written_length = 0;
+    ssize_t written = send(BIO_get_fd(BIO_next(bio), NULL), buffer, length,
+                           MSG_NOSIGNAL);
+    int saved_errno = errno;
+    if (written > 0) {
+        *written_length = (size_t)written;
+    } else if (written < 0 && BIO_sock_non_fatal_error(saved_errno)) {
+        BIO_set_retry_write(bio);
+    }
+    errno = saved_errno;
+    return written > 0;
+}
+
+static long net_tls_bio_ctrl(BIO *bio, int command, long number, void *argument) {
+    if (command == BIO_CTRL_DUP) {
+        return 0;
+    }
+    if (command == BIO_C_DO_STATE_MACHINE) {
+        BIO_clear_retry_flags(bio);
+        long result = BIO_ctrl(BIO_next(bio), command, number, argument);
+        int saved_errno = errno;
+        BIO_copy_next_retry(bio);
+        errno = saved_errno;
+        return result;
+    }
+    return BIO_ctrl(BIO_next(bio), command, number, argument);
+}
+
+static int net_tls_set_fd(SSL *ssl, BIO_METHOD *method, int fd) {
+    BIO *filter = BIO_new(method);
+    if (filter == NULL) {
+        return 0;
+    }
+    BIO *socket = BIO_new_socket(fd, BIO_NOCLOSE);
+    if (socket == NULL) {
+        BIO_free(filter);
+        return 0;
+    }
+    BIO_push(filter, socket);
+    SSL_set_bio(ssl, filter, filter);
+    return 1;
+}
+#endif
+
 static void net_tls_context_release(struct net_tls_context *context) {
     if (atomic_fetch_sub_explicit(&context->references, 1, memory_order_acq_rel) == 1) {
         SSL_CTX_free(context->ssl);
+#ifdef __linux__
+        BIO_meth_free(context->write_filter);
+#endif
         OPENSSL_free(context);
     }
 }
@@ -99,6 +168,24 @@ void *net_tls_context_server(const char *certificate, const char *private_key,
         return NULL;
     }
 
+#ifdef __linux__
+    context->write_filter = BIO_meth_new(BIO_TYPE_NONE | BIO_TYPE_FILTER,
+                                        "net TLS socket write");
+    if (context->write_filter == NULL) {
+        SSL_CTX_free(context->ssl);
+        OPENSSL_free(context);
+        return NULL;
+    }
+    if (BIO_meth_set_read_ex(context->write_filter, net_tls_bio_read) != 1 ||
+        BIO_meth_set_write_ex(context->write_filter, net_tls_bio_write) != 1 ||
+        BIO_meth_set_ctrl(context->write_filter, net_tls_bio_ctrl) != 1) {
+        BIO_meth_free(context->write_filter);
+        SSL_CTX_free(context->ssl);
+        OPENSSL_free(context);
+        return NULL;
+    }
+#endif
+
     atomic_init(&context->references, 1);
     SSL_CTX_set_alpn_select_cb(context->ssl, net_tls_select_alpn, context);
     return context;
@@ -124,7 +211,12 @@ void *net_tls_connection_new(void *opaque, int fd) {
         net_tls_context_release(context);
         return NULL;
     }
-    if (SSL_set_fd(connection->ssl, fd) != 1) {
+#ifdef __linux__
+    int fd_result = net_tls_set_fd(connection->ssl, context->write_filter, fd);
+#else
+    int fd_result = SSL_set_fd(connection->ssl, fd);
+#endif
+    if (fd_result != 1) {
         SSL_free(connection->ssl);
         OPENSSL_free(connection);
         net_tls_context_release(context);

@@ -1,0 +1,3281 @@
+{
+  "scope": "Public saved-result table; no live measurement or checker re-execution; numerical data unchanged from independently qualified H1 current120 derivative",
+  "source": {
+    "runtime": 87,
+    "Go_policy_public_commit93": "9ebb9ee120e979cd305ac9109ff276754ee593b7",
+    "configuration": {
+      "snapshot": 87,
+      "manifest_sha256": "519a57d2b77a7dfd8add6d52b31af87483248a1006b6133d1befc4b308b4c7af",
+      "source_patch_sha256": "4b23fbe75876f1545377ad1b83f9ab7ce8b090b5b54611fbe3d970b8d43319a7",
+      "compiler_version": "Mojo 1.1.0 (8189361e)",
+      "container": {
+        "architecture": "aarch64",
+        "cpuset": "0,1,2",
+        "memory_bytes": 2147483648,
+        "network_mode": "bridge",
+        "connected_networks": {},
+        "cap_add": [
+          "CAP_NET_ADMIN"
+        ],
+        "cap_drop": [
+          "ALL"
+        ]
+      },
+      "archive_sha256": "deb7661f366cddf7b3e62757835f77885e65bd04c8da1509ccebc9f8c7f71c17",
+      "binary_sha256": {
+        "go": "b6ed0f7905d1c3e696e4e49f118c40ee4acdc03d480fe229eb881e4beeea67cb",
+        "mojo": "8f85d51d16f062b3449847dcb6b3a45a119be3bce5033443e9370c78f2cfeaaf",
+        "loader": "641367c6bcc7085df581f14957f954a486b8561fbc4c0c20b6e7de0d8405b7b2",
+        "parser": "c8205039c348c6a4bbf53cb7e077f81447956481047a30239fa833db5c5a05b8"
+      },
+      "tool_sha256": {
+        "mojo": "be46936245ae995680155dcc2f61af5dac8678254c634110e99ceff25ce57c39",
+        "go": "299613d26b2fc429f9b1a8dbbc6f8952f7e0fb7b5b624c63ff0442a15233eaad"
+      },
+      "loader_revision": {
+        "label": "arrival-warmup-boundary89",
+        "source_sha256": {
+          "cmd/http-load/arrival.go": "c2c22a6eb26ead9fa1c54e34b081e601c8c7167c25c4910492b8db7b7bde436a",
+          "cmd/http-load/arrival_test.go": "5695a5c7d0437530a2a6fe484f2166a8c39805918bba87de395e5627e7de44de",
+          "cmd/http-load/idle.go": "7415acef919aaf314ba5e74c109db4d372122cc5cdcde420c608a76693c1f5ab",
+          "cmd/http-load/idle_test.go": "bd1eb6e155e5a326a7fe216c8cef0f8a911c415e9a79b51628a5fdfe1ab7bcf2",
+          "cmd/http-load/main.go": "454f03c13d99416b6803ab808930ae5f33e2caf17482ad1a70e1cd2124651724",
+          "cmd/http-load/main_test.go": "dea4f123127d356e5ffa37f676c97d25596d808d8a0693bbad043465aa04e46f",
+          "cmd/http-load/slow.go": "52e3551c6b7dcaad67367e0e068f26deb8922c1275a186ee5034f6bab1a7688b",
+          "cmd/http-load/slow_reader.go": "ae40020ca8d1bc174da783523413fb59b4f8a148aa9ed3daaa9eee11fe81ca73",
+          "cmd/http-load/slow_reader_test.go": "5a71ebe580caf8feb8192eb538e1a706ca96d7fdeceb73128ac0f86f49e66d70",
+          "cmd/http-load/slow_test.go": "879a41d4aeda665115563b9293a8df11533f392cef1748f22beb48896dd442f9",
+          "cmd/http-load/window_test.go": "40a32f0cac7178c36f54d624052e85a076bf2cb0faa7d4f46afe1bd550d2e375",
+          "go.mod": "58e9de2f3bff9e27e223c5e30cb2df3b2d8088d504463770c73c9a10811a13b2",
+          "go.sum": "51107503300d3d4e08ec05ca38b212a804a8110d929c5cf545e28cb46d9171b5",
+          "main.go": "d4179afef90a9cc73498e9a3fe82cf9d98ad8282186b1d318fd83e421ebd6961"
+        },
+        "candidate_patch_sha256": "4285f4641847d10d5211c5a4799a13e7dee036c9969e29361a5cc5a93784d63b",
+        "server_runtime_unchanged": 87
+      },
+      "phase_sha256": "05ce26b1fd5c9921ae11d0e2e6c701f9b9ddc3b9ece896746cab5e13bcfa4b76",
+      "capacity_rate": 250,
+      "procedure_clarification_sha256": "1572792dca4e1e7c86fd5c6cf753ed7448ec4838cce16aaeae3687405221291d",
+      "tcp_keepalive_policy": {
+        "policy": "OFF; HTTP connection reuse unchanged",
+        "module_sha256": {
+          "cmd/http-load/arrival.go": "c2c22a6eb26ead9fa1c54e34b081e601c8c7167c25c4910492b8db7b7bde436a",
+          "cmd/http-load/arrival_test.go": "5695a5c7d0437530a2a6fe484f2166a8c39805918bba87de395e5627e7de44de",
+          "cmd/http-load/idle.go": "9c515252adddd8b97e995cf18ee80a0be130e5c156fcd6d2467e2105304f9f04",
+          "cmd/http-load/idle_test.go": "bd1eb6e155e5a326a7fe216c8cef0f8a911c415e9a79b51628a5fdfe1ab7bcf2",
+          "cmd/http-load/main.go": "5075912d5b3a87eccf8eea879867b802ceba27bb326c5fca5850d9a5695d9f6e",
+          "cmd/http-load/main_test.go": "dea4f123127d356e5ffa37f676c97d25596d808d8a0693bbad043465aa04e46f",
+          "cmd/http-load/slow.go": "26b01c436d657ced24d920c050ac1445ecc7e4de4bceaf0649065117a55b72ad",
+          "cmd/http-load/slow_reader.go": "ae40020ca8d1bc174da783523413fb59b4f8a148aa9ed3daaa9eee11fe81ca73",
+          "cmd/http-load/slow_reader_test.go": "5a71ebe580caf8feb8192eb538e1a706ca96d7fdeceb73128ac0f86f49e66d70",
+          "cmd/http-load/slow_test.go": "879a41d4aeda665115563b9293a8df11533f392cef1748f22beb48896dd442f9",
+          "cmd/http-load/socket_policy_test.go": "d3604664cdf32ddf25e5221644e516277f1dbfe1966441d9f9710270dac08e48",
+          "cmd/http-load/window_test.go": "40a32f0cac7178c36f54d624052e85a076bf2cb0faa7d4f46afe1bd550d2e375",
+          "go.mod": "58e9de2f3bff9e27e223c5e30cb2df3b2d8088d504463770c73c9a10811a13b2",
+          "go.sum": "51107503300d3d4e08ec05ca38b212a804a8110d929c5cf545e28cb46d9171b5",
+          "main.go": "c8165ccc952808ede94398f18720057e707c9a92b3f685422443c8d97aaacdc9",
+          "socket_policy_test.go": "4c58ea4e885328d194d695ec4251bfd88f4dc0ee2bcdebeb39a1608a820f6ce4"
+        },
+        "changed_paths": [
+          "cmd/http-load/idle.go",
+          "cmd/http-load/main.go",
+          "cmd/http-load/slow.go",
+          "cmd/http-load/socket_policy_test.go",
+          "main.go",
+          "socket_policy_test.go"
+        ],
+        "constructor_qualification_sha256": "faa9502f5f98ecaf0081bf2d1152160448db52c455a19c3d3cb93e5515fc5783",
+        "historical_config_sha256": "3e583fe17e2bada6a71f71ea29cc4b86f606fbed006bb21a4a4b90f0337de8c2",
+        "module_public_path": "benchmarks/http_go"
+      }
+    }
+  },
+  "observed_trial_window_span_utc": [
+    "2026-10-06T03:40:42.369078+00:00",
+    "2026-10-06T05:03:10.991020+00:00"
+  ],
+  "aggregation": "per-role displayed values are medians of five independent trials; acceptance ratios are medians of five within-pair ratios, not ratios of displayed medians",
+  "original_trials": 120,
+  "valid_pairs_per_cell": 5,
+  "cells": {
+    "F1": {
+      "workload": "Fixed64 B;1 connection",
+      "valid_pairs": 5,
+      "paired": [
+        {
+          "pair": 1,
+          "go": "F1-1-go",
+          "mojo": "F1-1-mojo",
+          "throughput_ratio": 0.9997016947364779,
+          "p99_ratio": 0.9796083916083916
+        },
+        {
+          "pair": 2,
+          "go": "F1-2-go",
+          "mojo": "F1-2-mojo",
+          "throughput_ratio": 1.006260096268845,
+          "p99_ratio": 0.9774340362635915
+        },
+        {
+          "pair": 3,
+          "go": "F1-3-go",
+          "mojo": "F1-3-mojo",
+          "throughput_ratio": 0.9635775207841677,
+          "p99_ratio": 0.9170909090909092
+        },
+        {
+          "pair": 4,
+          "go": "F1-4-go",
+          "mojo": "F1-4-mojo",
+          "throughput_ratio": 0.9596807104578577,
+          "p99_ratio": 0.9820575021172148
+        },
+        {
+          "pair": 5,
+          "go": "F1-5-go",
+          "mojo": "F1-5-mojo",
+          "throughput_ratio": 0.9719380905337284,
+          "p99_ratio": 0.957038112522686
+        }
+      ],
+      "median_paired_throughput_ratio": 0.9719380905337284,
+      "median_paired_p99_ratio": 0.9774340362635915,
+      "roles": {
+        "go": {
+          "trial_ids": [
+            "F1-1-go",
+            "F1-2-go",
+            "F1-3-go",
+            "F1-4-go",
+            "F1-5-go"
+          ],
+          "median_requests_per_second": 20225.366666666665,
+          "median_successful_completion_latency_ms": {
+            "p50": 0.04925,
+            "p95": 0.059334,
+            "p99": 0.069667
+          },
+          "errors_total": 0,
+          "cutoffs": [
+            1,
+            1,
+            1,
+            1,
+            1
+          ],
+          "resources": {
+            "server": {
+              "median_cpu_percent": 42.551642010327356,
+              "cpu_percent_range": [
+                41.827620142077464,
+                42.68963319461298
+              ],
+              "cpu_observed_seconds_range": [
+                28.999976472000007,
+                29.000058014
+              ],
+              "sampled_rss_bytes_range": [
+                14528512,
+                16654336
+              ],
+              "sampled_fd_range": [
+                8,
+                8
+              ],
+              "running_snapshot_counts": [
+                30,
+                30,
+                30,
+                30,
+                30
+              ]
+            },
+            "loader": {
+              "median_cpu_percent": 71.55165419989,
+              "cpu_percent_range": [
+                70.55169217314885,
+                71.72397363367006
+              ],
+              "cpu_observed_seconds_range": [
+                28.999945763,
+                29.000080513999997
+              ],
+              "sampled_rss_bytes_range": [
+                13824000,
+                24121344
+              ],
+              "sampled_fd_range": [
+                7,
+                7
+              ],
+              "running_snapshot_counts": [
+                30,
+                30,
+                30,
+                30,
+                30
+              ]
+            }
+          }
+        },
+        "mojo": {
+          "trial_ids": [
+            "F1-1-mojo",
+            "F1-2-mojo",
+            "F1-3-mojo",
+            "F1-4-mojo",
+            "F1-5-mojo"
+          ],
+          "median_requests_per_second": 19680.3,
+          "median_successful_completion_latency_ms": {
+            "p50": 0.051792,
+            "p95": 0.058625,
+            "p99": 0.066833
+          },
+          "errors_total": 0,
+          "cutoffs": [
+            1,
+            1,
+            1,
+            1,
+            1
+          ],
+          "resources": {
+            "server": {
+              "median_cpu_percent": 36.96545099419245,
+              "cpu_percent_range": [
+                36.75861454716392,
+                37.13788913013764
+              ],
+              "cpu_observed_seconds_range": [
+                28.999982555,
+                29.000051971999998
+              ],
+              "sampled_rss_bytes_range": [
+                16785408,
+                18624512
+              ],
+              "sampled_fd_range": [
+                10,
+                10
+              ],
+              "running_snapshot_counts": [
+                30,
+                30,
+                30,
+                30,
+                30
+              ]
+            },
+            "loader": {
+              "median_cpu_percent": 71.0343293269188,
+              "cpu_percent_range": [
+                69.93102942602177,
+                72.31047383196501
+              ],
+              "cpu_observed_seconds_range": [
+                28.999948262999997,
+                29.000062639000006
+              ],
+              "sampled_rss_bytes_range": [
+                14032896,
+                24248320
+              ],
+              "sampled_fd_range": [
+                7,
+                7
+              ],
+              "running_snapshot_counts": [
+                30,
+                30,
+                30,
+                30,
+                30
+              ]
+            }
+          }
+        }
+      }
+    },
+    "F64": {
+      "workload": "Fixed64 B;64 connections",
+      "valid_pairs": 5,
+      "paired": [
+        {
+          "pair": 1,
+          "go": "F64-1-go",
+          "mojo": "F64-1-mojo",
+          "throughput_ratio": 1.0221413386927463,
+          "p99_ratio": 0.9931728150757307
+        },
+        {
+          "pair": 2,
+          "go": "F64-2-go",
+          "mojo": "F64-2-mojo",
+          "throughput_ratio": 1.0108567441418637,
+          "p99_ratio": 0.9949145834930572
+        },
+        {
+          "pair": 3,
+          "go": "F64-3-go",
+          "mojo": "F64-3-mojo",
+          "throughput_ratio": 1.0198034274180274,
+          "p99_ratio": 0.9911808662960085
+        },
+        {
+          "pair": 4,
+          "go": "F64-4-go",
+          "mojo": "F64-4-mojo",
+          "throughput_ratio": 1.0202554439735265,
+          "p99_ratio": 0.9873488502131823
+        },
+        {
+          "pair": 5,
+          "go": "F64-5-go",
+          "mojo": "F64-5-mojo",
+          "throughput_ratio": 1.02580664464802,
+          "p99_ratio": 0.9871311659192825
+        }
+      ],
+      "median_paired_throughput_ratio": 1.0202554439735265,
+      "median_paired_p99_ratio": 0.9911808662960085,
+      "roles": {
+        "go": {
+          "trial_ids": [
+            "F64-1-go",
+            "F64-2-go",
+            "F64-3-go",
+            "F64-4-go",
+            "F64-5-go"
+          ],
+          "median_requests_per_second": 127003.46666666666,
+          "median_successful_completion_latency_ms": {
+            "p50": 0.395042,
+            "p95": 1.038125,
+            "p99": 3.571666
+          },
+          "errors_total": 0,
+          "cutoffs": [
+            64,
+            64,
+            64,
+            64,
+            64
+          ],
+          "resources": {
+            "server": {
+              "median_cpu_percent": 93.75713171324841,
+              "cpu_percent_range": [
+                93.6207844446025,
+                93.86191073375547
+              ],
+              "cpu_observed_seconds_range": [
+                28.999970638,
+                29.001158305000004
+              ],
+              "sampled_rss_bytes_range": [
+                14385152,
+                16531456
+              ],
+              "sampled_fd_range": [
+                71,
+                71
+              ],
+              "running_snapshot_counts": [
+                30,
+                30,
+                30,
+                30,
+                30
+              ]
+            },
+            "loader": {
+              "median_cpu_percent": 121.2070163084358,
+              "cpu_percent_range": [
+                120.79319537606285,
+                121.68771912919472
+              ],
+              "cpu_observed_seconds_range": [
+                28.999971347000002,
+                29.001154805
+              ],
+              "sampled_rss_bytes_range": [
+                15704064,
+                89427968
+              ],
+              "sampled_fd_range": [
+                70,
+                70
+              ],
+              "running_snapshot_counts": [
+                30,
+                30,
+                30,
+                30,
+                30
+              ]
+            }
+          }
+        },
+        "mojo": {
+          "trial_ids": [
+            "F64-1-mojo",
+            "F64-2-mojo",
+            "F64-3-mojo",
+            "F64-4-mojo",
+            "F64-5-mojo"
+          ],
+          "median_requests_per_second": 129180.26666666666,
+          "median_successful_completion_latency_ms": {
+            "p50": 0.4025,
+            "p95": 0.945833,
+            "p99": 3.5315
+          },
+          "errors_total": 0,
+          "cutoffs": [
+            64,
+            64,
+            64,
+            64,
+            64
+          ],
+          "resources": {
+            "server": {
+              "median_cpu_percent": 97.3106119653493,
+              "cpu_percent_range": [
+                97.06880829254958,
+                97.41396283552166
+              ],
+              "cpu_observed_seconds_range": [
+                28.999920388999996,
+                29.000414513000003
+              ],
+              "sampled_rss_bytes_range": [
+                16797696,
+                18169856
+              ],
+              "sampled_fd_range": [
+                73,
+                73
+              ],
+              "running_snapshot_counts": [
+                30,
+                30,
+                30,
+                30,
+                30
+              ]
+            },
+            "loader": {
+              "median_cpu_percent": 118.31054960682889,
+              "cpu_percent_range": [
+                117.8967230971885,
+                118.44653451013092
+              ],
+              "cpu_observed_seconds_range": [
+                28.999949805,
+                29.00042634600001
+              ],
+              "sampled_rss_bytes_range": [
+                15806464,
+                89497600
+              ],
+              "sampled_fd_range": [
+                70,
+                70
+              ],
+              "running_snapshot_counts": [
+                30,
+                30,
+                30,
+                30,
+                30
+              ]
+            }
+          }
+        }
+      }
+    },
+    "F1024": {
+      "workload": "Fixed64 B;1,024 connections",
+      "valid_pairs": 5,
+      "paired": [
+        {
+          "pair": 1,
+          "go": "F1024-1-go",
+          "mojo": "F1024-1-mojo",
+          "throughput_ratio": 1.0669355339361826,
+          "p99_ratio": 1.0915170800465317
+        },
+        {
+          "pair": 2,
+          "go": "F1024-2-go",
+          "mojo": "F1024-2-mojo",
+          "throughput_ratio": 1.086907543925276,
+          "p99_ratio": 0.9491772897671596
+        },
+        {
+          "pair": 3,
+          "go": "F1024-3-go",
+          "mojo": "F1024-3-mojo",
+          "throughput_ratio": 1.095851259412786,
+          "p99_ratio": 0.9353912518811853
+        },
+        {
+          "pair": 4,
+          "go": "F1024-4-go",
+          "mojo": "F1024-4-mojo",
+          "throughput_ratio": 1.1036186442820735,
+          "p99_ratio": 0.928404799539918
+        },
+        {
+          "pair": 5,
+          "go": "F1024-5-go",
+          "mojo": "F1024-5-mojo",
+          "throughput_ratio": 1.0807784375256175,
+          "p99_ratio": 0.9780004724034737
+        }
+      ],
+      "median_paired_throughput_ratio": 1.086907543925276,
+      "median_paired_p99_ratio": 0.9491772897671596,
+      "roles": {
+        "go": {
+          "trial_ids": [
+            "F1024-1-go",
+            "F1024-2-go",
+            "F1024-3-go",
+            "F1024-4-go",
+            "F1024-5-go"
+          ],
+          "median_requests_per_second": 117514.03333333334,
+          "median_successful_completion_latency_ms": {
+            "p50": 8.3735,
+            "p95": 13.4185,
+            "p99": 16.126334
+          },
+          "errors_total": 0,
+          "cutoffs": [
+            1024,
+            1024,
+            1024,
+            1024,
+            1024
+          ],
+          "resources": {
+            "server": {
+              "median_cpu_percent": 99.79096965238247,
+              "cpu_percent_range": [
+                99.6615034486023,
+                99.82714324976577
+              ],
+              "cpu_observed_seconds_range": [
+                28.998157764000002,
+                29.000620097000002
+              ],
+              "sampled_rss_bytes_range": [
+                43012096,
+                45248512
+              ],
+              "sampled_fd_range": [
+                1031,
+                1031
+              ],
+              "running_snapshot_counts": [
+                30,
+                30,
+                30,
+                30,
+                30
+              ]
+            },
+            "loader": {
+              "median_cpu_percent": 148.96240094281495,
+              "cpu_percent_range": [
+                146.41322610560837,
+                150.31103821758865
+              ],
+              "cpu_observed_seconds_range": [
+                28.998117764000007,
+                29.000606681
+              ],
+              "sampled_rss_bytes_range": [
+                66695168,
+                128778240
+              ],
+              "sampled_fd_range": [
+                1030,
+                1030
+              ],
+              "running_snapshot_counts": [
+                30,
+                30,
+                30,
+                30,
+                30
+              ]
+            }
+          }
+        },
+        "mojo": {
+          "trial_ids": [
+            "F1024-1-mojo",
+            "F1024-2-mojo",
+            "F1024-3-mojo",
+            "F1024-4-mojo",
+            "F1024-5-mojo"
+          ],
+          "median_requests_per_second": 127006.63333333333,
+          "median_successful_completion_latency_ms": {
+            "p50": 7.802875,
+            "p95": 12.7295,
+            "p99": 15.729875
+          },
+          "errors_total": 0,
+          "cutoffs": [
+            1024,
+            1024,
+            1024,
+            1023,
+            1024
+          ],
+          "resources": {
+            "server": {
+              "median_cpu_percent": 99.44523830383584,
+              "cpu_percent_range": [
+                98.99940809278029,
+                99.58702672786204
+              ],
+              "cpu_observed_seconds_range": [
+                28.999761263000007,
+                29.002005013000005
+              ],
+              "sampled_rss_bytes_range": [
+                19070976,
+                20725760
+              ],
+              "sampled_fd_range": [
+                1033,
+                1033
+              ],
+              "running_snapshot_counts": [
+                30,
+                30,
+                30,
+                30,
+                30
+              ]
+            },
+            "loader": {
+              "median_cpu_percent": 156.3463406629618,
+              "cpu_percent_range": [
+                155.1963001015586,
+                157.3448037783104
+              ],
+              "cpu_observed_seconds_range": [
+                28.999719346,
+                29.001980053999997
+              ],
+              "sampled_rss_bytes_range": [
+                65888256,
+                152440832
+              ],
+              "sampled_fd_range": [
+                1030,
+                1030
+              ],
+              "running_snapshot_counts": [
+                30,
+                30,
+                30,
+                30,
+                30
+              ]
+            }
+          }
+        }
+      }
+    },
+    "J64": {
+      "workload": "JSON1 KiB;64 connections",
+      "valid_pairs": 5,
+      "paired": [
+        {
+          "pair": 1,
+          "go": "J64-1-go",
+          "mojo": "J64-1-mojo",
+          "throughput_ratio": 0.5361228386044773,
+          "p99_ratio": 0.5373050639565446
+        },
+        {
+          "pair": 2,
+          "go": "J64-2-go",
+          "mojo": "J64-2-mojo",
+          "throughput_ratio": 0.5362655638085669,
+          "p99_ratio": 0.537787336984953
+        },
+        {
+          "pair": 3,
+          "go": "J64-3-go",
+          "mojo": "J64-3-mojo",
+          "throughput_ratio": 0.5323880155984436,
+          "p99_ratio": 0.5396340895872973
+        },
+        {
+          "pair": 4,
+          "go": "J64-4-go",
+          "mojo": "J64-4-mojo",
+          "throughput_ratio": 0.5341541886546646,
+          "p99_ratio": 0.5376521019414245
+        },
+        {
+          "pair": 5,
+          "go": "J64-5-go",
+          "mojo": "J64-5-mojo",
+          "throughput_ratio": 0.5328273439333886,
+          "p99_ratio": 0.5405694530529509
+        }
+      ],
+      "median_paired_throughput_ratio": 0.5341541886546646,
+      "median_paired_p99_ratio": 0.537787336984953,
+      "roles": {
+        "go": {
+          "trial_ids": [
+            "J64-1-go",
+            "J64-2-go",
+            "J64-3-go",
+            "J64-4-go",
+            "J64-5-go"
+          ],
+          "median_requests_per_second": 123542.33333333333,
+          "median_successful_completion_latency_ms": {
+            "p50": 0.408125,
+            "p95": 1.097583,
+            "p99": 3.547292
+          },
+          "errors_total": 0,
+          "cutoffs": [
+            64,
+            64,
+            64,
+            64,
+            64
+          ],
+          "resources": {
+            "server": {
+              "median_cpu_percent": 93.07241865160547,
+              "cpu_percent_range": [
+                92.86208359930076,
+                93.37921947396715
+              ],
+              "cpu_observed_seconds_range": [
+                28.998924053999996,
+                29.000722722
+              ],
+              "sampled_rss_bytes_range": [
+                14626816,
+                16744448
+              ],
+              "sampled_fd_range": [
+                71,
+                71
+              ],
+              "running_snapshot_counts": [
+                30,
+                30,
+                30,
+                30,
+                30
+              ]
+            },
+            "loader": {
+              "median_cpu_percent": 124.68957414138914,
+              "cpu_percent_range": [
+                124.10803076375745,
+                126.5172427753627
+              ],
+              "cpu_observed_seconds_range": [
+                28.998929221999987,
+                29.000047888
+              ],
+              "sampled_rss_bytes_range": [
+                16019456,
+                87359488
+              ],
+              "sampled_fd_range": [
+                70,
+                70
+              ],
+              "running_snapshot_counts": [
+                30,
+                30,
+                30,
+                30,
+                30
+              ]
+            }
+          }
+        },
+        "mojo": {
+          "trial_ids": [
+            "J64-1-mojo",
+            "J64-2-mojo",
+            "J64-3-mojo",
+            "J64-4-mojo",
+            "J64-5-mojo"
+          ],
+          "median_requests_per_second": 65826.73333333334,
+          "median_successful_completion_latency_ms": {
+            "p50": 0.957333,
+            "p95": 1.208625,
+            "p99": 1.912625
+          },
+          "errors_total": 0,
+          "cutoffs": [
+            64,
+            64,
+            64,
+            64,
+            64
+          ],
+          "resources": {
+            "server": {
+              "median_cpu_percent": 99.96643800810999,
+              "cpu_percent_range": [
+                99.96541493194778,
+                100.00054650988326
+              ],
+              "cpu_observed_seconds_range": [
+                28.999732887999997,
+                29.000302513
+              ],
+              "sampled_rss_bytes_range": [
+                17043456,
+                17780736
+              ],
+              "sampled_fd_range": [
+                73,
+                73
+              ],
+              "running_snapshot_counts": [
+                30,
+                30,
+                30,
+                30,
+                30
+              ]
+            },
+            "loader": {
+              "median_cpu_percent": 107.27477910047746,
+              "cpu_percent_range": [
+                107.0692549845103,
+                108.2413122305909
+              ],
+              "cpu_observed_seconds_range": [
+                28.999724804999996,
+                29.000292762999997
+              ],
+              "sampled_rss_bytes_range": [
+                15634432,
+                51085312
+              ],
+              "sampled_fd_range": [
+                70,
+                70
+              ],
+              "running_snapshot_counts": [
+                30,
+                30,
+                30,
+                30,
+                30
+              ]
+            }
+          }
+        }
+      }
+    },
+    "E1CL": {
+      "workload": "Echo1 KiB;Content-Length;64 connections",
+      "valid_pairs": 5,
+      "paired": [
+        {
+          "pair": 1,
+          "go": "E1CL-1-go",
+          "mojo": "E1CL-1-mojo",
+          "throughput_ratio": 0.35271806224277674,
+          "p99_ratio": 0.9119237776126968
+        },
+        {
+          "pair": 2,
+          "go": "E1CL-2-go",
+          "mojo": "E1CL-2-mojo",
+          "throughput_ratio": 0.3519493200255242,
+          "p99_ratio": 0.9096612112376253
+        },
+        {
+          "pair": 3,
+          "go": "E1CL-3-go",
+          "mojo": "E1CL-3-mojo",
+          "throughput_ratio": 0.3530853259032141,
+          "p99_ratio": 0.9211794606575545
+        },
+        {
+          "pair": 4,
+          "go": "E1CL-4-go",
+          "mojo": "E1CL-4-mojo",
+          "throughput_ratio": 0.3493178002465636,
+          "p99_ratio": 0.9223439073291057
+        },
+        {
+          "pair": 5,
+          "go": "E1CL-5-go",
+          "mojo": "E1CL-5-mojo",
+          "throughput_ratio": 0.4188338986473836,
+          "p99_ratio": 0.8651827870106379
+        }
+      ],
+      "median_paired_throughput_ratio": 0.35271806224277674,
+      "median_paired_p99_ratio": 0.9119237776126968,
+      "roles": {
+        "go": {
+          "trial_ids": [
+            "E1CL-1-go",
+            "E1CL-2-go",
+            "E1CL-3-go",
+            "E1CL-4-go",
+            "E1CL-5-go"
+          ],
+          "median_requests_per_second": 114888.83333333333,
+          "median_successful_completion_latency_ms": {
+            "p50": 0.466458,
+            "p95": 1.118791,
+            "p99": 3.407083
+          },
+          "errors_total": 0,
+          "cutoffs": [
+            64,
+            64,
+            64,
+            64,
+            64
+          ],
+          "resources": {
+            "server": {
+              "median_cpu_percent": 96.37940944944792,
+              "cpu_percent_range": [
+                95.20714765565157,
+                97.00021290877768
+              ],
+              "cpu_observed_seconds_range": [
+                28.999594554999998,
+                29.000064054999996
+              ],
+              "sampled_rss_bytes_range": [
+                14266368,
+                16834560
+              ],
+              "sampled_fd_range": [
+                71,
+                71
+              ],
+              "running_snapshot_counts": [
+                30,
+                30,
+                30,
+                30,
+                30
+              ]
+            },
+            "loader": {
+              "median_cpu_percent": 119.8967854319133,
+              "cpu_percent_range": [
+                119.68985907027957,
+                125.93127958845331
+              ],
+              "cpu_observed_seconds_range": [
+                28.999622346999995,
+                29.000071763000005
+              ],
+              "sampled_rss_bytes_range": [
+                15941632,
+                74686464
+              ],
+              "sampled_fd_range": [
+                70,
+                70
+              ],
+              "running_snapshot_counts": [
+                30,
+                30,
+                30,
+                30,
+                30
+              ]
+            }
+          }
+        },
+        "mojo": {
+          "trial_ids": [
+            "E1CL-1-mojo",
+            "E1CL-2-mojo",
+            "E1CL-3-mojo",
+            "E1CL-4-mojo",
+            "E1CL-5-mojo"
+          ],
+          "median_requests_per_second": 40405.566666666666,
+          "median_successful_completion_latency_ms": {
+            "p50": 1.565792,
+            "p95": 1.683458,
+            "p99": 3.116292
+          },
+          "errors_total": 0,
+          "cutoffs": [
+            64,
+            64,
+            64,
+            64,
+            64
+          ],
+          "resources": {
+            "server": {
+              "median_cpu_percent": 99.99978271426518,
+              "cpu_percent_range": [
+                99.96547238445888,
+                100.03448630467076
+              ],
+              "cpu_observed_seconds_range": [
+                28.999794679000004,
+                29.000063013000013
+              ],
+              "sampled_rss_bytes_range": [
+                16908288,
+                18255872
+              ],
+              "sampled_fd_range": [
+                73,
+                73
+              ],
+              "running_snapshot_counts": [
+                30,
+                30,
+                30,
+                30,
+                30
+              ]
+            },
+            "loader": {
+              "median_cpu_percent": 92.10318635027993,
+              "cpu_percent_range": [
+                91.79305381672127,
+                96.38079921879655
+              ],
+              "cpu_observed_seconds_range": [
+                28.999552013,
+                29.000082471000002
+              ],
+              "sampled_rss_bytes_range": [
+                15327232,
+                38215680
+              ],
+              "sampled_fd_range": [
+                70,
+                70
+              ],
+              "running_snapshot_counts": [
+                30,
+                30,
+                30,
+                30,
+                30
+              ]
+            }
+          }
+        }
+      }
+    },
+    "E64CL": {
+      "workload": "Echo64 KiB;Content-Length;64 connections",
+      "valid_pairs": 5,
+      "paired": [
+        {
+          "pair": 1,
+          "go": "E64CL-1-go",
+          "mojo": "E64CL-1-mojo",
+          "throughput_ratio": 0.05078976403174716,
+          "p99_ratio": 4.571383626200598
+        },
+        {
+          "pair": 2,
+          "go": "E64CL-2-go",
+          "mojo": "E64CL-2-mojo",
+          "throughput_ratio": 0.050663265522791386,
+          "p99_ratio": 4.784388957303862
+        },
+        {
+          "pair": 3,
+          "go": "E64CL-3-go",
+          "mojo": "E64CL-3-mojo",
+          "throughput_ratio": 0.050627560458017,
+          "p99_ratio": 4.506658422537389
+        },
+        {
+          "pair": 4,
+          "go": "E64CL-4-go",
+          "mojo": "E64CL-4-mojo",
+          "throughput_ratio": 0.051486287099822343,
+          "p99_ratio": 4.938676891749869
+        },
+        {
+          "pair": 5,
+          "go": "E64CL-5-go",
+          "mojo": "E64CL-5-mojo",
+          "throughput_ratio": 0.05252694498322998,
+          "p99_ratio": 5.753771460825954
+        }
+      ],
+      "median_paired_throughput_ratio": 0.05078976403174716,
+      "median_paired_p99_ratio": 4.784388957303862,
+      "roles": {
+        "go": {
+          "trial_ids": [
+            "E64CL-1-go",
+            "E64CL-2-go",
+            "E64CL-3-go",
+            "E64CL-4-go",
+            "E64CL-5-go"
+          ],
+          "median_requests_per_second": 23414.166666666668,
+          "median_successful_completion_latency_ms": {
+            "p50": 2.209125,
+            "p95": 5.329333,
+            "p99": 15.593583
+          },
+          "errors_total": 0,
+          "cutoffs": [
+            64,
+            64,
+            64,
+            64,
+            64
+          ],
+          "resources": {
+            "server": {
+              "median_cpu_percent": 98.20689058142248,
+              "cpu_percent_range": [
+                97.82857288226884,
+                98.51739279035162
+              ],
+              "cpu_observed_seconds_range": [
+                28.999707513,
+                29.000231347000003
+              ],
+              "sampled_rss_bytes_range": [
+                14589952,
+                16969728
+              ],
+              "sampled_fd_range": [
+                71,
+                71
+              ],
+              "running_snapshot_counts": [
+                30,
+                30,
+                30,
+                30,
+                30
+              ]
+            },
+            "loader": {
+              "median_cpu_percent": 162.6896880581707,
+              "cpu_percent_range": [
+                160.75880285155245,
+                163.96717450849843
+              ],
+              "cpu_observed_seconds_range": [
+                28.999706888,
+                29.000222722000004
+              ],
+              "sampled_rss_bytes_range": [
+                17833984,
+                30556160
+              ],
+              "sampled_fd_range": [
+                70,
+                70
+              ],
+              "running_snapshot_counts": [
+                30,
+                30,
+                30,
+                30,
+                30
+              ]
+            }
+          }
+        },
+        "mojo": {
+          "trial_ids": [
+            "E64CL-1-mojo",
+            "E64CL-2-mojo",
+            "E64CL-3-mojo",
+            "E64CL-4-mojo",
+            "E64CL-5-mojo"
+          ],
+          "median_requests_per_second": 1193,
+          "median_successful_completion_latency_ms": {
+            "p50": 53.173041,
+            "p95": 56.057917,
+            "p99": 75.186417
+          },
+          "errors_total": 0,
+          "cutoffs": [
+            64,
+            64,
+            64,
+            64,
+            64
+          ],
+          "resources": {
+            "server": {
+              "median_cpu_percent": 99.99998055862447,
+              "cpu_percent_range": [
+                99.96520695627108,
+                100.00359721215328
+              ],
+              "cpu_observed_seconds_range": [
+                28.998956846000006,
+                29.000090013999998
+              ],
+              "sampled_rss_bytes_range": [
+                26263552,
+                27705344
+              ],
+              "sampled_fd_range": [
+                73,
+                73
+              ],
+              "running_snapshot_counts": [
+                30,
+                30,
+                30,
+                30,
+                30
+              ]
+            },
+            "loader": {
+              "median_cpu_percent": 16.655781993589255,
+              "cpu_percent_range": [
+                15.724117048864827,
+                17.37932039966336
+              ],
+              "cpu_observed_seconds_range": [
+                28.998938638,
+                29.000106804999998
+              ],
+              "sampled_rss_bytes_range": [
+                14716928,
+                21446656
+              ],
+              "sampled_fd_range": [
+                70,
+                70
+              ],
+              "running_snapshot_counts": [
+                30,
+                30,
+                30,
+                30,
+                30
+              ]
+            }
+          }
+        }
+      }
+    },
+    "E1CH": {
+      "workload": "Echo1 KiB;chunked;64 connections",
+      "valid_pairs": 5,
+      "paired": [
+        {
+          "pair": 1,
+          "go": "E1CH-1-go",
+          "mojo": "E1CH-1-mojo",
+          "throughput_ratio": 0.4010440312762229,
+          "p99_ratio": 0.8855915918926597
+        },
+        {
+          "pair": 2,
+          "go": "E1CH-2-go",
+          "mojo": "E1CH-2-mojo",
+          "throughput_ratio": 0.38672662321232365,
+          "p99_ratio": 0.9040131641787521
+        },
+        {
+          "pair": 3,
+          "go": "E1CH-3-go",
+          "mojo": "E1CH-3-mojo",
+          "throughput_ratio": 0.40560189478853015,
+          "p99_ratio": 0.8993067623223063
+        },
+        {
+          "pair": 4,
+          "go": "E1CH-4-go",
+          "mojo": "E1CH-4-mojo",
+          "throughput_ratio": 0.36575700195343436,
+          "p99_ratio": 0.9651943007652412
+        },
+        {
+          "pair": 5,
+          "go": "E1CH-5-go",
+          "mojo": "E1CH-5-mojo",
+          "throughput_ratio": 0.4163341008794142,
+          "p99_ratio": 0.889352068286277
+        }
+      ],
+      "median_paired_throughput_ratio": 0.4010440312762229,
+      "median_paired_p99_ratio": 0.8993067623223063,
+      "roles": {
+        "go": {
+          "trial_ids": [
+            "E1CH-1-go",
+            "E1CH-2-go",
+            "E1CH-3-go",
+            "E1CH-4-go",
+            "E1CH-5-go"
+          ],
+          "median_requests_per_second": 92436.56666666667,
+          "median_successful_completion_latency_ms": {
+            "p50": 0.5555,
+            "p95": 1.549458,
+            "p99": 3.7635
+          },
+          "errors_total": 0,
+          "cutoffs": [
+            64,
+            64,
+            64,
+            64,
+            64
+          ],
+          "resources": {
+            "server": {
+              "median_cpu_percent": 96.24144177104056,
+              "cpu_percent_range": [
+                95.44853322751919,
+                96.3442761913032
+              ],
+              "cpu_observed_seconds_range": [
+                28.999366888000008,
+                29.000455262999996
+              ],
+              "sampled_rss_bytes_range": [
+                14446592,
+                16896000
+              ],
+              "sampled_fd_range": [
+                71,
+                71
+              ],
+              "running_snapshot_counts": [
+                30,
+                30,
+                30,
+                30,
+                30
+              ]
+            },
+            "loader": {
+              "median_cpu_percent": 123.2439914582442,
+              "cpu_percent_range": [
+                122.20709719049351,
+                128.3428312090418
+              ],
+              "cpu_observed_seconds_range": [
+                28.999385347,
+                29.000451096000003
+              ],
+              "sampled_rss_bytes_range": [
+                15659008,
+                61800448
+              ],
+              "sampled_fd_range": [
+                70,
+                70
+              ],
+              "running_snapshot_counts": [
+                30,
+                30,
+                30,
+                30,
+                30
+              ]
+            }
+          }
+        },
+        "mojo": {
+          "trial_ids": [
+            "E1CH-1-mojo",
+            "E1CH-2-mojo",
+            "E1CH-3-mojo",
+            "E1CH-4-mojo",
+            "E1CH-5-mojo"
+          ],
+          "median_requests_per_second": 37071.13333333333,
+          "median_successful_completion_latency_ms": {
+            "p50": 1.701167,
+            "p95": 1.94325,
+            "p99": 3.386208
+          },
+          "errors_total": 0,
+          "cutoffs": [
+            64,
+            64,
+            64,
+            64,
+            64
+          ],
+          "resources": {
+            "server": {
+              "median_cpu_percent": 99.9661701342249,
+              "cpu_percent_range": [
+                99.93091512389525,
+                99.99984075887426
+              ],
+              "cpu_observed_seconds_range": [
+                28.99978747199999,
+                29.000046180000002
+              ],
+              "sampled_rss_bytes_range": [
+                16871424,
+                17711104
+              ],
+              "sampled_fd_range": [
+                73,
+                73
+              ],
+              "running_snapshot_counts": [
+                30,
+                30,
+                30,
+                30,
+                30
+              ]
+            },
+            "loader": {
+              "median_cpu_percent": 95.58590416610501,
+              "cpu_percent_range": [
+                92.44831115182085,
+                97.79289769876343
+              ],
+              "cpu_observed_seconds_range": [
+                28.999797680000004,
+                29.000091846000004
+              ],
+              "sampled_rss_bytes_range": [
+                15863808,
+                38207488
+              ],
+              "sampled_fd_range": [
+                70,
+                70
+              ],
+              "running_snapshot_counts": [
+                30,
+                30,
+                30,
+                30,
+                30
+              ]
+            }
+          }
+        }
+      }
+    },
+    "E64CH": {
+      "workload": "Echo64 KiB;chunked;64 connections",
+      "valid_pairs": 5,
+      "paired": [
+        {
+          "pair": 1,
+          "go": "E64CH-1-go",
+          "mojo": "E64CH-1-mojo",
+          "throughput_ratio": 0.05146429661734797,
+          "p99_ratio": 3.6654865720503236
+        },
+        {
+          "pair": 2,
+          "go": "E64CH-2-go",
+          "mojo": "E64CH-2-mojo",
+          "throughput_ratio": 0.05169635302171519,
+          "p99_ratio": 3.7081556150574895
+        },
+        {
+          "pair": 3,
+          "go": "E64CH-3-go",
+          "mojo": "E64CH-3-mojo",
+          "throughput_ratio": 0.0512338987464302,
+          "p99_ratio": 3.3034107216222197
+        },
+        {
+          "pair": 4,
+          "go": "E64CH-4-go",
+          "mojo": "E64CH-4-mojo",
+          "throughput_ratio": 0.054835087210881886,
+          "p99_ratio": 4.094625596587996
+        },
+        {
+          "pair": 5,
+          "go": "E64CH-5-go",
+          "mojo": "E64CH-5-mojo",
+          "throughput_ratio": 0.05056497217035628,
+          "p99_ratio": 4.290811987530454
+        }
+      ],
+      "median_paired_throughput_ratio": 0.05146429661734797,
+      "median_paired_p99_ratio": 3.7081556150574895,
+      "roles": {
+        "go": {
+          "trial_ids": [
+            "E64CH-1-go",
+            "E64CH-2-go",
+            "E64CH-3-go",
+            "E64CH-4-go",
+            "E64CH-5-go"
+          ],
+          "median_requests_per_second": 23256.9,
+          "median_successful_completion_latency_ms": {
+            "p50": 2.229333,
+            "p95": 4.728417,
+            "p99": 19.702375
+          },
+          "errors_total": 0,
+          "cutoffs": [
+            64,
+            64,
+            64,
+            64,
+            64
+          ],
+          "resources": {
+            "server": {
+              "median_cpu_percent": 98.75834721416989,
+              "cpu_percent_range": [
+                98.51628561167557,
+                98.99889717276803
+              ],
+              "cpu_observed_seconds_range": [
+                28.999646596,
+                29.000323054
+              ],
+              "sampled_rss_bytes_range": [
+                14094336,
+                16969728
+              ],
+              "sampled_fd_range": [
+                71,
+                71
+              ],
+              "running_snapshot_counts": [
+                30,
+                30,
+                30,
+                30,
+                30
+              ]
+            },
+            "loader": {
+              "median_cpu_percent": 155.37907005913257,
+              "cpu_percent_range": [
+                154.48097314025594,
+                156.58463535915658
+              ],
+              "cpu_observed_seconds_range": [
+                28.999659512999997,
+                29.000335180000004
+              ],
+              "sampled_rss_bytes_range": [
+                17821696,
+                30130176
+              ],
+              "sampled_fd_range": [
+                70,
+                70
+              ],
+              "running_snapshot_counts": [
+                30,
+                30,
+                30,
+                30,
+                30
+              ]
+            }
+          }
+        },
+        "mojo": {
+          "trial_ids": [
+            "E64CH-1-mojo",
+            "E64CH-2-mojo",
+            "E64CH-3-mojo",
+            "E64CH-4-mojo",
+            "E64CH-5-mojo"
+          ],
+          "median_requests_per_second": 1206.7666666666667,
+          "median_successful_completion_latency_ms": {
+            "p50": 52.541042,
+            "p95": 55.599792,
+            "p99": 73.572125
+          },
+          "errors_total": 0,
+          "cutoffs": [
+            64,
+            64,
+            64,
+            64,
+            64
+          ],
+          "resources": {
+            "server": {
+              "median_cpu_percent": 99.99874106067705,
+              "cpu_percent_range": [
+                99.9653991339838,
+                100.0003046974801
+              ],
+              "cpu_observed_seconds_range": [
+                28.999911638,
+                29.000365097
+              ],
+              "sampled_rss_bytes_range": [
+                25399296,
+                27557888
+              ],
+              "sampled_fd_range": [
+                73,
+                73
+              ],
+              "running_snapshot_counts": [
+                30,
+                30,
+                30,
+                30,
+                30
+              ]
+            },
+            "loader": {
+              "median_cpu_percent": 15.758590682581517,
+              "cpu_percent_range": [
+                14.724199508144553,
+                16.517000308564874
+              ],
+              "cpu_observed_seconds_range": [
+                28.999878721000005,
+                29.000423264000002
+              ],
+              "sampled_rss_bytes_range": [
+                16138240,
+                22228992
+              ],
+              "sampled_fd_range": [
+                70,
+                70
+              ],
+              "running_snapshot_counts": [
+                30,
+                30,
+                30,
+                30,
+                30
+              ]
+            }
+          }
+        }
+      }
+    },
+    "I10000": {
+      "workload": "9,900 original idle +100 active",
+      "valid_pairs": 5,
+      "paired": [
+        {
+          "pair": 1,
+          "go": "I10000-1-go",
+          "mojo": "I10000-1-mojo",
+          "throughput_ratio": 1.0537977273498913,
+          "p99_ratio": 0.8999967641154613
+        },
+        {
+          "pair": 2,
+          "go": "I10000-2-go",
+          "mojo": "I10000-2-mojo",
+          "throughput_ratio": 1.0554911884083609,
+          "p99_ratio": 0.9607547158348512
+        },
+        {
+          "pair": 3,
+          "go": "I10000-3-go",
+          "mojo": "I10000-3-mojo",
+          "throughput_ratio": 0.9866082895131971,
+          "p99_ratio": 0.9979580826809503
+        },
+        {
+          "pair": 4,
+          "go": "I10000-4-go",
+          "mojo": "I10000-4-mojo",
+          "throughput_ratio": 1.0403529524126653,
+          "p99_ratio": 0.982430492726827
+        },
+        {
+          "pair": 5,
+          "go": "I10000-5-go",
+          "mojo": "I10000-5-mojo",
+          "throughput_ratio": 1.0397795170981605,
+          "p99_ratio": 0.9610967823377944
+        }
+      ],
+      "median_paired_throughput_ratio": 1.0403529524126653,
+      "median_paired_p99_ratio": 0.9610967823377944,
+      "roles": {
+        "go": {
+          "trial_ids": [
+            "I10000-1-go",
+            "I10000-2-go",
+            "I10000-3-go",
+            "I10000-4-go",
+            "I10000-5-go"
+          ],
+          "median_requests_per_second": 103256.03333333334,
+          "median_successful_completion_latency_ms": {
+            "p50": 0.767083,
+            "p95": 2.725125,
+            "p99": 4.608834
+          },
+          "errors_total": 0,
+          "cutoffs": [
+            100,
+            100,
+            100,
+            100,
+            100
+          ],
+          "resources": {
+            "server": {
+              "median_cpu_percent": 90.30832219209408,
+              "cpu_percent_range": [
+                89.27484614276551,
+                90.82715043075666
+              ],
+              "cpu_observed_seconds_range": [
+                28.999903930000006,
+                29.001208013
+              ],
+              "sampled_rss_bytes_range": [
+                347258880,
+                353746944
+              ],
+              "sampled_fd_range": [
+                10007,
+                10007
+              ],
+              "running_snapshot_counts": [
+                30,
+                30,
+                30,
+                30,
+                30
+              ]
+            },
+            "loader": {
+              "median_cpu_percent": 149.46236660416284,
+              "cpu_percent_range": [
+                147.48642070851582,
+                156.72672637190942
+              ],
+              "cpu_observed_seconds_range": [
+                28.993140514000004,
+                29.003956638000005
+              ],
+              "sampled_rss_bytes_range": [
+                124219392,
+                182116352
+              ],
+              "sampled_fd_range": [
+                10006,
+                10006
+              ],
+              "running_snapshot_counts": [
+                30,
+                30,
+                30,
+                30,
+                30
+              ]
+            }
+          }
+        },
+        "mojo": {
+          "trial_ids": [
+            "I10000-1-mojo",
+            "I10000-2-mojo",
+            "I10000-3-mojo",
+            "I10000-4-mojo",
+            "I10000-5-mojo"
+          ],
+          "median_requests_per_second": 103310.06666666667,
+          "median_successful_completion_latency_ms": {
+            "p50": 0.766125,
+            "p95": 2.43775,
+            "p99": 4.541333
+          },
+          "errors_total": 0,
+          "cutoffs": [
+            100,
+            100,
+            100,
+            100,
+            100
+          ],
+          "resources": {
+            "server": {
+              "median_cpu_percent": 88.4482122800041,
+              "cpu_percent_range": [
+                87.72278386029235,
+                91.06782896247348
+              ],
+              "cpu_observed_seconds_range": [
+                28.998542472,
+                29.000703513999994
+              ],
+              "sampled_rss_bytes_range": [
+                52514816,
+                54472704
+              ],
+              "sampled_fd_range": [
+                10009,
+                10009
+              ],
+              "running_snapshot_counts": [
+                30,
+                30,
+                30,
+                30,
+                30
+              ]
+            },
+            "loader": {
+              "median_cpu_percent": 150.61744071232732,
+              "cpu_percent_range": [
+                135.36204909301864,
+                156.65364880040488
+              ],
+              "cpu_observed_seconds_range": [
+                28.996679264000004,
+                29.004674846999997
+              ],
+              "sampled_rss_bytes_range": [
+                124215296,
+                182177792
+              ],
+              "sampled_fd_range": [
+                10006,
+                10006
+              ],
+              "running_snapshot_counts": [
+                30,
+                30,
+                30,
+                30,
+                30
+              ]
+            }
+          }
+        }
+      }
+    },
+    "CHURN": {
+      "workload": "Fixed64 B;64 workers;new connection/request",
+      "valid_pairs": 5,
+      "paired": [
+        {
+          "pair": 1,
+          "go": "CHURN-1-go",
+          "mojo": "CHURN-1-mojo",
+          "throughput_ratio": 0.9766752542042941,
+          "p99_ratio": 1.0395292055061232
+        },
+        {
+          "pair": 2,
+          "go": "CHURN-2-go",
+          "mojo": "CHURN-2-mojo",
+          "throughput_ratio": 0.8675801427121028,
+          "p99_ratio": 1.1130345755876498
+        },
+        {
+          "pair": 3,
+          "go": "CHURN-3-go",
+          "mojo": "CHURN-3-mojo",
+          "throughput_ratio": 0.9825411304208516,
+          "p99_ratio": 1.044800621195491
+        },
+        {
+          "pair": 4,
+          "go": "CHURN-4-go",
+          "mojo": "CHURN-4-mojo",
+          "throughput_ratio": 0.8910905133539047,
+          "p99_ratio": 1.1330933738859104
+        },
+        {
+          "pair": 5,
+          "go": "CHURN-5-go",
+          "mojo": "CHURN-5-mojo",
+          "throughput_ratio": 0.9439167621584593,
+          "p99_ratio": 1.0385592886139572
+        }
+      ],
+      "median_paired_throughput_ratio": 0.9439167621584593,
+      "median_paired_p99_ratio": 1.044800621195491,
+      "roles": {
+        "go": {
+          "trial_ids": [
+            "CHURN-1-go",
+            "CHURN-2-go",
+            "CHURN-3-go",
+            "CHURN-4-go",
+            "CHURN-5-go"
+          ],
+          "median_requests_per_second": 46190.46666666667,
+          "median_successful_completion_latency_ms": {
+            "p50": 1.258292,
+            "p95": 2.493375,
+            "p99": 3.350958
+          },
+          "errors_total": 0,
+          "cutoffs": [
+            64,
+            64,
+            64,
+            64,
+            64
+          ],
+          "resources": {
+            "server": {
+              "median_cpu_percent": 88.0687410026889,
+              "cpu_percent_range": [
+                85.72174149994098,
+                88.93517133292049
+              ],
+              "cpu_observed_seconds_range": [
+                28.998651055,
+                29.000810722
+              ],
+              "sampled_rss_bytes_range": [
+                14049280,
+                16904192
+              ],
+              "sampled_fd_range": [
+                8,
+                70
+              ],
+              "running_snapshot_counts": [
+                30,
+                30,
+                30,
+                30,
+                30
+              ]
+            },
+            "loader": {
+              "median_cpu_percent": 191.5855147905763,
+              "cpu_percent_range": [
+                191.07131977944772,
+                191.87076260992237
+              ],
+              "cpu_observed_seconds_range": [
+                28.998686013000004,
+                29.000819013999998
+              ],
+              "sampled_rss_bytes_range": [
+                16162816,
+                44568576
+              ],
+              "sampled_fd_range": [
+                29,
+                70
+              ],
+              "running_snapshot_counts": [
+                30,
+                30,
+                30,
+                30,
+                30
+              ]
+            }
+          }
+        },
+        "mojo": {
+          "trial_ids": [
+            "CHURN-1-mojo",
+            "CHURN-2-mojo",
+            "CHURN-3-mojo",
+            "CHURN-4-mojo",
+            "CHURN-5-mojo"
+          ],
+          "median_requests_per_second": 45020.833333333336,
+          "median_successful_completion_latency_ms": {
+            "p50": 1.291458,
+            "p95": 2.590167,
+            "p99": 3.501083
+          },
+          "errors_total": 0,
+          "cutoffs": [
+            64,
+            64,
+            64,
+            64,
+            64
+          ],
+          "resources": {
+            "server": {
+              "median_cpu_percent": 79.86334134827159,
+              "cpu_percent_range": [
+                72.96541625221113,
+                84.62026469220315
+              ],
+              "cpu_observed_seconds_range": [
+                28.999537972000002,
+                29.001803263000003
+              ],
+              "sampled_rss_bytes_range": [
+                16990208,
+                18567168
+              ],
+              "sampled_fd_range": [
+                26,
+                67
+              ],
+              "running_snapshot_counts": [
+                30,
+                30,
+                30,
+                30,
+                30
+              ]
+            },
+            "loader": {
+              "median_cpu_percent": 193.72317368395764,
+              "cpu_percent_range": [
+                191.79227776929298,
+                194.30974366004074
+              ],
+              "cpu_observed_seconds_range": [
+                28.999288096999997,
+                29.001809803999997
+              ],
+              "sampled_rss_bytes_range": [
+                15597568,
+                38199296
+              ],
+              "sampled_fd_range": [
+                26,
+                70
+              ],
+              "running_snapshot_counts": [
+                30,
+                30,
+                30,
+                30,
+                30
+              ]
+            }
+          }
+        }
+      }
+    },
+    "SLOW": {
+      "workload": "Fixed64 B;64 active +three original slow clients",
+      "valid_pairs": 5,
+      "paired": [
+        {
+          "pair": 1,
+          "go": "SLOW-1-go",
+          "mojo": "SLOW-1-mojo",
+          "throughput_ratio": 1.0393613901016892,
+          "p99_ratio": 1.0123791655997567
+        },
+        {
+          "pair": 2,
+          "go": "SLOW-2-go",
+          "mojo": "SLOW-2-mojo",
+          "throughput_ratio": 0.9745685316680449,
+          "p99_ratio": 1.0220912941631524
+        },
+        {
+          "pair": 3,
+          "go": "SLOW-3-go",
+          "mojo": "SLOW-3-mojo",
+          "throughput_ratio": 0.9504751734814185,
+          "p99_ratio": 1.036285189748821
+        },
+        {
+          "pair": 4,
+          "go": "SLOW-4-go",
+          "mojo": "SLOW-4-mojo",
+          "throughput_ratio": 1.0045698131947893,
+          "p99_ratio": 1.0178477793669822
+        },
+        {
+          "pair": 5,
+          "go": "SLOW-5-go",
+          "mojo": "SLOW-5-mojo",
+          "throughput_ratio": 0.9938512969260133,
+          "p99_ratio": 1.013352001092747
+        }
+      ],
+      "median_paired_throughput_ratio": 0.9938512969260133,
+      "median_paired_p99_ratio": 1.0178477793669822,
+      "roles": {
+        "go": {
+          "trial_ids": [
+            "SLOW-1-go",
+            "SLOW-2-go",
+            "SLOW-3-go",
+            "SLOW-4-go",
+            "SLOW-5-go"
+          ],
+          "median_requests_per_second": 109622.03333333334,
+          "median_successful_completion_latency_ms": {
+            "p50": 0.466833,
+            "p95": 1.280292,
+            "p99": 3.655416
+          },
+          "errors_total": 0,
+          "cutoffs": [
+            64,
+            64,
+            64,
+            64,
+            64
+          ],
+          "resources": {
+            "server": {
+              "median_cpu_percent": 94.48269043025135,
+              "cpu_percent_range": [
+                93.6550936530888,
+                94.61636037267404
+              ],
+              "cpu_observed_seconds_range": [
+                29.000007305,
+                29.001719304999995
+              ],
+              "sampled_rss_bytes_range": [
+                14512128,
+                19025920
+              ],
+              "sampled_fd_range": [
+                74,
+                74
+              ],
+              "running_snapshot_counts": [
+                30,
+                30,
+                30,
+                30,
+                30
+              ]
+            },
+            "loader": {
+              "median_cpu_percent": 133.5093076807768,
+              "cpu_percent_range": [
+                126.96549146300646,
+                135.44820321045512
+              ],
+              "cpu_observed_seconds_range": [
+                29.000005887999993,
+                29.001723305000002
+              ],
+              "sampled_rss_bytes_range": [
+                17518592,
+                76787712
+              ],
+              "sampled_fd_range": [
+                73,
+                73
+              ],
+              "running_snapshot_counts": [
+                30,
+                30,
+                30,
+                30,
+                30
+              ]
+            }
+          }
+        },
+        "mojo": {
+          "trial_ids": [
+            "SLOW-1-mojo",
+            "SLOW-2-mojo",
+            "SLOW-3-mojo",
+            "SLOW-4-mojo",
+            "SLOW-5-mojo"
+          ],
+          "median_requests_per_second": 109718.13333333333,
+          "median_successful_completion_latency_ms": {
+            "p50": 0.45725,
+            "p95": 1.243625,
+            "p99": 3.720583
+          },
+          "errors_total": 0,
+          "cutoffs": [
+            64,
+            64,
+            64,
+            64,
+            64
+          ],
+          "resources": {
+            "server": {
+              "median_cpu_percent": 94.82721884298087,
+              "cpu_percent_range": [
+                94.17285038168515,
+                96.00041388757748
+              ],
+              "cpu_observed_seconds_range": [
+                28.999761389,
+                29.000112346999998
+              ],
+              "sampled_rss_bytes_range": [
+                21442560,
+                25030656
+              ],
+              "sampled_fd_range": [
+                76,
+                76
+              ],
+              "running_snapshot_counts": [
+                30,
+                30,
+                30,
+                30,
+                30
+              ]
+            },
+            "loader": {
+              "median_cpu_percent": 137.24220841892082,
+              "cpu_percent_range": [
+                129.06969944760854,
+                140.82863506943363
+              ],
+              "cpu_observed_seconds_range": [
+                28.999784013999996,
+                29.000166596999996
+              ],
+              "sampled_rss_bytes_range": [
+                17686528,
+                76783616
+              ],
+              "sampled_fd_range": [
+                73,
+                73
+              ],
+              "running_snapshot_counts": [
+                30,
+                30,
+                30,
+                30,
+                30
+              ]
+            }
+          }
+        }
+      }
+    },
+    "LATENCY": {
+      "workload": "Fixed64 B;64 workers;250 planned arrivals/s",
+      "valid_pairs": 5,
+      "paired": [
+        {
+          "pair": 1,
+          "go": "LATENCY-1-go",
+          "mojo": "LATENCY-1-mojo",
+          "throughput_ratio": 1.0,
+          "p99_ratio": 0.8129293664338535
+        },
+        {
+          "pair": 2,
+          "go": "LATENCY-2-go",
+          "mojo": "LATENCY-2-mojo",
+          "throughput_ratio": 1.0,
+          "p99_ratio": 0.8750522906283242
+        },
+        {
+          "pair": 3,
+          "go": "LATENCY-3-go",
+          "mojo": "LATENCY-3-mojo",
+          "throughput_ratio": 1.0,
+          "p99_ratio": 1.0299257135120252
+        },
+        {
+          "pair": 4,
+          "go": "LATENCY-4-go",
+          "mojo": "LATENCY-4-mojo",
+          "throughput_ratio": 1.0,
+          "p99_ratio": 0.9073573572923963
+        },
+        {
+          "pair": 5,
+          "go": "LATENCY-5-go",
+          "mojo": "LATENCY-5-mojo",
+          "throughput_ratio": 1.0,
+          "p99_ratio": 1.059162409660339
+        }
+      ],
+      "median_paired_throughput_ratio": 1.0,
+      "median_paired_p99_ratio": 0.9073573572923963,
+      "roles": {
+        "go": {
+          "trial_ids": [
+            "LATENCY-1-go",
+            "LATENCY-2-go",
+            "LATENCY-3-go",
+            "LATENCY-4-go",
+            "LATENCY-5-go"
+          ],
+          "median_requests_per_second": 250,
+          "median_successful_completion_latency_ms": {
+            "p50": 0.928134,
+            "p95": 1.598256,
+            "p99": 2.342676
+          },
+          "errors_total": 0,
+          "cutoffs": [
+            0,
+            0,
+            0,
+            0,
+            0
+          ],
+          "resources": {
+            "server": {
+              "median_cpu_percent": 3.8620308428780983,
+              "cpu_percent_range": [
+                3.413795662146983,
+                4.00003046974934
+              ],
+              "cpu_observed_seconds_range": [
+                28.999274804999995,
+                29.00028626299999
+              ],
+              "sampled_rss_bytes_range": [
+                14016512,
+                16642048
+              ],
+              "sampled_fd_range": [
+                9,
+                13
+              ],
+              "running_snapshot_counts": [
+                30,
+                30,
+                30,
+                30,
+                30
+              ]
+            },
+            "loader": {
+              "median_cpu_percent": 9.448158054289383,
+              "cpu_percent_range": [
+                8.482649877798305,
+                9.793225057167646
+              ],
+              "cpu_observed_seconds_range": [
+                28.999436638000002,
+                29.000371763999997
+              ],
+              "sampled_rss_bytes_range": [
+                15765504,
+                16760832
+              ],
+              "sampled_fd_range": [
+                8,
+                12
+              ],
+              "running_snapshot_counts": [
+                30,
+                30,
+                30,
+                30,
+                30
+              ]
+            }
+          }
+        },
+        "mojo": {
+          "trial_ids": [
+            "LATENCY-1-mojo",
+            "LATENCY-2-mojo",
+            "LATENCY-3-mojo",
+            "LATENCY-4-mojo",
+            "LATENCY-5-mojo"
+          ],
+          "median_requests_per_second": 250,
+          "median_successful_completion_latency_ms": {
+            "p50": 0.851505,
+            "p95": 1.532595,
+            "p99": 2.097254
+          },
+          "errors_total": 0,
+          "cutoffs": [
+            0,
+            0,
+            0,
+            0,
+            0
+          ],
+          "resources": {
+            "server": {
+              "median_cpu_percent": 2.5862003481140845,
+              "cpu_percent_range": [
+                2.482786204872458,
+                2.793143112834369
+              ],
+              "cpu_observed_seconds_range": [
+                28.999588180000007,
+                29.000902679999996
+              ],
+              "sampled_rss_bytes_range": [
+                17182720,
+                18550784
+              ],
+              "sampled_fd_range": [
+                10,
+                18
+              ],
+              "running_snapshot_counts": [
+                30,
+                30,
+                30,
+                30,
+                30
+              ]
+            },
+            "loader": {
+              "median_cpu_percent": 9.172489738471844,
+              "cpu_percent_range": [
+                8.793366563086943,
+                9.827814981484812
+              ],
+              "cpu_observed_seconds_range": [
+                28.999132262999996,
+                29.001523971
+              ],
+              "sampled_rss_bytes_range": [
+                13733888,
+                16760832
+              ],
+              "sampled_fd_range": [
+                7,
+                15
+              ],
+              "running_snapshot_counts": [
+                30,
+                30,
+                30,
+                30,
+                30
+              ]
+            }
+          }
+        }
+      }
+    }
+  },
+  "classified_measured_cutoff_total": 16369,
+  "successful_measured_completion_total": 236504824,
+  "original_targets": {
+    "F64_90percent": true,
+    "F1024_90percent": true,
+    "LATENCY_unsaturated_all10": true,
+    "LATENCY_p99_1_2": true
+  },
+  "negative_nominal_unix_gaps": [
+    {
+      "id": "F1-2-go",
+      "nominal_unix_gap_ns": -148843
+    },
+    {
+      "id": "F1-3-mojo",
+      "nominal_unix_gap_ns": -69385
+    },
+    {
+      "id": "F1-5-go",
+      "nominal_unix_gap_ns": -99176
+    }
+  ],
+  "qualification_provenance": {
+    "independent_terminal_summary_sha256": "42973f004e2955e2c833964e495e83b143f5bc84bde2069b4e529149cf5f4cb7",
+    "terminal_review_sha256": "8bf022ae7dcc02521a5118ec2c861238b5fbd3d7b5125df6c74641a8a9306c81",
+    "artifacts_verified_by_independent_review": 1992,
+    "raw_per_trial_CPU_recomputation_scope": "Existing qualified independent review; public summary medians/ranges retain its captured clipped values; raw packets are not included"
+  },
+  "maintained_cohort": {
+    "scope": "One separately identified Go→Mojo R250/1800 pair; original maintained-cohort and sampled server FD/RSS qualification; no five-pair latency/performance gate or historical replacement",
+    "original_criterion_passed": true,
+    "procedure": {
+      "rate_requests_per_second": 250,
+      "nominal_warmup_seconds": 10,
+      "measurement_seconds_per_role": 1800,
+      "response_body_bytes": 64,
+      "original_idle_connections": 9900,
+      "actually_used_original_active_connections": 100,
+      "total_original_connections": 10000,
+      "order": [
+        "Go",
+        "Mojo"
+      ]
+    },
+    "source": {
+      "runtime": 87,
+      "Go_policy_public_commit93": "9ebb9ee120e979cd305ac9109ff276754ee593b7",
+      "TCP_SO_KEEPALIVE": "OFF",
+      "HTTP_connection_reuse": "unchanged",
+      "captured_provenance": {
+        "manifest_sha256": "519a57d2b77a7dfd8add6d52b31af87483248a1006b6133d1befc4b308b4c7af",
+        "source_patch_sha256": "4b23fbe75876f1545377ad1b83f9ab7ce8b090b5b54611fbe3d970b8d43319a7",
+        "binaries": {
+          "go": "b6ed0f7905d1c3e696e4e49f118c40ee4acdc03d480fe229eb881e4beeea67cb",
+          "mojo": "8f85d51d16f062b3449847dcb6b3a45a119be3bce5033443e9370c78f2cfeaaf",
+          "loader": "641367c6bcc7085df581f14957f954a486b8561fbc4c0c20b6e7de0d8405b7b2",
+          "parser": "c8205039c348c6a4bbf53cb7e077f81447956481047a30239fa833db5c5a05b8"
+        },
+        "tool_executable_sha256": {
+          "mojo": "be46936245ae995680155dcc2f61af5dac8678254c634110e99ceff25ce57c39",
+          "go": "299613d26b2fc429f9b1a8dbbc6f8952f7e0fb7b5b624c63ff0442a15233eaad"
+        },
+        "runner_affinity": [
+          1,
+          2
+        ],
+        "compiler_version": "Mojo 1.1.0 (8189361e)",
+        "source_snapshot": 87,
+        "runner_sha256": "56b58e602468677bf791726c4ff5dca4b283f7f0a8ec6b483bae73067b89d976",
+        "collector_sha256": "4d110e886a4164971ea5a84ecad7a0eabb49df39e862a5a18d4fea1e37d0395d"
+      },
+      "container": {
+        "architecture": "aarch64",
+        "cpuset": "0,1,2",
+        "memory_bytes": 2147483648,
+        "network_mode": "bridge",
+        "connected_networks": {},
+        "cap_add": [
+          "CAP_NET_ADMIN"
+        ],
+        "cap_drop": [
+          "ALL"
+        ]
+      },
+      "kernel": {
+        "system": "Linux",
+        "release": "7.0.14-linuxkit",
+        "version": "#1 SMP PREEMPT Sun Sep 20 16:14:09 UTC 2026",
+        "architecture": "aarch64"
+      }
+    },
+    "trials": [
+      {
+        "id": "aligned93-soak-r250-go",
+        "window": {
+          "start_unix_ns": 1791268041447095959,
+          "end_unix_ns": 1791269841447095959,
+          "elapsed_ns": 1800000000000
+        },
+        "counts": {
+          "started": 450000,
+          "success": 450000,
+          "errors": 0,
+          "cutoff": 0,
+          "samples": 450000,
+          "response_bytes": 28800000,
+          "request_body_bytes": 0
+        },
+        "warmup_counts": {
+          "started": 2500,
+          "success": 2500,
+          "errors": 0,
+          "cutoff": 0
+        },
+        "cohort": {
+          "postflight_status": "passed",
+          "criterion_passed": true,
+          "recorded": {
+            "requested_total": 10000,
+            "confirmed_idle_initial": 9900,
+            "confirmed_idle_final": 9900,
+            "confirmed_active_initial": 100,
+            "active_used_in_measurement": 100,
+            "forbidden_replacement_attempts": 0,
+            "active_closed_before_deadline": 0,
+            "loader_fd_limit_soft": 1048576,
+            "loader_fd_limit_hard": 1048576,
+            "setup_seconds": 1.17057075,
+            "postflight_seconds": 0.5956725
+          },
+          "final_count_scope": "successful original-socket probe count/prefix"
+        },
+        "latency_ms": {
+          "p50": 0.959671,
+          "p95": 1.679313,
+          "p99": 3.173749
+        },
+        "arrivals": {
+          "scheduled": 450000,
+          "dropped": 0,
+          "unstarted": 0,
+          "service_samples": 450000,
+          "service_latency_ms": {
+            "p50": 0.361042,
+            "p95": 0.731458,
+            "p99": 1.600875
+          },
+          "start_lag_samples": 450000,
+          "start_lag_p99_ms": 1.732623,
+          "start_lag_max_ms": 47.341393
+        },
+        "resources": {
+          "server": {
+            "cpu_percent": 4.7648693636334025,
+            "cpu_observed_seconds": 1799.000003111,
+            "snapshots": 1800,
+            "fd_range": [
+              10007,
+              10007
+            ],
+            "rss_range": [
+              218673152,
+              277929984
+            ],
+            "quarter_ranges": [
+              {
+                "quarter": 1,
+                "snapshots": 450,
+                "rss_range": [
+                  218673152,
+                  277917696
+                ],
+                "fd_range": [
+                  10007,
+                  10007
+                ]
+              },
+              {
+                "quarter": 2,
+                "snapshots": 450,
+                "rss_range": [
+                  277917696,
+                  277929984
+                ],
+                "fd_range": [
+                  10007,
+                  10007
+                ]
+              },
+              {
+                "quarter": 3,
+                "snapshots": 450,
+                "rss_range": [
+                  277929984,
+                  277929984
+                ],
+                "fd_range": [
+                  10007,
+                  10007
+                ]
+              },
+              {
+                "quarter": 4,
+                "snapshots": 450,
+                "rss_range": [
+                  277929984,
+                  277929984
+                ],
+                "fd_range": [
+                  10007,
+                  10007
+                ]
+              }
+            ],
+            "final_rss_bytes": 277929984,
+            "final_constant_rss_since_measurement_seconds": 673.84518909,
+            "max_between_snapshot_gap_ns": 994585751
+          },
+          "loader": {
+            "cpu_percent": 10.861591038566784,
+            "cpu_observed_seconds": 1798.999790235,
+            "snapshots": 1800,
+            "fd_range": [
+              10006,
+              10006
+            ],
+            "rss_range": [
+              93257728,
+              146034688
+            ],
+            "quarter_ranges": [
+              {
+                "quarter": 1,
+                "snapshots": 450,
+                "rss_range": [
+                  93257728,
+                  126693376
+                ],
+                "fd_range": [
+                  10006,
+                  10006
+                ]
+              },
+              {
+                "quarter": 2,
+                "snapshots": 450,
+                "rss_range": [
+                  126693376,
+                  133091328
+                ],
+                "fd_range": [
+                  10006,
+                  10006
+                ]
+              },
+              {
+                "quarter": 3,
+                "snapshots": 450,
+                "rss_range": [
+                  133091328,
+                  137326592
+                ],
+                "fd_range": [
+                  10006,
+                  10006
+                ]
+              },
+              {
+                "quarter": 4,
+                "snapshots": 450,
+                "rss_range": [
+                  137326592,
+                  146034688
+                ],
+                "fd_range": [
+                  10006,
+                  10006
+                ]
+              }
+            ],
+            "final_rss_bytes": 146034688,
+            "final_constant_rss_since_measurement_seconds": 1738.852493957,
+            "max_between_snapshot_gap_ns": 1014559126
+          }
+        },
+        "context_records": 7,
+        "source_rank_limitation": "source-proven planned-start ceil(p*n)-1 scalars; raw per-request samples not exported, independent recomputation unavailable",
+        "role": "Go",
+        "canonical_valid": true,
+        "req_s": 250.0,
+        "warmup_arrivals": {
+          "scheduled": 2500,
+          "dropped": 0,
+          "unstarted": 0,
+          "service_samples": 0,
+          "service_latency_ms": {
+            "p50": 0,
+            "p95": 0,
+            "p99": 0
+          },
+          "start_lag_samples": 0,
+          "start_lag_p99_ms": 0,
+          "start_lag_max_ms": 0
+        },
+        "warmup_nominal_end_to_measurement_start_ns": 2400616,
+        "coverage": {
+          "server": {
+            "first_snapshot_interval": [
+              1791268042294276626,
+              1791268042311477334
+            ],
+            "last_snapshot_interval": [
+              1791269841288381417,
+              1791269841305154000
+            ],
+            "max_between_snapshot_gap_ns": 994585751,
+            "quarters": [
+              {
+                "quarter": 1,
+                "snapshots": 450,
+                "rss_range": [
+                  218673152,
+                  277917696
+                ],
+                "fd_range": [
+                  10007,
+                  10007
+                ]
+              },
+              {
+                "quarter": 2,
+                "snapshots": 450,
+                "rss_range": [
+                  277917696,
+                  277929984
+                ],
+                "fd_range": [
+                  10007,
+                  10007
+                ]
+              },
+              {
+                "quarter": 3,
+                "snapshots": 450,
+                "rss_range": [
+                  277929984,
+                  277929984
+                ],
+                "fd_range": [
+                  10007,
+                  10007
+                ]
+              },
+              {
+                "quarter": 4,
+                "snapshots": 450,
+                "rss_range": [
+                  277929984,
+                  277929984
+                ],
+                "fd_range": [
+                  10007,
+                  10007
+                ]
+              }
+            ],
+            "scope": "discrete captures and clipped CPU intervals; no invented stability threshold or continuous-RSS claim"
+          },
+          "loader": {
+            "first_snapshot_interval": [
+              1791268042311484001,
+              1791268042321597751
+            ],
+            "last_snapshot_interval": [
+              1791269841305157584,
+              1791269841316480500
+            ],
+            "max_between_snapshot_gap_ns": 1014559126,
+            "quarters": [
+              {
+                "quarter": 1,
+                "snapshots": 450,
+                "rss_range": [
+                  93257728,
+                  126693376
+                ],
+                "fd_range": [
+                  10006,
+                  10006
+                ]
+              },
+              {
+                "quarter": 2,
+                "snapshots": 450,
+                "rss_range": [
+                  126693376,
+                  133091328
+                ],
+                "fd_range": [
+                  10006,
+                  10006
+                ]
+              },
+              {
+                "quarter": 3,
+                "snapshots": 450,
+                "rss_range": [
+                  133091328,
+                  137326592
+                ],
+                "fd_range": [
+                  10006,
+                  10006
+                ]
+              },
+              {
+                "quarter": 4,
+                "snapshots": 450,
+                "rss_range": [
+                  137326592,
+                  146034688
+                ],
+                "fd_range": [
+                  10006,
+                  10006
+                ]
+              }
+            ],
+            "scope": "discrete captures and clipped CPU intervals; no invented stability threshold or continuous-RSS claim"
+          }
+        },
+        "context_scope": "passive non-atomic namespace records; not per-process ownership, cohort census, or causal proof"
+      },
+      {
+        "id": "aligned93-soak-r250-mojo",
+        "window": {
+          "start_unix_ns": 1791269854726645757,
+          "end_unix_ns": 1791271654726645757,
+          "elapsed_ns": 1800000000000
+        },
+        "counts": {
+          "started": 450000,
+          "success": 450000,
+          "errors": 0,
+          "cutoff": 0,
+          "samples": 450000,
+          "response_bytes": 28800000,
+          "request_body_bytes": 0
+        },
+        "warmup_counts": {
+          "started": 2500,
+          "success": 2500,
+          "errors": 0,
+          "cutoff": 0
+        },
+        "cohort": {
+          "postflight_status": "passed",
+          "criterion_passed": true,
+          "recorded": {
+            "requested_total": 10000,
+            "confirmed_idle_initial": 9900,
+            "confirmed_idle_final": 9900,
+            "confirmed_active_initial": 100,
+            "active_used_in_measurement": 100,
+            "forbidden_replacement_attempts": 0,
+            "active_closed_before_deadline": 0,
+            "loader_fd_limit_soft": 1048576,
+            "loader_fd_limit_hard": 1048576,
+            "setup_seconds": 1.186856709,
+            "postflight_seconds": 0.525537459
+          },
+          "final_count_scope": "successful original-socket probe count/prefix"
+        },
+        "latency_ms": {
+          "p50": 0.934208,
+          "p95": 1.604537,
+          "p99": 2.59085
+        },
+        "arrivals": {
+          "scheduled": 450000,
+          "dropped": 0,
+          "unstarted": 0,
+          "service_samples": 450000,
+          "service_latency_ms": {
+            "p50": 0.328792,
+            "p95": 0.610166,
+            "p99": 1.132292
+          },
+          "start_lag_samples": 450000,
+          "start_lag_p99_ms": 1.485421,
+          "start_lag_max_ms": 62.44452
+        },
+        "resources": {
+          "server": {
+            "cpu_percent": 3.181767976723562,
+            "cpu_observed_seconds": 1798.999814529,
+            "snapshots": 1800,
+            "fd_range": [
+              10009,
+              10009
+            ],
+            "rss_range": [
+              53563392,
+              53567488
+            ],
+            "quarter_ranges": [
+              {
+                "quarter": 1,
+                "snapshots": 450,
+                "rss_range": [
+                  53563392,
+                  53567488
+                ],
+                "fd_range": [
+                  10009,
+                  10009
+                ]
+              },
+              {
+                "quarter": 2,
+                "snapshots": 450,
+                "rss_range": [
+                  53567488,
+                  53567488
+                ],
+                "fd_range": [
+                  10009,
+                  10009
+                ]
+              },
+              {
+                "quarter": 3,
+                "snapshots": 450,
+                "rss_range": [
+                  53567488,
+                  53567488
+                ],
+                "fd_range": [
+                  10009,
+                  10009
+                ]
+              },
+              {
+                "quarter": 4,
+                "snapshots": 450,
+                "rss_range": [
+                  53567488,
+                  53567488
+                ],
+                "fd_range": [
+                  10009,
+                  10009
+                ]
+              }
+            ],
+            "final_rss_bytes": 53567488,
+            "final_constant_rss_since_measurement_seconds": 68.836275879,
+            "max_between_snapshot_gap_ns": 1025084042
+          },
+          "loader": {
+            "cpu_percent": 10.631465139938301,
+            "cpu_observed_seconds": 1798.999455696,
+            "snapshots": 1800,
+            "fd_range": [
+              10006,
+              10006
+            ],
+            "rss_range": [
+              91049984,
+              143839232
+            ],
+            "quarter_ranges": [
+              {
+                "quarter": 1,
+                "snapshots": 450,
+                "rss_range": [
+                  91049984,
+                  126566400
+                ],
+                "fd_range": [
+                  10006,
+                  10006
+                ]
+              },
+              {
+                "quarter": 2,
+                "snapshots": 450,
+                "rss_range": [
+                  126566400,
+                  132960256
+                ],
+                "fd_range": [
+                  10006,
+                  10006
+                ]
+              },
+              {
+                "quarter": 3,
+                "snapshots": 450,
+                "rss_range": [
+                  132960256,
+                  135094272
+                ],
+                "fd_range": [
+                  10006,
+                  10006
+                ]
+              },
+              {
+                "quarter": 4,
+                "snapshots": 450,
+                "rss_range": [
+                  135094272,
+                  143839232
+                ],
+                "fd_range": [
+                  10006,
+                  10006
+                ]
+              }
+            ],
+            "final_rss_bytes": 143839232,
+            "final_constant_rss_since_measurement_seconds": 1614.840336289,
+            "max_between_snapshot_gap_ns": 1025678084
+          }
+        },
+        "context_records": 7,
+        "source_rank_limitation": "source-proven planned-start ceil(p*n)-1 scalars; raw per-request samples not exported, independent recomputation unavailable",
+        "role": "Mojo",
+        "canonical_valid": true,
+        "req_s": 250.0,
+        "warmup_arrivals": {
+          "scheduled": 2500,
+          "dropped": 0,
+          "unstarted": 0,
+          "service_samples": 0,
+          "service_latency_ms": {
+            "p50": 0,
+            "p95": 0,
+            "p99": 0
+          },
+          "start_lag_samples": 0,
+          "start_lag_p99_ms": 0,
+          "start_lag_max_ms": 0
+        },
+        "warmup_nominal_end_to_measurement_start_ns": 867422,
+        "coverage": {
+          "server": {
+            "first_snapshot_interval": [
+              1791269855560529965,
+              1791269855576203174
+            ],
+            "last_snapshot_interval": [
+              1791271654555553840,
+              1791271654570721006
+            ],
+            "max_between_snapshot_gap_ns": 1025084042,
+            "quarters": [
+              {
+                "quarter": 1,
+                "snapshots": 450,
+                "rss_range": [
+                  53563392,
+                  53567488
+                ],
+                "fd_range": [
+                  10009,
+                  10009
+                ]
+              },
+              {
+                "quarter": 2,
+                "snapshots": 450,
+                "rss_range": [
+                  53567488,
+                  53567488
+                ],
+                "fd_range": [
+                  10009,
+                  10009
+                ]
+              },
+              {
+                "quarter": 3,
+                "snapshots": 450,
+                "rss_range": [
+                  53567488,
+                  53567488
+                ],
+                "fd_range": [
+                  10009,
+                  10009
+                ]
+              },
+              {
+                "quarter": 4,
+                "snapshots": 450,
+                "rss_range": [
+                  53567488,
+                  53567488
+                ],
+                "fd_range": [
+                  10009,
+                  10009
+                ]
+              }
+            ],
+            "scope": "discrete captures and clipped CPU intervals; no invented stability threshold or continuous-RSS claim"
+          },
+          "loader": {
+            "first_snapshot_interval": [
+              1791269855576207424,
+              1791269855587109757
+            ],
+            "last_snapshot_interval": [
+              1791271654570723631,
+              1791271654581058340
+            ],
+            "max_between_snapshot_gap_ns": 1025678084,
+            "quarters": [
+              {
+                "quarter": 1,
+                "snapshots": 450,
+                "rss_range": [
+                  91049984,
+                  126566400
+                ],
+                "fd_range": [
+                  10006,
+                  10006
+                ]
+              },
+              {
+                "quarter": 2,
+                "snapshots": 450,
+                "rss_range": [
+                  126566400,
+                  132960256
+                ],
+                "fd_range": [
+                  10006,
+                  10006
+                ]
+              },
+              {
+                "quarter": 3,
+                "snapshots": 450,
+                "rss_range": [
+                  132960256,
+                  135094272
+                ],
+                "fd_range": [
+                  10006,
+                  10006
+                ]
+              },
+              {
+                "quarter": 4,
+                "snapshots": 450,
+                "rss_range": [
+                  135094272,
+                  143839232
+                ],
+                "fd_range": [
+                  10006,
+                  10006
+                ]
+              }
+            ],
+            "scope": "discrete captures and clipped CPU intervals; no invented stability threshold or continuous-RSS claim"
+          }
+        },
+        "context_scope": "passive non-atomic namespace records; not per-process ownership, cohort census, or causal proof"
+      }
+    ],
+    "qualification_provenance": {
+      "independent_terminal_summary_sha256": "173d91c6e51b2c16fa7504b19901004abbb6ae21f1019ee45cd71160eae6a439",
+      "terminal_review_sha256": "690949e50655ac6ec6082b1c9afd3b08a730150570975cb81370f7dd7f227874",
+      "artifacts_independently_verified": 118,
+      "host_steps_exit_zero_and_owned_groups_absent": 23,
+      "owned_pids_terminal_absent": 8,
+      "owned_groups_terminal_absent": 7,
+      "source_binary_tool_constraints_before_after_equal": true
+    },
+    "stability_interpretation": "Mojo server FD remains 10009 across all 1800 clipped snapshots; RSS rises by one 4096-byte page in the first quarter then stays 53567488 through quarters 2–4. This satisfies the original sampled FD/RSS stability criterion for the Mojo server. Go server FD remains 10007; RSS grows early then plateaus at 277929984 for the last two quarters. Loader RSS grows while retaining successful-latency samples and is reported separately. Original socket postflight passes for both roles with no replacements/early active closes. This is discrete sampled evidence, not a whole allocator/RSS cap, continuous maximum, exact kernel cause, new performance gate or proof that prior failed attempts succeeded.",
+    "context_limitation": "Passive namespace snapshots are not cohort census or per-flow causality.",
+    "latency_rank_limitation": "Source-proven planned-start scalar quantiles and sample counts; no exported raw ranks.",
+    "resource_scope": "100% CPU means one logical CPU; capture windows and positive clipped CPU intervals are discrete observations, not full-epoch CPU coverage, a continuous RSS maximum or a whole-allocator cap",
+    "all_prior_failed_attempts_preserved": true,
+    "timing_trials_repeated": false
+  }
+}

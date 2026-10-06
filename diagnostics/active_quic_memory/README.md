@@ -6,6 +6,10 @@ windows and admission policy. Diagnostic additions to staged source are
 views immediately before retention. The three earlier patches are unchanged.
 This does not implement a memory quota.
 
+The diagnostic-only follow-up from 18cf35a adds 4/16/64 KiB scaling, two held
+requests and receive-state conservation. See [SCALING.md](SCALING.md) for the
+current measurements, transition assertions and reproduction commands.
+
 ## Current reproducer and historical baseline
 
 The original focused reproducer is `test/issue42-active-quic-memory`, based on
@@ -49,9 +53,13 @@ pixi run -e tls-http3 cargo test --locked --release \
   -- --test-threads=1
 ```
 
-The diagnostic script stages fresh pinned source and all four ordered patches
-before every run and appends test-only helpers. It verifies that the production configuration still matches
-the explicit fixture values. It uses an independent cargo target directory and
+The diagnostic script stages fresh pinned source and the current ordered patches
+before every run and appends test-only helpers. Its allocation comparison keeps
+the expressly historical 10,000,000 connection / 1,000,000 initial stream credit
+profile and 100 bidi / three uni streams. The runner verifies those fixture
+values and records the current production helper and its hash separately; a
+production flow-credit change does not relabel previous allocation artifacts.
+It uses an independent cargo target directory and
 does not build or modify the parent integration worktree. Re-staging through a
 different build entrypoint removes these test additions; rerun this script.
 
@@ -225,9 +233,20 @@ can bound this object's population; full native byte accounting needs additional
 container/base/send/crypto counters. The 720-byte empty-map observation must not
 be lost when active entry counters reach zero.
 
-A future quota unit needs meaningful exhaustion/release regressions and the
-same interoperability proof. It must wait for separate review of the counter,
-quota and close contract; backing compaction alone does not establish it.
+The opt-in native receive-budget patch now provides independent backing and
+slot limits, with exhaustion, atomic rejection and release regressions in
+`quic-suite`. These diagnostics supply actual unlimited budgets to preserve
+their receive-allocation experiment. The provider still selects unlimited
+limits; finite provider policy remains separate work.
+
+With this fifth patch, the 16 KiB low-level held sizes are 19,088 bytes
+contiguous, 2,394,792 sparse and 2,246,552 overlap. The corresponding server
+transport sizes after H3 drop are 42,324, 2,418,028 and 2,269,788 bytes.
+Nodes, unique bytes and backing are unchanged. A partial one-byte view still
+retains 1,024 backing bytes; low-level Rust drop sizes are now 1,952 for that
+state, 912 after reading, and 192 after reset. The shared default ledger object
+adds measured overhead; historical figures in SCALING.md retain their recorded
+source attribution. These Rust sizes are not the budget's charged byte count.
 
 ## Limits of this evidence
 
