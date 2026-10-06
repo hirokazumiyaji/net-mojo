@@ -44,3 +44,11 @@ cc -O2 -Wall -Wextra -Werror \
     -L"$tls_libdir" ${tls_libs[@]-} ${tls_ldflags[@]-} \
     -o build/tls/test_tls_shim
 build/tls/test_tls_shim build/tls/test-cert.pem build/tls/test-key.pem
+
+if [ "$(uname -s)" = "Linux" ]; then
+    cc -O2 -Wall -Wextra -Werror -I. tests/test_tls_sigpipe.c \
+        "$PWD/build/tls/libnet_tls" -Wl,-rpath,"$PWD/build/tls" \
+        -o build/tls/test_tls_sigpipe
+    python3 scripts/test_tls_sigpipe.py build/tls/test_tls_sigpipe \
+        build/tls/test-cert.pem build/tls/test-key.pem
+fi
