@@ -405,6 +405,38 @@ fn provider_send_crypto_accept_denial_refunds_and_keeps_admission_mutable() {
 }
 
 #[test]
+fn provider_send_quota_drops_connection_when_close_cannot_be_queued() {
+    let (mut server, budget) = current_api_send_server(proposed_send_limits(), false);
+    let mut peer = ReceiveBudgetPeer::new(&mut server, 0xd5);
+    let stream = send_pool_get(&mut peer, b"/close-failure");
+    send_pool_pump(&mut server, std::slice::from_mut(&mut peer));
+    let request = server.next_request().unwrap();
+    assert_eq!(request.stream_id, stream);
+    let key = server.request_routes[&request.id].0.clone();
+    assert!(server.enqueue_response(request.id, 200, Vec::new(), vec![b'x'; 4_096]));
+    assert!(server.connections[&key].transport.local_error().is_none());
+
+    peer.client.close(false, 0x1, b"peer close").unwrap();
+    let local: SocketAddr = "127.0.0.1:4433".parse().unwrap();
+    let mut packet = [0; 65_535];
+    for mut datagram in collect_client_datagrams(&mut peer.client, &mut packet) {
+        match server.recv_datagram(&mut datagram, local, peer.remote) {
+            Ok(()) | Err(super::QuicServerError::Quiche(quiche::Error::Done)) => (),
+            Err(error) => panic!("unexpected peer close: {error:?}"),
+        }
+    }
+    assert!(server.connections[&key].transport.is_draining());
+    assert!(server.connections[&key].transport.local_error().is_none());
+    assert!(!server.connections[&key].responses.is_empty());
+
+    server.terminate_send_quota(&key);
+    assert!(!server.connections.contains_key(&key));
+    assert_eq!(server.buffered_response_bytes, 0);
+    assert_eq!(budget.usage(), quiche::SendUsage::default());
+    assert_no_owned_provider_state(&server, &key);
+}
+
+#[test]
 fn provider_send_initial_crypto_callback_denial_is_local_and_refunds() {
     let mut limits = proposed_send_limits();
     limits.crypto.backing_bytes = 0;
