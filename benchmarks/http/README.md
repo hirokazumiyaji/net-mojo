@@ -722,6 +722,10 @@ bracketed wall-clock anchor; its span and half-span uncertainty are reported.
 These small batches are not 30-second saturated throughput or population tail
 estimates. Keep each trial separate and retain full-fixture `elapsed_ms`.
 
+The hyper-h2 client enables `TCP_NODELAY` before its first HTTP/2 frame.
+Both baseline and Mojo trials use this socket policy to avoid client buffering
+extending upload-credit waits.
+
 Both HTTP/2 special scenarios run over a **single** HTTP/2 connection
 (`benchmarks/http/http2_scenarios.py`, hyper-h2): the target stream and its
 siblings share one connection, so a server with per-connection

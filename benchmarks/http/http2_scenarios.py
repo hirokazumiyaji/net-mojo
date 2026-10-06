@@ -422,6 +422,7 @@ def connect_h2(host: str, port: int, timeout: float) -> ssl.SSLSocket:
     if sock.selected_alpn_protocol() != "h2":
         sock.close()
         raise ScenarioError("server did not negotiate h2")
+    sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
     return sock
 
 
