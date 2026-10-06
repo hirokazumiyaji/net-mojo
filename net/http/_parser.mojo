@@ -1534,6 +1534,7 @@ def parse_one[
         )
         if outcome.head.header_end + want > length:
             return ParseResult.need_more()
+        body.reserve(want)
         for i in range(want):
             body.append(buf[outcome.head.header_end + i])
         consumed = outcome.head.header_end + want

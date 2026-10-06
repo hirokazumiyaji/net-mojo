@@ -116,17 +116,19 @@ def main() raises:
 
 Constraints (see `docs/design/http-server.md` for the full contract):
 
-- The handler runs synchronously on the loop thread by default. Blocking
-  I/O or heavy computation can be offloaded to background threads using
-  `writer.detach()`.
+- The handler runs synchronously on the loop thread. HTTP/1 handlers can
+  move a `ResponseSender` returned by `writer.detach()` to a background
+  thread. HTTP/2 and HTTP/3 handlers return buffered responses; detach is
+  unsupported on those adapters.
 - Bounded buffered request body: the full request body (up to
   `max_body_bytes`, default 1 MiB) is received before `handle` runs.
-  Response streaming and deferred responses are supported via
+  HTTP/1 response streaming and deferred responses use
   `ResponseWriter.detach()` and `ResponseSender`; request body streaming,
   routers, and middleware frameworks are not included.
-- `Request` views and `ResponseWriter` are valid only during the
-  `handle` call. Copy values you want to keep; the server owns the
-  receive buffer and the queued response.
+- `Request` owns its decoded strings, headers and body. The handler borrows
+  that request and mutates the writer during `handle`; copy request fields
+  you want to keep. Views borrow their source values, while public header
+  getters return owned copies. The connection owns the queued response.
 - HTTP/1.1 is supported over plaintext or opt-in TLS. HTTPS negotiates HTTP/2
   with ALPN `h2`; HTTP/3 uses a separately configured UDP endpoint and ALPN
   `h3`. Both protocols call the shared `Handler`.
@@ -139,19 +141,17 @@ Constraints (see `docs/design/http-server.md` for the full contract):
   `TLSContext.server` (`h2,http/1.1`) and `QuicProvider.server_config` (`h3`),
   and replace `build/tls/test-*.pem` before deployment. UDP-unavailable hosts
   may serve HTTPS alone.
-- `Alt-Svc` is opt-in and never automatic. The Issue #42 remaining stack
-  ([PR #77](https://github.com/hirokazumiyaji/net-mojo/pull/77)) adds
-  `ServerConfig.alt_svc` (for example `h3=":8443"; ma=86400`) injected on TLS
-  responses when a QUIC endpoint is attached; leave it empty so HTTPS does not
-  advertise H3. A handler-supplied `Alt-Svc` wins; do not advertise when no H3
-  endpoint is listening.
-- Flood / resource limits on the same stack: HTTP/2 control and RST rate caps
-  ([#71](https://github.com/hirokazumiyaji/net-mojo/pull/71)–[#72](https://github.com/hirokazumiyaji/net-mojo/pull/72)),
-  explicit QUIC 0-RTT off ([#73](https://github.com/hirokazumiyaji/net-mojo/pull/73)),
-  soft `quic_max_transport_memory_bytes` admission
-  ([#75](https://github.com/hirokazumiyaji/net-mojo/pull/75)). Protocol behavior
-  and unsupported features are in [HTTP/2](docs/design/http2-server.md) and
-  [HTTP/3](docs/design/http3-server.md).
+- `Alt-Svc` is opt-in. Set `ServerConfig.alt_svc` (for example
+  `h3=":8443"; ma=86400`) only when the advertised QUIC endpoint is available.
+  The server injects the configured value on TLS responses without probing that
+  endpoint. Leave it empty when providing HTTPS alone. A handler-supplied
+  `Alt-Svc` wins. See the [same-origin operation guide](docs/design/http3-server.md#same-origin-operation).
+- HTTP/2 limits control frames, stream creation and resets. QUIC disables
+  0-RTT and uses `quic_max_transport_memory_bytes` as a soft connection
+  admission estimate. Receive backing and state entries have separate,
+  finite provider-wide pools; these limits are not an engine RSS cap.
+  Protocol behavior and unsupported features are in
+  [HTTP/2](docs/design/http2-server.md) and [HTTP/3](docs/design/http3-server.md).
 - HTTP/3 CI and independent-client coverage run on Linux x86_64 and aarch64;
   macOS end-to-end Mojo HTTP/3 validation runs in CI (`http3` on macos-14).
 - No client, no HTTP/1.0, no WebSocket/CONNECT/Upgrade switching, no
@@ -213,14 +213,16 @@ while server.tick(handler):
         server.request_shutdown()
 ```
 
-A running blocking `serve` cannot currently be stopped from another
-thread or from the same thread: `ServerControl` is not thread-safe and
-`serve_with_control` mutably borrows its `control` for the whole call,
-so the handle cannot be used while `serve_with_control` runs.
-Pre-requesting shutdown on the caller-held control before entry only
-makes it exit promptly. Cross-thread shutdown with a wakeup fd is
-future work. See `tests/test_http_server.mojo`
-(`test_shutdown_drains_in_flight_and_exits`).
+`ServerControl` is copyable and thread-safe. Keep a copy of `server.control`
+before handing the server to its loop thread, or supply a shared control to
+`serve_with_control` / `listen_and_serve_with_control`. Calling
+`control.request_shutdown()` from another thread wakes the reactor immediately.
+The loop owner stops accepting and drains requests; the calling thread never
+operates on server sockets. Repeated requests are harmless, and copies can
+outlive the server: requests after completion, an error, or server destruction
+are successful no-ops. Synchronous handlers must still return before shutdown
+can progress. See `tests/test_http_control.mojo` and
+`test_shutdown_drains_in_flight_and_exits` in `tests/test_http_server.mojo`.
 
 Reproduce the performance comparison with
 `benchmarks/http/README.md` (Go baseline in `benchmarks/http_go`,

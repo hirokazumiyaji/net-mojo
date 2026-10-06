@@ -98,6 +98,8 @@ class Http3ClientProtocol(QuicConnectionProtocol):
                 response["headers"].extend(http_event.headers)
             elif isinstance(http_event, DataReceived):
                 response["body"].extend(http_event.data)
+                if http_event.data and "started" in response:
+                    response["started"].set()
             if http_event.stream_ended:
                 response["future"].set_result(response)
 
@@ -162,6 +164,45 @@ class Http3ClientProtocol(QuicConnectionProtocol):
             return result
         finally:
             self.responses.pop(stream_id, None)
+
+    async def cancel_large_response(self):
+        stream_id = self._quic.get_next_available_stream_id()
+        response = {
+            "future": self._loop.create_future(),
+            "started": asyncio.Event(),
+            "headers": [],
+            "body": bytearray(),
+        }
+        reset = self._loop.create_future()
+        self.responses[stream_id] = response
+        self.resets[stream_id] = reset
+        self.http.send_headers(
+            stream_id,
+            [
+                (b":method", b"GET"),
+                (b":scheme", b"https"),
+                (b":authority", b"localhost"),
+                (b":path", b"/cancel-response"),
+            ],
+            end_stream=True,
+        )
+        self.transmit()
+        try:
+            await asyncio.wait_for(response["started"].wait(), timeout=5)
+            if response["future"].done() or not 0 < len(response["body"]) < 2_000_000:
+                raise RuntimeError(
+                    "large response must still be in progress before STOP_SENDING"
+                )
+            if (b":status", b"200") not in response["headers"]:
+                raise RuntimeError("large response did not start successfully")
+            self._quic.stop_stream(stream_id, error_code=H3_REQUEST_CANCELLED)
+            self.transmit()
+            code = await asyncio.wait_for(reset, timeout=5)
+            if code != H3_REQUEST_CANCELLED:
+                raise RuntimeError(f"unexpected STOP_SENDING reset code: {code}")
+        finally:
+            self.responses.pop(stream_id, None)
+            self.resets.pop(stream_id, None)
 
     async def cancel_partial_post(self):
         stream_id = self._quic.get_next_available_stream_id()
@@ -310,6 +351,18 @@ async def run_client(address):
         require_http3_alpn(client.alpn)
 
         await client.cancel_partial_post()
+        _, sibling = await asyncio.gather(
+            client.cancel_large_response(), client.post(b"data", trailers=False)
+        )
+        reused = await client.post(b"data", trailers=False)
+        for response in (sibling, reused):
+            if (
+                (b":status", b"200") not in response["headers"]
+                or bytes(response["body"]) != b"handled:data"
+            ):
+                raise RuntimeError(
+                    f"STOP_SENDING disrupted a sibling or connection reuse: {response}"
+                )
 
         reordered = await client.post(
             b"data", trailers=False, reorder_datagrams=True
@@ -362,10 +415,9 @@ async def run_client(address):
 
 
 fixture_env = dict(os.environ)
-# This flow completes 5 requests (reordered POST, two reset-storm
-# siblings, trailers POST, final POST); the shared fixture defaults to
-# the same count, set explicitly so the Rust test's "2" cannot leak in.
-fixture_env["HTTP3_FIXTURE_EXPECT"] = "5"
+# Count the cancelled response's completed request, its sibling and reuse,
+# plus the existing five completions; partial request cancellations do not count.
+fixture_env["HTTP3_FIXTURE_EXPECT"] = "8"
 process = subprocess.Popen(
     ["mojo", "run", "--Werror", "-I", ".", "tests/http3_server_fixture.mojo"],
     stdout=subprocess.PIPE,
@@ -385,7 +437,7 @@ try:
         raise RuntimeError(f"HTTP/3 fixture exited with {process.returncode}")
     print(
         "Independent aioquic HTTP/3 client roundtrips succeeded "
-        "(reorder + reset-storm siblings + ALPN h3)"
+        "(STOP_SENDING + reorder + reset-storm siblings + ALPN h3)"
     )
 finally:
     if process.poll() is None:

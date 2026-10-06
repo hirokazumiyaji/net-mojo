@@ -19,6 +19,7 @@ struct _FloodHandler(Handler):
 def main() raises:
     # Low reset budget so RST-storm regression completes in one tumbling window.
     var config = ServerConfig.default()
+    config.http2_max_new_streams_per_second = 2
     config.http2_max_resets_per_second = 2
     config.http2_max_control_frames_per_second = 1000
     var server = Server(config^)

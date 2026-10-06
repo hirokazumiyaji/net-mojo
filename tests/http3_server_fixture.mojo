@@ -1,3 +1,5 @@
+from std.testing import assert_true
+
 from net import Timeout
 from net.http import (
     Handler,
@@ -19,26 +21,32 @@ struct _Http3Handler(Handler):
         self.requests = 0
 
     def handle(mut self, req: Request, mut writer: ResponseWriter) raises:
-        assert req.version == HttpVersion.http3()
-        assert req.method == "POST"
-        assert req.path == "/echo"
-        assert req.query == "source=quic"
-        assert req.authority == "localhost"
-        assert req.scheme == "https"
-        assert len(req.body) == 4
+        assert_true(req.version == HttpVersion.http3())
+        assert_true(req.authority == "localhost")
+        assert_true(req.scheme == "https")
+        if req.path == "/cancel-response":
+            assert_true(req.method == "GET")
+            assert_true(len(req.body) == 0)
+            var body = List[Byte](length=2_000_000, fill=Byte(42))
+            writer.write(Span(body))
+            self.requests += 1
+            return
+        assert_true(req.method == "POST")
+        assert_true(req.path == "/echo")
+        assert_true(req.query == "source=quic")
+        assert_true(len(req.body) == 4)
         writer.write_string("handled:")
         writer.write(Span(req.body))
         if len(req.trailers) > 0:
-            assert req.trailers.get_first("x-check") == Optional[String]("done")
+            assert_true(
+                req.trailers.get_first("x-check") == Optional[String]("done")
+            )
             writer.write_string(":done")
         self.requests += 1
 
 
 def _expected_requests() -> Int:
-    # Shared by the aioquic client script (5 completions: reordered POST,
-    # two reset-storm siblings, trailers POST, final POST) and the Rust
-    # provider test (2 POSTs). Cancelled / reset streams never increment
-    # the handler counter, so each driver sets its own total; default 5.
+    # Drivers use different completion totals, so each sets its own count.
     var raw = getenv("HTTP3_FIXTURE_EXPECT")
     var count = 0
     var digits = 0
@@ -63,15 +71,14 @@ def main() raises:
     )
     var server_config = ServerConfig.default()
     server_config.shutdown_grace = Timeout.milliseconds(500)
+    server_config.max_response_body = 2_000_000
     var server = Server(server_config^)
     server.add_quic_endpoint(
         QuicUDPEndpoint(provider.server(config^), listener^)
     )
     var handler = _Http3Handler()
     print("READY " + address)
-    # Completions expected from the driver (see _expected_requests):
-    # reordered POST, two reset-storm siblings, trailers POST, final POST.
-    # Cancelled / reset streams do not increment this counter.
+    # A completed request counts even when its response is later cancelled.
     var expected = _expected_requests()
     while handler.requests < expected:
         _ = server.tick(handler, Timeout.seconds(2))

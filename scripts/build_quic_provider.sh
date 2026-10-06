@@ -14,7 +14,9 @@ if [ "$(uname -s)" = "Linux" ]; then
     export BINDGEN_EXTRA_CLANG_ARGS
 fi
 
+task_quiche_source=$(bash scripts/prepare_quiche_source.sh)
 cargo build --locked --release \
+    --config "paths=[\"$task_quiche_source\"]" \
     --manifest-path net/quic/provider/Cargo.toml \
     --target-dir build/quic/cargo
 
@@ -38,6 +40,7 @@ fi
 
 cc -O2 -Wall -Wextra -Werror \
     -Inet/quic/provider \
+    -I"$task_quiche_source/include" \
     tests/test_quic_provider.c \
     net/quic/provider/shim.c \
     build/quic/cargo/release/libnet_quic_provider.a \

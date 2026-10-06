@@ -1,0 +1,2229 @@
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -598,6 +598,8 @@
+     max_connection_window: u64,
+     max_stream_window: u64,
+ 
++    receive_budget: ReceiveBudget,
++
+     max_amplification_factor: usize,
+ 
+     disable_dcid_reuse: bool,
+@@ -613,6 +615,11 @@
+ }
+ 
+ impl Config {
++    /// Uses immutable shared receive capacities for future connections.
++    pub fn set_receive_budget(&mut self, budget: ReceiveBudget) {
++        self.receive_budget = budget;
++    }
++
+     /// Creates a config object with the given version.
+     ///
+     /// ## Examples:
+@@ -676,6 +683,7 @@
+ 
+             max_connection_window: MAX_CONNECTION_WINDOW,
+             max_stream_window: stream::MAX_STREAM_WINDOW,
++            receive_budget: ReceiveBudget::default(),
+ 
+             max_amplification_factor: MAX_AMPLIFICATION_FACTOR,
+ 
+@@ -2058,9 +2066,9 @@
+             ],
+ 
+             crypto_ctx: [
+-                packet::CryptoContext::new(),
+-                packet::CryptoContext::new(),
+-                packet::CryptoContext::new(),
++                packet::CryptoContext::new(config.receive_budget.clone())?,
++                packet::CryptoContext::new(config.receive_budget.clone())?,
++                packet::CryptoContext::new(config.receive_budget.clone())?,
+             ],
+ 
+             next_pkt_num: 0,
+@@ -2122,6 +2130,7 @@
+                 config.local_transport_params.initial_max_streams_bidi,
+                 config.local_transport_params.initial_max_streams_uni,
+                 config.max_stream_window,
++                config.receive_budget.clone(),
+             ),
+ 
+             odcid: None,
+@@ -9532,8 +9541,351 @@
+ mod pmtud;
+ mod rand;
+ mod range_buf;
++mod receive_budget;
++pub use receive_budget::{ReceiveBudget, ReceiveLimit, ReceiveLimits, ReceiveUsage};
+ mod ranges;
+ mod recovery;
+ mod stream;
+ mod tls;
+ mod transport_params;
++#[cfg(test)]
++mod receive_budget_connection_tests {
++    use super::*;
++    use crate::range_buf::RangeBuf;
++
++    struct Pair {
++        pipe: test_utils::Pipe,
++        client: h3::Connection,
++        server: h3::Connection,
++        base: u64,
++    }
++
++    fn limits() -> ReceiveLimits {
++        ReceiveLimits {
++            request: ReceiveLimit {
++                backing_bytes: 64,
++                slots: 6,
++            },
++            control: ReceiveLimit {
++                backing_bytes: 4096,
++                slots: 32,
++            },
++            crypto: ReceiveLimit {
++                backing_bytes: 4096,
++                slots: 64,
++            },
++        }
++    }
++
++    fn config() -> Config {
++        let mut config = test_utils::Pipe::default_config("reno").unwrap();
++        config
++            .set_application_protos(h3::APPLICATION_PROTOCOL)
++            .unwrap();
++        config.set_initial_max_data(10_000_000);
++        config.set_initial_max_stream_data_bidi_local(1_000_000);
++        config.set_initial_max_stream_data_bidi_remote(1_000_000);
++        config.set_initial_max_stream_data_uni(1_000_000);
++        config.set_initial_max_streams_bidi(100);
++        config.set_initial_max_streams_uni(3);
++        config
++    }
++
++    fn pair(budget: &ReceiveBudget) -> Pair {
++        let mut server_config = config();
++        server_config.set_receive_budget(budget.clone());
++        let mut pipe = test_utils::Pipe::with_client_and_server_config(
++            &mut config(),
++            &mut server_config,
++        )
++        .unwrap();
++        pipe.handshake().unwrap();
++        pipe.advance().unwrap();
++        let mut config = h3::Config::new().unwrap();
++        config.set_qpack_max_table_capacity(0);
++        config.set_qpack_blocked_streams(0);
++        let mut client =
++            h3::Connection::with_transport(&mut pipe.client, &config).unwrap();
++        let mut server =
++            h3::Connection::with_transport(&mut pipe.server, &config).unwrap();
++        let headers = [
++            h3::Header::new(b":method", b"POST"),
++            h3::Header::new(b":scheme", b"https"),
++            h3::Header::new(b":authority", b"quic.tech"),
++            h3::Header::new(b":path", b"/"),
++            h3::Header::new(b"content-length", b"128"),
++        ];
++        assert_eq!(
++            client.send_request(&mut pipe.client, &headers, false),
++            Ok(0)
++        );
++        // The held gap belongs to DATA, after valid HTTP framing was consumed.
++        pipe.client.stream_send(0, &[0, 0x40, 0x80], false).unwrap();
++        pipe.advance().unwrap();
++        let mut headers_seen = false;
++        loop {
++            match server.poll(&mut pipe.server) {
++                Ok((0, h3::Event::Headers { .. })) => {
++                    headers_seen = true;
++                },
++                Ok((0, h3::Event::Data)) => (),
++                Err(h3::Error::Done) => break,
++                event => panic!("unexpected initial H3 event {event:?}"),
++            }
++        }
++        assert!(headers_seen);
++        assert!(server.peer_settings_raw().is_some());
++        let base = pipe.server.streams.get(0).unwrap().recv.max_off();
++        assert_eq!(pipe.server.stream_recv(0, &mut [0; 1]), Err(Error::Done));
++        Pair {
++            pipe,
++            client,
++            server,
++            base,
++        }
++    }
++
++    fn inject(pair: &mut Pair, frame: frame::Frame) -> Result<usize> {
++        let mut packet = [0; 2048];
++        let written = test_utils::encode_pkt(
++            &mut pair.pipe.client,
++            Type::Short,
++            &[frame],
++            &mut packet,
++        )
++        .unwrap();
++        // Synthetic receive frames have no sender recovery records to ACK.
++        pair.pipe.server_recv(&mut packet[..written])
++    }
++
++    fn fill(pair: &mut Pair) {
++        let base = pair.base;
++        inject(
++            pair,
++            frame::Frame::Stream {
++                stream_id: 0,
++                data: RangeBuf::from(&[b'b'; 64], base + 1, false),
++            },
++        )
++        .unwrap();
++    }
++
++    #[test]
++    fn receive_budget_two_authenticated_connections_share_reject_and_refund() {
++        let budget = ReceiveBudget::new(limits());
++        let mut first = pair(&budget);
++        let mut second = pair(&budget);
++        fill(&mut first);
++        assert_eq!(
++            budget.usage().request,
++            ReceiveLimit {
++                backing_bytes: 64,
++                slots: 5
++            }
++        );
++        let state = second
++            .pipe
++            .server
++            .streams
++            .get(0)
++            .unwrap()
++            .recv
++            .test_receive_budget_state();
++        let received = second.pipe.server.rx_data;
++        let usage = budget.usage();
++        let base = second.base;
++        assert_eq!(
++            inject(
++                &mut second,
++                frame::Frame::Stream {
++                    stream_id: 0,
++                    data: RangeBuf::from(b"b", base + 127, true)
++                }
++            ),
++            Err(Error::ReceiveBufferExceeded)
++        );
++        assert_eq!(
++            second
++                .pipe
++                .server
++                .streams
++                .get(0)
++                .unwrap()
++                .recv
++                .test_receive_budget_state(),
++            state
++        );
++        assert_eq!(second.pipe.server.rx_data, received);
++        assert_eq!(budget.usage(), usage);
++        let closed = second.pipe.server.local_error().unwrap();
++        assert!(!closed.is_app);
++        assert_eq!(closed.error_code, 0x1);
++        drop(second);
++        assert_eq!(
++            budget.usage().request,
++            ReceiveLimit {
++                backing_bytes: 64,
++                slots: 3
++            }
++        );
++        drop(first);
++        assert_eq!(budget.usage(), ReceiveUsage::default());
++
++        let budget = ReceiveBudget::new(limits());
++        let mut first = pair(&budget);
++        let mut second = pair(&budget);
++        fill(&mut first);
++        drop(first);
++        assert_eq!(
++            budget.usage().request,
++            ReceiveLimit {
++                backing_bytes: 0,
++                slots: 2
++            }
++        );
++        let base = second.base;
++        inject(
++            &mut second,
++            frame::Frame::Stream {
++                stream_id: 0,
++                data: RangeBuf::from(b"b", base + 127, true),
++            },
++        )
++        .unwrap();
++        assert_eq!(
++            budget.usage().request,
++            ReceiveLimit {
++                backing_bytes: 1,
++                slots: 3
++            }
++        );
++        drop(second);
++        assert_eq!(budget.usage(), ReceiveUsage::default());
++    }
++
++    #[test]
++    fn receive_budget_request_full_keeps_valid_control_and_reset_resources() {
++        let budget = ReceiveBudget::new(limits());
++        let mut pair = pair(&budget);
++        fill(&mut pair);
++        let full = budget.usage().request;
++        assert_eq!(full.backing_bytes, 64);
++        let before = pair.pipe.server.streams.get(2).unwrap().recv.off_front();
++        pair.client
++            .send_priority_update_for_request(
++                &mut pair.pipe.client,
++                0,
++                &h3::Priority::new(0, false),
++            )
++            .unwrap();
++        let flight = test_utils::emit_flight(&mut pair.pipe.client).unwrap();
++        test_utils::process_flight(&mut pair.pipe.server, flight).unwrap();
++        assert_eq!(
++            pair.server.poll(&mut pair.pipe.server),
++            Ok((0, h3::Event::PriorityUpdate))
++        );
++        assert_eq!(
++            pair.server.take_last_priority_update(0),
++            Ok(b"u=0".to_vec())
++        );
++        assert!(
++            pair.pipe.server.streams.get(2).unwrap().recv.off_front() > before
++        );
++        assert_eq!(budget.usage().request, full);
++        let base = pair.base;
++        inject(
++            &mut pair,
++            frame::Frame::ResetStream {
++                stream_id: 0,
++                error_code: 0x10c,
++                final_size: base + 128,
++            },
++        )
++        .unwrap();
++        assert_eq!(
++            pair.server.poll(&mut pair.pipe.server),
++            Ok((0, h3::Event::Reset(0x10c)))
++        );
++        pair.server
++            .cancel_request(&mut pair.pipe.server, 0, 0x10c)
++            .unwrap();
++        assert!(pair.pipe.server.streams.get(0).is_some());
++        assert_eq!(
++            budget.usage().request,
++            ReceiveLimit {
++                backing_bytes: 0,
++                slots: 2
++            }
++        );
++        drop(pair);
++        assert_eq!(budget.usage(), ReceiveUsage::default());
++    }
++
++    #[test]
++    fn receive_budget_authenticated_crypto_exhaustion_is_separate() {
++        let budget = ReceiveBudget::new(limits());
++        let mut pair = pair(&budget);
++        fill(&mut pair);
++        let request = budget.usage().request;
++        let base = pair.pipe.server.crypto_ctx[packet::Epoch::Application]
++            .crypto_stream
++            .recv
++            .max_off();
++        let available = limits().crypto.slots - budget.usage().crypto.slots;
++        for off in 1..=available as u64 {
++            inject(
++                &mut pair,
++                frame::Frame::Crypto {
++                    data: RangeBuf::from(b"b", base + off, false),
++                },
++            )
++            .unwrap();
++        }
++        let usage = budget.usage();
++        assert_eq!(usage.crypto.slots, limits().crypto.slots);
++        assert_eq!(usage.request, request);
++        let before = pair.pipe.server.crypto_ctx[packet::Epoch::Application]
++            .crypto_stream
++            .recv
++            .test_receive_budget_state();
++        assert_eq!(
++            inject(
++                &mut pair,
++                frame::Frame::Crypto {
++                    data: RangeBuf::from(
++                        b"b",
++                        base + available as u64 + 1,
++                        false
++                    )
++                }
++            ),
++            Err(Error::CryptoBufferExceeded)
++        );
++        assert_eq!(
++            pair.pipe.server.crypto_ctx[packet::Epoch::Application]
++                .crypto_stream
++                .recv
++                .test_receive_budget_state(),
++            before
++        );
++        assert_eq!(budget.usage(), usage);
++        assert_eq!(pair.pipe.server.local_error().unwrap().error_code, 0xd);
++        drop(pair);
++        assert_eq!(budget.usage(), ReceiveUsage::default());
++    }
++
++    #[test]
++    fn receive_budget_failed_crypto_constructor_refunds_partial_contexts() {
++        let budget = ReceiveBudget::new(ReceiveLimits {
++            crypto: ReceiveLimit {
++                backing_bytes: 4096,
++                slots: 4,
++            },
++            ..limits()
++        });
++        let mut server_config = config();
++        server_config.set_receive_budget(budget.clone());
++        assert!(matches!(test_utils::Pipe::<DefaultBufFactory>::with_client_and_server_config(&mut config(), &mut server_config), Err(Error::CryptoBufferExceeded)));
++        assert_eq!(budget.usage(), ReceiveUsage::default());
++    }
++}
+--- a/src/error.rs
++++ b/src/error.rs
+@@ -105,6 +105,9 @@
+ 
+     /// The peer sent more data in CRYPTO frames than we can buffer.
+     CryptoBufferExceeded,
++
++    /// Locally configured retained receive resources are exhausted.
++    ReceiveBufferExceeded,
+ 
+     /// The peer sent an ACK frame with an invalid range.
+     InvalidAckRange,
+@@ -185,6 +188,7 @@
+     pub(crate) fn to_wire(self) -> u64 {
+         match self {
+             Error::Done => WireErrorCode::NoError as u64,
++            Error::ReceiveBufferExceeded => WireErrorCode::InternalError as u64,
+             Error::InvalidFrame => WireErrorCode::FrameEncodingError as u64,
+             Error::InvalidStreamState(..) =>
+                 WireErrorCode::StreamStateError as u64,
+@@ -227,6 +231,7 @@
+             Error::InvalidAckRange => -21,
+             Error::OptimisticAckDetected => -22,
+             Error::InvalidDcidInitialization => -23,
++            Error::ReceiveBufferExceeded => -24,
+         }
+     }
+ }
+--- a/src/packet.rs
++++ b/src/packet.rs
+@@ -921,7 +921,7 @@
+ }
+ 
+ impl CryptoContext {
+-    pub fn new() -> CryptoContext {
++    pub fn new(budget: crate::ReceiveBudget) -> Result<CryptoContext> {
+         let crypto_stream = stream::Stream::new(
+             0, // dummy
+             u64::MAX,
+@@ -929,27 +929,22 @@
+             true,
+             stream::MAX_STREAM_WINDOW,
+             stream::MAX_STREAM_WINDOW,
+-        );
+-        CryptoContext {
++            budget,
++            crate::receive_budget::ReceiveClass::Crypto,
++        )?;
++        Ok(CryptoContext {
+             key_update: None,
+             crypto_open: None,
+             crypto_seal: None,
+             crypto_0rtt_open: None,
+             crypto_stream,
+-        }
++        })
+     }
+ 
+     pub fn clear(&mut self) {
+         self.crypto_open = None;
+         self.crypto_seal = None;
+-        self.crypto_stream = <stream::Stream>::new(
+-            0, // dummy
+-            u64::MAX,
+-            u64::MAX,
+-            true,
+-            stream::MAX_STREAM_WINDOW,
+-            stream::MAX_STREAM_WINDOW,
+-        );
++        self.crypto_stream.clear_crypto();
+     }
+ 
+     pub fn data_available(&self) -> bool {
+--- a/src/range_buf.rs
++++ b/src/range_buf.rs
+@@ -157,6 +157,10 @@
+ }
+ 
+ impl RangeBuf<DefaultBufFactory> {
++    pub(crate) fn receive_backing_len(&self) -> usize {
++        self.data.as_ref().len()
++    }
++
+     pub(crate) fn compact_receive_view(self) -> Self {
+         if self.data.as_ref().len() > self.len() {
+             // A trimmed receive range must not retain a whole incoming frame.
+--- a/src/stream/mod.rs
++++ b/src/stream/mod.rs
+@@ -225,11 +225,14 @@
+ 
+     /// Total number of bytes in send buffers across all streams.
+     tx_buffered: usize,
++
++    receive_budget: crate::ReceiveBudget,
+ }
+ 
+ impl<F: BufFactory> StreamMap<F> {
+     pub fn new(
+         max_streams_bidi: u64, max_streams_uni: u64, max_stream_window: u64,
++        receive_budget: crate::ReceiveBudget,
+     ) -> Self {
+         StreamMap {
+             local_max_streams_bidi: max_streams_bidi,
+@@ -241,6 +244,7 @@
+             initial_max_streams_uni: max_streams_uni,
+ 
+             max_stream_window,
++            receive_budget,
+ 
+             ..StreamMap::default()
+         }
+@@ -309,70 +313,47 @@
+                 // that stream type.
+                 let stream_sequence = id >> 2;
+ 
+-                // Enforce stream count limits.
+-                match (is_local(id, is_server), is_bidi(id)) {
+-                    (true, true) => {
+-                        let n = cmp::max(
+-                            self.local_opened_streams_bidi,
+-                            stream_sequence + 1,
+-                        );
+-
+-                        if n > self.peer_max_streams_bidi {
+-                            return Err(Error::StreamLimit);
+-                        }
+-
+-                        self.local_opened_streams_bidi = n;
+-                    },
+-
+-                    (true, false) => {
+-                        let n = cmp::max(
+-                            self.local_opened_streams_uni,
+-                            stream_sequence + 1,
+-                        );
+-
+-                        if n > self.peer_max_streams_uni {
+-                            return Err(Error::StreamLimit);
+-                        }
+-
+-                        self.local_opened_streams_uni = n;
+-                    },
+-
+-                    (false, true) => {
+-                        let n = cmp::max(
+-                            self.peer_opened_streams_bidi,
+-                            stream_sequence + 1,
+-                        );
+-
+-                        if n > self.local_max_streams_bidi {
+-                            return Err(Error::StreamLimit);
+-                        }
+-
+-                        self.peer_opened_streams_bidi = n;
+-                    },
+-
+-                    (false, false) => {
+-                        let n = cmp::max(
+-                            self.peer_opened_streams_uni,
+-                            stream_sequence + 1,
+-                        );
+-
+-                        if n > self.local_max_streams_uni {
+-                            return Err(Error::StreamLimit);
+-                        }
+-
+-                        self.peer_opened_streams_uni = n;
+-                    },
++                let class = if is_bidi(id) {
++                    crate::receive_budget::ReceiveClass::Request
++                } else {
++                    crate::receive_budget::ReceiveClass::Control
+                 };
+ 
+-                let initial_window = max_rx_data;
++                let (opened, limit) = match (is_local(id, is_server), is_bidi(id)) {
++                    (true, true) => (
++                        &mut self.local_opened_streams_bidi,
++                        self.peer_max_streams_bidi,
++                    ),
++                    (true, false) => (
++                        &mut self.local_opened_streams_uni,
++                        self.peer_max_streams_uni,
++                    ),
++                    (false, true) => (
++                        &mut self.peer_opened_streams_bidi,
++                        self.local_max_streams_bidi,
++                    ),
++                    (false, false) => (
++                        &mut self.peer_opened_streams_uni,
++                        self.local_max_streams_uni,
++                    ),
++                };
++                let next = cmp::max(*opened, stream_sequence + 1);
++                if next > limit {
++                    return Err(Error::StreamLimit);
++                }
++
++                // Metadata admission must precede visible stream ownership.
+                 let s = Stream::new(
+                     id,
+                     max_rx_data,
+                     max_tx_data,
+                     local,
+-                    initial_window,
++                    max_rx_data,
+                     self.max_stream_window,
+-                );
++                    self.receive_budget.clone(),
++                    class,
++                )?;
++                *opened = next;
+ 
+                 let is_writable = s.is_writable();
+ 
+@@ -831,15 +812,23 @@
+     /// Creates a new stream with the given flow control limits.
+     pub fn new(
+         id: u64, max_rx_data: u64, max_tx_data: u64, local: bool,
+-        initial_window: u64, max_window: u64,
+-    ) -> Self {
++        initial_window: u64, max_window: u64, budget: crate::ReceiveBudget,
++        class: crate::receive_budget::ReceiveClass,
++    ) -> Result<Self> {
+         let priority_key = Arc::new(StreamPriorityKey {
+             id,
+             ..Default::default()
+         });
+ 
+-        Stream {
+-            recv: recv_buf::RecvBuf::new(max_rx_data, initial_window, max_window),
++        let recv = recv_buf::RecvBuf::new(
++            max_rx_data,
++            initial_window,
++            max_window,
++            budget,
++            class,
++        )?;
++        Ok(Stream {
++            recv,
+             send: send_buf::SendBuf::new(max_tx_data),
+             send_lowat: 1,
+             bidi: is_bidi(id),
+@@ -847,7 +836,21 @@
+             urgency: priority_key.urgency,
+             incremental: priority_key.incremental,
+             priority_key,
+-        }
++        })
++    }
++
++    pub(crate) fn clear_crypto(&mut self) {
++        self.recv.clear_crypto();
++        self.send = send_buf::SendBuf::new(u64::MAX);
++        self.send_lowat = 1;
++        self.bidi = true;
++        self.local = true;
++        self.priority_key = Arc::new(StreamPriorityKey {
++            id: 0,
++            ..Default::default()
++        });
++        self.urgency = self.priority_key.urgency;
++        self.incremental = self.priority_key.incremental;
+     }
+ 
+     /// Returns true if the stream has data to read.
+@@ -1054,6 +1057,19 @@
+     use crate::test_utils::Pipe;
+ 
+     use super::*;
++
++    fn stream_map(bidi: u64, uni: u64, window: u64) -> StreamMap {
++        StreamMap::new(bidi, uni, window, crate::ReceiveBudget::default())
++    }
++
++    fn stream(id: u64, max_rx: u64, max_tx: u64, local: bool,
++        initial_window: u64, max_window: u64) -> Stream {
++        let class = if is_bidi(id) { crate::receive_budget::ReceiveClass::Request }
++            else { crate::receive_budget::ReceiveClass::Control };
++        Stream::new(id, max_rx, max_tx, local, initial_window, max_window,
++            crate::ReceiveBudget::default(), class).unwrap()
++    }
++
+ 
+     /// The default size of the receiver stream flow control window.
+     const DEFAULT_STREAM_WINDOW: u64 = 32 * 1024;
+@@ -1294,7 +1310,7 @@
+         #[values(true, false)] local: bool,
+     ) {
+         let params = crate::TransportParams::default();
+-        let mut streams = <StreamMap>::new(1, 1, DEFAULT_STREAM_WINDOW);
++        let mut streams = stream_map(1, 1, DEFAULT_STREAM_WINDOW);
+         streams.update_peer_max_streams_bidi(1);
+         streams.update_peer_max_streams_uni(1);
+ 
+@@ -1328,7 +1344,7 @@
+ 
+     #[test]
+     fn recv_flow_control() {
+-        let mut stream = <Stream>::new(0, 15, 0, true, 15, DEFAULT_STREAM_WINDOW);
++        let mut stream = stream(0, 15, 0, true, 15, DEFAULT_STREAM_WINDOW);
+         assert!(!stream.recv.almost_full());
+ 
+         let mut buf = [0; 32];
+@@ -1359,7 +1375,7 @@
+ 
+     #[test]
+     fn recv_past_fin() {
+-        let mut stream = <Stream>::new(0, 15, 0, true, 15, DEFAULT_STREAM_WINDOW);
++        let mut stream = stream(0, 15, 0, true, 15, DEFAULT_STREAM_WINDOW);
+         assert!(!stream.recv.almost_full());
+ 
+         let first = RangeBuf::from(b"hello", 0, true);
+@@ -1371,7 +1387,7 @@
+ 
+     #[test]
+     fn recv_fin_dup() {
+-        let mut stream = <Stream>::new(0, 15, 0, true, 15, DEFAULT_STREAM_WINDOW);
++        let mut stream = stream(0, 15, 0, true, 15, DEFAULT_STREAM_WINDOW);
+         assert!(!stream.recv.almost_full());
+ 
+         let first = RangeBuf::from(b"hello", 0, true);
+@@ -1389,7 +1405,7 @@
+ 
+     #[test]
+     fn recv_fin_change() {
+-        let mut stream = <Stream>::new(0, 15, 0, true, 15, DEFAULT_STREAM_WINDOW);
++        let mut stream = stream(0, 15, 0, true, 15, DEFAULT_STREAM_WINDOW);
+         assert!(!stream.recv.almost_full());
+ 
+         let first = RangeBuf::from(b"hello", 0, true);
+@@ -1401,7 +1417,7 @@
+ 
+     #[test]
+     fn recv_fin_lower_than_received() {
+-        let mut stream = <Stream>::new(0, 15, 0, true, 15, DEFAULT_STREAM_WINDOW);
++        let mut stream = stream(0, 15, 0, true, 15, DEFAULT_STREAM_WINDOW);
+         assert!(!stream.recv.almost_full());
+ 
+         let first = RangeBuf::from(b"hello", 0, true);
+@@ -1413,7 +1429,7 @@
+ 
+     #[test]
+     fn recv_fin_flow_control() {
+-        let mut stream = <Stream>::new(0, 15, 0, true, 15, DEFAULT_STREAM_WINDOW);
++        let mut stream = stream(0, 15, 0, true, 15, DEFAULT_STREAM_WINDOW);
+         assert!(!stream.recv.almost_full());
+ 
+         let mut buf = [0; 32];
+@@ -1433,7 +1449,7 @@
+ 
+     #[test]
+     fn recv_fin_reset_mismatch() {
+-        let mut stream = <Stream>::new(0, 15, 0, true, 15, DEFAULT_STREAM_WINDOW);
++        let mut stream = stream(0, 15, 0, true, 15, DEFAULT_STREAM_WINDOW);
+         assert!(!stream.recv.almost_full());
+ 
+         let first = RangeBuf::from(b"hello", 0, true);
+@@ -1444,7 +1460,7 @@
+ 
+     #[test]
+     fn recv_reset_with_gap() {
+-        let mut stream = <Stream>::new(0, 15, 0, true, 15, DEFAULT_STREAM_WINDOW);
++        let mut stream = stream(0, 15, 0, true, 15, DEFAULT_STREAM_WINDOW);
+         assert!(!stream.recv.almost_full());
+ 
+         let first = RangeBuf::from(b"hello", 0, false);
+@@ -1466,7 +1482,7 @@
+ 
+     #[test]
+     fn recv_reset_dup() {
+-        let mut stream = <Stream>::new(0, 15, 0, true, 15, DEFAULT_STREAM_WINDOW);
++        let mut stream = stream(0, 15, 0, true, 15, DEFAULT_STREAM_WINDOW);
+         assert!(!stream.recv.almost_full());
+ 
+         let first = RangeBuf::from(b"hello", 0, false);
+@@ -1484,7 +1500,7 @@
+ 
+     #[test]
+     fn recv_reset_change() {
+-        let mut stream = <Stream>::new(0, 15, 0, true, 15, DEFAULT_STREAM_WINDOW);
++        let mut stream = stream(0, 15, 0, true, 15, DEFAULT_STREAM_WINDOW);
+         assert!(!stream.recv.almost_full());
+ 
+         let first = RangeBuf::from(b"hello", 0, false);
+@@ -1502,7 +1518,7 @@
+ 
+     #[test]
+     fn recv_reset_lower_than_received() {
+-        let mut stream = <Stream>::new(0, 15, 0, true, 15, DEFAULT_STREAM_WINDOW);
++        let mut stream = stream(0, 15, 0, true, 15, DEFAULT_STREAM_WINDOW);
+         assert!(!stream.recv.almost_full());
+ 
+         let first = RangeBuf::from(b"hello", 0, false);
+@@ -1515,7 +1531,7 @@
+     fn send_flow_control() {
+         let mut buf = [0; 25];
+ 
+-        let mut stream = <Stream>::new(0, 0, 15, true, 0, DEFAULT_STREAM_WINDOW);
++        let mut stream = stream(0, 0, 15, true, 0, DEFAULT_STREAM_WINDOW);
+ 
+         let first = b"hello";
+         let second = b"world";
+@@ -1558,7 +1574,7 @@
+ 
+     #[test]
+     fn send_past_fin() {
+-        let mut stream = <Stream>::new(0, 0, 15, true, 0, DEFAULT_STREAM_WINDOW);
++        let mut stream = stream(0, 0, 15, true, 0, DEFAULT_STREAM_WINDOW);
+ 
+         let first = b"hello";
+         let second = b"world";
+@@ -1574,7 +1590,7 @@
+ 
+     #[test]
+     fn send_fin_dup() {
+-        let mut stream = <Stream>::new(0, 0, 15, true, 0, DEFAULT_STREAM_WINDOW);
++        let mut stream = stream(0, 0, 15, true, 0, DEFAULT_STREAM_WINDOW);
+ 
+         assert_eq!(stream.send.write(b"hello", true), Ok(5));
+         assert!(stream.send.is_fin());
+@@ -1585,7 +1601,7 @@
+ 
+     #[test]
+     fn send_undo_fin() {
+-        let mut stream = <Stream>::new(0, 0, 15, true, 0, DEFAULT_STREAM_WINDOW);
++        let mut stream = stream(0, 0, 15, true, 0, DEFAULT_STREAM_WINDOW);
+ 
+         assert_eq!(stream.send.write(b"hello", true), Ok(5));
+         assert!(stream.send.is_fin());
+@@ -1600,7 +1616,7 @@
+     fn send_fin_max_data_match() {
+         let mut buf = [0; 15];
+ 
+-        let mut stream = <Stream>::new(0, 0, 15, true, 0, DEFAULT_STREAM_WINDOW);
++        let mut stream = stream(0, 0, 15, true, 0, DEFAULT_STREAM_WINDOW);
+ 
+         let slice = b"hellohellohello";
+ 
+@@ -1616,7 +1632,7 @@
+     fn send_fin_zero_length() {
+         let mut buf = [0; 5];
+ 
+-        let mut stream = <Stream>::new(0, 0, 15, true, 0, DEFAULT_STREAM_WINDOW);
++        let mut stream = stream(0, 0, 15, true, 0, DEFAULT_STREAM_WINDOW);
+ 
+         assert_eq!(stream.send.write(b"hello", false), Ok(5));
+         assert_eq!(stream.send.write(b"", true), Ok(0));
+@@ -1632,7 +1648,7 @@
+     fn send_ack() {
+         let mut buf = [0; 5];
+ 
+-        let mut stream = <Stream>::new(0, 0, 15, true, 0, DEFAULT_STREAM_WINDOW);
++        let mut stream = stream(0, 0, 15, true, 0, DEFAULT_STREAM_WINDOW);
+ 
+         assert_eq!(stream.send.write(b"hello", false), Ok(5));
+         assert_eq!(stream.send.write(b"world", false), Ok(5));
+@@ -1662,7 +1678,7 @@
+     fn send_ack_reordering() {
+         let mut buf = [0; 5];
+ 
+-        let mut stream = <Stream>::new(0, 0, 15, true, 0, DEFAULT_STREAM_WINDOW);
++        let mut stream = stream(0, 0, 15, true, 0, DEFAULT_STREAM_WINDOW);
+ 
+         assert_eq!(stream.send.write(b"hello", false), Ok(5));
+         assert_eq!(stream.send.write(b"world", false), Ok(5));
+@@ -1699,7 +1715,7 @@
+ 
+     #[test]
+     fn recv_data_below_off() {
+-        let mut stream = <Stream>::new(0, 15, 0, true, 15, DEFAULT_STREAM_WINDOW);
++        let mut stream = stream(0, 15, 0, true, 15, DEFAULT_STREAM_WINDOW);
+ 
+         let first = RangeBuf::from(b"hello", 0, false);
+ 
+@@ -1722,7 +1738,7 @@
+     #[test]
+     fn stream_complete() {
+         let mut stream =
+-            <Stream>::new(0, 30, 30, true, 30, DEFAULT_STREAM_WINDOW);
++            stream(0, 30, 30, true, 30, DEFAULT_STREAM_WINDOW);
+ 
+         assert_eq!(stream.send.write(b"hello", false), Ok(5));
+         assert_eq!(stream.send.write(b"world", false), Ok(5));
+@@ -1765,7 +1781,7 @@
+     fn send_fin_zero_length_output() {
+         let mut buf = [0; 5];
+ 
+-        let mut stream = <Stream>::new(0, 0, 15, true, 0, DEFAULT_STREAM_WINDOW);
++        let mut stream = stream(0, 0, 15, true, 0, DEFAULT_STREAM_WINDOW);
+ 
+         assert_eq!(stream.send.write(b"hello", false), Ok(5));
+         assert_eq!(stream.send.off_front(), 0);
+@@ -1795,7 +1811,7 @@
+     fn send_emit() {
+         let mut buf = [0; 5];
+ 
+-        let mut stream = <Stream>::new(0, 0, 20, true, 0, DEFAULT_STREAM_WINDOW);
++        let mut stream = stream(0, 0, 20, true, 0, DEFAULT_STREAM_WINDOW);
+ 
+         assert_eq!(stream.send.write(b"hello", false), Ok(5));
+         assert_eq!(stream.send.write(b"world", false), Ok(5));
+@@ -1847,7 +1863,7 @@
+     fn send_emit_ack() {
+         let mut buf = [0; 5];
+ 
+-        let mut stream = <Stream>::new(0, 0, 20, true, 0, DEFAULT_STREAM_WINDOW);
++        let mut stream = stream(0, 0, 20, true, 0, DEFAULT_STREAM_WINDOW);
+ 
+         assert_eq!(stream.send.write(b"hello", false), Ok(5));
+         assert_eq!(stream.send.write(b"world", false), Ok(5));
+@@ -1914,7 +1930,7 @@
+     fn send_emit_retransmit() {
+         let mut buf = [0; 5];
+ 
+-        let mut stream = <Stream>::new(
++        let mut stream = stream(
+             0,
+             0,
+             20,
+@@ -2151,7 +2167,7 @@
+         let local_tp = crate::TransportParams::default();
+         let peer_tp = crate::TransportParams::default();
+ 
+-        let mut streams = <StreamMap>::new(5, 5, 5);
++        let mut streams = stream_map(5, 5, 5);
+ 
+         let stream_id = 500;
+         assert!(!is_local(stream_id, true), "stream id is peer initiated");
+@@ -2172,7 +2188,7 @@
+         let local_tp = crate::TransportParams::default();
+         let peer_tp = crate::TransportParams::default();
+ 
+-        let mut streams = <StreamMap>::new(5, 5, 5);
++        let mut streams = stream_map(5, 5, 5);
+ 
+         for stream_id in [8, 12, 4] {
+             assert!(is_local(stream_id, false), "stream id is client initiated");
+@@ -2189,7 +2205,7 @@
+         let local_tp = crate::TransportParams::default();
+         let peer_tp = crate::TransportParams::default();
+ 
+-        let mut streams = <StreamMap>::new(3, 3, 3);
++        let mut streams = stream_map(3, 3, 3);
+ 
+         // Highest permitted
+         let stream_id = 8;
+@@ -2221,7 +2237,7 @@
+             ..Default::default()
+         };
+ 
+-        let mut streams = StreamMap::new(100, 100, 100);
++        let mut streams = StreamMap::new(100, 100, 100, crate::ReceiveBudget::default());
+ 
+         for id in [0, 4, 8, 12] {
+             assert!(streams
+@@ -2257,7 +2273,7 @@
+             ..Default::default()
+         };
+ 
+-        let mut streams = StreamMap::new(100, 100, 100);
++        let mut streams = StreamMap::new(100, 100, 100, crate::ReceiveBudget::default());
+ 
+         // Inserting same-urgency incremental streams in a "random" order yields
+         // same order to start with.
+@@ -2292,7 +2308,7 @@
+             ..Default::default()
+         };
+ 
+-        let mut streams = <StreamMap>::new(100, 100, 100);
++        let mut streams = stream_map(100, 100, 100);
+ 
+         // Streams where the urgency descends (becomes more important). No stream
+         // shares an urgency.
+@@ -2395,7 +2411,7 @@
+             ..Default::default()
+         };
+ 
+-        let mut streams = StreamMap::new(100, 100, 100);
++        let mut streams = StreamMap::new(100, 100, 100, crate::ReceiveBudget::default());
+ 
+         // Streams that share some urgency level
+         let input = vec![
+@@ -2553,7 +2569,7 @@
+ 
+     #[test]
+     fn retransmit_returns_zero_when_already_acked() {
+-        let mut stream = <Stream>::new(0, 15, 15, true, 0, 15);
++        let mut stream = stream(0, 15, 15, true, 0, 15);
+ 
+         // Write and emit some data.
+         assert_eq!(stream.send.write(b"hello", false), Ok(5));
+@@ -2581,7 +2597,7 @@
+ 
+     #[test]
+     fn retransmit_returns_partial_when_some_acked() {
+-        let mut stream = <Stream>::new(0, 15, 15, true, 0, 15);
++        let mut stream = stream(0, 15, 15, true, 0, 15);
+ 
+         // Write and emit 10 bytes.
+         assert_eq!(stream.send.write(b"helloworld", false), Ok(10));
+@@ -2611,7 +2627,7 @@
+ 
+     #[test]
+     fn ack_and_drop_decrements_len_and_returns_dropped() {
+-        let mut stream = <Stream>::new(0, 15, 15, true, 0, 15);
++        let mut stream = stream(0, 15, 15, true, 0, 15);
+ 
+         // Write some data.
+         assert_eq!(stream.send.write(b"hello", false), Ok(5));
+@@ -2636,7 +2652,7 @@
+ 
+     #[test]
+     fn ack_and_drop_partial_buffer() {
+-        let mut stream = <Stream>::new(0, 30, 30, true, 0, 30);
++        let mut stream = stream(0, 30, 30, true, 0, 30);
+ 
+         // Write and emit two chunks.
+         assert_eq!(stream.send.write(b"hello", false), Ok(5));
+@@ -2666,7 +2682,7 @@
+ 
+     #[test]
+     fn ack_and_drop_returns_zero_when_nothing_dropped() {
+-        let mut stream = <Stream>::new(0, 15, 15, true, 0, 15);
++        let mut stream = stream(0, 15, 15, true, 0, 15);
+ 
+         // Write and emit data.
+         assert_eq!(stream.send.write(b"hello", false), Ok(5));
+@@ -2686,7 +2702,7 @@
+         // This test verifies that StreamMap.tx_buffered stays in sync with
+         // actual buffered data through a full lifecycle: write → emit →
+         // retransmit → ack.
+-        let mut streams = <StreamMap>::new(5, 5, 15);
++        let mut streams = stream_map(5, 5, 15);
+ 
+         // Create a stream using low-level StreamMap interface.
+         let local_params = crate::TransportParams {
+@@ -2764,7 +2780,7 @@
+ 
+     #[test]
+     fn send_buf_len_reflects_buffered_data() {
+-        let mut stream = <Stream>::new(0, 15, 15, true, 0, 15);
++        let mut stream = stream(0, 15, 15, true, 0, 15);
+ 
+         // Initially empty.
+         assert_eq!(stream.send.buffered_bytes(), 0);
+@@ -2793,3 +2809,39 @@
+ 
+ mod recv_buf;
+ mod send_buf;
++
++#[cfg(test)]
++mod receive_budget_constructor_tests {
++    use super::*;
++    use crate::{ReceiveBudget, ReceiveLimit, ReceiveLimits, ReceiveUsage};
++
++    #[test]
++    fn receive_budget_metadata_rejects_before_stream_and_opened_counts() {
++        let budget = ReceiveBudget::new(ReceiveLimits {
++            request: ReceiveLimit {
++                backing_bytes: 100,
++                slots: 1,
++            },
++            ..ReceiveLimits::default()
++        });
++        let mut streams =
++            StreamMap::<DefaultBufFactory>::new(2, 2, 100, budget.clone());
++        let local = crate::TransportParams {
++            initial_max_stream_data_bidi_remote: 100,
++            ..Default::default()
++        };
++        let peer = crate::TransportParams::default();
++        assert!(matches!(
++            streams.get_or_create(0, &local, &peer, false, true),
++            Err(Error::ReceiveBufferExceeded)
++        ));
++        assert_eq!(streams.len(), 0);
++        assert_eq!(streams.peer_opened_streams_bidi, 0);
++        assert_eq!(budget.usage(), ReceiveUsage::default());
++        assert!(matches!(
++            streams.get_or_create(8, &local, &peer, false, true),
++            Err(Error::StreamLimit)
++        ));
++        assert_eq!(budget.usage(), ReceiveUsage::default());
++    }
++}
+--- a/src/stream/recv_buf.rs
++++ b/src/stream/recv_buf.rs
+@@ -27,7 +27,6 @@
+ use std::cmp;
+ 
+ use std::collections::BTreeMap;
+-use std::collections::VecDeque;
+ 
+ use std::time::Duration;
+ use std::time::Instant;
+@@ -36,6 +35,8 @@
+ use crate::stream::RecvBufResetReturn;
+ use crate::Error;
+ use crate::Result;
++use crate::receive_budget::{BufferCharge, ReceiveClass};
++use crate::{ReceiveBudget, ReceiveLimit};
+ 
+ use crate::flowcontrol;
+ 
+@@ -46,7 +47,7 @@
+ /// Stream data received by the peer is buffered in a list of data chunks
+ /// ordered by offset in ascending order. Contiguous data can then be read
+ /// into a slice.
+-#[derive(Debug, Default)]
++#[derive(Debug)]
+ pub struct RecvBuf {
+     /// Chunks of data received from the peer that have not yet been read by
+     /// the application, ordered by offset.
+@@ -69,19 +70,67 @@
+ 
+     /// Whether incoming data is validated but not buffered.
+     drain: bool,
++
++    charge: BufferCharge,
+ }
+ 
+ impl RecvBuf {
+     /// Creates a new receive buffer.
+-    pub fn new(max_data: u64, initial_window: u64, max_window: u64) -> RecvBuf {
+-        RecvBuf {
++    pub fn new(
++        max_data: u64, initial_window: u64, max_window: u64,
++        budget: ReceiveBudget, class: ReceiveClass,
++    ) -> Result<RecvBuf> {
++        let charge = BufferCharge::new(budget, class)?;
++        Ok(RecvBuf {
++            data: BTreeMap::new(),
++            off: 0,
++            len: 0,
+             flow_control: flowcontrol::FlowControl::new(
+                 max_data,
+                 initial_window,
+                 max_window,
+             ),
+-            ..RecvBuf::default()
+-        }
++            fin_off: None,
++            error: None,
++            drain: false,
++            charge,
++        })
++    }
++
++    pub(crate) fn clear_crypto(&mut self) {
++        self.data = BTreeMap::new();
++        self.charge.clear_retained();
++        self.off = 0;
++        self.len = 0;
++        self.flow_control = flowcontrol::FlowControl::new(
++            u64::MAX,
++            super::MAX_STREAM_WINDOW,
++            super::MAX_STREAM_WINDOW,
++        );
++        self.fin_off = None;
++        self.error = None;
++        self.drain = false;
++    }
++
++    fn next_novel_interval(
++        &self, mut cursor: u64, end: u64,
++    ) -> Option<(u64, u64)> {
++        for (_, buffered) in self.data.range(cursor..) {
++            if buffered.is_empty() {
++                continue;
++            }
++            if buffered.off() > cursor {
++                let until = buffered.off().min(end);
++                if cursor < until {
++                    return Some((cursor, until));
++                }
++            }
++            cursor = cursor.max(buffered.max_off());
++            if cursor >= end {
++                return None;
++            }
++        }
++        (cursor < end).then_some((cursor, end))
+     }
+ 
+     /// Inserts the given chunk of data in the buffer.
+@@ -117,83 +166,65 @@
+             return Ok(());
+         }
+ 
+-        if buf.fin() {
+-            self.fin_off = Some(buf.max_off());
+-        }
+-
+-        // No need to store empty buffer that doesn't carry the fin flag.
+         if !buf.fin() && buf.is_empty() {
+             return Ok(());
+         }
+ 
+-        // Check if data is fully duplicate, that is the buffer's max offset is
+-        // lower or equal to the offset already stored in the recv buffer.
+-        if self.off >= buf.max_off() {
+-            // An exception is applied to empty range buffers, because an empty
+-            // buffer's max offset matches the max offset of the recv buffer.
+-            //
+-            // By this point all spurious empty buffers should have already been
+-            // discarded, so allowing empty buffers here should be safe.
+-            if !buf.is_empty() {
+-                return Ok(());
+-            }
+-        }
+-
+-        let mut tmp_bufs = VecDeque::with_capacity(2);
+-        tmp_bufs.push_back(buf);
+-
+-        'tmp: while let Some(mut buf) = tmp_bufs.pop_front() {
+-            // Discard incoming data below current stream offset. Bytes up to
+-            // `self.off` have already been received so we should not buffer
+-            // them again. This is also important to make sure `ready()` doesn't
+-            // get stuck when a buffer with lower offset than the stream's is
+-            // buffered.
+-            if self.off_front() > buf.off() {
+-                buf = buf.split_off((self.off_front() - buf.off()) as usize);
+-            }
+-
+-            // Handle overlapping data. If the incoming data's starting offset
+-            // is above the previous maximum received offset, there is clearly
+-            // no overlap so this logic can be skipped. However do still try to
+-            // merge an empty final buffer (i.e. an empty buffer with the fin
+-            // flag set, which is the only kind of empty buffer that should
+-            // reach this point).
+-            if buf.off() < self.max_off() || buf.is_empty() {
+-                for (_, b) in self.data.range(buf.off()..) {
+-                    let off = buf.off();
+-
+-                    // We are past the current buffer.
+-                    if b.off() > buf.max_off() {
+-                        break;
++        let mut planned = ReceiveLimit::default();
++        let start = self.off.max(buf.off());
++        let end = buf.max_off();
++        let fin = buf.fin();
++        if !self.drain {
++            let mut cursor = start;
++            while let Some((off, until)) = self.next_novel_interval(cursor, end)
++            {
++                planned.backing_bytes += (until - off) as usize;
++                planned.slots += 1;
++                cursor = until;
++            }
++        }
++        // Admission must precede FIN and map changes for the whole incoming frame.
++        let mut reservation = self.charge.reserve(planned)?;
++
++        if !self.drain {
++            if buf.is_empty() {
++                let covered = self
++                    .data
++                    .range(end..)
++                    .next()
++                    .is_some_and(|(_, b)| b.off() <= end);
++                if !covered {
++                    self.data.insert(end, buf.clone().compact_receive_view());
++                }
++            } else {
++                let mut cursor = start;
++                while let Some((off, until)) =
++                    self.next_novel_interval(cursor, end)
++                {
++                    let mut retained = buf.clone();
++                    if off > retained.off() {
++                        retained =
++                            retained.split_off((off - retained.off) as usize);
+                     }
+-
+-                    // New buffer is fully contained in existing buffer.
+-                    if off >= b.off() && buf.max_off() <= b.max_off() {
+-                        continue 'tmp;
++                    if until < retained.max_off() {
++                        retained.split_off((until - retained.off) as usize);
+                     }
+-
+-                    // New buffer's start overlaps existing buffer.
+-                    if off >= b.off() && off < b.max_off() {
+-                        buf = buf.split_off((b.max_off() - off) as usize);
+-                    }
+-
+-                    // New buffer's end overlaps existing buffer.
+-                    if off < b.off() && buf.max_off() > b.off() {
+-                        tmp_bufs
+-                            .push_back(buf.split_off((b.off() - off) as usize));
+-                    }
++                    let retained = retained.compact_receive_view();
++                    let backing = retained.receive_backing_len();
++                    debug_assert_eq!(backing, (until - off) as usize);
++                    let replaced = self.data.insert(until, retained);
++                    debug_assert!(replaced.is_none_or(|old| old.is_empty()));
++                    reservation.commit_entry(&mut self.charge, backing);
++                    cursor = until;
+                 }
+             }
+-
+-            self.len = cmp::max(self.len, buf.max_off());
+-
+-            if !self.drain {
+-                let buf = buf.compact_receive_view();
+-                self.data.insert(buf.max_off(), buf);
+-            } else {
+-                // we are not storing any data, off == len
+-                self.off = self.len;
+-            }
++        }
++        if fin {
++            self.fin_off = Some(end);
++        }
++        self.len = self.len.max(end);
++        if self.drain {
++            self.off = self.len;
+         }
+ 
+         Ok(())
+@@ -245,6 +276,7 @@
+         // instead.
+         if let Some(e) = self.error {
+             self.data.clear();
++            self.charge.clear_retained();
+             return Err(Error::StreamReset(e));
+         }
+ 
+@@ -283,7 +315,12 @@
+                 break;
+             }
+ 
+-            entry.remove();
++            let removed = entry.remove();
++            if !removed.is_empty() {
++                let backing = removed.receive_backing_len();
++                drop(removed);
++                self.charge.release_entry(backing);
++            }
+         }
+ 
+         // Update consumed bytes for flow control.
+@@ -326,6 +363,7 @@
+         self.off = final_size;
+ 
+         self.data.clear();
++        self.charge.clear_retained();
+ 
+         // In order to ensure the application is notified when the stream is
+         // reset, enqueue a zero-length buffer at the final size offset.
+@@ -371,6 +409,7 @@
+         self.drain = true;
+ 
+         self.data.clear();
++        self.charge.clear_retained();
+ 
+         let consumed = self.max_off() - self.off;
+         self.off = self.max_off();
+@@ -429,6 +468,10 @@
+ #[cfg(test)]
+ mod tests {
+     use super::*;
++
++    fn receiver(max_data: u64, initial_window: u64, max_window: u64) -> RecvBuf {
++        RecvBuf::new(max_data, initial_window, max_window, ReceiveBudget::default(), ReceiveClass::Request).unwrap()
++    }
+ 
+     /// The default size of the receiver stream flow control window.
+     const DEFAULT_STREAM_WINDOW: u64 = 32 * 1024;
+@@ -493,7 +536,7 @@
+     #[rstest]
+     fn empty_read(#[values(true, false)] emit: bool) {
+         let mut recv =
+-            RecvBuf::new(u64::MAX, DEFAULT_STREAM_WINDOW, DEFAULT_STREAM_WINDOW);
++            receiver(u64::MAX, DEFAULT_STREAM_WINDOW, DEFAULT_STREAM_WINDOW);
+         assert_eq!(recv.len, 0);
+ 
+         assert_emit_discard_done(&mut recv, emit);
+@@ -502,7 +545,7 @@
+     #[rstest]
+     fn empty_stream_frame(#[values(true, false)] emit: bool) {
+         let mut recv =
+-            RecvBuf::new(15, DEFAULT_STREAM_WINDOW, DEFAULT_STREAM_WINDOW);
++            receiver(15, DEFAULT_STREAM_WINDOW, DEFAULT_STREAM_WINDOW);
+         assert_eq!(recv.len, 0);
+ 
+         let buf = RangeBuf::from(b"hello", 0, false);
+@@ -557,7 +600,7 @@
+     #[rstest]
+     fn ordered_read(#[values(true, false)] emit: bool) {
+         let mut recv =
+-            RecvBuf::new(u64::MAX, DEFAULT_STREAM_WINDOW, DEFAULT_STREAM_WINDOW);
++            receiver(u64::MAX, DEFAULT_STREAM_WINDOW, DEFAULT_STREAM_WINDOW);
+         assert_eq!(recv.len, 0);
+ 
+         let first = RangeBuf::from(b"hello", 0, false);
+@@ -598,7 +641,7 @@
+     #[rstest]
+     fn shutdown(#[values(true, false)] emit: bool) {
+         let mut recv =
+-            RecvBuf::new(u64::MAX, DEFAULT_STREAM_WINDOW, DEFAULT_STREAM_WINDOW);
++            receiver(u64::MAX, DEFAULT_STREAM_WINDOW, DEFAULT_STREAM_WINDOW);
+         assert_eq!(recv.len, 0);
+ 
+         let first = RangeBuf::from(b"hello", 0, false);
+@@ -651,7 +694,7 @@
+     #[rstest]
+     fn split_read(#[values(true, false)] emit: bool) {
+         let mut recv =
+-            RecvBuf::new(u64::MAX, DEFAULT_STREAM_WINDOW, DEFAULT_STREAM_WINDOW);
++            receiver(u64::MAX, DEFAULT_STREAM_WINDOW, DEFAULT_STREAM_WINDOW);
+         assert_eq!(recv.len, 0);
+ 
+         let first = RangeBuf::from(b"something", 0, false);
+@@ -681,7 +724,7 @@
+     #[test]
+     fn split_read_incremental_buf() {
+         let mut recv =
+-            RecvBuf::new(u64::MAX, DEFAULT_STREAM_WINDOW, DEFAULT_STREAM_WINDOW);
++            receiver(u64::MAX, DEFAULT_STREAM_WINDOW, DEFAULT_STREAM_WINDOW);
+         assert_eq!(recv.len, 0);
+ 
+         let first = RangeBuf::from(b"something", 0, false);
+@@ -729,7 +772,7 @@
+     #[rstest]
+     fn incomplete_read(#[values(true, false)] emit: bool) {
+         let mut recv =
+-            RecvBuf::new(u64::MAX, DEFAULT_STREAM_WINDOW, DEFAULT_STREAM_WINDOW);
++            receiver(u64::MAX, DEFAULT_STREAM_WINDOW, DEFAULT_STREAM_WINDOW);
+         assert_eq!(recv.len, 0);
+ 
+         let mut buf = [0u8; 32];
+@@ -769,7 +812,7 @@
+     #[rstest]
+     fn zero_len_read(#[values(true, false)] emit: bool) {
+         let mut recv =
+-            RecvBuf::new(u64::MAX, DEFAULT_STREAM_WINDOW, DEFAULT_STREAM_WINDOW);
++            receiver(u64::MAX, DEFAULT_STREAM_WINDOW, DEFAULT_STREAM_WINDOW);
+         assert_eq!(recv.len, 0);
+ 
+         let first = RangeBuf::from(b"something", 0, false);
+@@ -793,7 +836,7 @@
+     #[rstest]
+     fn past_read(#[values(true, false)] emit: bool) {
+         let mut recv =
+-            RecvBuf::new(u64::MAX, DEFAULT_STREAM_WINDOW, DEFAULT_STREAM_WINDOW);
++            receiver(u64::MAX, DEFAULT_STREAM_WINDOW, DEFAULT_STREAM_WINDOW);
+         assert_eq!(recv.len, 0);
+ 
+         let first = RangeBuf::from(b"something", 0, false);
+@@ -828,7 +871,7 @@
+     #[rstest]
+     fn fully_overlapping_read(#[values(true, false)] emit: bool) {
+         let mut recv =
+-            RecvBuf::new(u64::MAX, DEFAULT_STREAM_WINDOW, DEFAULT_STREAM_WINDOW);
++            receiver(u64::MAX, DEFAULT_STREAM_WINDOW, DEFAULT_STREAM_WINDOW);
+         assert_eq!(recv.len, 0);
+ 
+         let first = RangeBuf::from(b"something", 0, false);
+@@ -855,7 +898,7 @@
+     #[rstest]
+     fn fully_overlapping_read2(#[values(true, false)] emit: bool) {
+         let mut recv =
+-            RecvBuf::new(u64::MAX, DEFAULT_STREAM_WINDOW, DEFAULT_STREAM_WINDOW);
++            receiver(u64::MAX, DEFAULT_STREAM_WINDOW, DEFAULT_STREAM_WINDOW);
+         assert_eq!(recv.len, 0);
+ 
+         let first = RangeBuf::from(b"something", 0, false);
+@@ -882,7 +925,7 @@
+     #[rstest]
+     fn fully_overlapping_read3(#[values(true, false)] emit: bool) {
+         let mut recv =
+-            RecvBuf::new(u64::MAX, DEFAULT_STREAM_WINDOW, DEFAULT_STREAM_WINDOW);
++            receiver(u64::MAX, DEFAULT_STREAM_WINDOW, DEFAULT_STREAM_WINDOW);
+         assert_eq!(recv.len, 0);
+ 
+         let first = RangeBuf::from(b"something", 0, false);
+@@ -909,7 +952,7 @@
+     #[rstest]
+     fn fully_overlapping_read_multi(#[values(true, false)] emit: bool) {
+         let mut recv =
+-            RecvBuf::new(u64::MAX, DEFAULT_STREAM_WINDOW, DEFAULT_STREAM_WINDOW);
++            receiver(u64::MAX, DEFAULT_STREAM_WINDOW, DEFAULT_STREAM_WINDOW);
+         assert_eq!(recv.len, 0);
+ 
+         let first = RangeBuf::from(b"somethingsomething", 0, false);
+@@ -949,7 +992,7 @@
+     #[rstest]
+     fn overlapping_start_read(#[values(true, false)] emit: bool) {
+         let mut recv =
+-            RecvBuf::new(u64::MAX, DEFAULT_STREAM_WINDOW, DEFAULT_STREAM_WINDOW);
++            receiver(u64::MAX, DEFAULT_STREAM_WINDOW, DEFAULT_STREAM_WINDOW);
+         assert_eq!(recv.len, 0);
+ 
+         let first = RangeBuf::from(b"something", 0, false);
+@@ -983,7 +1026,7 @@
+     #[rstest]
+     fn overlapping_end_read(#[values(true, false)] emit: bool) {
+         let mut recv =
+-            RecvBuf::new(u64::MAX, DEFAULT_STREAM_WINDOW, DEFAULT_STREAM_WINDOW);
++            receiver(u64::MAX, DEFAULT_STREAM_WINDOW, DEFAULT_STREAM_WINDOW);
+         assert_eq!(recv.len, 0);
+ 
+         let first = RangeBuf::from(b"hello", 0, false);
+@@ -1009,7 +1052,7 @@
+     #[rstest]
+     fn overlapping_end_twice_read(#[values(true, false)] emit: bool) {
+         let mut recv =
+-            RecvBuf::new(u64::MAX, DEFAULT_STREAM_WINDOW, DEFAULT_STREAM_WINDOW);
++            receiver(u64::MAX, DEFAULT_STREAM_WINDOW, DEFAULT_STREAM_WINDOW);
+         assert_eq!(recv.len, 0);
+ 
+         let first = RangeBuf::from(b"he", 0, false);
+@@ -1049,7 +1092,7 @@
+         #[values(true, false)] emit: bool,
+     ) {
+         let mut recv =
+-            RecvBuf::new(u64::MAX, DEFAULT_STREAM_WINDOW, DEFAULT_STREAM_WINDOW);
++            receiver(u64::MAX, DEFAULT_STREAM_WINDOW, DEFAULT_STREAM_WINDOW);
+         assert_eq!(recv.len, 0);
+ 
+         let first = RangeBuf::from(b"hellow", 0, false);
+@@ -1096,7 +1139,7 @@
+         #[values(true, false)] emit: bool,
+     ) {
+         let mut recv =
+-            RecvBuf::new(u64::MAX, DEFAULT_STREAM_WINDOW, DEFAULT_STREAM_WINDOW);
++            receiver(u64::MAX, DEFAULT_STREAM_WINDOW, DEFAULT_STREAM_WINDOW);
+         assert_eq!(recv.len, 0);
+ 
+         let first = RangeBuf::from(b"hello", 8, false);
+@@ -1138,7 +1181,7 @@
+         #[values(true, false)] emit: bool,
+     ) {
+         let mut recv =
+-            RecvBuf::new(u64::MAX, DEFAULT_STREAM_WINDOW, DEFAULT_STREAM_WINDOW);
++            receiver(u64::MAX, DEFAULT_STREAM_WINDOW, DEFAULT_STREAM_WINDOW);
+         assert_eq!(recv.len, 0);
+ 
+         let first = RangeBuf::from(b"aaa", 0, false);
+@@ -1196,7 +1239,7 @@
+     #[test]
+     fn mixed_read_actions() {
+         let mut recv =
+-            RecvBuf::new(u64::MAX, DEFAULT_STREAM_WINDOW, DEFAULT_STREAM_WINDOW);
++            receiver(u64::MAX, DEFAULT_STREAM_WINDOW, DEFAULT_STREAM_WINDOW);
+         assert_eq!(recv.len, 0);
+ 
+         let first = RangeBuf::from(b"hello", 0, false);
+@@ -1243,7 +1286,7 @@
+     use super::*;
+ 
+     fn receiver() -> RecvBuf {
+-        RecvBuf::new(100, 100, 100)
++        RecvBuf::new(100, 100, 100, ReceiveBudget::default(), ReceiveClass::Request).unwrap()
+     }
+ 
+     fn assert_body(recv: &mut RecvBuf, expected: &[u8]) {
+@@ -1317,3 +1360,361 @@
+         assert_body(&mut recv, b"abcdef");
+     }
+ }
++#[cfg(test)]
++mod receive_budget_tests {
++    use super::*;
++    use crate::{ReceiveLimits, ReceiveUsage};
++
++    fn limited(backing_bytes: usize, slots: usize) -> ReceiveBudget {
++        ReceiveBudget::new(ReceiveLimits {
++            request: ReceiveLimit {
++                backing_bytes,
++                slots,
++            },
++            ..ReceiveLimits::default()
++        })
++    }
++    fn receiver(budget: &ReceiveBudget) -> RecvBuf {
++        RecvBuf::new(100, 100, 100, budget.clone(), ReceiveClass::Request)
++            .unwrap()
++    }
++    fn islands(recv: &mut RecvBuf) {
++        for (off, bytes) in [(2, b"cd"), (6, b"gh"), (10, b"kl")] {
++            recv.write(RangeBuf::from(bytes, off, false)).unwrap();
++        }
++    }
++
++    #[test]
++    fn receive_budget_atomic_islands_backing_and_fin_rejection() {
++        for (bytes, slots) in [(14, 8), (7, 9)] {
++            let budget = limited(bytes, slots);
++            let mut recv = receiver(&budget);
++            islands(&mut recv);
++            let before = recv.test_receive_budget_state();
++            let usage = budget.usage();
++            assert_eq!(
++                usage.request,
++                ReceiveLimit {
++                    backing_bytes: 6,
++                    slots: 5
++                }
++            );
++            assert_eq!(
++                recv.write(RangeBuf::from(b"abcdefghijklmn", 0, true)),
++                Err(Error::ReceiveBufferExceeded)
++            );
++            assert_eq!(recv.test_receive_budget_state(), before);
++            assert_eq!(budget.usage(), usage);
++            drop(recv);
++            assert_eq!(budget.usage(), ReceiveUsage::default());
++        }
++    }
++
++    #[test]
++    fn receive_budget_duplicate_and_covered_fin_at_full_quota() {
++        let budget = limited(6, 5);
++        let mut recv = receiver(&budget);
++        islands(&mut recv);
++        let before = budget.usage();
++        recv.write(RangeBuf::from(b"kl", 10, false)).unwrap();
++        recv.write(RangeBuf::from(b"", 12, true)).unwrap();
++        recv.write(RangeBuf::from(b"kl", 10, true)).unwrap();
++        recv.write(RangeBuf::from(b"", 12, true)).unwrap();
++        assert_eq!(budget.usage(), before);
++        assert_eq!(recv.data.len(), 3);
++        assert_eq!(recv.fin_off, Some(12));
++        assert_eq!(
++            recv.write(RangeBuf::from(b"", 11, true)),
++            Err(Error::FinalSize)
++        );
++        assert_eq!(budget.usage(), before);
++    }
++
++    #[test]
++    fn receive_budget_partial_backing_full_read_and_consumed_duplicate() {
++        let budget = limited(8, 3);
++        let mut recv = receiver(&budget);
++        recv.write(RangeBuf::from(b"abcdefgh", 0, true)).unwrap();
++        let mut first = [0; 7];
++        assert_eq!(recv.emit(&mut first), Ok((7, false)));
++        assert_eq!(&first, b"abcdefg");
++        assert_eq!(
++            recv.data.first_key_value().unwrap().1.receive_backing_len(),
++            8
++        );
++        assert_eq!(
++            budget.usage().request,
++            ReceiveLimit {
++                backing_bytes: 8,
++                slots: 3
++            }
++        );
++        recv.write(RangeBuf::from(b"abcdefgh", 0, false)).unwrap();
++        assert_eq!(
++            budget.usage().request,
++            ReceiveLimit {
++                backing_bytes: 8,
++                slots: 3
++            }
++        );
++        let mut last = [0; 1];
++        assert_eq!(recv.emit(&mut last), Ok((1, true)));
++        assert_eq!(&last, b"h");
++        assert_eq!(
++            budget.usage().request,
++            ReceiveLimit {
++                backing_bytes: 0,
++                slots: 2
++            }
++        );
++        drop(recv);
++        assert_eq!(budget.usage(), ReceiveUsage::default());
++    }
++
++    #[test]
++    fn receive_budget_discard_keeps_partial_backing_until_entry_release() {
++        let budget = limited(4, 3);
++        let mut recv = receiver(&budget);
++        recv.write(RangeBuf::from(b"abcd", 0, true)).unwrap();
++        assert_eq!(
++            recv.emit_or_discard::<&mut [u8]>(RecvAction::Discard { len: 3 }),
++            Ok((3, false))
++        );
++        assert_eq!(
++            budget.usage().request,
++            ReceiveLimit {
++                backing_bytes: 4,
++                slots: 3
++            }
++        );
++        assert_eq!(
++            recv.emit_or_discard::<&mut [u8]>(RecvAction::Discard { len: 1 }),
++            Ok((1, true))
++        );
++        assert_eq!(
++            budget.usage().request,
++            ReceiveLimit {
++                backing_bytes: 0,
++                slots: 2
++            }
++        );
++        drop(recv);
++        assert_eq!(budget.usage(), ReceiveUsage::default());
++    }
++
++    #[test]
++    fn receive_budget_consumed_input_split_around_island() {
++        let budget = limited(5, 5);
++        let mut recv = receiver(&budget);
++        recv.write(RangeBuf::from(b"abc", 0, false)).unwrap();
++        assert_eq!(recv.emit(&mut [0; 3]), Ok((3, false)));
++        recv.write(RangeBuf::from(b"e", 4, false)).unwrap();
++        let mut range = RangeBuf::from(b"abcdefgh", 0, true);
++        range.consume(3);
++        recv.write(range).unwrap();
++        let intervals: Vec<_> = recv
++            .data
++            .values()
++            .map(|b| {
++                (
++                    b.off(),
++                    b.max_off(),
++                    b.fin(),
++                    b.to_vec(),
++                    b.receive_backing_len(),
++                )
++            })
++            .collect();
++        assert_eq!(
++            intervals,
++            vec![
++                (3, 4, false, b"d".to_vec(), 1),
++                (4, 5, false, b"e".to_vec(), 1),
++                (5, 8, true, b"fgh".to_vec(), 3),
++            ]
++        );
++        assert_eq!(recv.fin_off, Some(8));
++        assert_eq!(
++            budget.usage().request,
++            ReceiveLimit {
++                backing_bytes: 5,
++                slots: 5
++            }
++        );
++        let mut out = [0; 5];
++        assert_eq!(recv.emit(&mut out), Ok((5, true)));
++        assert_eq!(&out, b"defgh");
++        assert_eq!(
++            budget.usage().request,
++            ReceiveLimit {
++                backing_bytes: 0,
++                slots: 2
++            }
++        );
++        drop(recv);
++        assert_eq!(budget.usage(), ReceiveUsage::default());
++    }
++
++    #[test]
++    fn receive_budget_trimmed_input_and_shutdown_charge_actual_backing() {
++        let budget = limited(1, 3);
++        let mut recv = receiver(&budget);
++        let mut range = RangeBuf::from(b"abcdefgh", 0, true);
++        range.consume(7);
++        assert_eq!(range.receive_backing_len(), 8);
++        recv.write(range).unwrap();
++        assert_eq!(
++            recv.data.first_key_value().unwrap().1.receive_backing_len(),
++            1
++        );
++        assert_eq!(
++            budget.usage().request,
++            ReceiveLimit {
++                backing_bytes: 1,
++                slots: 3
++            }
++        );
++        assert_eq!(recv.shutdown(), Ok(8));
++        assert_eq!(
++            budget.usage().request,
++            ReceiveLimit {
++                backing_bytes: 0,
++                slots: 2
++            }
++        );
++        recv.write(RangeBuf::from(b"abcdefgh", 0, false)).unwrap();
++        assert_eq!(
++            budget.usage().request,
++            ReceiveLimit {
++                backing_bytes: 0,
++                slots: 2
++            }
++        );
++        drop(recv);
++        assert_eq!(budget.usage(), ReceiveUsage::default());
++    }
++
++    #[test]
++    fn receive_budget_empty_marker_replacement_and_error_delivery() {
++        let budget = limited(4, 3);
++        let mut recv = receiver(&budget);
++        recv.write(RangeBuf::from(b"", 4, true)).unwrap();
++        assert_eq!(
++            budget.usage().request,
++            ReceiveLimit {
++                backing_bytes: 0,
++                slots: 2
++            }
++        );
++        recv.write(RangeBuf::from(b"abcd", 0, false)).unwrap();
++        assert_eq!(
++            budget.usage().request,
++            ReceiveLimit {
++                backing_bytes: 4,
++                slots: 3
++            }
++        );
++        assert_eq!(recv.data.len(), 1);
++        assert_eq!(recv.emit(&mut [0; 4]), Ok((4, true)));
++        drop(recv);
++        assert_eq!(budget.usage(), ReceiveUsage::default());
++
++        let budget = limited(2, 5);
++        let mut first = receiver(&budget);
++        let mut second = receiver(&budget);
++        first.write(RangeBuf::from(b"cd", 2, false)).unwrap();
++        first.reset(0x10c, 4).unwrap();
++        second.write(RangeBuf::from(b"xy", 0, false)).unwrap();
++        let full = budget.usage();
++        assert_eq!(
++            full.request,
++            ReceiveLimit {
++                backing_bytes: 2,
++                slots: 5
++            }
++        );
++        assert_eq!(first.emit(&mut [0; 1]), Err(Error::StreamReset(0x10c)));
++        assert_eq!(budget.usage(), full);
++        drop(first);
++        drop(second);
++        assert_eq!(budget.usage(), ReceiveUsage::default());
++    }
++
++    #[test]
++    fn receive_budget_crypto_clear_preserves_base_ownership() {
++        let budget = ReceiveBudget::new(ReceiveLimits {
++            crypto: ReceiveLimit {
++                backing_bytes: 8,
++                slots: 3,
++            },
++            ..ReceiveLimits::default()
++        });
++        let mut context =
++            crate::packet::CryptoContext::new(budget.clone()).unwrap();
++        context
++            .crypto_stream
++            .recv
++            .write(RangeBuf::from(b"abcdefgh", 0, true))
++            .unwrap();
++        assert_eq!(
++            context.crypto_stream.recv.emit(&mut [0; 7]),
++            Ok((7, false))
++        );
++        assert_eq!(
++            budget.usage().crypto,
++            ReceiveLimit {
++                backing_bytes: 8,
++                slots: 3
++            }
++        );
++        context.clear();
++        assert_eq!(
++            budget.usage().crypto,
++            ReceiveLimit {
++                backing_bytes: 0,
++                slots: 2
++            }
++        );
++        assert_eq!(
++            context.crypto_stream.recv.test_receive_budget_state(),
++            (0, 0, None, 0, 0)
++        );
++        context
++            .crypto_stream
++            .recv
++            .write(RangeBuf::from(b"12345678", 0, false))
++            .unwrap();
++        assert_eq!(
++            budget.usage().crypto,
++            ReceiveLimit {
++                backing_bytes: 8,
++                slots: 3
++            }
++        );
++        assert_eq!(
++            context
++                .crypto_stream
++                .recv
++                .write(RangeBuf::from(b"9", 8, false)),
++            Err(Error::CryptoBufferExceeded)
++        );
++        context.clear();
++        drop(context);
++        assert_eq!(budget.usage(), ReceiveUsage::default());
++    }
++}
++
++#[cfg(test)]
++impl RecvBuf {
++    pub(crate) fn test_receive_budget_state(
++        &self,
++    ) -> (u64, u64, Option<u64>, usize, usize) {
++        (
++            self.off,
++            self.len,
++            self.fin_off,
++            self.data.len(),
++            self.data.values().map(RangeBuf::receive_backing_len).sum(),
++        )
++    }
++}
+--- /dev/null
++++ b/src/receive_budget.rs
+@@ -0,0 +1,279 @@
++// Copyright (C) 2026, net-mojo contributors.
++// SPDX-License-Identifier: BSD-2-Clause
++
++use std::sync::{Arc, Mutex};
++
++use crate::{Error, Result};
++
++/// Independent retained payload and object population limits.
++#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
++pub struct ReceiveLimit {
++    /// Retained payload bytes, conservatively counted per view.
++    pub backing_bytes: usize,
++    /// Buffer/fragment tokens, not an allocator-byte estimate.
++    pub slots: usize,
++}
++
++/// Separate receive resources for bidirectional, unidirectional and CRYPTO data.
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++pub struct ReceiveLimits {
++    /// Bidirectional receive resources, including responses on clients.
++    pub request: ReceiveLimit,
++    /// Unidirectional receive resources.
++    pub control: ReceiveLimit,
++    /// CRYPTO receive resources across all packet epochs.
++    pub crypto: ReceiveLimit,
++}
++
++impl Default for ReceiveLimits {
++    fn default() -> Self {
++        let unlimited = ReceiveLimit {
++            backing_bytes: usize::MAX,
++            slots: usize::MAX,
++        };
++        Self {
++            request: unlimited,
++            control: unlimited,
++            crypto: unlimited,
++        }
++    }
++}
++
++/// Conservative charges currently reserved, including in-progress admissions.
++#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
++pub struct ReceiveUsage {
++    /// Bidirectional receive resources, including responses on clients.
++    pub request: ReceiveLimit,
++    /// Unidirectional receive resources.
++    pub control: ReceiveLimit,
++    /// CRYPTO receive resources across all packet epochs.
++    pub crypto: ReceiveLimit,
++}
++
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++pub(crate) enum ReceiveClass {
++    Request,
++    Control,
++    Crypto,
++}
++
++impl ReceiveClass {
++    fn error(self) -> Error {
++        match self {
++            Self::Crypto => Error::CryptoBufferExceeded,
++            Self::Request | Self::Control => Error::ReceiveBufferExceeded,
++        }
++    }
++    fn limit(self, limits: &ReceiveLimits) -> ReceiveLimit {
++        match self {
++            Self::Request => limits.request,
++            Self::Control => limits.control,
++            Self::Crypto => limits.crypto,
++        }
++    }
++    fn used(self, usage: &mut ReceiveUsage) -> &mut ReceiveLimit {
++        match self {
++            Self::Request => &mut usage.request,
++            Self::Control => &mut usage.control,
++            Self::Crypto => &mut usage.crypto,
++        }
++    }
++}
++
++#[derive(Debug)]
++struct Shared {
++    limits: ReceiveLimits,
++    used: Mutex<ReceiveUsage>,
++}
++
++/// Immutable capacities shared by all configurations/connections using a clone.
++#[derive(Clone, Debug)]
++pub struct ReceiveBudget(Arc<Shared>);
++
++impl Default for ReceiveBudget {
++    fn default() -> Self {
++        Self::new(ReceiveLimits::default())
++    }
++}
++
++impl ReceiveBudget {
++    /// Creates a shared budget whose capacities cannot be changed.
++    pub fn new(limits: ReceiveLimits) -> Self {
++        Self(Arc::new(Shared {
++            limits,
++            used: Mutex::new(ReceiveUsage::default()),
++        }))
++    }
++    /// Returns a consistent snapshot of all three resource classes.
++    pub fn usage(&self) -> ReceiveUsage {
++        *self.0.used.lock().unwrap()
++    }
++
++    fn reserve(&self, class: ReceiveClass, amount: ReceiveLimit) -> Result<Reservation> {
++        let mut usage = self.0.used.lock().unwrap();
++        let used = class.used(&mut usage);
++        let limit = class.limit(&self.0.limits);
++        let backing_bytes = used
++            .backing_bytes
++            .checked_add(amount.backing_bytes)
++            .ok_or_else(|| class.error())?;
++        let slots = used
++            .slots
++            .checked_add(amount.slots)
++            .ok_or_else(|| class.error())?;
++        if backing_bytes > limit.backing_bytes || slots > limit.slots {
++            return Err(class.error());
++        }
++        *used = ReceiveLimit {
++            backing_bytes,
++            slots,
++        };
++        Ok(Reservation {
++            budget: self.clone(),
++            class,
++            amount,
++        })
++    }
++
++    fn release(&self, class: ReceiveClass, amount: ReceiveLimit) {
++        let mut usage = self.0.used.lock().unwrap();
++        let used = class.used(&mut usage);
++        used.backing_bytes -= amount.backing_bytes;
++        used.slots -= amount.slots;
++    }
++}
++
++pub(crate) struct Reservation {
++    budget: ReceiveBudget,
++    class: ReceiveClass,
++    amount: ReceiveLimit,
++}
++
++impl Reservation {
++    pub(crate) fn commit_entry(&mut self, owner: &mut BufferCharge, backing_bytes: usize) {
++        self.amount.backing_bytes -= backing_bytes;
++        self.amount.slots -= 1;
++        owner.used.backing_bytes += backing_bytes;
++        owner.used.slots += 1;
++    }
++    pub(crate) fn commit(mut self, owner: &mut BufferCharge) {
++        owner.used.backing_bytes += self.amount.backing_bytes;
++        owner.used.slots += self.amount.slots;
++        self.amount = ReceiveLimit::default();
++    }
++}
++
++impl Drop for Reservation {
++    fn drop(&mut self) {
++        self.budget.release(self.class, self.amount);
++    }
++}
++
++#[derive(Debug)]
++pub(crate) struct BufferCharge {
++    budget: ReceiveBudget,
++    class: ReceiveClass,
++    used: ReceiveLimit,
++}
++
++impl BufferCharge {
++    pub(crate) fn new(budget: ReceiveBudget, class: ReceiveClass) -> Result<Self> {
++        // Prepaid terminal metadata keeps RESET delivery possible at full payload quota.
++        let reservation = budget.reserve(
++            class,
++            ReceiveLimit {
++                backing_bytes: 0,
++                slots: 2,
++            },
++        )?;
++        let mut owner = Self {
++            budget,
++            class,
++            used: ReceiveLimit::default(),
++        };
++        reservation.commit(&mut owner);
++        Ok(owner)
++    }
++    pub(crate) fn reserve(&self, amount: ReceiveLimit) -> Result<Reservation> {
++        self.budget.reserve(self.class, amount)
++    }
++    pub(crate) fn release_entry(&mut self, backing_bytes: usize) {
++        let amount = ReceiveLimit {
++            backing_bytes,
++            slots: 1,
++        };
++        self.budget.release(self.class, amount);
++        self.used.backing_bytes -= backing_bytes;
++        self.used.slots -= 1;
++    }
++    pub(crate) fn clear_retained(&mut self) {
++        let amount = ReceiveLimit {
++            backing_bytes: self.used.backing_bytes,
++            slots: self.used.slots - 2,
++        };
++        self.budget.release(self.class, amount);
++        self.used.backing_bytes = 0;
++        self.used.slots = 2;
++    }
++}
++
++impl Drop for BufferCharge {
++    fn drop(&mut self) {
++        self.budget.release(self.class, self.used);
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    #[test]
++    fn receive_budget_reservation_rollback_and_checked_addition() {
++        let budget = ReceiveBudget::default();
++        let mut owner = BufferCharge::new(budget.clone(), ReceiveClass::Request).unwrap();
++        let reservation = owner
++            .reserve(ReceiveLimit {
++                backing_bytes: usize::MAX,
++                slots: usize::MAX - 2,
++            })
++            .unwrap();
++        assert!(matches!(
++            owner.reserve(ReceiveLimit {
++                backing_bytes: 1,
++                slots: 0
++            }),
++            Err(Error::ReceiveBufferExceeded)
++        ));
++        assert!(matches!(
++            owner.reserve(ReceiveLimit {
++                backing_bytes: 0,
++                slots: 1
++            }),
++            Err(Error::ReceiveBufferExceeded)
++        ));
++        drop(reservation);
++        assert_eq!(
++            budget.usage().request,
++            ReceiveLimit {
++                backing_bytes: 0,
++                slots: 2
++            }
++        );
++        owner
++            .reserve(ReceiveLimit {
++                backing_bytes: 7,
++                slots: 1,
++            })
++            .unwrap()
++            .commit(&mut owner);
++        assert_eq!(
++            budget.usage().request,
++            ReceiveLimit {
++                backing_bytes: 7,
++                slots: 3
++            }
++        );
++        drop(owner);
++        assert_eq!(budget.usage(), ReceiveUsage::default());
++    }
++}
+--- a/include/quiche.h
++++ b/include/quiche.h
+@@ -137,6 +137,9 @@
+ 
+     /// An invalid DCID was used when connecting to a remote peer.
+     QUICHE_ERR_INVALID_DCID_INITIALIZATION = -23,
++
++    // Locally configured retained receive resources are exhausted.
++    QUICHE_ERR_RECEIVE_BUFFER_EXCEEDED = -24,
+ };
+ 
+ // Returns a human readable string with the quiche version number.
+@@ -1100,6 +1103,9 @@
+ 
+     // See QUICHE_ERR_CRYPTO_BUFFER_EXCEEDED.
+     QUICHE_H3_TRANSPORT_ERR_CRYPTO_BUFFER_EXCEEDED = QUICHE_ERR_CRYPTO_BUFFER_EXCEEDED - 1000,
++
++    // See QUICHE_ERR_RECEIVE_BUFFER_EXCEEDED.
++    QUICHE_H3_TRANSPORT_ERR_RECEIVE_BUFFER_EXCEEDED = QUICHE_ERR_RECEIVE_BUFFER_EXCEEDED - 1000,
+ 
+     // See QUICHE_ERR_INVALID_ACK_RANGE.
+     QUICHE_H3_TRANSPORT_ERR_INVALID_ACK_RANGE = QUICHE_ERR_INVALID_ACK_RANGE - 1000,

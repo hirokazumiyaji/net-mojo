@@ -12,7 +12,20 @@ from net import Timeout
 struct ServerConfig(Copyable, Movable):
     var max_connections: Int
     var quic_max_transport_memory_bytes: Int
+    var quic_receive_request_bytes: Int
+    var quic_receive_request_slots: Int
+    var quic_receive_control_bytes: Int
+    var quic_receive_control_slots: Int
+    var quic_receive_crypto_bytes: Int
+    var quic_receive_crypto_slots: Int
+    var quic_send_request_bytes: Int
+    var quic_send_request_slots: Int
+    var quic_send_control_bytes: Int
+    var quic_send_control_slots: Int
+    var quic_send_crypto_bytes: Int
+    var quic_send_crypto_slots: Int
     var max_http2_streams_per_connection: Int
+    var http2_max_new_streams_per_second: Int
     # Tumbling 1s window; non-ACK PING/SETTINGS, WINDOW_UPDATE, PRIORITY.
     var http2_max_control_frames_per_second: Int
     # Tumbling 1s window for RST_STREAM; separate from control-frame budget.
@@ -53,7 +66,20 @@ struct ServerConfig(Copyable, Movable):
             max_connections=10000,
             # Soft estimate: 10_000 connections × 256 KiB per-conn quiche charge.
             quic_max_transport_memory_bytes=2621440000,
+            quic_receive_request_bytes=67108864,
+            quic_receive_request_slots=65536,
+            quic_receive_control_bytes=4194304,
+            quic_receive_control_slots=131072,
+            quic_receive_crypto_bytes=16777216,
+            quic_receive_crypto_slots=131072,
+            quic_send_request_bytes=134217728,
+            quic_send_request_slots=524288,
+            quic_send_control_bytes=8388608,
+            quic_send_control_slots=524288,
+            quic_send_crypto_bytes=67108864,
+            quic_send_crypto_slots=524288,
             max_http2_streams_per_connection=100,
+            http2_max_new_streams_per_second=1000000,
             http2_max_control_frames_per_second=1000,
             http2_max_resets_per_second=100,
             max_request_line=8192,

@@ -9,8 +9,50 @@ if [ "$(uname -s)" = "Linux" ]; then
     export BINDGEN_EXTRA_CLANG_ARGS="-isystem $quic_gcc_include -isystem $CONDA_PREFIX/$quic_gcc_target/sysroot/usr/include"
 fi
 
+task_quiche_source=$(bash scripts/prepare_quiche_source.sh)
 NET_HTTP_TEST_CERT="$PWD/build/tls/test-cert.pem" \
 NET_HTTP_TEST_KEY="$PWD/build/tls/test-key.pem" \
     cargo test --locked --release \
+        --config "paths=[\"$task_quiche_source\"]" \
         --manifest-path net/quic/provider/Cargo.toml \
         --target-dir build/quic/cargo
+
+cargo test --locked --release \
+    --manifest-path "$task_quiche_source/Cargo.toml" \
+    --target-dir build/quic/cargo request_cancellation
+
+cargo test --locked --release \
+    --manifest-path "$task_quiche_source/Cargo.toml" \
+    --target-dir build/quic/cargo ranges::tests
+cargo test --locked --release \
+    --manifest-path "$task_quiche_source/Cargo.toml" \
+    --target-dir build/quic/cargo collected_streams
+cargo test --locked --release \
+    --manifest-path "$task_quiche_source/Cargo.toml" \
+    --target-dir build/quic/cargo stream_limit_does_not_collect
+
+cargo test --locked --release \
+    --manifest-path "$task_quiche_source/Cargo.toml" \
+    --target-dir build/quic/cargo locally_drained
+cargo test --locked --release \
+    --manifest-path "$task_quiche_source/Cargo.toml" \
+    --target-dir build/quic/cargo unknown_retirement
+
+cargo test --locked --release \
+    --manifest-path "$task_quiche_source/Cargo.toml" \
+    --target-dir build/quic/cargo receive_view_compaction
+cargo test --locked --release \
+    --manifest-path "$task_quiche_source/Cargo.toml" \
+    --target-dir build/quic/cargo stream::recv_buf::tests
+
+cargo test --locked --release \
+    --manifest-path "$task_quiche_source/Cargo.toml" \
+    --target-dir build/quic/cargo receive_budget
+
+cargo test --locked --release \
+    --manifest-path "$task_quiche_source/Cargo.toml" \
+    --target-dir build/quic/cargo flow_control_empty_stream_frame
+
+bash scripts/test_quic_flow_credit.sh
+
+python3 tests/test_http3_receive_limits.py

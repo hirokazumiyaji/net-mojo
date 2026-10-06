@@ -19,13 +19,16 @@ package main
 import (
 	"context"
 	"crypto/tls"
+	"encoding/json"
 	"flag"
 	"fmt"
 	"io"
 	"log"
 	"net"
 	"net/http"
+	"os"
 	"strings"
+	"syscall"
 	"time"
 
 	"golang.org/x/net/http2"
@@ -115,12 +118,30 @@ func withBodyDeadline(next http.Handler) http.Handler {
 	})
 }
 
+func listenBenchmark(address string) (net.Listener, error) {
+	lc := net.ListenConfig{KeepAlive: -1}
+	return lc.Listen(context.Background(), "tcp", address)
+}
+
 func main() {
 	addr := flag.String("addr", "127.0.0.1:18080", "listen address")
+	idleTimeout := flag.Duration("idle-timeout", 60*time.Second, "keepalive idle timeout (positive)")
 	useTLS := flag.Bool("tls", false, "serve HTTPS (enables HTTP/2 via ALPN h2)")
 	certFile := flag.String("cert", "build/tls/test-cert.pem", "TLS certificate (PEM)")
 	keyFile := flag.String("key", "build/tls/test-key.pem", "TLS private key (PEM)")
 	flag.Parse()
+	if *idleTimeout <= 0 {
+		log.Fatal("idle-timeout must be positive")
+	}
+	var limit syscall.Rlimit
+	if err := syscall.Getrlimit(syscall.RLIMIT_NOFILE, &limit); err != nil {
+		log.Fatal(err)
+	}
+	if err := json.NewEncoder(os.Stdout).Encode(map[string]any{
+		"event": "fd_limits", "source": "getrlimit", "pid": os.Getpid(), "soft": limit.Cur, "hard": limit.Max,
+	}); err != nil {
+		log.Fatal(err)
+	}
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/fixed", fixedHandler)
@@ -138,14 +159,14 @@ func main() {
 		ReadHeaderTimeout: 5 * time.Second,
 		ReadTimeout:       35 * time.Second,
 		WriteTimeout:      30 * time.Second,
-		IdleTimeout:       60 * time.Second,
+		IdleTimeout:       *idleTimeout,
 		ErrorLog:          log.New(io.Discard, "", 0),
 		ConnContext: func(ctx context.Context, c net.Conn) context.Context {
 			return context.WithValue(ctx, connKey{}, c)
 		},
 	}
 
-	ln, err := net.Listen("tcp", *addr)
+	ln, err := listenBenchmark(*addr)
 	if err != nil {
 		log.Fatalf("listen: %v", err)
 	}
@@ -163,9 +184,10 @@ func main() {
 	}
 
 	fmt.Printf(
-		"http_go baseline listening on %s proto=%s (fixed=%dB json=%dB)\n",
+		"http_go baseline listening on %s proto=%s idle_timeout=%s (fixed=%dB json=%dB)\n",
 		ln.Addr(),
 		proto,
+		server.IdleTimeout,
 		len(fixedBody),
 		len(jsonBody),
 	)

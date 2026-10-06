@@ -1,6 +1,7 @@
 """Optional quiche-backed QUIC provider loaded from the HTTP/3 build artifact."""
 
 from std.ffi import OwnedDLHandle, Pointer, c_int, c_size_t
+from std.time import perf_counter_ns
 
 from net.address import SocketAddress
 from net.error import NetError, NetErrorKind
@@ -78,6 +79,7 @@ struct QuicServerConfig(Movable):
 struct QuicSendDatagramResult(Copyable, Movable):
     var count: Int
     var destination: SocketAddress
+    var delay_ns: UInt64
 
 
 struct QuicServer(Movable):
@@ -161,6 +163,86 @@ struct QuicServer(Movable):
                 "set QUIC transport memory limit",
                 None,
                 "QUIC provider could not set the transport memory limit",
+            )
+
+    def set_receive_limits(
+        mut self,
+        request_bytes: Int,
+        request_slots: Int,
+        control_bytes: Int,
+        control_slots: Int,
+        crypto_bytes: Int,
+        crypto_slots: Int,
+    ) raises NetError:
+        if (
+            request_bytes < 0
+            or request_slots < 0
+            or control_bytes < 0
+            or control_slots < 0
+            or crypto_bytes < 0
+            or crypto_slots < 0
+        ):
+            raise NetError(
+                NetErrorKind.invalid_state(),
+                "set QUIC receive limits",
+                None,
+                "receive capacities must be nonnegative",
+            )
+        var result = self._library.call["net_quic_set_receive_limits", c_int](
+            self._server,
+            c_size_t(request_bytes),
+            c_size_t(request_slots),
+            c_size_t(control_bytes),
+            c_size_t(control_slots),
+            c_size_t(crypto_bytes),
+            c_size_t(crypto_slots),
+        )
+        if result != 1:
+            raise NetError(
+                NetErrorKind.invalid_state(),
+                "set QUIC receive limits",
+                None,
+                "receive limits cannot change after accepting a connection",
+            )
+
+    def set_send_limits(
+        mut self,
+        request_bytes: Int,
+        request_slots: Int,
+        control_bytes: Int,
+        control_slots: Int,
+        crypto_bytes: Int,
+        crypto_slots: Int,
+    ) raises NetError:
+        if (
+            request_bytes < 0
+            or request_slots < 0
+            or control_bytes < 0
+            or control_slots < 0
+            or crypto_bytes < 0
+            or crypto_slots < 0
+        ):
+            raise NetError(
+                NetErrorKind.invalid_state(),
+                "set QUIC send limits",
+                None,
+                "send capacities must be nonnegative",
+            )
+        var result = self._library.call["net_quic_set_send_limits", c_int](
+            self._server,
+            c_size_t(request_bytes),
+            c_size_t(request_slots),
+            c_size_t(control_bytes),
+            c_size_t(control_slots),
+            c_size_t(crypto_bytes),
+            c_size_t(crypto_slots),
+        )
+        if result != 1:
+            raise NetError(
+                NetErrorKind.invalid_state(),
+                "set QUIC send limits",
+                None,
+                "send limits cannot change after accepting a connection",
             )
 
     def transport_memory_bytes(self) -> Int:
@@ -271,12 +353,14 @@ struct QuicServer(Movable):
     ) raises NetError -> Optional[QuicSendDatagramResult]:
         var destination = Array[Byte, 64](fill=0)
         var destination_ptr = Pointer(to=destination).unsafe_bitcast[Byte]()
+        var send_delay_ns = UInt64(0)
         var result = self._library.call["net_quic_send", c_int](
             self._server,
             packet.unsafe_ptr(),
             c_size_t(len(packet)),
             destination_ptr,
             c_size_t(len(destination)),
+            Pointer(to=send_delay_ns),
         )
         if result < 0:
             raise NetError(
@@ -290,6 +374,7 @@ struct QuicServer(Movable):
         return QuicSendDatagramResult(
             count=Int(result),
             destination=SocketAddress.parse(_copy_c_string(destination_ptr)),
+            delay_ns=send_delay_ns,
         )
 
     def timeout_micros(self) -> UInt64:
@@ -370,6 +455,8 @@ struct QuicUDPEndpoint(Movable):
     var _receive_buffer: List[Byte]
     var _send_buffer: List[Byte]
     var _request_buffer: List[Byte]
+    var _pending_send_at: Int
+    var _pending_waiting_write: Bool
     var _pending_length: Int
     var _pending_destination: Optional[SocketAddress]
     var _send_would_block_once: Bool
@@ -379,6 +466,42 @@ struct QuicUDPEndpoint(Movable):
 
     def set_transport_memory_limit(mut self, limit: Int) raises NetError:
         self._server.set_transport_memory_limit(limit)
+
+    def set_receive_limits(
+        mut self,
+        request_bytes: Int,
+        request_slots: Int,
+        control_bytes: Int,
+        control_slots: Int,
+        crypto_bytes: Int,
+        crypto_slots: Int,
+    ) raises NetError:
+        self._server.set_receive_limits(
+            request_bytes,
+            request_slots,
+            control_bytes,
+            control_slots,
+            crypto_bytes,
+            crypto_slots,
+        )
+
+    def set_send_limits(
+        mut self,
+        request_bytes: Int,
+        request_slots: Int,
+        control_bytes: Int,
+        control_slots: Int,
+        crypto_bytes: Int,
+        crypto_slots: Int,
+    ) raises NetError:
+        self._server.set_send_limits(
+            request_bytes,
+            request_slots,
+            control_bytes,
+            control_slots,
+            crypto_bytes,
+            crypto_slots,
+        )
 
     def transport_memory_bytes(self) -> Int:
         return self._server.transport_memory_bytes()
@@ -441,6 +564,8 @@ struct QuicUDPEndpoint(Movable):
         self._receive_buffer = List[Byte](length=65535, fill=0)
         self._send_buffer = List[Byte](length=65535, fill=0)
         self._request_buffer = List[Byte](length=1_200_000, fill=0)
+        self._pending_send_at = 0
+        self._pending_waiting_write = False
         self._pending_length = 0
         self._pending_destination = None
         self._send_would_block_once = False
@@ -476,13 +601,17 @@ struct QuicUDPEndpoint(Movable):
             self._pending_destination = Optional(
                 packet.value().destination.copy()
             )
+            self._pending_send_at = _send_at(
+                packet.value().delay_ns, Int(perf_counter_ns())
+            )
+            self._pending_waiting_write = False
+        return self._try_send_at(Int(perf_counter_ns()))
 
+    def _try_send_at(mut self, now: Int) raises NetError -> Bool:
+        if now < self._pending_send_at:
+            return False
         try:
             if self._send_would_block_once:
-                # Deterministic test hook: simulate EAGAIN at the socket-send
-                # boundary so both injected and real would-block outcomes
-                # flow through the same timeout handler below (which must
-                # preserve pending and keep write interest armed).
                 self._send_would_block_once = False
                 raise NetError(
                     NetErrorKind.timeout(),
@@ -503,14 +632,30 @@ struct QuicUDPEndpoint(Movable):
                 )
             self._pending_length = 0
             self._pending_destination = None
+            self._pending_send_at = 0
+            self._pending_waiting_write = False
             return True
         except error:
             if error.kind == NetErrorKind.timeout():
+                self._pending_waiting_write = True
                 return False
             raise error^
 
+    def _timeout_micros_at(self, now: Int, transport_timeout: UInt64) -> UInt64:
+        if self._pending_length > 0 and not self._pending_waiting_write:
+            var remaining = self._pending_send_at - now
+            var pacing_timeout = UInt64(0)
+            if remaining > 0:
+                pacing_timeout = UInt64((remaining - 1) // 1000) + 1
+            if pacing_timeout < transport_timeout:
+                return pacing_timeout
+        return transport_timeout
+
     def wants_write(self) -> Bool:
-        return self._pending_length > 0
+        return (
+            self._pending_length > 0
+            and Int(perf_counter_ns()) >= self._pending_send_at
+        )
 
     def inject_send_would_block_once(mut self):
         """Fail the next `try_send` with would-block, preserving pending.
@@ -523,7 +668,10 @@ struct QuicUDPEndpoint(Movable):
     def stage_outgoing_datagram[
         origin: Origin
     ](
-        mut self, packet: Span[Byte, origin], destination: SocketAddress
+        mut self,
+        packet: Span[Byte, origin],
+        destination: SocketAddress,
+        send_at: Int = 0,
     ) raises NetError:
         """Retain `packet` as the current pending UDP send.
 
@@ -539,11 +687,18 @@ struct QuicUDPEndpoint(Movable):
             )
         for i in range(len(packet)):
             self._send_buffer[i] = packet[i]
+        self._pending_send_at = send_at
+        self._pending_waiting_write = False
         self._pending_length = len(packet)
         self._pending_destination = Optional(destination.copy())
 
-    def timeout_micros(self) -> UInt64:
+    def transport_timeout_micros(self) -> UInt64:
         return self._server.timeout_micros()
+
+    def timeout_micros(self) -> UInt64:
+        return self._timeout_micros_at(
+            Int(perf_counter_ns()), self.transport_timeout_micros()
+        )
 
     def on_timeout(mut self):
         self._server.on_timeout()
@@ -695,3 +850,9 @@ def _copy_c_string[origin: MutOrigin](address: Pointer[Byte, origin]) -> String:
     for i in range(length):
         bytes.append(address[unsafe_offset=i])
     return String(from_utf8_lossy=Span(bytes))
+
+
+def _send_at(delay_ns: UInt64, now: Int) -> Int:
+    if delay_ns > UInt64(Int.MAX - now):
+        return Int.MAX
+    return now + Int(delay_ns)

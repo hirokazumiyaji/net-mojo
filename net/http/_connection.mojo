@@ -1,7 +1,9 @@
 """Per-connection state for the HTTP server loop.
 
 A connection owns its socket, its unprocessed wire bytes, and at most
-one queued response. All moves are whole values; nothing borrows across
+one queued response. Admitted HTTP/1 connections also own a prepaid error
+wire until it is transferred into pending or dropped. All moves are whole
+values; nothing borrows across
 connections, so the table never shares ownership between threads.
 """
 
@@ -12,6 +14,12 @@ from net.tls import TLSConnection, TLSIOResult
 from net.http._http2.hpack import Http2HpackDeflater
 from net.http._http2.request_session import Http2RequestSession
 from net.http._http2.response_scheduler import Http2ResponseScheduler
+from net.http._buffer import (
+    _CapacityBudget,
+    _CapacityTicket,
+    SharedBufferBudget,
+    _reserve_capacity,
+)
 
 comptime STATE_READING: UInt8 = 0
 comptime STATE_SENDING: UInt8 = 1
@@ -24,6 +32,7 @@ comptime STATE_SENDING_HTTP2_CONTROL: UInt8 = 7
 comptime PROTOCOL_HTTP11: UInt8 = 1
 comptime PROTOCOL_HTTP2: UInt8 = 2
 comptime READ_BUFFER_SIZE: Int = 8192
+comptime H1_ERROR_CAPACITY: Int = 256
 
 
 struct HttpConnection(Movable):
@@ -57,6 +66,7 @@ struct HttpConnection(Movable):
     var bytes_this_tick: Int
     var requests_this_tick: Int
     var reserved: Int
+    var http1_body_reserved: Int
     var scanned_len: Int
     var more_work: Bool
     var active: Bool
@@ -74,6 +84,8 @@ struct HttpConnection(Movable):
     var tls_write_closed: Bool
     var tls_write_retry_length: Int
     var tls_read_buffer: List[Byte]
+    var _error_wire: List[Byte]
+    var _error_ticket: _CapacityTicket
 
     def __init__(
         out self,
@@ -115,6 +127,7 @@ struct HttpConnection(Movable):
         self.bytes_this_tick = 0
         self.requests_this_tick = 0
         self.reserved = 0
+        self.http1_body_reserved = 0
         self.scanned_len = 0
         self.more_work = False
         self.active = True
@@ -131,10 +144,34 @@ struct HttpConnection(Movable):
         self.tls_write_closed = False
         self.tls_write_retry_length = 0
         self.tls_read_buffer = List[Byte]()
+        self._error_wire = List[Byte]()
+        self._error_ticket = _CapacityTicket()
         if self.tls:
             self.state = STATE_HANDSHAKING
             self.tls_handshake_wants_read = True
             self.tls_read_buffer = List[Byte](length=READ_BUFFER_SIZE, fill=0)
+
+    def __deinit__(deinit self):
+        self._drop_error_wire()
+
+    def _reserve_error_wire(
+        mut self, var budget: SharedBufferBudget, capacity: Int
+    ) -> Bool:
+        var ticket = _CapacityTicket(Optional(budget^))
+        if not ticket._try_reserve(capacity):
+            return False
+        self._error_wire = List[Byte](capacity=capacity)
+        self._error_ticket = ticket^
+        return True
+
+    def _take_error_wire(mut self) -> List[Byte]:
+        var wire = self._error_wire^
+        self._error_wire = List[Byte]()
+        return wire^
+
+    def _drop_error_wire(mut self):
+        self._error_wire = List[Byte]()
+        self._error_ticket.release()
 
     def wants_read(self) -> Bool:
         if not self.active or self.read_eof:
@@ -211,10 +248,13 @@ struct HttpConnection(Movable):
             self.buf.append(data[i])
 
     def drain_prefix(mut self, count: Int):
-        var rest = List[Byte]()
-        for i in range(count, len(self.buf)):
-            rest.append(self.buf[i])
-        self.buf = rest^
+        var remaining = len(self.buf) - count
+        if remaining == 0:
+            self.buf = List[Byte]()
+        else:
+            for i in range(remaining):
+                self.buf[i] = self.buf[count + i]
+            self.buf.shrink(remaining)
         # The drained prefix was necessarily scanned; the remainder
         # keeps its scanned prefix length.
         if self.scanned_len > count:
@@ -222,28 +262,68 @@ struct HttpConnection(Movable):
         else:
             self.scanned_len = 0
 
-    def set_pending(mut self, var bytes: List[Byte]):
+    def _adopt_pending[
+        B: _CapacityBudget
+    ](mut self, var bytes: List[Byte], mut budget: B) -> Bool:
+        if not budget.try_reserve(bytes.capacity()):
+            return False
+        self._adopt_reserved_pending(bytes^, budget)
+        return True
+
+    def _adopt_reserved_pending[
+        B: _CapacityBudget
+    ](mut self, var bytes: List[Byte], mut budget: B):
+        var old_capacity = self.pending.capacity()
         self.pending = bytes^
+        budget.release(old_capacity)
         self.pending_offset = 0
+
+    def _set_reserved_pending[
+        B: _CapacityBudget
+    ](mut self, var bytes: List[Byte], mut budget: B):
+        self._adopt_reserved_pending(bytes^, budget)
         self.state = STATE_SENDING
 
-    def append_pending(mut self, var bytes: List[Byte]):
+    def set_pending[
+        B: _CapacityBudget
+    ](mut self, var bytes: List[Byte], mut budget: B) -> Bool:
+        if not self._adopt_pending(bytes^, budget):
+            return False
+        self.state = STATE_SENDING
+        return True
+
+    def append_pending[
+        B: _CapacityBudget
+    ](mut self, var bytes: List[Byte], mut budget: B) -> Bool:
+        if not budget.try_reserve(bytes.capacity()):
+            return False
+        return self._append_reserved_pending(bytes^, budget)
+
+    def _append_reserved_pending[
+        B: _CapacityBudget
+    ](mut self, var bytes: List[Byte], mut budget: B) -> Bool:
         if self.pending_offset >= len(self.pending):
-            self.pending = bytes^
+            self._adopt_reserved_pending(bytes^, budget)
+            return True
+        var incoming_capacity = bytes.capacity()
+        var remaining = self.pending_remaining()
+        var reservation = 0
+        if not _reserve_capacity(
+            self.pending, budget, remaining + len(bytes), reservation
+        ):
+            _ = bytes^
+            budget.release(incoming_capacity)
+            return False
+        if self.pending_offset > 0:
+            for i in range(remaining):
+                self.pending[i] = self.pending[self.pending_offset + i]
+            self.pending.shrink(remaining)
             self.pending_offset = 0
-        elif self.pending_offset > 0:
-            var rest = List[Byte]()
-            rest.reserve(self.pending_remaining() + len(bytes))
-            for i in range(self.pending_offset, len(self.pending)):
-                rest.append(self.pending[i])
-            for i in range(len(bytes)):
-                rest.append(bytes[i])
-            self.pending = rest^
-            self.pending_offset = 0
-        else:
-            self.pending.reserve(len(self.pending) + len(bytes))
-            for i in range(len(bytes)):
-                self.pending.append(bytes[i])
+        for i in range(len(bytes)):
+            self.pending.append(bytes[i])
+        _ = bytes^
+        budget.release(incoming_capacity)
+        return True
 
     def pending_span(self) -> Span[Byte, origin_of(self.pending)]:
         return Span(self.pending)[self.pending_offset :]
@@ -255,18 +335,19 @@ struct HttpConnection(Movable):
         return self.pending_offset >= len(self.pending)
 
     def clear_pending(mut self):
-        self.pending.clear()
+        self.pending = List[Byte]()
         self.pending_offset = 0
         self.tls_write_would_block = False
         self.tls_write_wants_read = False
         self.tls_write_closed = False
         self.tls_write_retry_length = 0
 
-    def try_read_bytes(mut self, limit: Int) raises NetError -> List[Byte]:
-        """One non-blocking read of up to `limit` bytes. An empty result
+    def try_read_into[
+        origin: MutOrigin
+    ](mut self, output: Span[mut=True, Byte, origin]) raises NetError -> Int:
+        """One non-blocking read into caller scratch. A zero count
         means EOF; a would-block socket raises a timeout `NetError`."""
-        var bound = limit if limit < READ_BUFFER_SIZE else READ_BUFFER_SIZE
-        var out = List[Byte]()
+        var bound = min(len(output), READ_BUFFER_SIZE)
         if self.tls:
             if self.tls_read_retry_length > 0:
                 bound = self.tls_read_retry_length
@@ -290,15 +371,14 @@ struct HttpConnection(Movable):
             self.tls_read_wants_write = False
             self.tls_read_retry_length = 0
             if result.progress.is_closed():
-                return out^
-            out.extend(Span(self.tls_read_buffer)[0 : result.count])
+                return 0
+            for i in range(result.count):
+                output[i] = self.tls_read_buffer[i]
             if self.tls.value().pending() > 0:
                 self.more_work = True
+            return result.count
         else:
-            var tmp = Array[Byte, READ_BUFFER_SIZE](fill=0)
-            var count = self.conn.value().try_read(Span(tmp)[0:bound])
-            out.extend(Span(tmp)[0:count])
-        return out^
+            return self.conn.value().try_read(output[0:bound])
 
     def try_write_pending_capped(mut self, cap: Int) raises NetError -> Int:
         """Writes at most `cap` pending bytes so one connection cannot
@@ -365,6 +445,8 @@ struct HttpConnection(Movable):
         # longer accounts for. Both lists are replaced, not cleared.
         self.buf = List[Byte]()
         self.pending = List[Byte]()
+        self.tls_read_buffer = List[Byte]()
+        self._drop_error_wire()
         self.pending_offset = 0
         self.reserved = 0
         self.detach_state_addr = 0

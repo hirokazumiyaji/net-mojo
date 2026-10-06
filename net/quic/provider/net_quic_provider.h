@@ -21,6 +21,14 @@ int32_t net_quic_server_set_connection_limit(
     struct NetQuicServer *server, size_t limit);
 int32_t net_quic_server_set_transport_memory_limit(
     struct NetQuicServer *server, size_t limit);
+int32_t net_quic_server_set_receive_limits(
+    struct NetQuicServer *server, size_t request_bytes, size_t request_slots,
+    size_t control_bytes, size_t control_slots, size_t crypto_bytes,
+    size_t crypto_slots);
+int32_t net_quic_server_set_send_limits(
+    struct NetQuicServer *server, size_t request_bytes, size_t request_slots,
+    size_t control_bytes, size_t control_slots, size_t crypto_bytes,
+    size_t crypto_slots);
 size_t net_quic_server_transport_memory_bytes(
     const struct NetQuicServer *server);
 int32_t net_quic_server_set_request_limits(
@@ -43,7 +51,7 @@ int32_t net_quic_server_recv(
     const char *local_address, const char *remote_address);
 int32_t net_quic_server_send(
     struct NetQuicServer *server, uint8_t *packet, size_t packet_capacity,
-    char *remote_address, size_t address_capacity);
+    char *remote_address, size_t address_capacity, uint64_t *send_delay_ns);
 uint64_t net_quic_server_timeout_micros(
     const struct NetQuicServer *server);
 void net_quic_server_on_timeout(struct NetQuicServer *server);
@@ -59,6 +67,14 @@ int32_t net_quic_set_connection_limit(
     struct NetQuicServer *server, size_t limit);
 int32_t net_quic_set_transport_memory_limit(
     struct NetQuicServer *server, size_t limit);
+int32_t net_quic_set_receive_limits(
+    struct NetQuicServer *server, size_t request_bytes, size_t request_slots,
+    size_t control_bytes, size_t control_slots, size_t crypto_bytes,
+    size_t crypto_slots);
+int32_t net_quic_set_send_limits(
+    struct NetQuicServer *server, size_t request_bytes, size_t request_slots,
+    size_t control_bytes, size_t control_slots, size_t crypto_bytes,
+    size_t crypto_slots);
 size_t net_quic_transport_memory_bytes(
     const struct NetQuicServer *server);
 int32_t net_quic_set_request_limits(
@@ -81,7 +97,7 @@ int32_t net_quic_receive(
     const char *local_address, const char *remote_address);
 int32_t net_quic_send(
     struct NetQuicServer *server, uint8_t *packet, size_t packet_capacity,
-    char *remote_address, size_t address_capacity);
+    char *remote_address, size_t address_capacity, uint64_t *send_delay_ns);
 uint64_t net_quic_timeout_micros(const struct NetQuicServer *server);
 void net_quic_on_timeout(struct NetQuicServer *server);
 int32_t net_quic_next_request(
