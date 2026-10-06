@@ -495,8 +495,7 @@ pixi run -e tls-http2 hpack-test
 pixi run -e tls-http2 mojo build --Werror -I . \
   benchmarks/http2_tls_server.mojo -o /tmp/http2_server
 go -C benchmarks/http_go build -o /tmp/http_go_h2 .
-git show c538fb56ad69a9417bbbf9b0ff92519ebe8ffd18:benchmarks/http/http2_scenarios.py \
-  > /tmp/http2_scenarios.py
+cp benchmarks/http/http2_scenarios.py /tmp/http2_scenarios.py
 /tmp/http2_server &
 mojo_pid=$!
 /tmp/http_go_h2 -tls -addr 127.0.0.1:18442 \
