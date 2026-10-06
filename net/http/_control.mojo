@@ -15,7 +15,7 @@ struct _ControlState:
     var channel: Optional[WakeupChannel]
 
     def __init__(out self, var channel: WakeupChannel):
-        self.mutex = PthreadMutex()
+        self.mutex = PthreadMutex._uninitialized()
         self.references = 1
         self.requested = False
         self.exited = False
@@ -43,6 +43,7 @@ struct ServerControl(Copyable, Movable):
             _ControlState(channel^)
         )
         self._addr = Int(raw)
+        self._state()[].mutex._initialize()
 
     def __init__(out self, *, copy: Self):
         self._addr = copy._addr

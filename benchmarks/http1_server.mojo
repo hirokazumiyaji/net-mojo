@@ -1,11 +1,13 @@
 """Production HTTP/1.1 benchmark entry point matching the Go/H2/H3 handlers."""
 
 from benchmarks.http_handler import BenchHandler
+from benchmarks._process_resources import print_fd_limits
 from net import Timeout, listen_tcp
 from net.http import Server, ServerConfig
 
 
 def main() raises:
+    print_fd_limits()
     var config = ServerConfig.default()
     config.idle_timeout = Timeout.seconds(3600)
     print(

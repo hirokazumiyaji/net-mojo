@@ -10,7 +10,9 @@ shape before calling the handler:
   first `?` with no percent decoding applied.
 - `scheme` and `authority` carry the HTTP/2 and HTTP/3 pseudo-header
   values. HTTP/1.1 adapters fill `authority` from the absolute-form
-  authority or the `Host` header, and leave `scheme` as `"http"`.
+  authority or the `Host` header. Their `scheme` describes the local
+  connection: `"http"` for plaintext and `"https"` for TLS, regardless
+  of the scheme written in an absolute-form target.
 - `trailers` are kept separate from `headers` and never affect
   framing or routing.
 """
@@ -56,10 +58,11 @@ struct HttpVersion(Copyable, Equatable, Writable):
 
 
 struct Request(Movable):
-    """Borrowed request views, valid only for the handler call.
+    """Owned decoded request fields, borrowed by the handler.
 
-    The server owns the receive buffer and never moves, grows, or
-    reuses it while the handler runs. Copy out anything to keep.
+    Copy fields that must outlive the handler call so retained data
+    does not depend on the server's request lifetime. StringSlice and
+    Span views borrow their source field storage.
     The full bounded body is received before the handler runs; there
     is no request streaming in this phase.
     """

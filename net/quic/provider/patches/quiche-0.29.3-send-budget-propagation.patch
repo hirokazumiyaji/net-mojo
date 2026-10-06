@@ -1,0 +1,416 @@
+--- a/src/h3/mod.rs
++++ b/src/h3/mod.rs
+@@ -1119,21 +1119,33 @@
+         match http3_conn.send_settings(conn) {
+             Ok(_) => (),
+ 
++            Err(e @ Error::TransportError(crate::Error::SendBufferExceeded)) =>
++                return Err(e),
+             Err(e) => {
+                 conn.close(true, e.to_wire(), b"Error opening control stream")?;
+                 return Err(e);
+             },
+         };
+ 
+-        // Try opening QPACK streams, but ignore errors if it fails since we
+-        // don't need them right now.
+-        http3_conn.open_qpack_encoder_stream(conn).ok();
+-        http3_conn.open_qpack_decoder_stream(conn).ok();
++        // QPACK streams are optional when dynamic compression is unused.
++        if let Err(e @ Error::TransportError(crate::Error::SendBufferExceeded)) =
++            http3_conn.open_qpack_encoder_stream(conn)
++        {
++            return Err(e);
++        }
++        if let Err(e @ Error::TransportError(crate::Error::SendBufferExceeded)) =
++            http3_conn.open_qpack_decoder_stream(conn)
++        {
++            return Err(e);
++        }
+ 
+         if conn.grease {
+-            // Try opening a GREASE stream, but ignore errors since it's not
+-            // critical.
+-            http3_conn.open_grease_stream(conn).ok();
++            // GREASE is optional.
++            if let Err(e @ Error::TransportError(crate::Error::SendBufferExceeded)) =
++                http3_conn.open_grease_stream(conn)
++            {
++                return Err(e);
++            }
+         }
+ 
+         Ok(http3_conn)
+@@ -8583,3 +8595,7 @@
+ #[doc(hidden)]
+ pub mod qpack;
+ mod stream;
++
++#[cfg(test)]
++#[path = "send_h3_propagation_tests.rs"]
++mod send_h3_propagation_tests;
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -8036,11 +8036,26 @@
+             is_server: self.is_server,
+         };
+ 
++        let result = if self.handshake_completed {
++            self.handshake.process_post_handshake(&mut ex_data)
++        } else {
++            self.handshake.do_handshake(&mut ex_data)
++        };
++        if ex_data.crypto_ctx.iter().any(|space|
++            space.crypto_stream.send.crypto_send_exhausted)
++        {
++            *ex_data.local_error = Some(ConnectionError {
++                is_app: false,
++                error_code: Error::SendBufferExceeded.to_wire(),
++                reason: Vec::new(),
++            });
++            return Err(Error::SendBufferExceeded);
++        }
+         if self.handshake_completed {
+-            return self.handshake.process_post_handshake(&mut ex_data);
+-        }
+-
+-        match self.handshake.do_handshake(&mut ex_data) {
++            return result;
++        }
++
++        match result {
+             Ok(_) => (),
+ 
+             Err(Error::Done) => {
+--- a/src/stream/send_buf.rs
++++ b/src/stream/send_buf.rs
+@@ -133,6 +133,7 @@
+     error: Option<u64>,
+ 
+     charge: SendCharge,
++    pub(crate) crypto_send_exhausted: bool,
+ }
+ 
+ impl<F: BufFactory> Default for SendBuf<F> {
+@@ -165,6 +166,7 @@
+             acked: ranges::RangeSet::default(),
+             error: None,
+             charge,
++            crypto_send_exhausted: false,
+         })
+     }
+ 
+@@ -192,6 +194,7 @@
+     }
+ 
+     pub(crate) fn clear_crypto(&mut self) {
++        self.crypto_send_exhausted = false;
+         self.data = VecDeque::new();
+         self.charge.clear_retained();
+         self.pos = 0;
+@@ -962,3 +965,7 @@
+ #[cfg(test)]
+ #[path = "send_budget_tests.rs"]
+ mod send_budget_tests;
++
++#[cfg(test)]
++#[path = "send_tls_propagation_tests.rs"]
++mod send_tls_propagation_tests;
+--- a/src/tls/mod.rs
++++ b/src/tls/mod.rs
+@@ -871,11 +871,14 @@
+             &mut ex_data.crypto_ctx[packet::Epoch::Application],
+     };
+ 
+-    if space.crypto_stream.send.write(buf, false).is_err() {
+-        return 0;
+-    }
+-
+-    1
++    match space.crypto_stream.send.write(buf, false) {
++        Ok(_) => 1,
++        Err(Error::SendBufferExceeded) => {
++            space.crypto_stream.send.crypto_send_exhausted = true;
++            0
++        },
++        Err(_) => 0,
++    }
+ }
+ 
+ extern "C" fn flush_flight(_ssl: *mut SSL) -> c_int {
+--- /dev/null
++++ b/src/stream/send_tls_propagation_tests.rs
+@@ -0,0 +1,156 @@
++use super::*;
++use crate::{SendBudget, SendLimit, SendLimits, SendUsage};
++use std::mem::size_of;
++
++fn crypto_pool(bytes: usize) -> SendBudget {
++    SendBudget::new(SendLimits {
++        crypto: SendLimit { backing_bytes: bytes, slots: 524288 },
++        ..SendLimits::default()
++    })
++}
++
++fn server_pipe(budget: &SendBudget) -> crate::test_utils::Pipe {
++    let mut config = crate::test_utils::Pipe::default_config("reno").unwrap();
++    config.set_send_budget(budget.clone());
++    crate::test_utils::Pipe::with_server_config(&mut config).unwrap()
++}
++
++fn assert_native_quota_close(conn: &crate::Connection) {
++    let error = conn.local_error().unwrap();
++    assert!(!error.is_app);
++    assert_eq!(error.error_code, Error::SendBufferExceeded.to_wire());
++}
++
++fn assert_wire_quota_close(pipe: &mut crate::test_utils::Pipe) {
++    let mut packet = [0; 1500];
++    let (len, _) = pipe.server.send(&mut packet).unwrap();
++    pipe.client_recv(&mut packet[..len]).unwrap();
++    let error = pipe.client.peer_error().unwrap();
++    assert!(!error.is_app);
++    assert_eq!(error.error_code, Error::SendBufferExceeded.to_wire());
++}
++
++#[test]
++fn send_propagation_tls_initial_reports_exact_quota() {
++    let budget = crypto_pool(0);
++    let mut config = crate::test_utils::Pipe::default_config("reno").unwrap();
++    config.set_send_budget(budget.clone());
++    let mut pipe = crate::test_utils::Pipe::with_client_config(&mut config).unwrap();
++    let mut packet = [0; 1500];
++    let result = pipe.client.send(&mut packet);
++    println!("TLS_INITIAL_QUOTA result={result:?} accepted={} local_error={:?}",
++        pipe.client.crypto_ctx[crate::packet::Epoch::Initial].crypto_stream.send.off_back(),
++        pipe.client.local_error());
++    assert!(matches!(result, Err(Error::SendBufferExceeded)));
++    assert_eq!(budget.usage().crypto.backing_bytes, 0);
++    assert_native_quota_close(&pipe.client);
++    drop(pipe);
++    assert_eq!(budget.usage(), SendUsage::default());
++}
++
++#[test]
++fn send_propagation_tls_handshake_reports_exact_quota() {
++    let unlimited = crypto_pool(usize::MAX);
++    let mut observed = server_pipe(&unlimited);
++    let hello = crate::test_utils::emit_flight(&mut observed.client).unwrap();
++    crate::test_utils::process_flight(&mut observed.server, hello).unwrap();
++    let initial_bytes = observed.server.crypto_ctx[crate::packet::Epoch::Initial]
++        .crypto_stream.send.off_back() as usize;
++    assert!(initial_bytes > 0);
++    assert!(observed.server.crypto_ctx[crate::packet::Epoch::Handshake]
++        .crypto_stream.send.off_back() > 0);
++    drop(observed);
++
++    let budget = crypto_pool(initial_bytes);
++    let mut pipe = server_pipe(&budget);
++    let hello = crate::test_utils::emit_flight(&mut pipe.client).unwrap();
++    let result = crate::test_utils::process_flight(&mut pipe.server, hello);
++    assert_eq!(pipe.server.crypto_ctx[crate::packet::Epoch::Initial]
++        .crypto_stream.send.off_back() as usize, initial_bytes);
++    assert!(pipe.server.crypto_ctx[crate::packet::Epoch::Handshake].crypto_seal.is_some());
++    assert_eq!(pipe.server.crypto_ctx[crate::packet::Epoch::Handshake]
++        .crypto_stream.send.off_back(), 0);
++    println!("TLS_HANDSHAKE_QUOTA initial_bytes={initial_bytes} result={result:?}");
++    assert_eq!(result, Err(Error::SendBufferExceeded));
++    assert_native_quota_close(&pipe.server);
++    assert_wire_quota_close(&mut pipe);
++    drop(pipe);
++    assert_eq!(budget.usage(), SendUsage::default());
++}
++
++#[test]
++fn send_propagation_tls_real_application_ticket_reports_exact_quota() {
++    let budget = crypto_pool(65536);
++    let mut pipe = server_pipe(&budget);
++    let hello = crate::test_utils::emit_flight(&mut pipe.client).unwrap();
++    crate::test_utils::process_flight(&mut pipe.server, hello).unwrap();
++    let flight = crate::test_utils::emit_flight(&mut pipe.server).unwrap();
++    crate::test_utils::process_flight(&mut pipe.client, flight).unwrap();
++    assert!(!pipe.server.is_established());
++    assert!(pipe.client.is_established());
++    assert_eq!(pipe.server.crypto_ctx[crate::packet::Epoch::Application]
++        .crypto_stream.send.off_back(), 0);
++    let free = 65536 - budget.usage().crypto.backing_bytes;
++    let mut occupied = SendBuf::<DefaultBufFactory>::with_budget(
++        u64::MAX, budget.clone(), SendClass::Crypto,
++    ).unwrap();
++    occupied.write(&vec![0; free], false).unwrap();
++    assert_eq!(budget.usage().crypto.backing_bytes, 65536);
++    let finished = crate::test_utils::emit_flight(&mut pipe.client).unwrap();
++    let result = crate::test_utils::process_flight(&mut pipe.server, finished);
++    assert!(pipe.server.crypto_ctx[crate::packet::Epoch::Application].has_keys());
++    assert_eq!(pipe.server.crypto_ctx[crate::packet::Epoch::Application]
++        .crypto_stream.send.off_back(), 0);
++    println!("TLS_APPLICATION_TICKET_QUOTA result={result:?}");
++    assert_eq!(result, Err(Error::SendBufferExceeded));
++    assert_native_quota_close(&pipe.server);
++    assert_wire_quota_close(&mut pipe);
++    drop(occupied);
++    drop(pipe);
++    assert_eq!(budget.usage(), SendUsage::default());
++}
++
++#[test]
++fn send_propagation_marker_free_alpn_failure_remains_tls_failure() {
++    let mut config = crate::test_utils::Pipe::default_config("reno").unwrap();
++    config.set_application_protos(&[b"mismatched"]).unwrap();
++    let mut pipe = crate::test_utils::Pipe::with_client_config(&mut config).unwrap();
++    assert_eq!(pipe.handshake(), Err(Error::TlsFail));
++    assert!(pipe.server.crypto_ctx.iter().all(|space|
++        !space.crypto_stream.send.crypto_send_exhausted));
++    let alert = pipe.server.local_error().unwrap();
++    assert!(!alert.is_app);
++    let error_code = alert.error_code;
++    assert!(error_code >= 0x100);
++    let mut packet = [0; 1500];
++    let (len, _) = pipe.server.send(&mut packet).unwrap();
++    pipe.client_recv(&mut packet[..len]).unwrap();
++    let peer = pipe.client.peer_error().unwrap();
++    assert!(!peer.is_app);
++    assert_eq!(peer.error_code, error_code);
++}
++
++#[test]
++fn send_propagation_exact_callback_marker_clear_and_owner_drop() {
++    for clear_context in [false, true] {
++        let budget = crypto_pool(0);
++        let mut config = crate::test_utils::Pipe::default_config("reno").unwrap();
++        config.set_send_budget(budget.clone());
++        let mut pipe = crate::test_utils::Pipe::with_client_config(&mut config).unwrap();
++        let mut packet = [0; 1500];
++        assert!(matches!(pipe.client.send(&mut packet), Err(Error::SendBufferExceeded)));
++        let context = &mut pipe.client.crypto_ctx[crate::packet::Epoch::Initial];
++        assert!(context.crypto_stream.send.crypto_send_exhausted);
++        if clear_context {
++            context.clear();
++            assert!(!context.crypto_stream.send.crypto_send_exhausted);
++        }
++        assert_eq!(context.crypto_stream.send.off_back(), 0);
++        assert_eq!(budget.usage().crypto.backing_bytes, 0);
++        assert_eq!(budget.usage().crypto.slots, 6);
++        drop(pipe);
++        assert_eq!(budget.usage(), SendUsage::default());
++    }
++    println!("TLS_QUOTA_STATE_LAYOUT SendBuf={} callback_flag={}",
++        size_of::<SendBuf>(), size_of::<bool>());
++}
+--- /dev/null
++++ b/src/h3/send_h3_propagation_tests.rs
+@@ -0,0 +1,114 @@
++use super::*;
++use crate::{SendBudget, SendLimit, SendLimits, SendUsage};
++
++fn control_pool(bytes: usize, slots: usize) -> SendBudget {
++    SendBudget::new(SendLimits {
++        control: SendLimit { backing_bytes: bytes, slots },
++        ..SendLimits::default()
++    })
++}
++
++fn control_pipe(budget: &SendBudget, grease: bool, credit: u64, uni: u64)
++    -> crate::test_utils::Pipe
++{
++    let mut client = crate::test_utils::Pipe::default_config("reno").unwrap();
++    client.set_application_protos(APPLICATION_PROTOCOL).unwrap();
++    client.set_initial_max_data(credit);
++    client.set_initial_max_stream_data_uni(4096);
++    client.set_initial_max_streams_uni(uni);
++    client.grease(false);
++    let mut server = crate::test_utils::Pipe::default_config("reno").unwrap();
++    server.set_application_protos(APPLICATION_PROTOCOL).unwrap();
++    server.grease(grease);
++    server.set_send_budget(budget.clone());
++    let mut pipe = crate::test_utils::Pipe::with_client_and_server_config(
++        &mut client, &mut server,
++    ).unwrap();
++    pipe.handshake().unwrap();
++    pipe.advance().unwrap();
++    pipe
++}
++
++fn assert_optional_quota(slots: usize, grease: bool, successful_qpack: usize) {
++    let budget = control_pool(1024, slots);
++    let mut pipe = control_pipe(&budget, grease, 65536, 8);
++    let result = Connection::with_transport(&mut pipe.server, &Config::new().unwrap());
++    assert!(pipe.server.local_error().is_none());
++    for id in [7, 11].into_iter().take(successful_qpack) {
++        assert_eq!(pipe.server.streams.get_mut(id).unwrap().send.buffered_bytes(), 1);
++    }
++    assert!(matches!(result, Err(Error::TransportError(crate::Error::SendBufferExceeded))));
++    drop(result);
++    drop(pipe);
++    assert_eq!(budget.usage(), SendUsage::default());
++}
++
++#[test]
++fn send_propagation_h3_settings_quota_preserves_transport_cause_without_app_close() {
++    let budget = control_pool(0, 64);
++    let mut pipe = control_pipe(&budget, false, 65536, 8);
++    let result = Connection::with_transport(&mut pipe.server, &Config::new().unwrap());
++    assert!(matches!(result, Err(Error::TransportError(crate::Error::SendBufferExceeded))));
++    assert!(pipe.server.local_error().is_none());
++    drop(result);
++    drop(pipe);
++    assert_eq!(budget.usage(), SendUsage::default());
++}
++
++#[test]
++fn send_propagation_h3_optional_encoder_quota_is_not_ignored() {
++    assert_optional_quota(6, false, 0);
++}
++
++#[test]
++fn send_propagation_h3_optional_decoder_quota_is_not_ignored() {
++    assert_optional_quota(12, false, 1);
++}
++
++#[test]
++fn send_propagation_h3_optional_grease_quota_is_not_ignored() {
++    assert_optional_quota(22, true, 2);
++}
++
++#[test]
++fn send_propagation_h3_optional_done_is_still_ignored() {
++    let budget = control_pool(1024, 128);
++    let mut pipe = control_pipe(&budget, false, 3, 8);
++    let h3 = Connection::with_transport(&mut pipe.server, &Config::new().unwrap()).unwrap();
++    assert!(h3.control_stream_id.is_some());
++    assert!(h3.local_qpack_streams.encoder_stream_id.is_none());
++    assert!(h3.local_qpack_streams.decoder_stream_id.is_none());
++    assert_eq!(budget.usage().control.backing_bytes, 3);
++    assert!(pipe.server.local_error().is_none());
++    drop(h3);
++    drop(pipe);
++    assert_eq!(budget.usage(), SendUsage::default());
++}
++
++#[test]
++fn send_propagation_h3_optional_stream_limit_is_still_ignored() {
++    let budget = control_pool(1024, 128);
++    let mut pipe = control_pipe(&budget, false, 65536, 1);
++    let h3 = Connection::with_transport(&mut pipe.server, &Config::new().unwrap()).unwrap();
++    assert!(h3.control_stream_id.is_some());
++    assert!(h3.local_qpack_streams.encoder_stream_id.is_none());
++    assert!(h3.local_qpack_streams.decoder_stream_id.is_none());
++    assert!(pipe.server.local_error().is_none());
++    drop(h3);
++    drop(pipe);
++    assert_eq!(budget.usage(), SendUsage::default());
++}
++
++#[test]
++fn send_propagation_h3_critical_done_keeps_existing_h3_close() {
++    let budget = control_pool(1024, 128);
++    let mut pipe = control_pipe(&budget, false, 0, 8);
++    let result = Connection::with_transport(&mut pipe.server, &Config::new().unwrap());
++    assert!(matches!(result, Err(Error::InternalError)));
++    let error = pipe.server.local_error().unwrap();
++    assert!(error.is_app);
++    assert_eq!(error.error_code, Error::InternalError.to_wire());
++    drop(result);
++    drop(pipe);
++    assert_eq!(budget.usage(), SendUsage::default());
++}

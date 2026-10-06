@@ -36,10 +36,16 @@ task_quiche_patches=(
     quiche-0.29.3-cancel-request.patch
     quiche-0.29.3-collected-stream-ranges.patch
     quiche-0.29.3-unknown-stream-retirement.patch
+    quiche-0.29.3-receive-view-compaction.patch
+    quiche-0.29.3-receive-budget.patch
+    quiche-0.29.3-empty-stream-horizon.patch
+    quiche-0.29.3-send-budget.patch
+    quiche-0.29.3-send-budget-propagation.patch
 )
 for task_quiche_patch in "${task_quiche_patches[@]}"; do
-    patch --silent --directory "$task_quiche_stage/quiche-0.29.3" -p1 \
-        < "net/quic/provider/patches/$task_quiche_patch"
+    GIT_CEILING_DIRECTORIES="$task_quiche_stage" \
+        git -C "$task_quiche_stage/quiche-0.29.3" apply --whitespace=nowarn \
+        "$PWD/net/quic/provider/patches/$task_quiche_patch"
 done
 rm -rf build/quic/quiche-0.29.3
 mv "$task_quiche_stage/quiche-0.29.3" build/quic/quiche-0.29.3

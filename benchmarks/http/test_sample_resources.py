@@ -10,9 +10,10 @@ import sample_resources as sampler
 
 
 @contextlib.contextmanager
-def owned_child():
+def owned_child(limited=False):
     code = '''
-import sys,tempfile,time
+import resource,sys,tempfile,time
+if sys.argv[1]=="True": resource.setrlimit(resource.RLIMIT_NOFILE,(64,64))
 files=[]
 body=None
 print("ready",flush=True)
@@ -23,13 +24,15 @@ for command in sys.stdin:
         files=[tempfile.TemporaryFile() for _ in range(16)]
         end=time.monotonic()+.2
         while time.monotonic()<end: value=sum(range(100))
+    elif command.strip()=="limit":
+        resource.setrlimit(resource.RLIMIT_NOFILE,(32,64))
     else:
         for item in files: item.close()
         files=[]
         body=None
     print("done",flush=True)
 '''
-    child = subprocess.Popen([sys.executable, "-u", "-c", code], stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True)
+    child = subprocess.Popen([sys.executable, "-u", "-c", code, str(limited)], stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True)
     try:
         assert child.stdout.readline().strip() == "ready"
         yield child
@@ -42,6 +45,29 @@ for command in sys.stdin:
 
 
 class ResourceTests(unittest.TestCase):
+    def test_linux_fd_limit_formats_and_required_metadata(self):
+        for soft, hard, expected in [("64", "128", (64, 128)), ("64", "unlimited", (64, "unlimited")),
+                                     ("unlimited", "unlimited", ("unlimited", "unlimited"))]:
+            text = "Limit                     Soft Limit           Hard Limit           Units\n"
+            text += f"Max open files            {soft}                   {hard}                  files\n"
+            self.assertEqual(sampler._linux_fd_limits(text), expected)
+        for text in ("Max processes 64 128 processes\n", "Max open files unknown 128 files\n"):
+            with self.assertRaises(ValueError): sampler._linux_fd_limits(text)
+
+    def test_real_child_limit_changes_are_sampled(self):
+        with owned_child(limited=True) as child, sampler.Process(child.pid, "server") as process:
+            initial = process.sample()
+            self.assertEqual(initial["state"], "running")
+            expected = (64, 64, "proc_limits") if sys.platform == "linux" else (None, None, "not_exposed")
+            self.assertEqual(tuple(initial[field] for field in ("fd_limit_soft", "fd_limit_hard", "fd_limit_source")), expected)
+            child.stdin.write("limit\n"); child.stdin.flush()
+            self.assertEqual(child.stdout.readline().strip(), "done")
+            changed = process.sample()
+            self.assertEqual(changed["state"], "running")
+            self.assertEqual(changed["start_token"], initial["start_token"])
+            expected = (32, 64, "proc_limits") if sys.platform == "linux" else (None, None, "not_exposed")
+            self.assertEqual(tuple(changed[field] for field in ("fd_limit_soft", "fd_limit_hard", "fd_limit_source")), expected)
+
     def test_numeric_resource_formats_preserve_units(self):
         for text, seconds in [("0:00.07", .07), ("12:03.5", 723.5), ("2:03:04.50", 7384.5), ("1-02:03:04.50", 93784.5)]:
             self.assertEqual(sampler._cpu_time(text), seconds)
@@ -85,7 +111,7 @@ class ResourceTests(unittest.TestCase):
             child.terminate(); child.wait(timeout=3)
             dead = process.sample()
             self.assertEqual(dead["state"], "exited")
-            for field in ("cpu_seconds", "cpu_percent", "rss_bytes", "fd_count"):
+            for field in ("cpu_seconds", "cpu_percent", "rss_bytes", "fd_count", "fd_limit_soft", "fd_limit_hard", "fd_limit_source"):
                 self.assertNotIn(field, dead)
             self.assertEqual(process.sample()["state"], "exited")
 

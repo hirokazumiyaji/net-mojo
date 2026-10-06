@@ -18,6 +18,9 @@ Both build and test scripts stage the public Cargo archive, verify SHA-256
 and apply the explicit ordered patch list before compilation. Cargo's
 same-graph `paths` override keeps the upstream version, dependency graph and lockfile unchanged. The
 archive's license remains in the generated source and `quiche-COPYING`.
+Patch application uses the HTTP/3 feature's existing Git dependency, without
+requiring a separate `patch` executable. Git repository discovery stops at the
+fresh staging directory so an enclosing checkout cannot filter staged paths.
 
 The 10,000-cancellation regression measures live Rust allocations released by
 dropping the server's H3 object, independently of application byte counters.
@@ -76,3 +79,88 @@ transport repair restores credit but retained 2,404,680 H3 Rust allocation bytes
 after 10,000 FIN unknown streams in the same fixture. That intermediate case
 fails the allocation regression; it does not describe the old exhausted-credit
 behavior.
+
+The fourth patch compacts a received RangeBuf view immediately before RecvBuf
+insertion when its Arc backing is larger than the retained bytes. It preserves
+bytes, current offset, final offset and FIN. Ordinary receive buffers retain
+their backing; generic send buffers and partial application reads are unchanged.
+
+The authenticated diagnostic in `diagnostics/active_quic_memory` holds the
+same 16,383-byte body and missing first byte under contiguous, one-byte and
+consistent overlapping frames. Overlap backing falls from 15,728,640 to 16,383
+bytes; server transport Rust allocations released after H3 drop fall from
+17,874,276 to 2,269,532 bytes. Node counts and read/reset cleanup are unchanged.
+All 38 existing RecvBuf contracts and eight new view/overlap/FIN contracts run
+in `quic-suite`. The real client also verifies a full 1 MiB echo and reuse.
+
+This fixes retained backing amplification, not a memory quota. Sparse fragment
+nodes, Arc headers, empty-map capacity, partly read backing, transient input/copy
+allocations, retransmission and native TLS/RSS costs remain separate work.
+
+The fifth patch adds an opt-in native `ReceiveBudget` shared by clones installed
+with `Config::set_receive_budget()`. Its immutable capacities separately limit
+bidirectional receive data, all unidirectional receive data, and CRYPTO data.
+The native default remains unlimited; the provider selects finite shared
+limits described in `docs/design/quic-transport.md`.
+
+Each live receive object reserves two metadata/terminal tokens. Each positive
+fragment additionally reserves one token and its full retained backing length.
+Partly consumed backing remains charged until that fragment is removed.
+Reset, Read shutdown and CRYPTO clear refund retained fragments; metadata stays
+charged until the receive object is dropped. CRYPTO clear preserves the object
+and its original shared budget across packet epochs.
+
+An allocation-free overlap planner reserves all novel fragments in an incoming
+frame before map, FIN, stream length or connection received-byte mutation.
+Already covered bytes need no new reservation and remain acceptable at full
+quota. New compacted views are charged using their actual backing accessor.
+Unaccepted admission cannot consume stream-open counts. RAII reservations and
+owners refund failed construction and connection disposal.
+
+Exhausted STREAM resources return `ReceiveBufferExceeded` and close transport
+with QUIC INTERNAL_ERROR (`0x1`); the C error value is `-24`. Exhausted CRYPTO
+resources retain the existing CRYPTO_BUFFER_EXCEEDED (`0xd`) mapping. The native
+C header records these error values; this unit adds no C settings interface.
+
+`quic-suite` verifies atomic rejection, empty FIN/marker replacement, consumed
+input split around islands, partial and complete read/discard, reset, clear,
+constructor rollback and arithmetic overflow. Authenticated packet tests use
+two real connections sharing a finite budget, preserve receiver state on
+rejection and check a real HTTP/3 priority update while request resources are
+full. CRYPTO has its own finite pool. Synthetic packet injections deliberately
+receive no ACK flight because their sender has no recovery records; these are
+receive-state tests, not loss, recovery or full control-progress proofs.
+
+Slots bound receive-object/fragment population without assuming portable
+allocator bytes per node. Backing charges conservatively count each retained
+view; map capacity, Arc/node overhead, transient input/copies, H3/application
+state, send state, native TLS and RSS are outside the byte ledger. This native
+opt-in facility does not establish a whole-engine or default server memory cap.
+
+The sixth patch backports only the receive side of merged upstream
+[PR #2697](https://github.com/cloudflare/quiche/pull/2697), merge commit
+`a64d972144803ed2db22aaeeca76ed07cfe5c138`. An empty non-FIN STREAM frame
+advances the existing largest-received-offset horizon without retaining a
+fragment. A draining stream consumes that horizon immediately. This preserves
+connection accounting on duplicates, later gap filling and RESET final size.
+Sender packing changes from that upstream PR are outside this patch.
+
+With connection credit 30 and stream credit 15, the old receiver charges the
+same empty offset 10 three times, exhausting MAX_DATA while the stream horizon
+stays zero. An authenticated subsequent three-byte uni STREAM fails with
+FLOW_CONTROL_ERROR (0x3), despite available control backing. The repaired
+receiver records offset 10 once; this is receive-counter evidence, not a
+control/QPACK progress or recovery benchmark.
+
+The upstream receive tests cover gap filling, Read shutdown and RESET under
+both congestion algorithms, and correct the former oracle that accepted FIN
+below an empty-frame horizon. Finite-budget tests additionally verify duplicate
+and below-consumed offsets, full-quota empty input, exact reset consumption,
+unchanged retained backing/slots, final-size rejection and atomic failed payload
+admission. The unchanged archive checksum, lockfile, license and ordered staging
+apply to all six patches. Fresh `quic-suite` exercises these contracts together
+with existing provider, buffer and budget tests.
+
+This fixes receive accounting. It does not reserve independent connection flow
+credit for critical control streams, increase MAX_DATA, change receive limits
+or establish a whole-engine memory bound. Those requirements remain separate.

@@ -41,6 +41,14 @@ def _linux_rss(text):
     raise ValueError("VmRSS is unavailable")
 
 
+def _linux_fd_limits(text):
+    for line in text.splitlines():
+        if line.startswith("Max open files "):
+            soft, hard = line.split()[3:5]
+            return tuple(value if value == "unlimited" else int(value) for value in (soft, hard))
+    raise ValueError("Max open files limit unavailable")
+
+
 def _quota_tree(root, leaf):
     if not leaf.is_relative_to(root) or not leaf.is_dir():
         return None, "unavailable"
@@ -78,10 +86,12 @@ def _linux_snapshot(pid):
             break
     with os.scandir(directory / "fd") as entries:
         fds = sum(entry.name.isdigit() for entry in entries)
+    soft, hard = _linux_fd_limits((directory / "limits").read_text())
     hz = os.sysconf("SC_CLK_TCK")
     return {"start_token": start, "cpu_seconds": ticks / hz, "cpu_monotonic_ns": captured,
             "cpu_time_resolution_seconds": 1 / hz, "rss_bytes": _linux_rss((directory / "status").read_text()),
-            "fd_count": fds, "cpu_affinity": sorted(os.sched_getaffinity(pid)),
+            "fd_count": fds, "fd_limit_soft": soft, "fd_limit_hard": hard, "fd_limit_source": "proc_limits",
+            "cpu_affinity": sorted(os.sched_getaffinity(pid)),
             "cpu_quota_cores": quota, "cpu_quota_state": quota_state}
 
 
@@ -94,6 +104,7 @@ def _mac_snapshot(pid):
     return {"start_token": " ".join(ps[:-2]), "cpu_seconds": _cpu_time(ps[-2]),
             "cpu_monotonic_ns": captured, "cpu_time_resolution_seconds": .01,
             "rss_bytes": int(ps[-1]) * 1024, "fd_count": _numeric_fds(fds),
+            "fd_limit_soft": None, "fd_limit_hard": None, "fd_limit_source": "not_exposed",
             "cpu_affinity": None, "cpu_quota_cores": None, "cpu_quota_state": "not_exposed"}
 
 
