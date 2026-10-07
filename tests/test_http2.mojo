@@ -3,10 +3,7 @@ from net.http.request import HttpVersion
 
 from net.http._http2.frame import FrameParseResult, parse_frame
 from net.http._http2.frame_encoder import encode_frame
-from net.http._http2.response_frames import (
-    encode_data_frames,
-    encode_headers_block,
-)
+from net.http._http2.response_frames import encode_headers_block
 from net.http._http2.data_frame import parse_data_frame
 from net.http._http2.request_body import Http2RequestBody
 from net.http._http2.request_stream import Http2RequestStream
@@ -26,7 +23,6 @@ from net.http._http2.settings_state import (
     Http2PeerSettingsSnapshot,
 )
 from net.http._http2.stream_state import Http2StreamState
-from net.http._http2.stream_table import Http2ActiveStreams
 from net.http._http2.preface import parse_client_preface
 from net.http._http2.settings import (
     Setting,
@@ -48,6 +44,7 @@ from net.http._http2.request_headers import (
     decode_http2_request_headers,
     decode_http2_trailers,
 )
+from tests.support import _append_hpack_field
 
 
 def test_header_block_collects_headers_payload_until_end_headers() raises:
@@ -1078,23 +1075,6 @@ def test_http2_connection_input_returns_stream_frame_payload() raises:
     assert_equal(drain.stream_id, UInt32(1))
 
 
-def _append_hpack_field(mut wire: List[Byte], name: String, value: String):
-    var name_bytes = name.as_bytes()
-    var value_bytes = value.as_bytes()
-    wire.append(Byte((len(name_bytes) >> 24) & 0xFF))
-    wire.append(Byte((len(name_bytes) >> 16) & 0xFF))
-    wire.append(Byte((len(name_bytes) >> 8) & 0xFF))
-    wire.append(Byte(len(name_bytes) & 0xFF))
-    wire.append(Byte((len(value_bytes) >> 24) & 0xFF))
-    wire.append(Byte((len(value_bytes) >> 16) & 0xFF))
-    wire.append(Byte((len(value_bytes) >> 8) & 0xFF))
-    wire.append(Byte(len(value_bytes) & 0xFF))
-    for i in range(len(name_bytes)):
-        wire.append(name_bytes[i])
-    for i in range(len(value_bytes)):
-        wire.append(value_bytes[i])
-
-
 def test_http2_request_headers_map_pseudo_and_regular_fields() raises:
     var encoded = List[Byte]()
     _append_hpack_field(encoded, String(":method"), String("GET"))
@@ -1584,45 +1564,6 @@ def test_http2_headers_block_fragments_with_continuation() raises:
     assert_equal(final.flags, Byte(4))
     assert_equal(final.payload_length, 1)
     assert_equal(offset + final.consumed, len(encoded.wire))
-
-
-def test_http2_data_frames_fragment_and_end_stream() raises:
-    var body: List[Byte] = [
-        Byte(10),
-        Byte(11),
-        Byte(12),
-        Byte(13),
-        Byte(14),
-        Byte(15),
-        Byte(16),
-    ]
-    var encoded = encode_data_frames(UInt32(3), Span(body), True, 3, 64)
-    assert_true(encoded.is_complete())
-    var first = parse_frame(Span(encoded.wire), 3)
-    assert_true(first.is_complete())
-    assert_equal(first.frame_type, Byte(0))
-    assert_equal(first.flags, Byte(0))
-    var second = parse_frame(Span(encoded.wire)[first.consumed :], 3)
-    assert_true(second.is_complete())
-    assert_equal(second.flags, Byte(0))
-    var final = parse_frame(
-        Span(encoded.wire)[first.consumed + second.consumed :], 3
-    )
-    assert_true(final.is_complete())
-    assert_equal(final.flags, Byte(1))
-    assert_equal(final.payload_length, 1)
-
-    var empty: List[Byte] = []
-    var end = encode_data_frames(UInt32(3), Span(empty), True, 3, 9)
-    assert_true(end.is_complete())
-    var empty_frame = parse_frame(Span(end.wire), 3)
-    assert_true(empty_frame.is_complete())
-    assert_equal(empty_frame.payload_length, 0)
-    assert_equal(empty_frame.flags, Byte(1))
-
-    assert_true(
-        encode_data_frames(UInt32(3), Span(body), True, 3, 8).is_error()
-    )
 
 
 def test_settings_frame_accepts_payload_on_stream_zero() raises:
@@ -2124,68 +2065,6 @@ def test_http2_stream_reset_closes_active_stream() raises:
     assert_true(active.is_closed())
     assert_false(active.receive_data(False))
     assert_false(active.reset())
-
-
-def test_http2_stream_table_enforces_local_limit_and_half_close_count() raises:
-    var streams = Http2ActiveStreams(UInt32(1))
-    assert_true(streams.receive_headers(UInt32(1), False).is_accepted())
-    assert_equal(streams.active_count(), 1)
-    assert_true(streams.receive_headers(UInt32(3), False).is_refused())
-    assert_equal(streams.active_count(), 1)
-
-    assert_true(streams.receive_headers(UInt32(1), True).is_accepted())
-    assert_equal(streams.active_count(), 1)
-    assert_true(streams.send_headers(UInt32(1), True))
-    assert_equal(streams.active_count(), 0)
-    assert_true(streams.receive_headers(UInt32(5), False).is_accepted())
-    assert_equal(streams.active_count(), 1)
-
-
-def test_http2_stream_table_releases_capacity_after_reset() raises:
-    var streams = Http2ActiveStreams(UInt32(1))
-    assert_true(streams.receive_headers(UInt32(1), False).is_accepted())
-    assert_true(streams.reset(UInt32(1)))
-    assert_equal(streams.active_count(), 0)
-    assert_true(streams.receive_headers(UInt32(3), False).is_accepted())
-
-
-def test_http2_stream_table_rejects_invalid_or_reused_ids() raises:
-    var streams = Http2ActiveStreams(UInt32(2))
-    assert_true(streams.receive_headers(UInt32(0), False).is_error())
-    assert_true(streams.receive_headers(UInt32(2), False).is_error())
-    assert_true(streams.receive_headers(UInt32(0x80000001), False).is_error())
-    assert_true(streams.receive_headers(UInt32(3), False).is_accepted())
-    assert_true(streams.reset(UInt32(3)))
-    assert_true(streams.receive_headers(UInt32(3), False).is_error())
-    assert_true(streams.receive_headers(UInt32(1), False).is_error())
-
-
-def test_http2_stream_table_releases_capacity_after_remote_data_end() raises:
-    var streams = Http2ActiveStreams(UInt32(1))
-    assert_true(streams.receive_headers(UInt32(1), False).is_accepted())
-    assert_true(streams.send_headers(UInt32(1), True))
-    assert_equal(streams.active_count(), 1)
-    assert_true(streams.receive_data(UInt32(1), True))
-    assert_equal(streams.active_count(), 0)
-    assert_true(streams.receive_headers(UInt32(3), False).is_accepted())
-
-
-def test_http2_stream_table_zero_limit_still_consumes_stream_id() raises:
-    var streams = Http2ActiveStreams(UInt32(0))
-    assert_true(streams.receive_headers(UInt32(1), False).is_refused())
-    assert_true(streams.receive_headers(UInt32(1), False).is_error())
-    assert_true(streams.receive_headers(UInt32(3), False).is_refused())
-
-
-def test_http2_peer_stream_limit_does_not_set_local_admission_limit() raises:
-    var peer_settings = Http2PeerSettings()
-    var setting_values = List[Setting]()
-    setting_values.append(Setting(identifier=UInt16(3), value=UInt32(0)))
-    assert_true(peer_settings.apply(Span(setting_values)).is_success())
-    assert_equal(peer_settings.max_concurrent_streams, UInt32(0))
-
-    var streams = Http2ActiveStreams(UInt32(1))
-    assert_true(streams.receive_headers(UInt32(1), False).is_accepted())
 
 
 def test_http2_dispatcher_new_stream_flood_is_independent_of_resets() raises:

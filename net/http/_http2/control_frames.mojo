@@ -124,11 +124,8 @@ def parse_ping_frame[
     ):
         return PingFrameResult.error()
 
-    var opaque_data = List[Byte]()
-    for i in range(8):
-        opaque_data.append(payload[i])
     return PingFrameResult.valid(
-        (frame.flags & Byte(1)) != Byte(0), opaque_data^
+        (frame.flags & Byte(1)) != Byte(0), List[Byte](payload[:8])
     )
 
 

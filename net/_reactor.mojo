@@ -39,7 +39,6 @@ struct ReactorToken(Copyable, Equatable, Hashable, Writable):
 @fieldwise_init
 struct ReactorEvent(Copyable, Movable):
     var token: ReactorToken
-    var fd: Int32
     var readable: Bool
     var writable: Bool
     var has_error: Bool
@@ -154,16 +153,6 @@ struct Reactor(Movable, Sized):
         self._active_count -= 1
         return True
 
-    def clear(mut self):
-        for i in range(len(self._slots)):
-            if self._slots[i].active:
-                self._queue.remove(self._slots[i].fd)
-                self._slots[i].active = False
-        self._free.clear()
-        for i in range(len(self._slots)):
-            self._free.append(len(self._slots) - 1 - i)
-        self._active_count = 0
-
     def wait(
         mut self, timeout: Optional[Timeout] = None
     ) raises NetError -> List[ReactorEvent]:
@@ -204,9 +193,9 @@ struct Reactor(Movable, Sized):
                 continue
             # The wire carries the low 32 bits of the generation; 2**32
             # reuses of one slot would be needed to collide.
-            if _decode_gen_low(
-                _encode_token(slot, self._slots[slot].generation)
-            ) != _decode_gen_low(batch[i].token_data):
+            if _decode_gen_low(self._slots[slot].generation) != _decode_gen_low(
+                batch[i].token_data
+            ):
                 continue
             var want_read = self._slots[slot].readable
             var want_write = self._slots[slot].writable
@@ -224,10 +213,9 @@ struct Reactor(Movable, Sized):
                 writable = True
             if not readable and not writable:
                 continue
-            # On Linux the queue cannot report the fd; recover it from the
-            # slot. On Darwin the kernel ident must agree with the slot.
-            var fd = self._slots[slot].fd
-            if batch[i].fd >= 0 and batch[i].fd != fd:
+            # Darwin reports the kernel ident, which must still match the
+            # slot; Linux reports -1.
+            if batch[i].fd >= 0 and batch[i].fd != self._slots[slot].fd:
                 continue
             out.append(
                 ReactorEvent(
@@ -235,7 +223,6 @@ struct Reactor(Movable, Sized):
                         slot=slot,
                         generation=self._slots[slot].generation,
                     ),
-                    fd=fd,
                     readable=readable,
                     writable=writable,
                     has_error=batch[i].has_error,

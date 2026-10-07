@@ -100,30 +100,39 @@ struct Http2FrameReader(Movable):
             return Http2FrameReadResult.error(0)
 
         var consumed = 0
-        while consumed < len(data):
-            self._frame.append(data[consumed])
-            consumed += 1
-            var frame = parse_frame(Span(self._frame), self._max_frame_size)
-            if frame.is_error():
-                self._failed = True
-                return Http2FrameReadResult.error(consumed)
-            if not frame.is_complete():
-                continue
-
-            var payload = List[Byte]()
-            payload.reserve(frame.payload_length)
-            for i in range(frame.payload_length):
-                payload.append(self._frame[9 + i])
-            self._frame.clear()
-            return Http2FrameReadResult.frame(
-                consumed,
-                frame.frame_type,
-                frame.flags,
-                frame.stream_id,
-                payload^,
+        if len(self._frame) < 9:
+            consumed = min(9 - len(self._frame), len(data))
+            self._frame.extend(data[:consumed])
+            if len(self._frame) < 9:
+                return Http2FrameReadResult.need_more(consumed)
+        var frame = parse_frame(Span(self._frame), self._max_frame_size)
+        if frame.is_error():
+            self._failed = True
+            return Http2FrameReadResult.error(consumed)
+        if frame.is_need_more():
+            var frame_length = 9 + (
+                (Int(self._frame[0]) << 16)
+                | (Int(self._frame[1]) << 8)
+                | Int(self._frame[2])
             )
+            var take = min(
+                frame_length - len(self._frame), len(data) - consumed
+            )
+            self._frame.extend(data[consumed : consumed + take])
+            consumed += take
+            frame = parse_frame(Span(self._frame), self._max_frame_size)
+            if not frame.is_complete():
+                return Http2FrameReadResult.need_more(consumed)
 
-        return Http2FrameReadResult.need_more(consumed)
+        var payload = List[Byte](Span(self._frame)[9:])
+        self._frame.clear()
+        return Http2FrameReadResult.frame(
+            consumed,
+            frame.frame_type,
+            frame.flags,
+            frame.stream_id,
+            payload^,
+        )
 
     def is_failed(self) -> Bool:
         return self._failed

@@ -2,7 +2,7 @@
 
 from std.ffi import OwnedDLHandle, Pointer, c_int, c_size_t
 
-from net.error import NetError, NetErrorKind
+from net.error import NetError, NetErrorKind, _require_handle
 
 
 @fieldwise_init
@@ -30,19 +30,16 @@ struct Http2HpackInflater(Movable):
         out self, var library_path: String, max_table_size: Int
     ) raises:
         var library = OwnedDLHandle(library_path)
-        var inflater = library.call[
-            "net_hpack_inflater_new",
-            Optional[Pointer[Byte, MutUntrackedOrigin]],
-        ](c_size_t(max_table_size))
-        if inflater == None:
-            raise NetError(
-                NetErrorKind.system_error(),
-                "create HTTP/2 HPACK inflater",
-                None,
-                "libnghttp2 could not create an inflater",
-            )
+        var inflater = _require_handle(
+            library.call[
+                "net_hpack_inflater_new",
+                Optional[Pointer[Byte, MutUntrackedOrigin]],
+            ](c_size_t(max_table_size)),
+            "create HTTP/2 HPACK inflater",
+            "libnghttp2 could not create an inflater",
+        )
         self._library = library^
-        self._inflater = inflater.value()
+        self._inflater = inflater
 
     def __deinit__(deinit self):
         self._library.call["net_hpack_inflater_free"](self._inflater)
@@ -121,19 +118,16 @@ struct Http2HpackDeflater(Movable):
         out self, var library_path: String, max_table_size: Int
     ) raises:
         var library = OwnedDLHandle(library_path)
-        var deflater = library.call[
-            "net_hpack_deflater_new",
-            Optional[Pointer[Byte, MutUntrackedOrigin]],
-        ](c_size_t(max_table_size))
-        if deflater == None:
-            raise NetError(
-                NetErrorKind.system_error(),
-                "create HTTP/2 HPACK deflater",
-                None,
-                "libnghttp2 could not create a deflater",
-            )
+        var deflater = _require_handle(
+            library.call[
+                "net_hpack_deflater_new",
+                Optional[Pointer[Byte, MutUntrackedOrigin]],
+            ](c_size_t(max_table_size)),
+            "create HTTP/2 HPACK deflater",
+            "libnghttp2 could not create a deflater",
+        )
         self._library = library^
-        self._deflater = deflater.value()
+        self._deflater = deflater
         self._failed = False
 
     def __deinit__(deinit self):

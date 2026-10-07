@@ -387,7 +387,7 @@ def _verify_abi_layouts():
         comptime assert size_of[_MsgHdr]() == 56, "invalid Linux msghdr ABI"
 
 
-def _copy_c_string(address: Pointer[Byte, MutUntrackedOrigin]) -> String:
+def _copy_c_string[origin: MutOrigin](address: Pointer[Byte, origin]) -> String:
     var length = 0
     while length < 256 and address[unsafe_offset=length] != 0:
         length += 1

@@ -9,27 +9,13 @@ from net.http._http2.frame_encoder import encode_frame
 from net.http._http2.control_frames import parse_rst_stream_frame
 from net.http._http2.control_frames import parse_goaway_frame
 from net.http._http2.window_update import parse_window_update_frame
-from net.http._http2.response_encoder import encode_http2_response
+from net.http._http2.response_encoder import (
+    encode_http2_response_header_frames,
+)
 from net.http._http2.request_headers import decode_http2_request_headers
 from net.http.response import ResponseWriter
 from net.http.request import HttpVersion
-
-
-def _append_field(mut fields: List[Byte], name: String, value: String):
-    var name_bytes = name.as_bytes()
-    var value_bytes = value.as_bytes()
-    fields.append(Byte((len(name_bytes) >> 24) & 0xFF))
-    fields.append(Byte((len(name_bytes) >> 16) & 0xFF))
-    fields.append(Byte((len(name_bytes) >> 8) & 0xFF))
-    fields.append(Byte(len(name_bytes) & 0xFF))
-    fields.append(Byte((len(value_bytes) >> 24) & 0xFF))
-    fields.append(Byte((len(value_bytes) >> 16) & 0xFF))
-    fields.append(Byte((len(value_bytes) >> 8) & 0xFF))
-    fields.append(Byte(len(value_bytes) & 0xFF))
-    for i in range(len(name_bytes)):
-        fields.append(name_bytes[i])
-    for i in range(len(value_bytes)):
-        fields.append(value_bytes[i])
+from tests.support import _append_hpack_field
 
 
 def _append_frame[
@@ -80,8 +66,8 @@ def test_hpack_inflater_decodes_huffman_header_block() raises:
 def test_hpack_deflater_encodes_bounded_header_fields() raises:
     var deflater = Http2HpackDeflater("build/http2/libnet_hpack", 4096)
     var fields = List[Byte]()
-    _append_field(fields, String(":status"), String("200"))
-    _append_field(fields, String("content-type"), String("text/plain"))
+    _append_hpack_field(fields, String(":status"), String("200"))
+    _append_hpack_field(fields, String("content-type"), String("text/plain"))
     var too_small = Array[Byte, 1](fill=0)
     var result = deflater.encode(Span(fields), 1024, 8, Span(too_small))
     assert_true(result.is_too_large())
@@ -105,14 +91,14 @@ def test_hpack_deflater_encodes_bounded_header_fields() raises:
     assert_equal(decoded.output_length, len(fields))
 
 
-def test_shared_response_encodes_to_http2_headers_and_data() raises:
+def test_shared_response_encodes_to_http2_header_frames() raises:
     var writer = ResponseWriter(64)
     writer.set_status(201)
     writer.headers.add("X-Trace", "abc")
     writer.write_string("body")
     var deflater = Http2HpackDeflater("build/http2/libnet_hpack", 4096)
     var compressed = Array[Byte, 1024](fill=0)
-    var encoded = encode_http2_response(
+    var encoded = encode_http2_response_header_frames(
         deflater,
         writer,
         False,
@@ -139,13 +125,7 @@ def test_shared_response_encodes_to_http2_headers_and_data() raises:
     )
     assert_true(decoded.is_success())
     assert_equal(decoded.field_count, 4)
-
-    var data = parse_frame(Span(encoded.wire)[headers.consumed :])
-    assert_true(data.is_complete())
-    assert_equal(data.frame_type, Byte(0))
-    assert_equal(data.flags, Byte(1))
-    assert_equal(data.payload_length, 4)
-    assert_equal(encoded.wire[headers.consumed + 9], Byte(ord("b")))
+    assert_equal(headers.consumed, len(encoded.wire))
 
 
 def test_failed_response_encoding_poisoned_deflater() raises:
@@ -153,7 +133,7 @@ def test_failed_response_encoding_poisoned_deflater() raises:
     writer.write_string("body")
     var deflater = Http2HpackDeflater("build/http2/libnet_hpack", 4096)
     var compressed = Array[Byte, 1024](fill=0)
-    var failed = encode_http2_response(
+    var failed = encode_http2_response_header_frames(
         deflater,
         writer,
         False,
@@ -166,7 +146,7 @@ def test_failed_response_encoding_poisoned_deflater() raises:
         Span[mut=True](compressed),
     )
     assert_true(failed.is_error())
-    var retried = encode_http2_response(
+    var retried = encode_http2_response_header_frames(
         deflater,
         writer,
         False,

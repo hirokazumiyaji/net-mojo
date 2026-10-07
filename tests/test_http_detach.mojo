@@ -30,7 +30,13 @@ from net.http._detach import (
     _release_detach_state,
     _SharedDetachState,
 )
-from tests.support import _join_thread
+from tests.support import (
+    _content_length_of,
+    _header_end,
+    _join_thread,
+    _response_complete,
+    _status_of,
+)
 from tests.test_http_server import _drain_head_error_to_eof
 
 
@@ -300,63 +306,6 @@ def test_sender_drop_without_respond_records_abort_without_array_growth() raises
     _release_detach_state(state_addr, from_sender=False)
 
 
-def _header_end(buf: List[Byte]) -> Int:
-    var i = 0
-    while i + 3 < len(buf):
-        if (
-            buf[i] == Byte(ord("\r"))
-            and buf[i + 1] == Byte(ord("\n"))
-            and buf[i + 2] == Byte(ord("\r"))
-            and buf[i + 3] == Byte(ord("\n"))
-        ):
-            return i + 4
-        i += 1
-    return -1
-
-
-def _status_of(buf: List[Byte]) -> Int:
-    if len(buf) < 12:
-        return -1
-    var code = 0
-    for i in range(9, 12):
-        var byte = buf[i]
-        if byte < Byte(ord("0")) or byte > Byte(ord("9")):
-            return -1
-        code = code * 10 + Int(byte - Byte(ord("0")))
-    return code
-
-
-def _content_length_of(buf: List[Byte]) -> Int:
-    var end = _header_end(buf)
-    if end < 0:
-        return -1
-    var head = String(from_utf8_lossy=Span(buf)[0:end]).lower()
-    var needle = String("content-length:")
-    var at = head.find(needle)
-    if at < 0:
-        return -1
-    var value_start = at + len(needle.as_bytes())
-    var value_end = value_start
-    var head_bytes = head.as_bytes()
-    while value_end < len(head_bytes) and (
-        head_bytes[value_end] == Byte(ord(" "))
-        or head_bytes[value_end] == Byte(ord("\t"))
-    ):
-        value_end += 1
-    var digits_start = value_end
-    while value_end < len(head_bytes) and (
-        head_bytes[value_end] >= Byte(ord("0"))
-        and head_bytes[value_end] <= Byte(ord("9"))
-    ):
-        value_end += 1
-    if value_end == digits_start:
-        return -1
-    var value = 0
-    for i in range(digits_start, value_end):
-        value = value * 10 + Int(head_bytes[i] - Byte(ord("0")))
-    return value
-
-
 def _body_of(buf: List[Byte]) -> String:
     var end = _header_end(buf)
     if end < 0:
@@ -365,18 +314,6 @@ def _body_of(buf: List[Byte]) -> String:
     if len_val < 0 or end + len_val > len(buf):
         return String(from_utf8_lossy=Span(buf)[end:])
     return String(from_utf8_lossy=Span(buf)[end : end + len_val])
-
-
-def _response_complete(buf: List[Byte], expect_body: Bool = True) -> Bool:
-    var end = _header_end(buf)
-    if end < 0:
-        return False
-    if not expect_body:
-        return True
-    var length = _content_length_of(buf)
-    if length < 0:
-        return True
-    return len(buf) >= end + length
 
 
 def _split_responses(buf: List[Byte]) -> List[List[Byte]]:

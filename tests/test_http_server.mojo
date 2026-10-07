@@ -22,7 +22,15 @@ from net.http import (
     ServerConfig,
     ServerControl,
 )
-from tests.support import _socket_pair, _tick_n
+from tests.support import (
+    _content_length_of,
+    _header_end,
+    _response_complete,
+    _socket_pair,
+    _status_of,
+    _tick_n,
+    _to_bytes,
+)
 
 
 struct _HeadErrorHandler(Handler):
@@ -1004,14 +1012,12 @@ def test_receive_compaction_consumption_close_and_slot_reuse() raises:
     assert_true(server._charge_read(0, 8))
     for i in range(8):
         server._conns[0].buf.append(Byte(i))
-    server._conns[0].scanned_len = 8
     server._consume_receive(0, 5)
     assert_equal(server._budget.used(), 8 + H1_ERROR_CAPACITY)
     assert_equal(server._conns[0].buf.capacity(), 8)
     assert_equal(len(server._conns[0].buf), 3)
     assert_equal(server._conns[0].buf[0], 5)
     assert_equal(server._conns[0].buf[2], 7)
-    assert_equal(server._conns[0].scanned_len, 3)
     server._consume_receive(0, 3)
     assert_equal(server._budget.used(), H1_ERROR_CAPACITY)
     assert_equal(server._conns[0].buf.capacity(), 0)
@@ -1622,6 +1628,52 @@ def test_partial_chunked_body_does_not_reserve_decoded_allocation() raises:
     client.close()
 
 
+def _tick_until_buffered[
+    H: Handler
+](mut server: Server, mut handler: H, want: Int) raises:
+    for _ in range(200):
+        _ = server.tick(handler, Timeout.nanoseconds(0))
+        if server._conns[0].buffered_len() >= want:
+            return
+    raise Error("server never buffered the dripped bytes")
+
+
+def test_dripped_request_parses_head_once_and_resumes_chunk_scan() raises:
+    # One byte per read must cost O(new bytes): the head is parsed once,
+    # when its terminator arrives, and the chunk scan resumes from its
+    # frontier instead of rescanning the buffered body.
+    var server = Server(ServerConfig.default())
+    server.add_listener(listen_tcp("127.0.0.1:0"))
+    var handler = _EchoHandler()
+    var client = dial_tcp(
+        String("127.0.0.1:") + String(server.local_address().port),
+        Timeout.seconds(1),
+    )
+    _tick_n(server, handler, 2)
+    assert_equal(len(server._conns), 1)
+    var head = String(
+        "POST /echo HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n"
+        "Connection: close\r\n\r\n"
+    )
+    var request = head + String("2\r\nbo\r\n3\r\ndy!\r\n0\r\n\r\n")
+    var bytes = request.as_bytes()
+    for i in range(len(bytes) - 1):
+        client.write_all(bytes[i : i + 1], Timeout.seconds(1))
+        _tick_until_buffered(server, handler, i + 1)
+        assert_equal(
+            Bool(server._conns[0].request_head),
+            i + 1 >= head.byte_length(),
+        )
+    assert_true(
+        server._conns[0].request_scan.body_wire
+        >= head.byte_length() + "2\r\nbo\r\n3\r\ndy!\r\n".byte_length()
+    )
+    var out = _exchange(server, handler, client, "\n")
+    assert_equal(_status_of(out), 200)
+    _assert_body(out, "body!")
+    client.close()
+
+
 def test_request_copy_peak_is_rejected_before_receiving_body() raises:
     var config = ServerConfig.default()
     config.total_buffer_budget = 8192 + H1_ERROR_CAPACITY
@@ -1705,81 +1757,6 @@ struct _TwoHandler(Handler):
         else:
             writer.set_status(404)
             writer.write_string("missing")
-
-
-def _bytes_of(data: StringSlice) -> List[Byte]:
-    var out = List[Byte]()
-    var bytes = data.as_bytes()
-    for i in range(len(bytes)):
-        out.append(bytes[i])
-    return out^
-
-
-def _header_end(buf: List[Byte]) -> Int:
-    var i = 0
-    while i + 3 < len(buf):
-        if (
-            buf[i] == Byte(ord("\r"))
-            and buf[i + 1] == Byte(ord("\n"))
-            and buf[i + 2] == Byte(ord("\r"))
-            and buf[i + 3] == Byte(ord("\n"))
-        ):
-            return i + 4
-        i += 1
-    return -1
-
-
-def _status_of(buf: List[Byte]) -> Int:
-    if len(buf) < 12:
-        return -1
-    var code = 0
-    for i in range(9, 12):
-        var byte = buf[i]
-        if byte < Byte(ord("0")) or byte > Byte(ord("9")):
-            return -1
-        code = code * 10 + Int(byte - Byte(ord("0")))
-    return code
-
-
-def _content_length_of(buf: List[Byte]) -> Int:
-    var end = _header_end(buf)
-    if end < 0:
-        return -1
-    var head = String(from_utf8_lossy=Span(buf)[0:end]).lower()
-    var needle = String("content-length:")
-    var at = head.find(needle)
-    if at < 0:
-        return -1
-    var value_start = at + len(needle.as_bytes())
-    var value_end = value_start
-    var head_bytes = head.as_bytes()
-    while value_end < len(head_bytes) and (
-        head_bytes[value_end] == Byte(ord(" "))
-        or head_bytes[value_end] == Byte(ord("\t"))
-    ):
-        value_end += 1
-    var digits_start = value_end
-    while value_end < len(head_bytes) and (
-        head_bytes[value_end] >= Byte(ord("0"))
-        and head_bytes[value_end] <= Byte(ord("9"))
-    ):
-        value_end += 1
-    if value_end == digits_start:
-        return -1
-    var value = 0
-    for i in range(digits_start, value_end):
-        value = value * 10 + Int(head_bytes[i] - Byte(ord("0")))
-    return value
-
-
-def _response_complete(buf: List[Byte]) -> Bool:
-    var end = _header_end(buf)
-    if end < 0:
-        return False
-    var length = _content_length_of(buf)
-    if length < 0:
-        return True
-    return len(buf) >= end + length
 
 
 def _exchange[
@@ -2555,7 +2532,7 @@ def test_binary_body_roundtrip() raises:
     var client = dial_tcp(
         String("127.0.0.1:") + String(port), Timeout.seconds(2)
     )
-    var head = _bytes_of(
+    var head = _to_bytes(
         "POST /echo HTTP/1.1\r\nHost: x\r\nContent-Length: 6\r\n\r\n"
     )
     head.append(Byte(0))

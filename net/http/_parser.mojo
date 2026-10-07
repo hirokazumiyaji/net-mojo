@@ -3,12 +3,12 @@
 `parse_one` parses a single request from the start of a byte buffer and
 reports `need_more`, `complete`, or `error` with the consumed count, so
 callers get identical results for any byte-wise split and never mistake
-pipelined next-request bytes for a body. `HttpParser` owns the buffer
-for connection use.
+pipelined next-request bytes for a body.
 """
 
 from net.http import Headers, HttpError, HttpVersion, Request, ServerConfig
 from net.http import split_path_query
+from net.http.headers import _is_tchar, _parse_decimal
 from ._authority import _host_is_valid
 
 
@@ -98,34 +98,6 @@ struct ParseResult(Movable):
         return self.error.copy()
 
 
-def _is_tchar(byte: Byte) -> Bool:
-    if (
-        (byte >= Byte(ord("A")) and byte <= Byte(ord("Z")))
-        or (byte >= Byte(ord("a")) and byte <= Byte(ord("z")))
-        or (byte >= Byte(ord("0")) and byte <= Byte(ord("9")))
-    ):
-        return True
-    if (
-        byte == Byte(ord("!"))
-        or byte == Byte(ord("#"))
-        or byte == Byte(ord("$"))
-        or byte == Byte(ord("%"))
-        or byte == Byte(ord("&"))
-        or byte == Byte(ord("'"))
-        or byte == Byte(ord("*"))
-        or byte == Byte(ord("+"))
-        or byte == Byte(ord("-"))
-        or byte == Byte(ord("."))
-        or byte == Byte(ord("^"))
-        or byte == Byte(ord("_"))
-        or byte == Byte(ord("`"))
-        or byte == Byte(ord("|"))
-        or byte == Byte(ord("~"))
-    ):
-        return True
-    return False
-
-
 def _is_token(data: StringSlice) -> Bool:
     var bytes = data.as_bytes()
     if len(bytes) == 0:
@@ -211,21 +183,6 @@ def _split_comma_tokens(data: StringSlice) -> List[String]:
                 out.append(trimmed^)
             start = i + 1
     return out^
-
-
-def _parse_decimal_length(data: StringSlice) -> Int:
-    var bytes = data.as_bytes()
-    if len(bytes) == 0:
-        return -1
-    var value = 0
-    for i in range(len(bytes)):
-        var byte = bytes[i]
-        if byte < Byte(ord("0")) or byte > Byte(ord("9")):
-            return -1
-        value = value * 10 + Int(byte - Byte(ord("0")))
-        if value > 16 * 1024 * 1024 * 1024:
-            return -1
-    return value
 
 
 def _skip_bws[origin: Origin](bytes: Span[Byte, origin], mut i: Int):
@@ -345,24 +302,32 @@ def _parse_hex_size(data: StringSlice) -> Int:
     return value
 
 
+def _starts_with_ignore_case(text: StringSlice, prefix: StringSlice) -> Bool:
+    var bytes = text.as_bytes()
+    var expected = prefix.as_bytes()
+    if len(bytes) < len(expected):
+        return False
+    for i in range(len(expected)):
+        var byte = bytes[i]
+        if byte >= Byte(ord("A")) and byte <= Byte(ord("Z")):
+            byte += Byte(32)
+        if byte != expected[i]:
+            return False
+    return True
+
+
 def _parse_absolute_authority(
     target: StringSlice,
 ) -> Tuple[Bool, String, String, String]:
     # Returns (matched, authority, path, query). Only http/https.
-    var text = String(target)
-    var rest: String
-    if (
-        text.byte_length() >= 7
-        and String(from_utf8_lossy=text.as_bytes()[0:7]).lower() == "http://"
-    ):
-        rest = String(from_utf8_lossy=text.as_bytes()[7:])
-    elif (
-        text.byte_length() >= 8
-        and String(from_utf8_lossy=text.as_bytes()[0:8]).lower() == "https://"
-    ):
-        rest = String(from_utf8_lossy=text.as_bytes()[8:])
+    var scheme_length: Int
+    if _starts_with_ignore_case(target, "http://"):
+        scheme_length = 7
+    elif _starts_with_ignore_case(target, "https://"):
+        scheme_length = 8
     else:
         return False, String(""), String(""), String("")
+    var rest = String(from_utf8_lossy=target.as_bytes()[scheme_length:])
     var authority_end = len(rest.as_bytes())
     for i in range(len(rest.as_bytes())):
         var byte = rest.as_bytes()[i]
@@ -611,12 +576,13 @@ def _scan_chunked[
     return _ChunkScan.complete(consumed, decoded)
 
 
+@fieldwise_init
 struct HeadInfo(Movable):
     """Validated request head without the body.
 
     `header_end` is the offset just past the blank line terminating the
     headers. The server answers `100-continue` from this alone when the
-    body has not arrived yet, then parses the body with `parse_one`.
+    body has not arrived yet, then parses the body with `parse_body`.
     """
 
     var method: String
@@ -632,36 +598,6 @@ struct HeadInfo(Movable):
     var expect_100: Bool
     var should_close: Bool
     var header_end: Int
-
-    def __init__(
-        out self,
-        var method: String,
-        var target: String,
-        var path: String,
-        var query: String,
-        var scheme: String,
-        var authority: String,
-        version: HttpVersion,
-        var headers: Headers,
-        content_length: Int,
-        chunked: Bool,
-        expect_100: Bool,
-        should_close: Bool,
-        header_end: Int,
-    ):
-        self.method = method^
-        self.target = target^
-        self.path = path^
-        self.query = query^
-        self.scheme = scheme^
-        self.authority = authority^
-        self.version = version.copy()
-        self.headers = headers^
-        self.content_length = content_length
-        self.chunked = chunked
-        self.expect_100 = expect_100
-        self.should_close = should_close
-        self.header_end = header_end
 
 
 @fieldwise_init
@@ -701,14 +637,7 @@ struct HeadOutcome(Movable):
         )
 
     @staticmethod
-    def failure(
-        var error: HttpError, consumed: Int, should_close: Bool
-    ) -> Self:
-        # `consumed` and `should_close` mirror `ParseResult.failure` so the
-        # head section below needs no restructuring; head errors always
-        # close with nothing consumed.
-        _ = consumed
-        _ = should_close
+    def failure(var error: HttpError) -> Self:
         return Self(
             kind=2,
             head=HeadInfo(
@@ -748,6 +677,25 @@ struct HeadOutcome(Movable):
 
 
 @fieldwise_init
+struct _RequestScan(ImplicitlyCopyable, Movable):
+    """Frontier of a partially received request: `_scan_head` and
+    `_scan_chunked` resume from it, so dripped input costs O(new bytes)
+    per read instead of rescanning the buffered prefix."""
+
+    var head_wire: Int
+    var head_bytes: Int
+    var head_lines: Int
+    var in_headers: Bool
+    var body_wire: Int
+    var body_meta: Int
+    var body_decoded: Int
+
+    @staticmethod
+    def start() -> Self:
+        return Self(0, 0, 0, False, 0, 0, 0)
+
+
+@fieldwise_init
 struct _HeadScan(Copyable, Movable):
     """Structural pre-scan of the request head: finds line boundaries
     and enforces size caps without allocating header Strings."""
@@ -776,14 +724,6 @@ struct _HeadScan(Copyable, Movable):
 
     def is_error(self) -> Bool:
         return self.kind == 2
-
-
-def _head_status_error(status: Int) -> HttpError:
-    if status == 414:
-        return HttpError.uri_too_long(String("request target too long"))
-    if status == 431:
-        return HttpError.header_too_large(String("headers too large"))
-    return HttpError.bad_request(String("bad request head"))
 
 
 def _scan_head[
@@ -867,21 +807,17 @@ def parse_head[
     if line_end < 0:
         if _has_lone_lf_before(buf, 0, length):
             return HeadOutcome.failure(
-                HttpError.bad_request(String("bare LF in request line")),
-                0,
-                True,
+                HttpError.bad_request(String("bare LF in request line"))
             )
         # A trailing CR may be a split CRLF.
         if length > config.max_request_line:
             return HeadOutcome.failure(
-                HttpError.header_too_large(String("request line too long")),
-                0,
-                True,
+                HttpError.header_too_large(String("request line too long"))
             )
         return HeadOutcome.need_more()
     if _has_lone_lf_before(buf, 0, line_end):
         return HeadOutcome.failure(
-            HttpError.bad_request(String("bare LF in request line")), 0, True
+            HttpError.bad_request(String("bare LF in request line"))
         )
     if line_end > config.max_request_line:
         # Target-only excess maps to 414, other line excess to 431.
@@ -899,14 +835,10 @@ def parse_head[
             var target_len = second - first - 1
             if target_len > config.max_request_line:
                 return HeadOutcome.failure(
-                    HttpError.uri_too_long(String("request target too long")),
-                    0,
-                    True,
+                    HttpError.uri_too_long(String("request target too long"))
                 )
         return HeadOutcome.failure(
-            HttpError.header_too_large(String("request line too long")),
-            0,
-            True,
+            HttpError.header_too_large(String("request line too long"))
         )
     # Split METHOD SP TARGET SP VERSION directly on the wire bytes:
     # no intermediate line String is allocated on this hot path.
@@ -921,34 +853,32 @@ def parse_head[
                 break
         if buf[i] == Byte(ord("\r")) or buf[i] == Byte(ord("\n")):
             return HeadOutcome.failure(
-                HttpError.bad_request(String("bad request line")), 0, True
+                HttpError.bad_request(String("bad request line"))
             )
     if first_sp < 0 or second_sp < 0:
         return HeadOutcome.failure(
-            HttpError.bad_request(String("bad request line")), 0, True
+            HttpError.bad_request(String("bad request line"))
         )
     # Reject extra spaces inside the version part.
     for i in range(second_sp + 1, line_end):
         if buf[i] == Byte(ord(" ")):
             return HeadOutcome.failure(
-                HttpError.bad_request(String("bad request line")), 0, True
+                HttpError.bad_request(String("bad request line"))
             )
     var method = String(from_utf8_lossy=buf[0:first_sp])
     var target = String(from_utf8_lossy=buf[first_sp + 1 : second_sp])
     var version_text = String(from_utf8_lossy=buf[second_sp + 1 : line_end])
     if not _is_valid_method(method):
-        return HeadOutcome.failure(
-            HttpError.bad_request(String("bad method")), 0, True
-        )
+        return HeadOutcome.failure(HttpError.bad_request(String("bad method")))
     if target.byte_length() == 0:
         return HeadOutcome.failure(
-            HttpError.bad_request(String("empty request target")), 0, True
+            HttpError.bad_request(String("empty request target"))
         )
     for i in range(len(target.as_bytes())):
         var byte = target.as_bytes()[i]
         if Int(byte) < 33 or Int(byte) == 127:
             return HeadOutcome.failure(
-                HttpError.bad_request(String("bad request target")), 0, True
+                HttpError.bad_request(String("bad request target"))
             )
         # Fragments are never sent on the wire (RFC 9112 3.1): a literal
         # `#` would route differently across clients and intermediaries
@@ -957,9 +887,7 @@ def parse_head[
             return HeadOutcome.failure(
                 HttpError.bad_request(
                     String("fragment not allowed in request target")
-                ),
-                0,
-                True,
+                )
             )
         # Raw non-ASCII bytes are invalid in a request-target (RFC 9112
         # 3.1: senders must percent-encode them). Rejecting here keeps
@@ -969,24 +897,18 @@ def parse_head[
             return HeadOutcome.failure(
                 HttpError.bad_request(
                     String("non-ASCII request target must be percent-encoded")
-                ),
-                0,
-                True,
+                )
             )
     if target.byte_length() > config.max_request_line:
         return HeadOutcome.failure(
-            HttpError.uri_too_long(String("request target too long")),
-            0,
-            True,
+            HttpError.uri_too_long(String("request target too long"))
         )
     var version = HttpVersion.http11()
     if version_text == "HTTP/1.1":
         pass
     elif version_text == "HTTP/1.0":
         return HeadOutcome.failure(
-            HttpError.version_not_supported(String("HTTP/1.0 not supported")),
-            0,
-            True,
+            HttpError.version_not_supported(String("HTTP/1.0 not supported"))
         )
     else:
         # Syntactically valid `HTTP/DIGIT.DIGIT` versions that we do not
@@ -994,16 +916,12 @@ def parse_head[
         # line and falls under the 400 contract.
         if _is_version_number(version_text):
             return HeadOutcome.failure(
-                HttpError.version_not_supported(String("unsupported version")),
-                0,
-                True,
+                HttpError.version_not_supported(String("unsupported version"))
             )
-        return HeadOutcome.failure(
-            HttpError.bad_request(String("bad version")), 0, True
-        )
+        return HeadOutcome.failure(HttpError.bad_request(String("bad version")))
     if method == "CONNECT":
         return HeadOutcome.failure(
-            HttpError.bad_request(String("CONNECT not supported")), 0, True
+            HttpError.bad_request(String("CONNECT not supported"))
         )
     # --- Headers. ---
     var headers = Headers()
@@ -1030,23 +948,19 @@ def parse_head[
         if header_end < 0:
             if _has_lone_lf_before(buf, pos, length):
                 return HeadOutcome.failure(
-                    HttpError.bad_request(String("bare LF in headers")),
-                    0,
-                    True,
+                    HttpError.bad_request(String("bare LF in headers"))
                 )
             # Count completed lines plus the unfinished tail: without
             # the completed part, nearly twice the header budget could
             # be retained behind one unterminated line.
             if header_bytes_total + (length - pos) > config.max_headers_bytes:
                 return HeadOutcome.failure(
-                    HttpError.header_too_large(String("headers too large")),
-                    0,
-                    True,
+                    HttpError.header_too_large(String("headers too large"))
                 )
             return HeadOutcome.need_more()
         if _has_lone_lf_before(buf, pos, header_end):
             return HeadOutcome.failure(
-                HttpError.bad_request(String("bare LF in headers")), 0, True
+                HttpError.bad_request(String("bare LF in headers"))
             )
         if header_end == pos:
             pos += 2
@@ -1055,15 +969,11 @@ def parse_head[
         header_bytes_total += header_line_len
         if header_bytes_total > config.max_headers_bytes:
             return HeadOutcome.failure(
-                HttpError.header_too_large(String("headers too large")),
-                0,
-                True,
+                HttpError.header_too_large(String("headers too large"))
             )
         if len(headers) + 1 > config.max_headers_count:
             return HeadOutcome.failure(
-                HttpError.header_too_large(String("too many headers")),
-                0,
-                True,
+                HttpError.header_too_large(String("too many headers"))
             )
         # obs-fold: CRLF followed by SP/HT is rejected, never folded.
         # (Checked after the empty-line test: a header line itself never
@@ -1076,9 +986,7 @@ def parse_head[
             or header_line_bytes[0] == Byte(ord("\t"))
         ):
             return HeadOutcome.failure(
-                HttpError.bad_request(String("obs-fold not supported")),
-                0,
-                True,
+                HttpError.bad_request(String("obs-fold not supported"))
             )
         var colon = -1
         for i in range(len(header_line_bytes)):
@@ -1087,7 +995,7 @@ def parse_head[
                 break
         if colon <= 0:
             return HeadOutcome.failure(
-                HttpError.bad_request(String("bad header line")), 0, True
+                HttpError.bad_request(String("bad header line"))
             )
         var raw_name = String(from_utf8_lossy=header_line_bytes[0:colon])
         # No whitespace between field-name and colon.
@@ -1097,11 +1005,11 @@ def parse_head[
             ord("\t")
         ):
             return HeadOutcome.failure(
-                HttpError.bad_request(String("bad header name")), 0, True
+                HttpError.bad_request(String("bad header name"))
             )
         if not _is_token(raw_name):
             return HeadOutcome.failure(
-                HttpError.bad_request(String("bad header name")), 0, True
+                HttpError.bad_request(String("bad header name"))
             )
         var raw_value = String(from_utf8_lossy=header_line_bytes[colon + 1 :])
         var value = _trim_ows(raw_value)
@@ -1127,12 +1035,10 @@ def parse_head[
             host_value = String(value)
         elif lowered == "content-length":
             content_length_count += 1
-            var parsed = _parse_decimal_length(value)
+            var parsed = _parse_decimal(value, 16 * 1024 * 1024 * 1024)
             if parsed < 0:
                 return HeadOutcome.failure(
-                    HttpError.bad_request(String("bad Content-Length")),
-                    0,
-                    True,
+                    HttpError.bad_request(String("bad Content-Length"))
                 )
             content_length_value = parsed
         elif lowered == "transfer-encoding":
@@ -1164,7 +1070,7 @@ def parse_head[
             headers.add_bytes(String(raw_name), buf[value_start:value_end])
         except e:
             return HeadOutcome.failure(
-                HttpError.bad_request(String("bad header")), 0, True
+                HttpError.bad_request(String("bad header"))
             )
         pos = header_end + 2
         # Peek for obs-fold on the next line without consuming: if the
@@ -1174,48 +1080,36 @@ def parse_head[
             buf[pos] == Byte(ord(" ")) or buf[pos] == Byte(ord("\t"))
         ):
             return HeadOutcome.failure(
-                HttpError.bad_request(String("obs-fold not supported")),
-                0,
-                True,
+                HttpError.bad_request(String("obs-fold not supported"))
             )
     if has_upgrade:
         return HeadOutcome.failure(
-            HttpError.bad_request(String("Upgrade not supported")), 0, True
+            HttpError.bad_request(String("Upgrade not supported"))
         )
     if host_count != 1 or not _host_is_valid(host_value):
-        return HeadOutcome.failure(
-            HttpError.bad_request(String("bad Host")), 0, True
-        )
+        return HeadOutcome.failure(HttpError.bad_request(String("bad Host")))
     if content_length_count > 1:
         return HeadOutcome.failure(
-            HttpError.bad_request(String("duplicate Content-Length")),
-            0,
-            True,
+            HttpError.bad_request(String("duplicate Content-Length"))
         )
     if transfer_encoding_seen:
         var tokens = _split_comma_tokens(transfer_encoding_raw)
         if len(tokens) != 1 or tokens[0].lower() != "chunked":
             return HeadOutcome.failure(
-                HttpError.bad_request(String("unsupported Transfer-Encoding")),
-                0,
-                True,
+                HttpError.bad_request(String("unsupported Transfer-Encoding"))
             )
         transfer_encoding_chunked_only = True
     if transfer_encoding_seen and content_length_count > 0:
         return HeadOutcome.failure(
             HttpError.bad_request(
                 String("Content-Length with Transfer-Encoding")
-            ),
-            0,
-            True,
+            )
         )
     var needs_100 = False
     if expect_seen:
         if expect_invalid:
             return HeadOutcome.failure(
-                HttpError.expectation_failed(String("unknown Expect")),
-                0,
-                True,
+                HttpError.expectation_failed(String("unknown Expect"))
             )
         needs_100 = True
     # --- Request target forms. ---
@@ -1231,7 +1125,7 @@ def parse_head[
         if matched:
             if not _host_is_valid(abs_authority):
                 return HeadOutcome.failure(
-                    HttpError.bad_request(String("bad authority")), 0, True
+                    HttpError.bad_request(String("bad authority"))
                 )
             authority = String(abs_authority)
             # This server speaks plaintext HTTP/1.1: the scheme stays
@@ -1245,16 +1139,14 @@ def parse_head[
         else:
             if not target.startswith("/"):
                 return HeadOutcome.failure(
-                    HttpError.bad_request(String("bad request target")),
-                    0,
-                    True,
+                    HttpError.bad_request(String("bad request target"))
                 )
             var split_path, split_query = split_path_query(target)
             path = String(split_path)
             query = String(split_query)
     if content_length_value > config.max_body_bytes:
         return HeadOutcome.failure(
-            HttpError.payload_too_large(String("body too large")), 0, True
+            HttpError.payload_too_large(String("body too large"))
         )
     return HeadOutcome.complete(
         HeadInfo(
@@ -1283,6 +1175,15 @@ def parse_one[
         return ParseResult.need_more()
     if outcome.is_error():
         return ParseResult.failure(outcome.take_error(), 0, True)
+    return parse_body(outcome^, buf, config)
+
+
+def parse_body[
+    origin: ImmOrigin
+](
+    var outcome: HeadOutcome, buf: Span[Byte, origin], config: ServerConfig
+) -> ParseResult:
+    """Completes a request whose head `parse_head` already accepted."""
     var length = len(buf)
 
     var body = List[Byte]()
@@ -1515,8 +1416,7 @@ def parse_one[
                     0,
                     True,
                 )
-            for i in range(chunk_size):
-                body.append(buf[data_start + i])
+            body.extend(buf[data_start : data_start + chunk_size])
             decoded_total += chunk_size
             if buf[data_start + chunk_size] != Byte(ord("\r")) or buf[
                 data_start + chunk_size + 1
@@ -1535,8 +1435,9 @@ def parse_one[
         if outcome.head.header_end + want > length:
             return ParseResult.need_more()
         body.reserve(want)
-        for i in range(want):
-            body.append(buf[outcome.head.header_end + i])
+        body.extend(
+            buf[outcome.head.header_end : outcome.head.header_end + want]
+        )
         consumed = outcome.head.header_end + want
     var expect_100 = outcome.head.expect_100
     var should_close = outcome.head.should_close
@@ -1553,156 +1454,3 @@ def parse_one[
     request.trailers = trailers^
     request.body = body^
     return ParseResult.complete(request^, consumed, expect_100, should_close)
-
-
-struct HttpParser(Movable):
-    """Owns unprocessed bytes for one connection. Feed arbitrary splits;
-    call `next_result` repeatedly to drain pipelined requests.
-
-    Incremental state is retained across feeds so dripping senders
-    cannot force quadratic work: the validated head end (with its
-    chunked flag and declared length) plus the chunk-scan frontier
-    (`wire`, `meta`, `decoded`) persist while a request is incomplete.
-    Each feed therefore revalidates only new bytes (plus a bounded
-    partial tail). Completion and errors delegate to `parse_one` for a
-    single authoritative assembly walk. All retained state is plain
-    scalars; buffers are append-only until a terminal outcome drains
-    them, which also resets the cache.
-    """
-
-    var _buf: List[Byte]
-    var _head_end: Int
-    var _head_chunked: Bool
-    var _head_clen: Int
-    var _scan_wire: Int
-    var _scan_meta: Int
-    var _scan_decoded: Int
-    var _scan_active: Bool
-    var _hs_wire: Int
-    var _hs_bytes: Int
-    var _hs_count: Int
-    var _hs_in_headers: Bool
-    var _hs_active: Bool
-
-    def __init__(out self):
-        self._buf = List[Byte]()
-        self._head_end = -1
-        self._head_chunked = False
-        self._head_clen = -1
-        self._scan_wire = 0
-        self._scan_meta = 0
-        self._scan_decoded = 0
-        self._scan_active = False
-        self._hs_wire = 0
-        self._hs_bytes = 0
-        self._hs_count = 0
-        self._hs_in_headers = False
-        self._hs_active = False
-
-    def _reset_progress(mut self):
-        self._head_end = -1
-        self._head_chunked = False
-        self._head_clen = -1
-        self._scan_wire = 0
-        self._scan_meta = 0
-        self._scan_decoded = 0
-        self._scan_active = False
-        self._hs_wire = 0
-        self._hs_bytes = 0
-        self._hs_count = 0
-        self._hs_in_headers = False
-        self._hs_active = False
-
-    def buffered_len(self) -> Int:
-        return len(self._buf)
-
-    def feed[origin: ImmOrigin](mut self, data: Span[Byte, origin]):
-        for i in range(len(data)):
-            self._buf.append(data[i])
-
-    def feed_string(mut self, data: StringSlice):
-        var bytes = data.as_bytes()
-        for i in range(len(bytes)):
-            self._buf.append(bytes[i])
-
-    def next_result(mut self, config: ServerConfig) -> ParseResult:
-        if self._head_end < 0:
-            # Structural head scan first: completed lines stay behind
-            # the frontier, so dripped headers cost O(new bytes) per
-            # feed instead of rescanning and rebuilding every header.
-            if not self._hs_active:
-                self._hs_wire = 0
-                self._hs_bytes = 0
-                self._hs_count = 0
-                self._hs_in_headers = False
-                self._hs_active = True
-            var wire = self._hs_wire
-            var bytes_total = self._hs_bytes
-            var line_count = self._hs_count
-            var in_headers = self._hs_in_headers
-            var scan = _scan_head(
-                Span(self._buf),
-                config,
-                wire,
-                bytes_total,
-                line_count,
-                in_headers,
-            )
-            self._hs_wire = wire
-            self._hs_bytes = bytes_total
-            self._hs_count = line_count
-            self._hs_in_headers = in_headers
-            if scan.is_need_more():
-                return ParseResult.need_more()
-            if scan.is_error():
-                self._reset_progress()
-                return ParseResult.failure(
-                    _head_status_error(scan.status), 0, True
-                )
-            # One authoritative validation and construction pass.
-            var head = parse_head(Span(self._buf), config)
-            if head.is_need_more():
-                self._reset_progress()
-                return ParseResult.need_more()
-            if head.is_error():
-                self._reset_progress()
-                return ParseResult.failure(head.take_error(), 0, True)
-            self._head_end = head.head.header_end
-            self._head_chunked = head.head.chunked
-            self._head_clen = head.head.content_length
-        if not self._head_chunked:
-            var want = self._head_clen if self._head_clen >= 0 else 0
-            if len(self._buf) < self._head_end + want:
-                return ParseResult.need_more()
-        else:
-            if not self._scan_active:
-                self._scan_wire = self._head_end
-                self._scan_meta = 0
-                self._scan_decoded = 0
-                self._scan_active = True
-            var wire = self._scan_wire
-            var meta = self._scan_meta
-            var decoded = self._scan_decoded
-            var scan = _scan_chunked(
-                Span(self._buf), config, wire, meta, decoded
-            )
-            self._scan_wire = wire
-            self._scan_meta = meta
-            self._scan_decoded = decoded
-            if scan.is_need_more():
-                return ParseResult.need_more()
-            # Terminal scan verdicts still assemble through parse_one
-            # once, keeping a single authoritative construction path.
-            self._reset_progress()
-        var result = parse_one(Span(self._buf), config)
-        if result.is_complete() or result.is_error():
-            self._reset_progress()
-            var remaining = List[Byte]()
-            for i in range(result.consumed, len(self._buf)):
-                remaining.append(self._buf[i])
-            self._buf = remaining^
-        return result^
-
-    def clear(mut self):
-        self._buf.clear()
-        self._reset_progress()

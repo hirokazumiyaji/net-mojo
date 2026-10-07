@@ -67,6 +67,22 @@ def _is_tchar(byte: Byte) -> Bool:
     return False
 
 
+def _parse_decimal(data: StringSlice, max_value: Int) -> Int:
+    var bytes = data.as_bytes()
+    if len(bytes) == 0:
+        return -1
+    var value = 0
+    for i in range(len(bytes)):
+        var byte = bytes[i]
+        if byte < Byte(ord("0")) or byte > Byte(ord("9")):
+            return -1
+        var digit = Int(byte - Byte(ord("0")))
+        if value > (max_value - digit) // 10:
+            return -1
+        value = value * 10 + digit
+    return value
+
+
 def _reject_bad_name[
     origin: Origin
 ](name: Span[Byte, origin], operation: String) raises NetError:
@@ -237,8 +253,7 @@ struct Headers(Movable, Sized):
             name.capacity_bytes() + lower_capacity + 2 * String.REF_COUNT_SIZE,
         )
         var raw = List[Byte](capacity=len(value))
-        for i in range(len(value)):
-            raw.append(value[i])
+        raw.extend(value)
         var lowered = String(capacity_bytes=name_length)
         lowered.resize(name_length)
         var lower_bytes = lowered.unsafe_as_bytes_mut()
@@ -312,12 +327,7 @@ struct Headers(Movable, Sized):
         return String(from_utf8_lossy=Span(self._values[index]))
 
     def value_bytes_at(self, index: Int) -> List[Byte]:
-        var out = List[Byte]()
-        var stored = Span(self._values[index])
-        out.reserve(len(stored))
-        for i in range(len(stored)):
-            out.append(stored[i])
-        return out^
+        return List[Byte](Span(self._values[index]))
 
     def _value_bytes_span(
         self, index: Int

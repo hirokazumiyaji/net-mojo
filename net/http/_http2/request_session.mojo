@@ -184,7 +184,7 @@ struct Http2RequestSession(Movable):
         self._draining = True
         var goaway = encode_goaway_frame(self._last_stream_id, UInt32(0))
         var output = List[Byte]()
-        _append_session_output(output, Span(goaway.wire))
+        output.extend(Span(goaway.wire))
         return output^
 
     def next_deadline(self) -> Int:
@@ -216,11 +216,8 @@ struct Http2RequestSession(Movable):
                 expired.append(self._streams[i].stream_id)
         for i in range(len(expired)):
             var stream_id = expired[i]
-            var reset = encode_rst_stream_frame(stream_id, UInt32(8))
-            if not reset.is_complete():
-                self._failed = True
+            if not self._append_reset(output, stream_id, UInt32(8)):
                 return output^
-            _append_session_output(output, Span(reset.wire))
             self._remove_stream(stream_id)
         return output^
 
@@ -247,7 +244,7 @@ struct Http2RequestSession(Movable):
                 ):
                     self._failed = True
                     return Http2RequestSessionResult.error(consumed, output^)
-            _append_session_output(output, Span(input.output))
+            output.extend(Span(input.output))
             if input.is_flood():
                 # Flooded: queue ENHANCE_YOUR_CALM GOAWAY and mark the
                 # session failed so the server flushes pending output and
@@ -262,7 +259,7 @@ struct Http2RequestSession(Movable):
                 if not goaway.is_complete():
                     self._failed = True
                     return Http2RequestSessionResult.error(consumed, output^)
-                _append_session_output(output, Span(goaway.wire))
+                output.extend(Span(goaway.wire))
                 return Http2RequestSessionResult.pending(consumed, output^)
 
             if (
@@ -290,27 +287,21 @@ struct Http2RequestSession(Movable):
                             self._find_stream(decoded.stream_id) < 0
                         )
                         if self._draining and is_new_stream:
-                            var reset = encode_rst_stream_frame(
-                                decoded.stream_id, UInt32(7)
-                            )
-                            if not reset.is_complete():
-                                self._failed = True
+                            if not self._append_reset(
+                                output, decoded.stream_id, UInt32(7)
+                            ):
                                 return Http2RequestSessionResult.error(
                                     consumed, output^
                                 )
-                            _append_session_output(output, Span(reset.wire))
                             continue
                         var request_result = self._receive_headers(decoded)
                         if request_result.is_malformed():
-                            var reset = encode_rst_stream_frame(
-                                decoded.stream_id, UInt32(1)
-                            )
-                            if not reset.is_complete():
-                                self._failed = True
+                            if not self._append_reset(
+                                output, decoded.stream_id, UInt32(1)
+                            ):
                                 return Http2RequestSessionResult.error(
                                     consumed, output^
                                 )
-                            _append_session_output(output, Span(reset.wire))
                             self._remove_stream(decoded.stream_id)
                             continue
                         if request_result.is_error():
@@ -319,15 +310,12 @@ struct Http2RequestSession(Movable):
                                 consumed, output^
                             )
                         if request_result.is_refused():
-                            var reset = encode_rst_stream_frame(
-                                decoded.stream_id, UInt32(7)
-                            )
-                            if not reset.is_complete():
-                                self._failed = True
+                            if not self._append_reset(
+                                output, decoded.stream_id, UInt32(7)
+                            ):
                                 return Http2RequestSessionResult.error(
                                     consumed, output^
                                 )
-                            _append_session_output(output, Span(reset.wire))
                             continue
                         if request_result.is_complete():
                             var request = self._take_request(decoded.stream_id)
@@ -357,15 +345,12 @@ struct Http2RequestSession(Movable):
                             stream_id = input.stream_id
                         if stream_id > self._last_stream_id:
                             self._last_stream_id = stream_id
-                        var reset = encode_rst_stream_frame(
-                            stream_id, UInt32(11)
-                        )
-                        if not reset.is_complete():
-                            self._failed = True
+                        if not self._append_reset(
+                            output, stream_id, UInt32(11)
+                        ):
                             return Http2RequestSessionResult.error(
                                 consumed, output^
                             )
-                        _append_session_output(output, Span(reset.wire))
                         self._remove_stream(stream_id)
                         continue
                     else:
@@ -378,15 +363,12 @@ struct Http2RequestSession(Movable):
                         frame, Span(input.payload), output
                     )
                     if request_result.is_malformed():
-                        var reset = encode_rst_stream_frame(
-                            input.stream_id, UInt32(1)
-                        )
-                        if not reset.is_complete():
-                            self._failed = True
+                        if not self._append_reset(
+                            output, input.stream_id, UInt32(1)
+                        ):
                             return Http2RequestSessionResult.error(
                                 consumed, output^
                             )
-                        _append_session_output(output, Span(reset.wire))
                         self._remove_stream(input.stream_id)
                         continue
                     if request_result.is_error():
@@ -395,15 +377,12 @@ struct Http2RequestSession(Movable):
                             consumed, output^
                         )
                     if request_result.is_too_large():
-                        var reset = encode_rst_stream_frame(
-                            input.stream_id, UInt32(11)
-                        )
-                        if not reset.is_complete():
-                            self._failed = True
+                        if not self._append_reset(
+                            output, input.stream_id, UInt32(11)
+                        ):
                             return Http2RequestSessionResult.error(
                                 consumed, output^
                             )
-                        _append_session_output(output, Span(reset.wire))
                         self._remove_stream(input.stream_id)
                         continue
                     if request_result.is_complete():
@@ -647,16 +626,20 @@ struct Http2RequestSession(Movable):
             if send_index < len(self._send_streams):
                 self._send_streams[send_index] = last^
 
+    def _append_reset(
+        mut self, mut output: List[Byte], stream_id: UInt32, code: UInt32
+    ) -> Bool:
+        var reset = encode_rst_stream_frame(stream_id, code)
+        if not reset.is_complete():
+            self._failed = True
+            return False
+        output.extend(Span(reset.wire))
+        return True
+
     def _remove_stream_at(mut self, index: Int):
         var last = self._streams.pop()
         if index < len(self._streams):
             self._streams[index] = last^
-
-
-def _append_session_output[
-    origin: Origin
-](mut output: List[Byte], bytes: Span[Byte, origin]):
-    output.extend(bytes)
 
 
 def _append_window_update(
@@ -669,4 +652,4 @@ def _append_window_update(
         Byte(increment & 0xFF),
     ]
     var frame = encode_frame(Byte(8), Byte(0), stream_id, Span(payload))
-    _append_session_output(output, Span(frame.wire))
+    output.extend(Span(frame.wire))

@@ -13,7 +13,7 @@ from std.ffi import (
     Pointer,
 )
 
-from net.error import NetError, NetErrorKind
+from net.error import NetError, NetErrorKind, _require_handle
 from net.tcp import TCPConn
 
 
@@ -99,24 +99,21 @@ struct TLSContext(Movable):
         var certificate = certificate_path.as_c_string_span()
         var private_key = private_key_path.as_c_string_span()
         var alpn = protocols.as_c_string_span()
-        var context = library.call[
-            "net_tls_context_server",
-            Optional[Pointer[Byte, MutUntrackedOrigin]],
-        ](
-            certificate.ptr(),
-            private_key.ptr(),
-            alpn.ptr(),
+        var context = _require_handle(
+            library.call[
+                "net_tls_context_server",
+                Optional[Pointer[Byte, MutUntrackedOrigin]],
+            ](
+                certificate.ptr(),
+                private_key.ptr(),
+                alpn.ptr(),
+            ),
+            "create TLS server context",
+            "OpenSSL could not load the certificate, key, or ALPN list",
         )
-        if context == None:
-            raise NetError(
-                NetErrorKind.system_error(),
-                "create TLS server context",
-                None,
-                "OpenSSL could not load the certificate, key, or ALPN list",
-            )
         self._library_path = library_path^
         self._library = library^
-        self._context = context.value()
+        self._context = context
 
     def __deinit__(deinit self):
         self._library.call["net_tls_context_free"](self._context)
@@ -124,20 +121,17 @@ struct TLSContext(Movable):
     def accept(mut self, var socket: TCPConn) raises -> TLSConnection:
         var fd = socket.raw_fd()
         var session_library = OwnedDLHandle(self._library_path)
-        var session = self._library.call[
-            "net_tls_connection_new",
-            Optional[Pointer[Byte, MutUntrackedOrigin]],
-        ](self._context, c_int(fd))
-        if session == None:
-            raise NetError(
-                NetErrorKind.system_error(),
-                "create TLS connection",
-                None,
-                "OpenSSL could not create a connection for the socket",
-            )
+        var session = _require_handle(
+            self._library.call[
+                "net_tls_connection_new",
+                Optional[Pointer[Byte, MutUntrackedOrigin]],
+            ](self._context, c_int(fd)),
+            "create TLS connection",
+            "OpenSSL could not create a connection for the socket",
+        )
         return TLSConnection(
             library=session_library^,
-            session=session.value(),
+            session=session,
             socket=socket^,
         )
 

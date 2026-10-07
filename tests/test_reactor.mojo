@@ -250,7 +250,6 @@ def test_remove_then_close_leaves_no_watch_or_leak() raises:
         var server = listener.accept(Timeout.seconds(1))
         var token = reactor.register(server.raw_fd())
         assert_true(reactor.remove(token))
-        reactor.clear()
         client.close()
         server.close()
 
