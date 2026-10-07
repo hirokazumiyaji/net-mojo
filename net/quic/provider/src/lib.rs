@@ -530,6 +530,8 @@ pub unsafe extern "C" fn net_quic_server_respond(
     header_length: usize,
     body_data: *const u8,
     body_length: usize,
+    trailer_data: *const u8,
+    trailer_length: usize,
 ) -> i32 {
     if server.is_null() || !(100..=599).contains(&status) {
         return -1;
@@ -539,6 +541,7 @@ pub unsafe extern "C" fn net_quic_server_respond(
         || body_length > inner.max_response_body_bytes
         || (header_length > 0 && header_data.is_null())
         || (body_length > 0 && body_data.is_null())
+        || (trailer_length > 0 && trailer_data.is_null())
     {
         return -1;
     }
@@ -572,7 +575,41 @@ pub unsafe extern "C" fn net_quic_server_respond(
     } else {
         unsafe { slice::from_raw_parts(body_data, body_length) }.to_vec()
     };
-    i32::from(inner.enqueue_response(request_id, status as u16, headers, body))
+    let trailer_bytes = if trailer_length == 0 {
+        &[][..]
+    } else {
+        unsafe { slice::from_raw_parts(trailer_data, trailer_length) }
+    };
+    let mut trailer_offset = 0usize;
+    let mut trailers: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+    if trailer_length > 0 {
+        let Some(trailer_count) = read_u32(trailer_bytes, &mut trailer_offset) else {
+            return -1;
+        };
+        if trailer_count as usize > inner.max_response_headers_count {
+            return -1;
+        }
+        trailers.reserve(trailer_count as usize);
+        for _ in 0..trailer_count {
+            let Some(name) = read_bytes(trailer_bytes, &mut trailer_offset) else {
+                return -1;
+            };
+            let Some(value) = read_bytes(trailer_bytes, &mut trailer_offset) else {
+                return -1;
+            };
+            trailers.push((name, value));
+        }
+        if trailer_offset != trailer_length {
+            return -1;
+        }
+    }
+    i32::from(inner.enqueue_response(
+        request_id,
+        status as u16,
+        headers,
+        body,
+        trailers,
+    ))
 }
 
 fn read_u32(data: &[u8], offset: &mut usize) -> Option<u32> {
@@ -1025,8 +1062,10 @@ struct PendingResponse {
     request_id: u64,
     headers: Vec<quiche::h3::Header>,
     body: Vec<u8>,
+    trailers: Vec<quiche::h3::Header>,
     headers_sent: bool,
     body_offset: usize,
+    trailers_sent: bool,
     buffered_bytes: usize,
     write_deadline_at: Instant,
 }
@@ -2079,6 +2118,7 @@ impl QuicServer {
         status: u16,
         headers: Vec<(Vec<u8>, Vec<u8>)>,
         body: Vec<u8>,
+        trailers: Vec<(Vec<u8>, Vec<u8>)>,
     ) -> bool {
         let Some((connection_key, stream_id)) = self.request_routes.get(&request_id).cloned()
         else {
@@ -2095,13 +2135,18 @@ impl QuicServer {
         }
         self.send_ready.push(&connection_key);
         let status_value = status.to_string();
+        let trailer_bytes: usize = trailers
+            .iter()
+            .map(|(name, value)| name.len() + value.len())
+            .sum();
         let buffered_bytes = body.len()
             + b":status".len()
             + status_value.len()
             + headers
                 .iter()
                 .map(|(name, value)| name.len() + value.len())
-                .sum::<usize>();
+                .sum::<usize>()
+            + trailer_bytes;
         if !reserve_response_bytes(&mut self.buffered_response_bytes, buffered_bytes) {
             let connection = self.connections.get_mut(&connection_key).unwrap();
             cancel_http3_request(connection, stream_id, H3_EXCESSIVE_LOAD);
@@ -2126,6 +2171,20 @@ impl QuicServer {
             };
             response_headers.push(quiche::h3::Header::new(&normalized, &value));
         }
+        let mut response_trailers = Vec::with_capacity(trailers.len());
+        for (name, value) in trailers {
+            let Some(normalized) = normalize_http3_response_header_name(&name) else {
+                self.buffered_response_bytes -= buffered_bytes;
+                let connection = self.connections.get_mut(&connection_key).unwrap();
+                cancel_http3_request(connection, stream_id, H3_GENERAL_PROTOCOL_ERROR);
+                self.refresh_transport_timeout(&connection_key);
+                self.remove_request_route(request_id);
+                self.refresh_response_ready(&connection_key);
+                self.refresh_goaway_ready(&connection_key);
+                return true;
+            };
+            response_trailers.push(quiche::h3::Header::new(&normalized, &value));
+        }
         let connection = self.connections.get_mut(&connection_key).unwrap();
         connection.responses.insert(
             stream_id,
@@ -2133,8 +2192,10 @@ impl QuicServer {
                 request_id,
                 headers: response_headers,
                 body,
+                trailers: response_trailers,
                 headers_sent: false,
                 body_offset: 0,
+                trailers_sent: false,
                 buffered_bytes,
                 write_deadline_at: Instant::now() + self.write_deadline,
             },
@@ -2162,12 +2223,14 @@ impl QuicServer {
                 let Some(http3) = connection.http3.as_mut() else {
                     continue;
                 };
+                let has_trailers = !response.trailers.is_empty();
                 if !response.headers_sent {
+                    let fin = response.body.is_empty() && !has_trailers;
                     match http3.send_response(
                         &mut connection.transport,
                         stream_id,
                         &response.headers,
-                        response.body.is_empty(),
+                        fin,
                     ) {
                         Ok(()) => {
                             response.headers_sent = true;
@@ -2195,28 +2258,66 @@ impl QuicServer {
                         }
                     }
                 }
-                if response.body.is_empty() {
-                    completed.push((connection_key.clone(), stream_id, response.request_id));
-                    continue;
-                }
-                match http3.send_body(
-                    &mut connection.transport,
-                    stream_id,
-                    &response.body[response.body_offset..],
-                    true,
-                ) {
-                    Ok(written) => {
-                        if written > 0 {
-                            self.send_ready.push(&connection_key);
+                if !response.body.is_empty() {
+                    let body_fin = !has_trailers;
+                    match http3.send_body(
+                        &mut connection.transport,
+                        stream_id,
+                        &response.body[response.body_offset..],
+                        body_fin,
+                    ) {
+                        Ok(written) => {
+                            if written > 0 {
+                                self.send_ready.push(&connection_key);
+                            }
+                            response.body_offset += written;
+                            if response.body_offset != response.body.len() {
+                                continue;
+                            }
                         }
-                        response.body_offset += written;
-                        if response.body_offset == response.body.len() {
+                        Err(quiche::h3::Error::TransportError(quiche::Error::StreamStopped(
+                            _,
+                        ))) => {
+                            self.send_ready.push(&connection_key);
                             completed.push((
                                 connection_key.clone(),
                                 stream_id,
                                 response.request_id,
                             ));
+                            continue;
                         }
+                        Err(quiche::h3::Error::Done | quiche::h3::Error::StreamBlocked) => continue,
+                        Err(quiche::h3::Error::TransportError(
+                            quiche::Error::SendBufferExceeded,
+                        )) => {
+                            self.terminate_send_quota(&connection_key);
+                            continue 'connections;
+                        }
+                        Err(error) => {
+                            self.response_ready.push(&connection_key);
+                            return Err(error.into());
+                        }
+                    }
+                }
+                if !has_trailers {
+                    completed.push((connection_key.clone(), stream_id, response.request_id));
+                    continue;
+                }
+                match http3.send_additional_headers(
+                    &mut connection.transport,
+                    stream_id,
+                    &response.trailers,
+                    true,
+                    true,
+                ) {
+                    Ok(()) => {
+                        response.trailers_sent = true;
+                        self.send_ready.push(&connection_key);
+                        completed.push((
+                            connection_key.clone(),
+                            stream_id,
+                            response.request_id,
+                        ));
                     }
                     Err(quiche::h3::Error::TransportError(quiche::Error::StreamStopped(_))) => {
                         self.send_ready.push(&connection_key);
@@ -2601,6 +2702,7 @@ mod tests {
     use std::ffi::{CStr, CString, c_char};
     use std::net::UdpSocket;
     use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+    use std::ptr;
     use std::time::Duration;
 
     use quiche::{ConnectionId, Header, RecvInfo};
@@ -2829,7 +2931,7 @@ mod tests {
                 .count(),
             2
         );
-        assert!(server.enqueue_response(request.id, 200, Vec::new(), vec![42; 2_000_000]));
+        assert!(server.enqueue_response(request.id, 200, Vec::new(), vec![42; 2_000_000], Vec::new()));
         server.drive_responses().unwrap();
         assert!(
             server
@@ -3185,7 +3287,7 @@ mod tests {
         assert_eq!(server.routes, unrelated);
         assert!(!server.request_routes.contains_key(&request.id));
         assert!(server.request_routes.contains_key(&sibling_request.id));
-        assert!(server.enqueue_response(sibling_request.id, 200, Vec::new(), b"survivor".to_vec()));
+        assert!(server.enqueue_response(sibling_request.id, 200, Vec::new(), b"survivor".to_vec(), Vec::new()));
         let mut received = Vec::new();
         let mut finished = false;
         for _ in 0..32 {
@@ -3293,7 +3395,7 @@ mod tests {
             &quiche::h3::Config::new().unwrap(),
         )
         .unwrap();
-        assert!(server.enqueue_response(responding.id, 200, Vec::new(), vec![42; 2_000_000]));
+        assert!(server.enqueue_response(responding.id, 200, Vec::new(), vec![42; 2_000_000], Vec::new()));
         server.drive_responses().unwrap();
         let mut owned_queued_bytes = 0;
         let before = server.buffered_request_bytes;
@@ -3354,7 +3456,7 @@ mod tests {
         assert!(server.requests.is_empty());
         assert_eq!(server.buffered_request_bytes, 0);
         let survivor = survivor.unwrap();
-        assert!(server.enqueue_response(survivor.id, 200, Vec::new(), b"survivor".to_vec()));
+        assert!(server.enqueue_response(survivor.id, 200, Vec::new(), b"survivor".to_vec(), Vec::new()));
         let mut body = Vec::new();
         let mut finished = false;
         let mut packet = [0; 65535];
@@ -3521,6 +3623,7 @@ mod tests {
                     request.id,
                     200,
                     vec![(b"bad name".to_vec(), b"ignored".to_vec())],
+                    Vec::new(),
                     Vec::new()
                 ));
             } else {
@@ -3529,7 +3632,8 @@ mod tests {
                     request.id,
                     200,
                     Vec::new(),
-                    vec![0; MAX_HTTP3_BUFFERED_RESPONSE_BYTES]
+                    vec![0; MAX_HTTP3_BUFFERED_RESPONSE_BYTES],
+                    Vec::new()
                 ));
             }
             assert!(server.connections[&key].request_route_ids.is_empty());
@@ -3577,7 +3681,7 @@ mod tests {
                 completed_ready_request(&mut server, &mut sibling, &mut sibling_h3, local, other);
             sibling_ids.push((request.id, request.stream_id));
         }
-        assert!(server.enqueue_response(responding.id, 200, Vec::new(), vec![42; 2_000_000]));
+        assert!(server.enqueue_response(responding.id, 200, Vec::new(), vec![42; 2_000_000], Vec::new()));
         server.drive_responses().unwrap();
         let headers = [
             quiche::h3::Header::new(b":method", b"POST"),
@@ -3625,7 +3729,7 @@ mod tests {
         assert_eq!(server.buffered_request_bytes, 0);
         assert_eq!(server.buffered_response_bytes, 0);
         let (sibling_id, sibling_stream) = sibling_ids[0];
-        assert!(server.enqueue_response(sibling_id, 200, Vec::new(), b"survivor".to_vec()));
+        assert!(server.enqueue_response(sibling_id, 200, Vec::new(), b"survivor".to_vec(), Vec::new()));
         let mut body = Vec::new();
         let mut finished = false;
         for _ in 0..32 {
@@ -3672,7 +3776,7 @@ mod tests {
         assert_eq!(server.request_route_visits, 0);
         assert_eq!(server.request_routes, routes_before_reuse);
         assert_request_route_ownership(&server);
-        assert!(server.enqueue_response(reused.id, 200, Vec::new(), b"reused".to_vec()));
+        assert!(server.enqueue_response(reused.id, 200, Vec::new(), b"reused".to_vec(), Vec::new()));
         for _ in 0..32 {
             pump_in_memory(
                 &mut sibling,
@@ -3753,7 +3857,7 @@ mod tests {
             let (mut server, mut client, mut h3, local, remote) = request_timer_peer();
             let request = completed_ready_request(&mut server, &mut client, &mut h3, local, remote);
             let key = server.connections.keys().next().unwrap().clone();
-            assert!(server.enqueue_response(request.id, 200, Vec::new(), vec![42; 2_000_000]));
+            assert!(server.enqueue_response(request.id, 200, Vec::new(), vec![42; 2_000_000], Vec::new()));
             server.drive_responses().unwrap();
             let retained = server.buffered_response_bytes;
             assert!(retained >= 2_000_000);
@@ -3832,7 +3936,7 @@ mod tests {
         for connection in server.connections.values_mut() {
             connection.response_drive_visits = 0;
         }
-        assert!(server.enqueue_response(request.id, 200, Vec::new(), vec![42; 2_000_000]));
+        assert!(server.enqueue_response(request.id, 200, Vec::new(), vec![42; 2_000_000], Vec::new()));
         server.drive_responses().unwrap();
         assert_eq!(
             server
@@ -3861,7 +3965,7 @@ mod tests {
         let (mut server, mut client, mut h3, local, remote) = request_timer_peer();
         let first = completed_ready_request(&mut server, &mut client, &mut h3, local, remote);
         let key = server.connections.keys().next().unwrap().clone();
-        assert!(server.enqueue_response(first.id, 200, Vec::new(), vec![42; 2_000_000]));
+        assert!(server.enqueue_response(first.id, 200, Vec::new(), vec![42; 2_000_000], Vec::new()));
         server.drive_responses().unwrap();
         let rejected = completed_ready_request(&mut server, &mut client, &mut h3, local, remote);
         assert_eq!(server.connections[&key].responses.len(), 1);
@@ -3872,6 +3976,7 @@ mod tests {
             rejected.id,
             200,
             vec![(b"bad name".to_vec(), b"ignored".to_vec())],
+            Vec::new(),
             Vec::new()
         ));
         assert_eq!(server.buffered_response_bytes, retained);
@@ -3909,7 +4014,7 @@ mod tests {
             &quiche::h3::Config::new().unwrap(),
         )
         .unwrap();
-        assert!(server.enqueue_response(request.id, 200, Vec::new(), vec![42; 2_000_000]));
+        assert!(server.enqueue_response(request.id, 200, Vec::new(), vec![42; 2_000_000], Vec::new()));
         server.drive_responses().unwrap();
         let offset = server.connections[&key].responses[&request.stream_id].body_offset;
         assert!(offset > 0 && offset < 2_000_000);
@@ -3958,7 +4063,7 @@ mod tests {
         }
         let sibling_request = server.next_request().unwrap();
         assert_eq!(sibling_request.stream_id, sibling_id);
-        assert!(server.enqueue_response(sibling_request.id, 200, Vec::new(), b"alive".to_vec()));
+        assert!(server.enqueue_response(sibling_request.id, 200, Vec::new(), b"alive".to_vec(), Vec::new()));
         while let Some((length, info)) = server.send(&mut packet).unwrap() {
             if info.to == remote {
                 held.push(packet[..length].to_vec());
@@ -4052,7 +4157,7 @@ mod tests {
             }
             let request = server.next_request().unwrap();
             assert_eq!(request.stream_id, cancelled_id);
-            assert!(server.enqueue_response(request.id, 200, Vec::new(), vec![42; 2_000_000]));
+            assert!(server.enqueue_response(request.id, 200, Vec::new(), vec![42; 2_000_000], Vec::new()));
             if started {
                 server.drive_responses().unwrap();
             }
@@ -4097,7 +4202,7 @@ mod tests {
                 }
                 let request = server.next_request().unwrap();
                 assert_eq!(request.stream_id, id);
-                assert!(server.enqueue_response(request.id, 200, Vec::new(), b"alive".to_vec()));
+                assert!(server.enqueue_response(request.id, 200, Vec::new(), b"alive".to_vec(), Vec::new()));
                 let mut body = Vec::new();
                 let mut finished = false;
                 for _ in 0..64 {
@@ -4225,7 +4330,7 @@ mod tests {
         }
         let request = server.next_request().unwrap();
         let key = server.connections.keys().next().unwrap().clone();
-        assert!(server.enqueue_response(request.id, 200, Vec::new(), vec![42; 2_000_000]));
+        assert!(server.enqueue_response(request.id, 200, Vec::new(), vec![42; 2_000_000], Vec::new()));
         server.drive_responses().unwrap();
         assert_eq!(server.connections[&key].responses.len(), 1);
         let now = std::time::Instant::now();
@@ -4297,7 +4402,8 @@ mod tests {
                     vec![42; 4]
                 } else {
                     vec![42; 2_000_000]
-                }
+                },
+                Vec::new()
             ));
             let retained = server.buffered_response_bytes;
             let original_deadline = server.response_timeouts.first().unwrap().0;
@@ -4314,6 +4420,8 @@ mod tests {
                         headers.len(),
                         body.as_ptr(),
                         body.len(),
+                        ptr::null(),
+                        0,
                     )
                 },
                 0
@@ -4828,7 +4936,7 @@ mod tests {
             request_ids.push(request.id);
         }
         for request_id in request_ids {
-            assert!(server.enqueue_response(request_id, 200, Vec::new(), vec![42; 65536]));
+            assert!(server.enqueue_response(request_id, 200, Vec::new(), vec![42; 65536], Vec::new()));
         }
         let first = server.send(&mut packet).unwrap().unwrap().1.to;
         let second = server.send(&mut packet).unwrap().unwrap().1.to;
@@ -5503,6 +5611,8 @@ mod tests {
                     response_headers.len(),
                     response_body.as_ptr(),
                     response_body.len(),
+                    ptr::null(),
+                    0,
                 )
             },
             1
@@ -6276,7 +6386,8 @@ mod tests {
                     request.id,
                     200,
                     Vec::new(),
-                    b"response".to_vec()
+                    b"response".to_vec(),
+                    Vec::new()
                 ));
                 self.pump_until(|server| {
                     server.connections.values().all(|c| c.responses.is_empty())
@@ -6561,7 +6672,7 @@ mod tests {
             assert!(
                 fixture
                     .server
-                    .enqueue_response(request.id, 200, Vec::new(), vec![0; 32])
+                    .enqueue_response(request.id, 200, Vec::new(), vec![0; 32], Vec::new())
             );
             let key = fixture.server.connections.keys().next().unwrap().clone();
             fixture.server.remove_response_timeout(&key, id);
@@ -6803,7 +6914,7 @@ mod tests {
                 // address (not just ACKs/PATH_CHALLENGE) before declaring
                 // the connection usable.
                 assert!(
-                    server.enqueue_response(request.id, 200, Vec::new(), b"rebound-ok".to_vec()),
+                    server.enqueue_response(request.id, 200, Vec::new(), b"rebound-ok".to_vec(), Vec::new()),
                     "server must enqueue rebound response"
                 );
                 let mut response_bytes_to_rebound = 0;
@@ -7041,6 +7152,69 @@ mod tests {
             server.estimated_transport_memory_bytes(),
             super::ESTIMATED_QUIC_TRANSPORT_BYTES_PER_CONNECTION
         );
+    }
+
+    #[test]
+    fn responses_with_trailers_emit_trailer_section_after_body() {
+        let (mut server, mut client, mut h3, local, remote) = request_timer_peer();
+        let request = completed_ready_request(&mut server, &mut client, &mut h3, local, remote);
+        assert!(server.enqueue_response(
+            request.id,
+            200,
+            Vec::new(),
+            b"payload".to_vec(),
+            vec![(b"x-digest".to_vec(), b"deadbeef".to_vec())],
+        ));
+        let mut body = Vec::new();
+        let mut trailer_values = Vec::new();
+        let mut saw_trailer_section = false;
+        for _ in 0..32 {
+            pump_in_memory(
+                &mut client,
+                &mut server,
+                &mut [0; 65535],
+                local,
+                remote,
+                false,
+                false,
+            );
+            loop {
+                match h3.poll(&mut client) {
+                    Ok((stream_id, quiche::h3::Event::Data)) if stream_id == request.stream_id => {
+                        let mut chunk = [0; 4096];
+                        while let Ok(length) =
+                            h3.recv_body(&mut client, request.stream_id, &mut chunk)
+                        {
+                            body.extend_from_slice(&chunk[..length]);
+                            if length == 0 {
+                                break;
+                            }
+                        }
+                    }
+                    Ok((stream_id, quiche::h3::Event::Headers { list, .. }))
+                        if stream_id == request.stream_id =>
+                    {
+                        if !body.is_empty() {
+                            saw_trailer_section = true;
+                            for header in list {
+                                if header.name() == b"x-digest" {
+                                    trailer_values.push(header.value().to_vec());
+                                }
+                            }
+                        }
+                    }
+                    Ok(_) => (),
+                    Err(quiche::h3::Error::Done) => break,
+                    Err(error) => panic!("response poll failed: {error:?}"),
+                }
+            }
+            if saw_trailer_section {
+                break;
+            }
+        }
+        assert_eq!(body, b"payload");
+        assert!(saw_trailer_section);
+        assert_eq!(trailer_values, vec![b"deadbeef".to_vec()]);
     }
 
     #[test]

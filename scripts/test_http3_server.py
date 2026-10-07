@@ -394,6 +394,14 @@ async def run_client(address):
                 raise RuntimeError(f"unexpected HTTP/3 response headers: {response}")
             if bytes(response["body"]) != expected_body:
                 raise RuntimeError(f"unexpected HTTP/3 response body: {response}")
+        if (b"x-digest", b"ok") not in first["headers"]:
+            raise RuntimeError(
+                f"expected server trailer x-digest=ok on trailered POST: {first}"
+            )
+        if any(name == b"x-digest" for name, _ in second["headers"]):
+            raise RuntimeError(
+                f"unexpected trailer on plain POST without request trailers: {second}"
+            )
 
         # Re-check after traffic: still must be h3, never HTTPS-only.
         require_http3_alpn(client.alpn)

@@ -11,6 +11,7 @@ from net.http._http2.control_frames import parse_goaway_frame
 from net.http._http2.window_update import parse_window_update_frame
 from net.http._http2.response_encoder import (
     encode_http2_response_header_frames,
+    encode_http2_response_trailer_frames,
 )
 from net.http._http2.request_headers import decode_http2_request_headers
 from net.http.response import ResponseWriter
@@ -1391,6 +1392,290 @@ def test_http2_scheduler_peer_reset_after_headers_sent_removes_entry() raises:
     assert_false(reset.kept_headers)
     assert_equal(reset.released_bytes, 11)
     assert_equal(scheduler.queued_count(), 0)
+
+
+def _encode_trailer_wire(
+    mut deflater: Http2HpackDeflater,
+    mut writer: ResponseWriter,
+    stream_id: UInt32,
+) raises -> List[Byte]:
+    var scratch = Array[Byte, 1024](fill=0)
+    var encoded = encode_http2_response_trailer_frames(
+        deflater,
+        writer,
+        False,
+        stream_id,
+        4096,
+        32,
+        16384,
+        1024,
+        Span[mut=True](scratch),
+    )
+    assert_true(encoded.is_complete())
+    var wire = encoded.wire^
+    encoded.wire = List[Byte]()
+    return wire^
+
+
+def _enqueue_with_trailers(
+    mut scheduler: Http2ResponseScheduler,
+    stream_id: UInt32,
+    var body: List[Byte],
+    mut deflater: Http2HpackDeflater,
+    mut writer: ResponseWriter,
+) raises:
+    var header_payload = List[Byte]()
+    var headers = List[Byte]()
+    _append_frame(headers, Byte(1), Byte(0), stream_id, Span(header_payload))
+    var trailers = _encode_trailer_wire(deflater, writer, stream_id)
+    assert_true(
+        scheduler.enqueue(
+            stream_id,
+            headers^,
+            body^,
+            end_on_headers=False,
+            trailers=trailers^,
+        )
+    )
+
+
+def test_http2_scheduler_sends_trailer_headers_after_data() raises:
+    var session = Http2RequestSession("build/http2/libnet_hpack", 4, 1024)
+    _bootstrap_session(session)
+    var opening_fields: List[Byte] = [
+        0x82,
+        0x86,
+        0x84,
+        0x01,
+        0x01,
+        Byte(ord("x")),
+    ]
+    var opening = List[Byte]()
+    _append_frame(opening, Byte(1), Byte(5), UInt32(1), Span(opening_fields))
+    assert_true(session.consume(Span(opening)).is_request())
+
+    var deflater = Http2HpackDeflater("build/http2/libnet_hpack", 4096)
+    var writer = ResponseWriter(64)
+    writer.set_status(200)
+    writer.add_trailer(String("x-digest"), String("deadbeef"))
+    var body: List[Byte] = [Byte(ord("A")), Byte(ord("B")), Byte(ord("C"))]
+
+    var scheduler = Http2ResponseScheduler()
+    _enqueue_with_trailers(scheduler, UInt32(1), body^, deflater, writer)
+
+    var batch = scheduler.drain(session, 16384, 65536)
+    assert_equal(len(batch.completed_streams), 1)
+    assert_equal(batch.completed_streams[0], UInt32(1))
+
+    var saw_data_without_end = False
+    var saw_trailer_headers = False
+    var offset = 0
+    while offset < len(batch.wire):
+        var frame = parse_frame(Span(batch.wire)[offset:])
+        assert_true(frame.is_complete())
+        if frame.frame_type == Byte(0):
+            saw_data_without_end = True
+            assert_equal(frame.flags & Byte(1), Byte(0))
+        elif frame.frame_type == Byte(1):
+            if saw_data_without_end:
+                saw_trailer_headers = True
+                assert_equal(frame.flags & Byte(1), Byte(1))
+                assert_equal(frame.flags & Byte(4), Byte(4))
+                var inflater = Http2HpackInflater(
+                    "build/http2/libnet_hpack", 4096
+                )
+                var decoded_fields = Array[Byte, 1024](fill=0)
+                var decoded = inflater.decode(
+                    Span(batch.wire)[offset + 9 : offset + frame.consumed],
+                    4096,
+                    32,
+                    Span(decoded_fields),
+                )
+                assert_true(decoded.is_success())
+                assert_equal(decoded.field_count, 1)
+        offset += frame.consumed
+    assert_true(saw_data_without_end)
+    assert_true(saw_trailer_headers)
+
+
+def test_http2_scheduler_withholds_trailers_until_credit_arrives() raises:
+    var session = Http2RequestSession("build/http2/libnet_hpack", 4, 1024)
+    var wire = List[Byte]()
+    var preface = "PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n".as_bytes()
+    for i in range(len(preface)):
+        wire.append(preface[i])
+    var initial_window: List[Byte] = [
+        Byte(0),
+        Byte(4),
+        Byte(0),
+        Byte(0),
+        Byte(0),
+        Byte(2),
+    ]
+    _append_frame(wire, Byte(4), Byte(0), UInt32(0), Span(initial_window))
+    var opening_fields: List[Byte] = [
+        0x82,
+        0x86,
+        0x84,
+        0x01,
+        0x01,
+        Byte(ord("x")),
+    ]
+    _append_frame(wire, Byte(1), Byte(5), UInt32(1), Span(opening_fields))
+    assert_true(session.consume(Span(wire)).is_request())
+
+    var deflater = Http2HpackDeflater("build/http2/libnet_hpack", 4096)
+    var writer = ResponseWriter(64)
+    writer.set_status(200)
+    writer.add_trailer(String("x-digest"), String("ff"))
+    var body: List[Byte] = [
+        Byte(ord("a")),
+        Byte(ord("b")),
+        Byte(ord("c")),
+        Byte(ord("d")),
+    ]
+
+    var scheduler = Http2ResponseScheduler()
+    _enqueue_with_trailers(scheduler, UInt32(1), body^, deflater, writer)
+
+    var first = scheduler.drain(session, 16384, 65536)
+    assert_equal(len(first.completed_streams), 0)
+    var saw_trailers_before_credit = False
+    var offset = 0
+    while offset < len(first.wire):
+        var frame = parse_frame(Span(first.wire)[offset:])
+        if (
+            frame.frame_type == Byte(1)
+            and frame.stream_id == UInt32(1)
+            and (frame.flags & Byte(1)) == Byte(1)
+        ):
+            saw_trailers_before_credit = True
+        offset += frame.consumed
+    assert_false(saw_trailers_before_credit)
+
+    var credit = List[Byte]()
+    var increment: List[Byte] = [Byte(0), Byte(0), Byte(0), Byte(4)]
+    _append_frame(credit, Byte(8), Byte(0), UInt32(1), Span(increment))
+    assert_true(session.consume(Span(credit)).is_pending())
+
+    var second = scheduler.drain(session, 16384, 65536)
+    assert_equal(len(second.completed_streams), 1)
+    var saw_trailer_headers = False
+    offset = 0
+    while offset < len(second.wire):
+        var frame = parse_frame(Span(second.wire)[offset:])
+        if frame.frame_type == Byte(1) and (frame.flags & Byte(1)) == Byte(1):
+            saw_trailer_headers = True
+        offset += frame.consumed
+    assert_true(saw_trailer_headers)
+
+
+def test_http2_scheduler_interleaved_trailers_decode_in_order() raises:
+    var session = Http2RequestSession("build/http2/libnet_hpack", 4, 1024)
+    _bootstrap_session(session)
+    var opening_fields: List[Byte] = [
+        0x82,
+        0x86,
+        0x84,
+        0x01,
+        0x01,
+        Byte(ord("x")),
+    ]
+    var opening = List[Byte]()
+    _append_frame(opening, Byte(1), Byte(5), UInt32(1), Span(opening_fields))
+    _append_frame(opening, Byte(1), Byte(5), UInt32(3), Span(opening_fields))
+    var first = session.consume(Span(opening))
+    assert_true(first.is_request())
+    var second = session.consume(Span(opening)[first.consumed :])
+    assert_true(second.is_request())
+
+    var deflater = Http2HpackDeflater("build/http2/libnet_hpack", 4096)
+    var writer1 = ResponseWriter(64)
+    writer1.set_status(200)
+    writer1.headers.add("x-trace", "one")
+    writer1.add_trailer(String("x-digest"), String("1111"))
+    var writer3 = ResponseWriter(64)
+    writer3.set_status(200)
+    writer3.headers.add("x-trace", "two")
+    writer3.add_trailer(String("x-digest"), String("3333"))
+
+    var scheduler = Http2ResponseScheduler()
+    var compressed_scratch1 = Array[Byte, 1024](fill=0)
+    var header_frames1 = encode_http2_response_header_frames(
+        deflater,
+        writer1,
+        False,
+        "Thu, 01 Jan 1970 00:00:00 GMT",
+        UInt32(1),
+        4096,
+        32,
+        16384,
+        2048,
+        Span[mut=True](compressed_scratch1),
+    )
+    assert_true(header_frames1.is_complete())
+    var compressed_scratch3 = Array[Byte, 1024](fill=0)
+    var header_frames3 = encode_http2_response_header_frames(
+        deflater,
+        writer3,
+        False,
+        "Thu, 01 Jan 1970 00:00:00 GMT",
+        UInt32(3),
+        4096,
+        32,
+        16384,
+        2048,
+        Span[mut=True](compressed_scratch3),
+    )
+    assert_true(header_frames3.is_complete())
+
+    var body1: List[Byte] = [Byte(ord("x")), Byte(ord("y"))]
+    var body3: List[Byte] = [Byte(ord("p")), Byte(ord("q"))]
+    var header_wire1 = header_frames1.wire^
+    header_frames1.wire = List[Byte]()
+    var header_wire3 = header_frames3.wire^
+    header_frames3.wire = List[Byte]()
+    var trailers1 = _encode_trailer_wire(deflater, writer1, UInt32(1))
+    var trailers3 = _encode_trailer_wire(deflater, writer3, UInt32(3))
+    assert_true(
+        scheduler.enqueue(
+            UInt32(1),
+            header_wire1^,
+            body1^,
+            end_on_headers=False,
+            trailers=trailers1^,
+        )
+    )
+    assert_true(
+        scheduler.enqueue(
+            UInt32(3),
+            header_wire3^,
+            body3^,
+            end_on_headers=False,
+            trailers=trailers3^,
+        )
+    )
+
+    var batch = scheduler.drain(session, 16384, 65536)
+    assert_equal(len(batch.completed_streams), 2)
+    var inflater = Http2HpackInflater("build/http2/libnet_hpack", 4096)
+    var header_blocks_seen = 0
+    var offset = 0
+    while offset < len(batch.wire):
+        var frame = parse_frame(Span(batch.wire)[offset:])
+        if frame.frame_type == Byte(1):
+            var decoded_fields = Array[Byte, 2048](fill=0)
+            var decoded = inflater.decode(
+                Span(batch.wire)[offset + 9 : offset + frame.consumed],
+                4096,
+                32,
+                Span(decoded_fields),
+            )
+            assert_true(decoded.is_success())
+            header_blocks_seen += 1
+        offset += frame.consumed
+    # Two response HEADERS + two trailer HEADERS, all decoded consistently.
+    assert_equal(header_blocks_seen, 4)
 
 
 def main() raises:

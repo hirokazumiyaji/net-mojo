@@ -248,7 +248,7 @@ fn provider_receive_two_clients_share_cap_and_close_refunds() {
     let completed = server.next_request().unwrap();
     assert_eq!(completed.stream_id, id);
     assert!(completed.body.is_empty());
-    assert!(server.enqueue_response(completed.id, 200, Vec::new(), b"alive".to_vec()));
+    assert!(server.enqueue_response(completed.id, 200, Vec::new(), b"alive".to_vec(), Vec::new()));
     for _ in 0..8 {
         receive_budget_pump(&mut server, &mut peers);
     }

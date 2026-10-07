@@ -162,6 +162,38 @@ struct Http2HpackDeflater(Movable):
         max_fields: Int,
         output: Span[mut=True, Byte, output_origin],
     ) -> HpackEncodeResult:
+        return self._encode["net_hpack_encode"](
+            fields, max_header_list_size, max_fields, output
+        )
+
+    def encode_no_index[
+        field_origin: ImmOrigin,
+        output_origin: MutOrigin,
+    ](
+        mut self,
+        fields: Span[Byte, field_origin],
+        max_header_list_size: Int,
+        max_fields: Int,
+        output: Span[mut=True, Byte, output_origin],
+    ) -> HpackEncodeResult:
+        # Trailer blocks encode here. "Never Indexed" skips dynamic-table
+        # mutation on both deflater and inflater, so the block has no
+        # ordering dependency against other streams' indexed HEADERS.
+        return self._encode["net_hpack_encode_no_index"](
+            fields, max_header_list_size, max_fields, output
+        )
+
+    def _encode[
+        symbol: StaticString,
+        field_origin: ImmOrigin,
+        output_origin: MutOrigin,
+    ](
+        mut self,
+        fields: Span[Byte, field_origin],
+        max_header_list_size: Int,
+        max_fields: Int,
+        output: Span[mut=True, Byte, output_origin],
+    ) -> HpackEncodeResult:
         if self._failed:
             return HpackEncodeResult(status=2, output_length=0)
         if max_header_list_size < 0 or max_fields < 0:
@@ -170,7 +202,7 @@ struct Http2HpackDeflater(Movable):
         var output_length_ptr = Pointer[c_size_t, origin_of(output_length)](
             to=output_length
         )
-        var status = self._library.call["net_hpack_encode", c_int](
+        var status = self._library.call[symbol, c_int](
             self._deflater,
             fields.unsafe_ptr(),
             c_size_t(len(fields)),

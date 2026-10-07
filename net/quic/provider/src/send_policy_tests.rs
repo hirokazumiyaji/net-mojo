@@ -187,7 +187,7 @@ fn provider_send_whole_copy_quota_case(headers_fail: bool) {
     } else {
         (Vec::new(), vec![b'x'; 8_192])
     };
-    assert!(server.enqueue_response(target.id, 200, headers, body));
+    assert!(server.enqueue_response(target.id, 200, headers, body, Vec::new()));
     let control_before = budget.usage().control;
     let result = server.drive_responses();
     eprintln!(
@@ -239,7 +239,7 @@ fn provider_send_whole_copy_quota_case(headers_fail: bool) {
         }
         let request = server.next_request().unwrap();
         assert_eq!(request.stream_id, stream);
-        assert!(server.enqueue_response(request.id, 200, Vec::new(), b"alive".to_vec()));
+        assert!(server.enqueue_response(request.id, 200, Vec::new(), b"alive".to_vec(), Vec::new()));
         let mut body = Vec::new();
         let mut finished = false;
         for _ in 0..32 {
@@ -413,7 +413,7 @@ fn provider_send_quota_drops_connection_when_close_cannot_be_queued() {
     let request = server.next_request().unwrap();
     assert_eq!(request.stream_id, stream);
     let key = server.request_routes[&request.id].0.clone();
-    assert!(server.enqueue_response(request.id, 200, Vec::new(), vec![b'x'; 4_096]));
+    assert!(server.enqueue_response(request.id, 200, Vec::new(), vec![b'x'; 4_096], Vec::new()));
     assert!(server.connections[&key].transport.local_error().is_none());
 
     peer.client.close(false, 0x1, b"peer close").unwrap();
@@ -596,7 +596,7 @@ fn provider_send_real_packet_loss_quota_still_emits_close_and_serves_sibling() {
     let request = server.next_request().unwrap();
     assert_eq!(request.stream_id, stream);
     let key = server.request_routes[&request.id].0.clone();
-    assert!(server.enqueue_response(request.id, 200, Vec::new(), vec![b'x'; 4_096]));
+    assert!(server.enqueue_response(request.id, 200, Vec::new(), vec![b'x'; 4_096], Vec::new()));
     server.drive_responses().unwrap();
     assert_eq!(server.buffered_response_bytes, 0);
     assert!(budget.usage().request.backing_bytes >= 4_096);
@@ -683,7 +683,7 @@ fn provider_send_real_packet_loss_quota_still_emits_close_and_serves_sibling() {
     }
     let sibling = server.next_request().unwrap();
     assert_eq!(sibling.stream_id, sibling_stream);
-    assert!(server.enqueue_response(sibling.id, 200, Vec::new(), b"alive".to_vec()));
+    assert!(server.enqueue_response(sibling.id, 200, Vec::new(), b"alive".to_vec(), Vec::new()));
     let mut body = Vec::new();
     let mut finished = false;
     for _ in 0..32 {
@@ -853,7 +853,7 @@ fn public_send_request_zero(slots: bool) {
     } else {
         let request = server.next_request().unwrap();
         assert_eq!(request.stream_id, id);
-        assert!(server.enqueue_response(request.id, 200, Vec::new(), b"alive".to_vec()));
+        assert!(server.enqueue_response(request.id, 200, Vec::new(), b"alive".to_vec(), Vec::new()));
         server.drive_responses().unwrap();
     }
     public_send_close(
@@ -977,7 +977,7 @@ fn provider_send_public_crypto_zero_slots_restore_original_initial_and_sibling()
         }
         let request = server.next_request().unwrap();
         assert_eq!(request.stream_id, stream);
-        assert!(server.enqueue_response(request.id, 200, Vec::new(), b"alive".to_vec()));
+        assert!(server.enqueue_response(request.id, 200, Vec::new(), b"alive".to_vec(), Vec::new()));
         let mut body = Vec::new();
         let mut finished = false;
         for _ in 0..32 {

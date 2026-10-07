@@ -142,3 +142,41 @@ def encode_http2_response_headers(
             return Http2ResponseHeadersResult.error()
 
     return Http2ResponseHeadersResult.valid(fields^, field_count, send_body)
+
+
+def encode_http2_response_trailers(
+    writer: ResponseWriter,
+    is_head: Bool,
+    max_header_list_size: Int,
+    max_fields: Int,
+) -> Http2ResponseHeadersResult:
+    if max_header_list_size < 0 or max_fields < 1:
+        return Http2ResponseHeadersResult.error()
+    if is_head or not has_body_for_status(writer.status, is_head):
+        return Http2ResponseHeadersResult.valid(
+            List[Byte](), 0, send_body=False
+        )
+    if len(writer.trailers) == 0:
+        return Http2ResponseHeadersResult.valid(
+            List[Byte](), 0, send_body=False
+        )
+
+    var header_list_size = 0
+    var field_count = 0
+    var fields = List[Byte]()
+    for i in range(len(writer.trailers)):
+        ref name = writer.trailers._lower_names[i]
+        var value = writer.trailers._value_bytes_span(i)
+        if _is_connection_specific(name) or name == "te":
+            continue
+        header_list_size += _field_size(name.byte_length(), len(value))
+        field_count += 1
+        if (
+            field_count > max_fields
+            or header_list_size > max_header_list_size
+            or not _append_field(fields, name, value)
+        ):
+            return Http2ResponseHeadersResult.error()
+    return Http2ResponseHeadersResult.valid(
+        fields^, field_count, send_body=False
+    )

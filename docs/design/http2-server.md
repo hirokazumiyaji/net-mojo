@@ -184,6 +184,33 @@ The shared response encoder composes header adaptation, connection-owned HPACK
 compression, and frame generation; output failure after compression makes that
 deflater terminal because the peer did not receive its updated table state.
 
+## Response trailers
+
+When `ResponseWriter.trailers` carries at least one entry on a body-capable
+status, the server emits DATA frames without END_STREAM and finishes the
+stream with a trailer HEADERS block (plus CONTINUATION frames when needed)
+that carries END_STREAM. HEAD responses and statuses that cannot carry a
+body (1xx/204/205/304) silently drop trailers before encoding. The trailer
+field list rejects HTTP/1-specific hop-by-hop names and `TE` the same way
+response headers do.
+
+Trailer HPACK encoding uses Literal Header Field Never Indexed
+(`NGHTTP2_NV_FLAG_NO_INDEX`) for every field. Response HEADERS are encoded
+at enqueue time because the scheduler owns the HPACK deflater, so trailer
+frames would otherwise need to be interleaved with other streams'
+dynamic-table-mutating HEADERS. "Never Indexed" trailer entries do not
+insert into either peer's dynamic table, so a trailer block encoded now and
+flushed later cannot desynchronize decode order against any other stream's
+response HEADERS. Trailer wire bytes are reserved against the shared
+response budget on enqueue and released when the stream completes.
+
+The response scheduler sends trailers only after the last DATA chunk leaves
+the per-stream send window, so flow-blocked streams keep the trailer section
+behind the final DATA frame. A client RST_STREAM before headers have been
+flushed clears the pending trailer bytes along with the body; after the
+headers block has been flushed, the whole entry (headers + body + trailers)
+is dropped on the subsequent reset notification.
+
 ## Integrated flow control and response scheduling
 
 The server tracks connection and stream send windows independently and applies

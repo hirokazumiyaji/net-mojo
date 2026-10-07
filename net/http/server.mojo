@@ -108,7 +108,7 @@ from net.http._http2.request_session import (
 from net.http._http2.response_headers import _content_length_matches
 from net.http._http2.response_encoder import (
     encode_http2_response_header_frames,
-    http2_response_end_on_headers,
+    encode_http2_response_trailer_frames,
 )
 from net.http._http2.control_frames import encode_rst_stream_frame
 
@@ -865,9 +865,11 @@ struct Server(Movable):
                 response._cancel_detach()
                 response.status = 500
                 response.body.clear()
+                response.trailers.clear()
             if response.status < 100 or response.status > 599:
                 response.status = 500
                 response.body.clear()
+                response.trailers.clear()
             var response_header_bytes = 0
             for i in range(len(response.headers)):
                 response_header_bytes += (
@@ -882,6 +884,7 @@ struct Server(Movable):
             ):
                 response.status = 500
                 response.headers.clear()
+                response.trailers.clear()
                 response.body.clear()
             var wire_length = -1
             if has_body_for_status(response.status, False):
@@ -923,6 +926,7 @@ struct Server(Movable):
             response.body = List[Byte]()
             if not has_body_for_status(response.status, is_head):
                 response_body.clear()
+                response.trailers.clear()
             if (
                 len(response_body) > self.config.max_response_body
                 or len(headers) > self.config.max_response_headers_bytes
@@ -932,12 +936,38 @@ struct Server(Movable):
                 headers.clear()
                 _append_quic_u32(headers, UInt32(0))
                 response_body.clear()
+                response.trailers.clear()
+            var trailers = List[Byte]()
+            if len(response.trailers) > 0:
+                var trailer_bytes = 0
+                for i in range(len(response.trailers)):
+                    trailer_bytes += (
+                        response.trailers.name_at(i).byte_length()
+                        + response.trailers.value_byte_length(i)
+                        + 4
+                    )
+                if (
+                    len(response.trailers)
+                    > self.config.max_response_headers_count
+                    or trailer_bytes > self.config.max_response_headers_bytes
+                ):
+                    response.trailers.clear()
+            if len(response.trailers) > 0:
+                _append_quic_u32(trailers, UInt32(len(response.trailers)))
+                for i in range(len(response.trailers)):
+                    _append_quic_field(
+                        trailers, response.trailers._names[i].as_bytes()
+                    )
+                    _append_quic_field(
+                        trailers, response.trailers._value_bytes_span(i)
+                    )
             try:
                 self._quic_endpoint.value().respond(
                     request_id,
                     response.status,
                     Span(headers),
                     Span(response_body),
+                    Span(trailers),
                 )
             except e:
                 _ = e
@@ -1528,6 +1558,7 @@ struct Server(Movable):
             _ = e
             writer.set_status(500)
             writer.headers.clear()
+            writer.trailers.clear()
             writer.body.clear()
 
         self._budget.release(request_body_bytes)
@@ -1540,10 +1571,12 @@ struct Server(Movable):
             writer._cancel_detach()
             writer.set_status(500)
             writer.headers.clear()
+            writer.trailers.clear()
             writer.body.clear()
         if len(writer.body) > cap:
             writer.set_status(500)
             writer.headers.clear()
+            writer.trailers.clear()
             writer.body.clear()
 
         try:
@@ -1621,6 +1654,7 @@ struct Server(Movable):
             # streams on the same connection stay alive.
             writer.set_status(500)
             writer.headers.clear()
+            writer.trailers.clear()
             writer.body.clear()
             encoded = encode_http2_response_header_frames(
                 self._conns[idx].http2_deflater.value(),
@@ -1645,15 +1679,57 @@ struct Server(Movable):
         writer.body = List[Byte]()
         if not has_body_for_status(writer.status, is_head):
             response_body.clear()
+            writer.trailers.clear()
         var headers_wire = encoded.wire^
         encoded.wire = List[Byte]()
-        var response_reservation = len(headers_wire) + len(response_body)
+
+        var trailer_wire = List[Byte]()
+        if len(writer.trailers) > 0:
+            var trailer_room = (
+                self._budget.remaining()
+                - len(control_output)
+                - len(headers_wire)
+                - len(response_body)
+            )
+            if trailer_room < 0:
+                trailer_room = 0
+            if trailer_room > max_response_header_bytes:
+                trailer_room = max_response_header_bytes
+            var trailer_compressed = List[Byte](
+                length=compressed_capacity, fill=0
+            )
+            var trailer_encoded = encode_http2_response_trailer_frames(
+                self._conns[idx].http2_deflater.value(),
+                writer,
+                is_head,
+                stream_id,
+                max_response_header_bytes,
+                self.config.max_response_headers_count,
+                16384,
+                trailer_room,
+                Span(trailer_compressed),
+            )
+            if trailer_encoded.is_complete():
+                trailer_wire = trailer_encoded.wire^
+                trailer_encoded.wire = List[Byte]()
+            # Encoding uses no-indexing HPACK literals, so a failure never
+            # poisons the deflater; dropping the trailer section is safe.
+
+        var response_reservation = (
+            len(headers_wire) + len(response_body) + len(trailer_wire)
+        )
         if not self._budget.try_reserve(response_reservation):
             self._refuse_http2_stream(idx, stream_id, UInt32(7))
             return
-        var end_on_headers = http2_response_end_on_headers(writer, is_head)
+        var end_on_headers = (
+            not has_body_for_status(writer.status, is_head)
+        ) or (len(response_body) == 0 and len(trailer_wire) == 0)
         if not self._conns[idx].http2_responses.enqueue(
-            stream_id, headers_wire^, response_body^, end_on_headers
+            stream_id,
+            headers_wire^,
+            response_body^,
+            end_on_headers,
+            trailer_wire^,
         ):
             self._budget.release(response_reservation)
             self._refuse_http2_stream(idx, stream_id, UInt32(7))

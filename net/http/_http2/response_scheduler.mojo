@@ -10,9 +10,12 @@ struct _PendingHttp2Response(Movable):
     var stream_id: UInt32
     var headers: List[Byte]
     var body: List[Byte]
+    var trailers: List[Byte]
     var body_offset: Int
     var headers_offset: Int
+    var trailers_offset: Int
     var headers_sent: Bool
+    var trailers_sent: Bool
     var end_on_headers: Bool
     var cancelled: Bool
 
@@ -44,8 +47,11 @@ struct Http2ResponseScheduler(Movable):
         var headers: List[Byte],
         var body: List[Byte],
         end_on_headers: Bool = False,
+        var trailers: List[Byte] = List[Byte](),
     ) -> Bool:
         if stream_id == UInt32(0) or len(headers) == 0:
+            return False
+        if end_on_headers and len(trailers) > 0:
             return False
         for i in range(len(self._responses)):
             if self._responses[i].stream_id == stream_id:
@@ -54,9 +60,12 @@ struct Http2ResponseScheduler(Movable):
             stream_id=stream_id,
             headers=headers^,
             body=body^,
+            trailers=trailers^,
             body_offset=0,
             headers_offset=0,
+            trailers_offset=0,
             headers_sent=False,
+            trailers_sent=False,
             end_on_headers=end_on_headers,
             cancelled=False,
         )
@@ -70,8 +79,10 @@ struct Http2ResponseScheduler(Movable):
         var index = self._find(stream_id)
         if index < 0:
             return 0
-        var released = len(self._responses[index].headers) + len(
-            self._responses[index].body
+        var released = (
+            len(self._responses[index].headers)
+            + len(self._responses[index].body)
+            + len(self._responses[index].trailers)
         )
         self._remove(index)
         return released
@@ -79,21 +90,27 @@ struct Http2ResponseScheduler(Movable):
     def on_peer_reset(mut self, stream_id: UInt32) -> Http2PeerResetResult:
         # Dropping the already-HPACK-encoded header block would desync the
         # deflater; keep headers so drain still ships them and release only
-        # the body budget here. The body is replaced with an empty list and
+        # the body/trailer budget here. The body/trailers are cleared and
         # drain emits RST_STREAM(CANCEL) after headers to close the stream.
         var index = self._find(stream_id)
         if index < 0:
             return Http2PeerResetResult(released_bytes=0, kept_headers=False)
         if not self._responses[index].headers_sent:
-            var body_bytes = len(self._responses[index].body)
+            var released_bytes = len(self._responses[index].body) + len(
+                self._responses[index].trailers
+            )
             self._responses[index].body = List[Byte]()
             self._responses[index].body_offset = 0
+            self._responses[index].trailers = List[Byte]()
+            self._responses[index].trailers_offset = 0
             self._responses[index].cancelled = True
             return Http2PeerResetResult(
-                released_bytes=body_bytes, kept_headers=True
+                released_bytes=released_bytes, kept_headers=True
             )
-        var released = len(self._responses[index].headers) + len(
-            self._responses[index].body
+        var released = (
+            len(self._responses[index].headers)
+            + len(self._responses[index].body)
+            + len(self._responses[index].trailers)
         )
         self._remove(index)
         return Http2PeerResetResult(released_bytes=released, kept_headers=False)
@@ -147,8 +164,10 @@ struct Http2ResponseScheduler(Movable):
                 ):
                     break
                 self._responses[index].headers_sent = True
-                if len(self._responses[index].body) == 0 and (
-                    not self._responses[index].cancelled
+                if (
+                    len(self._responses[index].body) == 0
+                    and len(self._responses[index].trailers) == 0
+                    and (not self._responses[index].cancelled)
                 ):
                     session.finish_response(stream_id)
                     completed.append(stream_id)
@@ -170,6 +189,45 @@ struct Http2ResponseScheduler(Movable):
                 self._remove(index)
                 continue
 
+            var body_done = self._responses[index].body_offset == len(
+                self._responses[index].body
+            )
+            if body_done and len(self._responses[index].trailers) > 0:
+                var remaining_trailers = (
+                    len(self._responses[index].trailers)
+                    - self._responses[index].trailers_offset
+                )
+                var trailer_room = max_output_bytes - len(output)
+                if trailer_room <= 0:
+                    break
+                var trailer_chunk = remaining_trailers
+                if trailer_chunk > trailer_room:
+                    trailer_chunk = trailer_room
+                var trailer_start = self._responses[index].trailers_offset
+                output.extend(
+                    Span(self._responses[index].trailers)[
+                        trailer_start : trailer_start + trailer_chunk
+                    ]
+                )
+                self._responses[index].trailers_offset = (
+                    trailer_start + trailer_chunk
+                )
+                skipped = 0
+                if self._responses[index].trailers_offset < len(
+                    self._responses[index].trailers
+                ):
+                    break
+                self._responses[index].trailers_sent = True
+                session.finish_response(stream_id)
+                completed.append(stream_id)
+                released += (
+                    len(self._responses[index].headers)
+                    + len(self._responses[index].body)
+                    + len(self._responses[index].trailers)
+                )
+                self._remove(index)
+                continue
+
             var remaining_body = len(self._responses[index].body) - (
                 self._responses[index].body_offset
             )
@@ -185,7 +243,10 @@ struct Http2ResponseScheduler(Movable):
             var payload_length = min(
                 remaining_body, min(max_frame_size, min(credit, output_room))
             )
-            var end_stream = payload_length == remaining_body
+            var end_stream = (
+                payload_length == remaining_body
+                and len(self._responses[index].trailers) == 0
+            )
             var flags = Byte(1) if end_stream else Byte(0)
             var frame = encode_frame(
                 Byte(0),

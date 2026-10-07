@@ -153,7 +153,7 @@ fn provider_path_notifications_do_not_accumulate_across_validated_nat_rebinding(
     let request = server.next_request().unwrap();
     assert_eq!(request.stream_id, peer.request_stream);
     assert_eq!(request.body, vec![b'x'; 128]);
-    assert!(server.enqueue_response(request.id, 200, Vec::new(), b"alive".to_vec()));
+    assert!(server.enqueue_response(request.id, 200, Vec::new(), b"alive".to_vec(), Vec::new()));
     let mut body = Vec::new();
     let mut status = false;
     let mut finished = false;

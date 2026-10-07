@@ -42,6 +42,7 @@ struct _Http3Handler(Handler):
                 req.trailers.get_first("x-check") == Optional[String]("done")
             )
             writer.write_string(":done")
+            writer.add_trailer(String("x-digest"), String("ok"))
         self.requests += 1
 
 

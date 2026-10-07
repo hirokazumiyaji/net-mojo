@@ -360,13 +360,14 @@ struct QuicServer(Movable):
         )
 
     def respond[
-        headers_origin: Origin, body_origin: Origin
+        headers_origin: Origin, body_origin: Origin, trailers_origin: Origin
     ](
         mut self,
         request_id: UInt64,
         status: Int,
         headers: Span[Byte, headers_origin],
         body: Span[Byte, body_origin],
+        trailers: Span[Byte, trailers_origin],
     ) raises NetError:
         _require_ok(
             self._library.call["net_quic_respond", c_int](
@@ -377,6 +378,8 @@ struct QuicServer(Movable):
                 c_size_t(len(headers)),
                 body.unsafe_ptr(),
                 c_size_t(len(body)),
+                trailers.unsafe_ptr(),
+                c_size_t(len(trailers)),
             ),
             "send HTTP/3 response",
             "QUIC provider could not queue the response",
@@ -715,15 +718,16 @@ struct QuicUDPEndpoint(Movable):
             self._request_buffer = List[Byte](length=capacity, fill=0)
 
     def respond[
-        headers_origin: Origin, body_origin: Origin
+        headers_origin: Origin, body_origin: Origin, trailers_origin: Origin
     ](
         mut self,
         request_id: UInt64,
         status: Int,
         headers: Span[Byte, headers_origin],
         body: Span[Byte, body_origin],
+        trailers: Span[Byte, trailers_origin],
     ) raises NetError:
-        self._server.respond(request_id, status, headers, body)
+        self._server.respond(request_id, status, headers, body, trailers)
 
 
 def _read_request_u32[
