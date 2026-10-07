@@ -27,7 +27,13 @@ sanitize-sys = { cmd = "bash scripts/run_sanitized.sh tests/test_sys.mojo", defa
 sanitize-tcp = { cmd = "bash scripts/run_sanitized.sh tests/test_tcp.mojo", default-environment = "sanitize" }
 sanitize-udp = { cmd = "bash scripts/run_sanitized.sh tests/test_udp.mojo", default-environment = "sanitize" }
 sanitize-unix = { cmd = "bash scripts/run_sanitized.sh tests/test_unix.mojo", default-environment = "sanitize" }
+sanitize-reactor = { cmd = "bash scripts/run_sanitized.sh tests/test_reactor.mojo", default-environment = "sanitize" }
 sanitize-actor = { cmd = "bash scripts/run_sanitized.sh tests/test_actor.mojo", default-environment = "sanitize" }
+sanitize-http-api = { cmd = "bash scripts/run_sanitized.sh tests/test_http_api.mojo", default-environment = "sanitize" }
+sanitize-http-control = { cmd = "bash scripts/run_sanitized.sh tests/test_http_control.mojo", default-environment = "sanitize" }
+sanitize-http-parser = { cmd = "bash scripts/run_sanitized.sh tests/test_http_parser.mojo", default-environment = "sanitize" }
+sanitize-http-response = { cmd = "bash scripts/run_sanitized.sh tests/test_http_response.mojo", default-environment = "sanitize" }
+sanitize-http-server = { cmd = "bash scripts/run_sanitized.sh tests/test_http_server.mojo", default-environment = "sanitize" }
 sanitize-http2 = { cmd = "bash scripts/run_sanitized.sh tests/test_http2.mojo", default-environment = "sanitize", depends-on = [
   { task = "hpack-test", environment = "http2" },
 ] }
@@ -38,7 +44,13 @@ sanitize = { depends-on = [
   { task = "sanitize-tcp", environment = "sanitize" },
   { task = "sanitize-udp", environment = "sanitize" },
   { task = "sanitize-unix", environment = "sanitize" },
+  { task = "sanitize-reactor", environment = "sanitize" },
   { task = "sanitize-actor", environment = "sanitize" },
+  { task = "sanitize-http-api", environment = "sanitize" },
+  { task = "sanitize-http-control", environment = "sanitize" },
+  { task = "sanitize-http-parser", environment = "sanitize" },
+  { task = "sanitize-http-response", environment = "sanitize" },
+  { task = "sanitize-http-server", environment = "sanitize" },
   { task = "sanitize-http2", environment = "sanitize" },
   { task = "sanitize-http-detach", environment = "sanitize" },
 ] }
@@ -107,6 +119,9 @@ http2-example-build = { cmd = "bash scripts/check_http2_example.sh", depends-on 
   "tls-build",
   "hpack-test",
 ] }
+https-h2-interop-test = { cmd = "python3 scripts/test_https_h2_interop.py", depends-on = [
+  "tls-build",
+] }
 
 [feature.http3.dependencies]
 binutils = "*"
@@ -166,6 +181,9 @@ https-state-test = { cmd = "mojo run --Werror -I . tests/test_https_server.mojo"
 https-client-test = { cmd = "python3 scripts/test_https_server.py", depends-on = [
   "tls-build",
 ] }
+https-alt-svc-invalid-test = { cmd = "python3 scripts/test_https_alt_svc_invalid.py", depends-on = [
+  "tls-build",
+] }
 https-example-build = { cmd = "bash scripts/check_https_example.sh", depends-on = [
   "tls-build",
 ] }
@@ -173,6 +191,7 @@ tls-suite = { depends-on = [
   "tls-test",
   "https-state-test",
   "https-client-test",
+  "https-alt-svc-invalid-test",
   "https-example-build",
 ] }
 example-https-hello = { cmd = "mojo run --Werror -I . examples/https_hello.mojo", depends-on = [
