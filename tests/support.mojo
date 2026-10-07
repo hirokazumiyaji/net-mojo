@@ -111,3 +111,91 @@ def _socket_pair() raises -> _SocketPair:
 def _tick_n[H: Handler](mut server: Server, mut handler: H, n: Int) raises:
     for _ in range(n):
         _ = server.tick(handler, Timeout.nanoseconds(0))
+
+
+def _to_bytes(data: StringSlice) -> List[Byte]:
+    return List[Byte](data.as_bytes())
+
+
+def _header_end(buf: List[Byte]) -> Int:
+    var i = 0
+    while i + 3 < len(buf):
+        if (
+            buf[i] == Byte(ord("\r"))
+            and buf[i + 1] == Byte(ord("\n"))
+            and buf[i + 2] == Byte(ord("\r"))
+            and buf[i + 3] == Byte(ord("\n"))
+        ):
+            return i + 4
+        i += 1
+    return -1
+
+
+def _status_of(buf: List[Byte]) -> Int:
+    if len(buf) < 12:
+        return -1
+    var code = 0
+    for i in range(9, 12):
+        var byte = buf[i]
+        if byte < Byte(ord("0")) or byte > Byte(ord("9")):
+            return -1
+        code = code * 10 + Int(byte - Byte(ord("0")))
+    return code
+
+
+def _content_length_of(buf: List[Byte]) -> Int:
+    var end = _header_end(buf)
+    if end < 0:
+        return -1
+    var head = String(from_utf8_lossy=Span(buf)[0:end]).lower()
+    var needle = String("content-length:")
+    var at = head.find(needle)
+    if at < 0:
+        return -1
+    var value_start = at + len(needle.as_bytes())
+    var value_end = value_start
+    var head_bytes = head.as_bytes()
+    while value_end < len(head_bytes) and (
+        head_bytes[value_end] == Byte(ord(" "))
+        or head_bytes[value_end] == Byte(ord("\t"))
+    ):
+        value_end += 1
+    var digits_start = value_end
+    while value_end < len(head_bytes) and (
+        head_bytes[value_end] >= Byte(ord("0"))
+        and head_bytes[value_end] <= Byte(ord("9"))
+    ):
+        value_end += 1
+    if value_end == digits_start:
+        return -1
+    var value = 0
+    for i in range(digits_start, value_end):
+        value = value * 10 + Int(head_bytes[i] - Byte(ord("0")))
+    return value
+
+
+def _response_complete(buf: List[Byte], expect_body: Bool = True) -> Bool:
+    var end = _header_end(buf)
+    if end < 0:
+        return False
+    if not expect_body:
+        return True
+    var length = _content_length_of(buf)
+    if length < 0:
+        return True
+    return len(buf) >= end + length
+
+
+def _append_hpack_field(mut wire: List[Byte], name: String, value: String):
+    var name_bytes = name.as_bytes()
+    var value_bytes = value.as_bytes()
+    wire.append(Byte((len(name_bytes) >> 24) & 0xFF))
+    wire.append(Byte((len(name_bytes) >> 16) & 0xFF))
+    wire.append(Byte((len(name_bytes) >> 8) & 0xFF))
+    wire.append(Byte(len(name_bytes) & 0xFF))
+    wire.append(Byte((len(value_bytes) >> 24) & 0xFF))
+    wire.append(Byte((len(value_bytes) >> 16) & 0xFF))
+    wire.append(Byte((len(value_bytes) >> 8) & 0xFF))
+    wire.append(Byte(len(value_bytes) & 0xFF))
+    wire.extend(name_bytes)
+    wire.extend(value_bytes)

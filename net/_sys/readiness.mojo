@@ -14,7 +14,7 @@ from std.sys import CompilationTarget, align_of, size_of
 
 import net._sys.darwin as darwin
 import net._sys.linux as linux
-from net._sys.common import EINTR, _OwnedFD, _system_error
+from net._sys.common import EINTR, _OwnedFD, _poll_timeout_ms, _system_error
 from net.error import NetError
 from net.timeout import _Deadline
 
@@ -207,7 +207,7 @@ struct _EventQueue(Movable):
         var out = List[_ReadyEvent]()
         var base = Pointer(to=self._scratch[0]).unsafe_bitcast[UInt32]()
         while True:
-            var timeout = _epoll_timeout_ms(deadline)
+            var timeout = _poll_timeout_ms(deadline)
             var rc = external_call["epoll_wait", c_int](
                 c_int(self._fd._value),
                 base,
@@ -262,10 +262,7 @@ struct _EventQueue(Movable):
             var rc: Int32
             if use_timeout:
                 # Refresh the remaining time across EINTR restarts.
-                var remaining_ms = deadline.remaining_milliseconds()
-                if remaining_ms < 0:
-                    remaining_ms = 0
-                var remaining_ns = remaining_ms * 1_000_000
+                var remaining_ns = deadline.remaining_milliseconds() * 1_000_000
                 var spec = _Timespec(
                     tv_sec=Int64(remaining_ns // 1_000_000_000),
                     tv_nsec=Int64(remaining_ns % 1_000_000_000),
@@ -314,51 +311,34 @@ struct _EventQueue(Movable):
             var base = Pointer(to=self._scratch[0]).unsafe_bitcast[
                 darwin._Kevent
             ]()
-            var seen_token = List[UInt64]()
-            var seen_fd = List[Int32]()
-            var seen_read = List[Bool]()
-            var seen_write = List[Bool]()
-            var seen_err = List[Bool]()
-            var seen_eof = List[Bool]()
             for i in range(count):
                 var kev = base[unsafe_offset=i]
-                var fd = Int32(kev.ident & UInt64(0xFFFFFFFF))
-                var is_read = kev.filter == darwin.EVFILT_READ
-                var is_write = kev.filter == darwin.EVFILT_WRITE
-                var eof = (kev.flags & darwin.EV_EOF) != 0
-                var err = (kev.flags & darwin.EV_ERROR) != 0
                 var idx = -1
-                for j in range(len(seen_token)):
-                    if seen_token[j] == kev.udata:
+                for j in range(len(out)):
+                    if out[j].token_data == kev.udata:
                         idx = j
                         break
                 if idx < 0:
-                    seen_token.append(kev.udata)
-                    seen_fd.append(fd)
-                    seen_read.append(False)
-                    seen_write.append(False)
-                    seen_err.append(False)
-                    seen_eof.append(False)
-                    idx = len(seen_token) - 1
-                if is_read:
-                    seen_read[idx] = True
-                if is_write:
-                    seen_write[idx] = True
-                if eof or err:
-                    seen_eof[idx] = True
-                if err:
-                    seen_err[idx] = True
-            for j in range(len(seen_token)):
-                out.append(
-                    _ReadyEvent(
-                        fd=seen_fd[j],
-                        readable=seen_read[j],
-                        writable=seen_write[j],
-                        has_error=seen_err[j],
-                        eof=seen_eof[j],
-                        token_data=seen_token[j],
+                    out.append(
+                        _ReadyEvent(
+                            fd=Int32(kev.ident & UInt64(0xFFFFFFFF)),
+                            readable=False,
+                            writable=False,
+                            has_error=False,
+                            eof=False,
+                            token_data=kev.udata,
+                        )
                     )
-                )
+                    idx = len(out) - 1
+                var err = (kev.flags & darwin.EV_ERROR) != 0
+                if kev.filter == darwin.EVFILT_READ:
+                    out[idx].readable = True
+                if kev.filter == darwin.EVFILT_WRITE:
+                    out[idx].writable = True
+                if err or (kev.flags & darwin.EV_EOF) != 0:
+                    out[idx].eof = True
+                if err:
+                    out[idx].has_error = True
             return out^
 
     def _kevent_add(
@@ -409,14 +389,3 @@ struct _EventQueue(Movable):
             c_int(0),
             Pointer(to=dummy_ts),
         )
-
-
-def _epoll_timeout_ms(deadline: _Deadline) -> Int32:
-    if deadline.is_indefinite():
-        return -1
-    var remaining = deadline.remaining_milliseconds()
-    if remaining < 0:
-        return 0
-    if remaining > Int(Int32.MAX):
-        return Int32.MAX
-    return Int32(remaining)

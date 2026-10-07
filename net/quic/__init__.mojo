@@ -3,6 +3,7 @@
 from std.ffi import OwnedDLHandle, Pointer, c_int, c_size_t
 from std.time import perf_counter_ns
 
+from net._sys.common import _copy_c_string
 from net.address import SocketAddress
 from net.error import NetError, NetErrorKind
 from net.timeout import Timeout
@@ -98,40 +99,27 @@ struct QuicServer(Movable):
         self._library.call["net_quic_free"](self._server)
 
     def begin_shutdown(mut self) raises NetError:
-        var result = self._library.call["net_quic_begin_shutdown", c_int](
-            self._server
+        _require_ok(
+            self._library.call["net_quic_begin_shutdown", c_int](self._server),
+            "begin HTTP/3 shutdown",
+            "QUIC provider could not begin shutdown",
         )
-        if result != 1:
-            raise NetError(
-                NetErrorKind.invalid_state(),
-                "begin HTTP/3 shutdown",
-                None,
-                "QUIC provider could not begin shutdown",
-            )
 
     def finish_shutdown(mut self) raises NetError:
-        var result = self._library.call["net_quic_finish_shutdown", c_int](
-            self._server
+        _require_ok(
+            self._library.call["net_quic_finish_shutdown", c_int](self._server),
+            "finish HTTP/3 shutdown",
+            "QUIC provider could not finish shutdown",
         )
-        if result != 1:
-            raise NetError(
-                NetErrorKind.invalid_state(),
-                "finish HTTP/3 shutdown",
-                None,
-                "QUIC provider could not finish shutdown",
-            )
 
     def close_connections(mut self) raises NetError:
-        var result = self._library.call["net_quic_close_connections", c_int](
-            self._server
+        _require_ok(
+            self._library.call["net_quic_close_connections", c_int](
+                self._server
+            ),
+            "close QUIC connections",
+            "QUIC provider could not close connections",
         )
-        if result != 1:
-            raise NetError(
-                NetErrorKind.invalid_state(),
-                "close QUIC connections",
-                None,
-                "QUIC provider could not close connections",
-            )
 
     def shutdown_complete(self) -> Bool:
         return (
@@ -142,28 +130,22 @@ struct QuicServer(Movable):
         )
 
     def set_connection_limit(mut self, limit: Int) raises NetError:
-        var result = self._library.call["net_quic_set_connection_limit", c_int](
-            self._server, c_size_t(limit)
+        _require_ok(
+            self._library.call["net_quic_set_connection_limit", c_int](
+                self._server, c_size_t(limit)
+            ),
+            "set QUIC connection limit",
+            "QUIC provider could not set the connection limit",
         )
-        if result != 1:
-            raise NetError(
-                NetErrorKind.invalid_state(),
-                "set QUIC connection limit",
-                None,
-                "QUIC provider could not set the connection limit",
-            )
 
     def set_transport_memory_limit(mut self, limit: Int) raises NetError:
-        var result = self._library.call[
-            "net_quic_set_transport_memory_limit", c_int
-        ](self._server, c_size_t(limit))
-        if result != 1:
-            raise NetError(
-                NetErrorKind.invalid_state(),
-                "set QUIC transport memory limit",
-                None,
-                "QUIC provider could not set the transport memory limit",
-            )
+        _require_ok(
+            self._library.call["net_quic_set_transport_memory_limit", c_int](
+                self._server, c_size_t(limit)
+            ),
+            "set QUIC transport memory limit",
+            "QUIC provider could not set the transport memory limit",
+        )
 
     def set_receive_limits(
         mut self,
@@ -188,22 +170,19 @@ struct QuicServer(Movable):
                 None,
                 "receive capacities must be nonnegative",
             )
-        var result = self._library.call["net_quic_set_receive_limits", c_int](
-            self._server,
-            c_size_t(request_bytes),
-            c_size_t(request_slots),
-            c_size_t(control_bytes),
-            c_size_t(control_slots),
-            c_size_t(crypto_bytes),
-            c_size_t(crypto_slots),
+        _require_ok(
+            self._library.call["net_quic_set_receive_limits", c_int](
+                self._server,
+                c_size_t(request_bytes),
+                c_size_t(request_slots),
+                c_size_t(control_bytes),
+                c_size_t(control_slots),
+                c_size_t(crypto_bytes),
+                c_size_t(crypto_slots),
+            ),
+            "set QUIC receive limits",
+            "receive limits cannot change after accepting a connection",
         )
-        if result != 1:
-            raise NetError(
-                NetErrorKind.invalid_state(),
-                "set QUIC receive limits",
-                None,
-                "receive limits cannot change after accepting a connection",
-            )
 
     def set_send_limits(
         mut self,
@@ -228,22 +207,19 @@ struct QuicServer(Movable):
                 None,
                 "send capacities must be nonnegative",
             )
-        var result = self._library.call["net_quic_set_send_limits", c_int](
-            self._server,
-            c_size_t(request_bytes),
-            c_size_t(request_slots),
-            c_size_t(control_bytes),
-            c_size_t(control_slots),
-            c_size_t(crypto_bytes),
-            c_size_t(crypto_slots),
+        _require_ok(
+            self._library.call["net_quic_set_send_limits", c_int](
+                self._server,
+                c_size_t(request_bytes),
+                c_size_t(request_slots),
+                c_size_t(control_bytes),
+                c_size_t(control_slots),
+                c_size_t(crypto_bytes),
+                c_size_t(crypto_slots),
+            ),
+            "set QUIC send limits",
+            "send limits cannot change after accepting a connection",
         )
-        if result != 1:
-            raise NetError(
-                NetErrorKind.invalid_state(),
-                "set QUIC send limits",
-                None,
-                "send limits cannot change after accepting a connection",
-            )
 
     def transport_memory_bytes(self) -> Int:
         return Int(
@@ -260,21 +236,18 @@ struct QuicServer(Movable):
         max_trailer_bytes: Int = 8192,
         max_trailer_count: Int = 32,
     ) raises NetError:
-        var result = self._library.call["net_quic_set_request_limits", c_int](
-            self._server,
-            c_size_t(max_body_bytes),
-            c_size_t(max_headers_bytes),
-            c_size_t(max_headers_count),
-            c_size_t(max_trailer_bytes),
-            c_size_t(max_trailer_count),
+        _require_ok(
+            self._library.call["net_quic_set_request_limits", c_int](
+                self._server,
+                c_size_t(max_body_bytes),
+                c_size_t(max_headers_bytes),
+                c_size_t(max_headers_count),
+                c_size_t(max_trailer_bytes),
+                c_size_t(max_trailer_count),
+            ),
+            "set QUIC request limits",
+            "QUIC provider could not set request limits",
         )
-        if result != 1:
-            raise NetError(
-                NetErrorKind.invalid_state(),
-                "set QUIC request limits",
-                None,
-                "QUIC provider could not set request limits",
-            )
 
     def set_response_limits(
         mut self,
@@ -282,19 +255,16 @@ struct QuicServer(Movable):
         max_headers_bytes: Int,
         max_headers_count: Int,
     ) raises NetError:
-        var result = self._library.call["net_quic_set_response_limits", c_int](
-            self._server,
-            c_size_t(max_body_bytes),
-            c_size_t(max_headers_bytes),
-            c_size_t(max_headers_count),
+        _require_ok(
+            self._library.call["net_quic_set_response_limits", c_int](
+                self._server,
+                c_size_t(max_body_bytes),
+                c_size_t(max_headers_bytes),
+                c_size_t(max_headers_count),
+            ),
+            "set QUIC response limits",
+            "QUIC provider could not set response limits",
         )
-        if result != 1:
-            raise NetError(
-                NetErrorKind.invalid_state(),
-                "set QUIC response limits",
-                None,
-                "QUIC provider could not set response limits",
-            )
 
     def set_stream_deadlines(
         mut self,
@@ -303,20 +273,17 @@ struct QuicServer(Movable):
         idle_timeout: Timeout,
         write_deadline: Timeout = Timeout.nanoseconds(30_000_000_000),
     ) raises NetError:
-        var result = self._library.call["net_quic_set_stream_deadlines", c_int](
-            self._server,
-            header_deadline._value,
-            body_deadline._value,
-            idle_timeout._value,
-            write_deadline._value,
+        _require_ok(
+            self._library.call["net_quic_set_stream_deadlines", c_int](
+                self._server,
+                header_deadline._value,
+                body_deadline._value,
+                idle_timeout._value,
+                write_deadline._value,
+            ),
+            "set QUIC stream deadlines",
+            "QUIC provider could not set stream deadlines",
         )
-        if result != 1:
-            raise NetError(
-                NetErrorKind.invalid_state(),
-                "set QUIC stream deadlines",
-                None,
-                "QUIC provider could not set stream deadlines",
-            )
 
     def recv_datagram[
         origin: MutOrigin
@@ -407,22 +374,19 @@ struct QuicServer(Movable):
         headers: Span[Byte, headers_origin],
         body: Span[Byte, body_origin],
     ) raises NetError:
-        var result = self._library.call["net_quic_respond", c_int](
-            self._server,
-            request_id,
-            UInt32(status),
-            headers.unsafe_ptr(),
-            c_size_t(len(headers)),
-            body.unsafe_ptr(),
-            c_size_t(len(body)),
+        _require_ok(
+            self._library.call["net_quic_respond", c_int](
+                self._server,
+                request_id,
+                UInt32(status),
+                headers.unsafe_ptr(),
+                c_size_t(len(headers)),
+                body.unsafe_ptr(),
+                c_size_t(len(body)),
+            ),
+            "send HTTP/3 response",
+            "QUIC provider could not queue the response",
         )
-        if result != 1:
-            raise NetError(
-                NetErrorKind.invalid_state(),
-                "send HTTP/3 response",
-                None,
-                "QUIC provider could not queue the response",
-            )
 
 
 @fieldwise_init
@@ -792,10 +756,7 @@ def _read_request_bytes[
     origin: Origin
 ](data: Span[Byte, origin], mut offset: Int) -> List[Byte]:
     var length = Int(_read_request_u32(data, offset))
-    var value = List[Byte]()
-    value.reserve(length)
-    for i in range(length):
-        value.append(data[offset + i])
+    var value = List[Byte](data[offset : offset + length])
     offset += length
     return value^
 
@@ -842,14 +803,16 @@ def _decode_request_record[
     )
 
 
-def _copy_c_string[origin: MutOrigin](address: Pointer[Byte, origin]) -> String:
-    var length = 0
-    while address[unsafe_offset=length] != 0:
-        length += 1
-    var bytes = List[Byte]()
-    for i in range(length):
-        bytes.append(address[unsafe_offset=i])
-    return String(from_utf8_lossy=Span(bytes))
+def _require_ok(
+    result: c_int, operation: StaticString, message: StaticString
+) raises NetError:
+    if result != 1:
+        raise NetError(
+            NetErrorKind.invalid_state(),
+            String(operation),
+            None,
+            String(message),
+        )
 
 
 def _send_at(delay_ns: UInt64, now: Int) -> Int:

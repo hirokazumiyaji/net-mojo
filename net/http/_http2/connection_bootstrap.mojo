@@ -79,7 +79,7 @@ struct Http2ConnectionBootstrap(Movable):
                 if not settings.is_complete():
                     self._failed = True
                     return Http2BootstrapConsumeResult.error(consumed)
-                _append_wire(output, Span(settings.wire))
+                output.extend(Span(settings.wire))
 
         while consumed < len(data):
             self._frame.append(data[consumed])
@@ -98,7 +98,7 @@ struct Http2ConnectionBootstrap(Movable):
             if not ack.is_complete():
                 self._failed = True
                 return Http2BootstrapConsumeResult.error(consumed)
-            _append_wire(output, Span(ack.wire))
+            output.extend(Span(ack.wire))
             self._ready = True
             return Http2BootstrapConsumeResult.ready(consumed, output^)
 
@@ -112,9 +112,3 @@ struct Http2ConnectionBootstrap(Movable):
 
     def peer_settings(self) -> Http2PeerSettingsSnapshot:
         return self._protocol.peer_settings.snapshot()
-
-
-def _append_wire[
-    origin: Origin
-](mut output: List[Byte], wire: Span[Byte, origin]):
-    output.extend(wire)

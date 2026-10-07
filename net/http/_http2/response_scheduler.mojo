@@ -101,8 +101,11 @@ struct Http2ResponseScheduler(Movable):
                 if header_chunk > header_room:
                     header_chunk = header_room
                 var start = self._responses[index].headers_offset
-                for i in range(header_chunk):
-                    output.append(self._responses[index].headers[start + i])
+                output.extend(
+                    Span(self._responses[index].headers)[
+                        start : start + header_chunk
+                    ]
+                )
                 self._responses[index].headers_offset = start + header_chunk
                 skipped = 0
                 if self._responses[index].headers_offset < len(
@@ -154,8 +157,7 @@ struct Http2ResponseScheduler(Movable):
                 if skipped >= len(self._responses):
                     break
                 continue
-            for i in range(len(frame.wire)):
-                output.append(frame.wire[i])
+            output.extend(Span(frame.wire))
             self._responses[index].body_offset += payload_length
             skipped = 0
             if end_stream:

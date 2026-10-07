@@ -15,7 +15,11 @@ capacity; direct public Headers replacement is admitted after allocation.
 
 from net.error import NetError, NetErrorKind
 
-from ._detach import ResponseSender, _create_detach_state
+from ._detach import (
+    ResponseSender,
+    _cancel_detach_state,
+    _create_detach_state,
+)
 from ._buffer import SharedBufferBudget, _reserve_capacity
 from .headers import Headers
 
@@ -107,6 +111,11 @@ struct ResponseWriter(Movable, Sized):
     def is_detached(self) -> Bool:
         return self._detached
 
+    def _cancel_detach(mut self):
+        if self._detach_state_addr != 0:
+            _cancel_detach_state(self._detach_state_addr)
+            self._detach_state_addr = 0
+
     def set_detach_state(mut self, addr: Int):
         self._detach_state_addr = addr
 
@@ -177,8 +186,7 @@ struct ResponseWriter(Movable, Sized):
             self._body_capacity_reserved = self.body.capacity()
         else:
             self.body.reserve(len(self.body) + len(data))
-        for i in range(len(data)):
-            self.body.append(data[i])
+        self.body.extend(data)
 
     def write_string(mut self, data: StringSlice) raises NetError:
         self.write(data.as_bytes())

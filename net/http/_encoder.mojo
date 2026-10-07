@@ -112,9 +112,7 @@ def current_http_date() -> String:
 
 
 def _append_string(mut out: List[Byte], data: StringSlice):
-    var bytes = data.as_bytes()
-    for i in range(len(bytes)):
-        out.append(bytes[i])
+    out.extend(data.as_bytes())
 
 
 def _reject_response_injection(
@@ -182,8 +180,7 @@ def _append_response_bytes[
     comptime if measure:
         byte_count += len(data)
     else:
-        for i in range(len(data)):
-            out.append(data[i])
+        out.extend(data)
 
 
 def _append_response_string[
@@ -233,13 +230,8 @@ def _render_response[
     # HEAD omits body bytes but keeps the GET-equivalent length.
     # 1xx / 204 / 205 / 304 omit both length and bytes.
     var wire_length = -1
-    if writer.status < 100 or writer.status > 199:
-        if (
-            writer.status != 204
-            and writer.status != 205
-            and writer.status != 304
-        ):
-            wire_length = len(writer.body)
+    if has_body_for_status(writer.status, False):
+        wire_length = len(writer.body)
     # Validate a caller-supplied Content-Length against the framed length.
     # For HEAD the framed length is the GET-equivalent body length.
     # For 1xx/204/205/304 there is no framed length; a caller value is
@@ -765,8 +757,7 @@ def encode_chunk[origin: ImmOrigin](data: Span[Byte, origin]) -> List[Byte]:
     _append_hex(out, len(data))
     out.append(Byte(ord("\r")))
     out.append(Byte(ord("\n")))
-    for i in range(len(data)):
-        out.append(data[i])
+    out.extend(data)
     out.append(Byte(ord("\r")))
     out.append(Byte(ord("\n")))
     return out^

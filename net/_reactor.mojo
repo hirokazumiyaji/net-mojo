@@ -154,16 +154,6 @@ struct Reactor(Movable, Sized):
         self._active_count -= 1
         return True
 
-    def clear(mut self):
-        for i in range(len(self._slots)):
-            if self._slots[i].active:
-                self._queue.remove(self._slots[i].fd)
-                self._slots[i].active = False
-        self._free.clear()
-        for i in range(len(self._slots)):
-            self._free.append(len(self._slots) - 1 - i)
-        self._active_count = 0
-
     def wait(
         mut self, timeout: Optional[Timeout] = None
     ) raises NetError -> List[ReactorEvent]:
@@ -204,9 +194,9 @@ struct Reactor(Movable, Sized):
                 continue
             # The wire carries the low 32 bits of the generation; 2**32
             # reuses of one slot would be needed to collide.
-            if _decode_gen_low(
-                _encode_token(slot, self._slots[slot].generation)
-            ) != _decode_gen_low(batch[i].token_data):
+            if _decode_gen_low(self._slots[slot].generation) != _decode_gen_low(
+                batch[i].token_data
+            ):
                 continue
             var want_read = self._slots[slot].readable
             var want_write = self._slots[slot].writable

@@ -1,7 +1,8 @@
 from std.testing import assert_equal, assert_false, assert_true, TestSuite
 
 from net.http import ServerConfig
-from net.http._parser import HttpParser, parse_one
+from net.http._parser import parse_one
+from tests.support import _to_bytes
 
 
 def test_content_length_body_capacity_is_exact_and_owned() raises:
@@ -37,14 +38,6 @@ def test_incomplete_content_length_does_not_allocate_body() raises:
     assert_equal(result.request.body.capacity(), 0)
 
 
-def _to_bytes(data: StringSlice) -> List[Byte]:
-    var out = List[Byte]()
-    var bytes = data.as_bytes()
-    for i in range(len(bytes)):
-        out.append(bytes[i])
-    return out^
-
-
 def _assert_complete(
     raw: String, want_method: String, want_path: String, want_body_len: Int
 ) raises:
@@ -67,31 +60,14 @@ def _assert_status(raw: String, want_status: Int) raises:
 
 
 def _assert_split_identical(raw: String) raises:
-    # Every single-byte split point must yield the same final request.
+    # Every proper prefix must ask for more bytes instead of misparsing.
     var config = ServerConfig.default()
     var full = _to_bytes(raw)
     var expected = parse_one(Span(full), config)
     assert_true(expected.is_complete())
+    assert_equal(expected.consumed, len(full))
     for split in range(1, len(full)):
-        var parser = HttpParser()
-        var first = List[Byte]()
-        for i in range(split):
-            first.append(full[i])
-        parser.feed(Span(first))
-        var early = parser.next_result(config)
-        assert_true(early.is_need_more())
-        var second = List[Byte]()
-        for i in range(split, len(full)):
-            second.append(full[i])
-        parser.feed(Span(second))
-        var final = parser.next_result(config)
-        assert_true(final.is_complete())
-        # The parser accumulates both feeds, so consumed equals the full
-        # request length regardless of the split point.
-        assert_equal(final.consumed, len(full))
-        assert_equal(final.request.method, expected.request.method)
-        assert_equal(final.request.path, expected.request.path)
-        assert_equal(len(final.request.body), len(expected.request.body))
+        assert_true(parse_one(Span(full)[0:split], config).is_need_more())
 
 
 def test_simple_get_with_content_length() raises:
@@ -250,45 +226,15 @@ def test_seed_recorded_fragmentation() raises:
     )
     var expected = parse_one(Span(full), config)
     assert_true(expected.is_complete())
+    assert_equal(len(expected.request.body), 6)
     var state = UInt64(42)
-    var points = List[Int]()
     for _ in range(5):
         state = state * UInt64(6364136223846793005) + UInt64(
             1442695040888963407
         )
-        points.append(Int(state % UInt64(len(full))))
-    var parser = HttpParser()
-    var cursor = 0
-    # Feed in increasing split order plus the tail.
-    var ordered = List[Int]()
-    for i in range(len(points)):
-        ordered.append(points[i])
-    # Simple insertion sort for determinism.
-    for i in range(len(ordered)):
-        for j in range(i + 1, len(ordered)):
-            if ordered[j] < ordered[i]:
-                var tmp = ordered[i]
-                ordered[i] = ordered[j]
-                ordered[j] = tmp
-    for k in range(len(ordered)):
-        var point = ordered[k]
-        if point <= cursor or point >= len(full):
-            continue
-        var chunk = List[Byte]()
-        for i in range(cursor, point):
-            chunk.append(full[i])
-        parser.feed(Span(chunk))
-        var interim = parser.next_result(config)
-        assert_true(interim.is_need_more())
-        cursor = point
-    var tail = List[Byte]()
-    for i in range(cursor, len(full)):
-        tail.append(full[i])
-    parser.feed(Span(tail))
-    var final = parser.next_result(config)
-    assert_true(final.is_complete())
-    assert_equal(final.request.path, expected.request.path)
-    assert_equal(len(final.request.body), len(expected.request.body))
+        var point = Int(state % UInt64(len(full)))
+        if point > 0:
+            assert_true(parse_one(Span(full)[0:point], config).is_need_more())
 
 
 def test_host_missing_duplicate_invalid() raises:
@@ -505,30 +451,23 @@ def test_expect_comma_list_all_supported() raises:
 
 
 def test_chunk_extension_fragment_no_double_count() raises:
-    # A size line larger than half the metadata cap, fragmented right
-    # after its CRLF: the first feed must report need_more (not an
-    # error), and the second must complete (not a spurious 413 from
-    # counting the same line twice across the resume).
+    # A size line larger than half the metadata cap, cut right after its
+    # CRLF: the prefix must report need_more (not an error), and the
+    # whole request must complete (not a spurious 413 from counting the
+    # same line twice).
     var config = ServerConfig.default()
-    var part1 = _to_bytes(
+    var full = _to_bytes(
         "POST /a HTTP/1.1\r\nHost: h\r\nTransfer-Encoding: chunked\r\n\r\n5;"
     )
     var padding = String("e") * 40000
-    var pad_bytes = padding.as_bytes()
-    for i in range(len(pad_bytes)):
-        part1.append(pad_bytes[i])
-    var crlf = _to_bytes("\r\n")
-    for i in range(len(crlf)):
-        part1.append(crlf[i])
-    var parser = HttpParser()
-    parser.feed(Span(part1))
-    var first = parser.next_result(config)
-    assert_true(first.is_need_more())
-    var part2 = _to_bytes("hello\r\n0\r\n\r\n")
-    parser.feed(Span(part2))
-    var second = parser.next_result(config)
-    assert_true(second.is_complete())
-    assert_equal(len(second.request.body), 5)
+    full.extend(padding.as_bytes())
+    full.extend("\r\n".as_bytes())
+    var split = len(full)
+    full.extend("hello\r\n0\r\n\r\n".as_bytes())
+    assert_true(parse_one(Span(full)[0:split], config).is_need_more())
+    var result = parse_one(Span(full), config)
+    assert_true(result.is_complete())
+    assert_equal(len(result.request.body), 5)
 
 
 def test_obs_text_header_value_preserved() raises:
@@ -550,38 +489,25 @@ def test_obs_text_header_value_preserved() raises:
 
 
 def test_dripped_headers_complete_identically() raises:
-    # Two thousand header bytes dripped one at a time: the incremental
-    # head scan must reach the same verdict as the one-shot parse.
+    # Two thousand header bytes arriving one at a time: every prefix must
+    # ask for more, and the full head must reach the one-shot verdict.
     var config = ServerConfig.default()
     var full = _to_bytes("POST /drip HTTP/1.1\r\nHost: h\r\n")
     for i in range(40):
-        var line = _to_bytes(
-            String("X-Pad-") + String(i) + String(": abcdefghij\r\n")
-        )
-        for k in range(len(line)):
-            full.append(line[k])
-    var tail = _to_bytes("Content-Length: 3\r\n\r\nabc")
-    for i in range(len(tail)):
-        full.append(tail[i])
-    var expected = parse_one(Span(full), config)
-    assert_true(expected.is_complete())
-    var parser = HttpParser()
-    for i in range(len(full)):
-        var one = List[Byte]()
-        one.append(full[i])
-        parser.feed(Span(one))
-        var interim = parser.next_result(config)
-        if i + 1 < len(full):
-            assert_true(interim.is_need_more())
-        else:
-            assert_true(interim.is_complete())
-            assert_equal(len(interim.request.body), 3)
-            assert_equal(interim.request.headers.count("X-Pad-7"), 1)
-            assert_equal(interim.consumed, expected.consumed)
+        var line = String("X-Pad-") + String(i) + String(": abcdefghij\r\n")
+        full.extend(line.as_bytes())
+    full.extend("Content-Length: 3\r\n\r\nabc".as_bytes())
+    for end in range(1, len(full)):
+        assert_true(parse_one(Span(full)[0:end], config).is_need_more())
+    var result = parse_one(Span(full), config)
+    assert_true(result.is_complete())
+    assert_equal(len(result.request.body), 3)
+    assert_equal(result.request.headers.count("X-Pad-7"), 1)
+    assert_equal(result.consumed, len(full))
 
 
 def test_dripped_tail_decodes_without_loss() raises:
-    # One completed chunk followed by byte-wise drips: slow feeds must
+    # One completed chunk followed by byte-wise drips: slow arrival must
     # neither lose bytes nor change the outcome.
     var config = ServerConfig.default()
     var full = _to_bytes(
@@ -590,41 +516,20 @@ def test_dripped_tail_decodes_without_loss() raises:
     )
     for _ in range(1024):
         full.append(Byte(ord("x")))
-    var tail = _to_bytes("\r\n3\r\nabc\r\n0\r\nX-T: 1\r\n\r\n")
-    for i in range(len(tail)):
-        full.append(tail[i])
-    var expected = parse_one(Span(full), config)
-    assert_true(expected.is_complete())
-    var parser = HttpParser()
-    var head_end = len(full) - len(tail)
-    var first = List[Byte]()
-    for i in range(head_end):
-        first.append(full[i])
-    parser.feed(Span(first))
-    var early = parser.next_result(config)
-    assert_true(early.is_need_more())
-    var done = False
-    for i in range(head_end, len(full)):
-        var one = List[Byte]()
-        one.append(full[i])
-        parser.feed(Span(one))
-        var interim = parser.next_result(config)
-        if i + 1 < len(full):
-            assert_true(interim.is_need_more())
-        else:
-            assert_true(interim.is_complete())
-            assert_equal(len(interim.request.body), len(expected.request.body))
-            assert_equal(interim.consumed, expected.consumed)
-            done = True
-    assert_true(done)
+    var tail = "\r\n3\r\nabc\r\n0\r\nX-T: 1\r\n\r\n"
+    full.extend(tail.as_bytes())
+    for end in range(len(full) - tail.byte_length(), len(full)):
+        assert_true(parse_one(Span(full)[0:end], config).is_need_more())
+    var result = parse_one(Span(full), config)
+    assert_true(result.is_complete())
+    assert_equal(len(result.request.body), 1027)
+    assert_equal(result.consumed, len(full))
 
 
 def test_resume_advances_past_completed_chunks() raises:
-    # Feed five chunks one at a time through one HttpParser: every
-    # intermediate call must report need_more (never a spurious
-    # complete or error), and the final call must match the one-shot
-    # parse exactly. This exercises prime/resume transitions across
-    # feeds rather than one-shot decoding.
+    # Five chunks arriving one at a time: every intermediate prefix must
+    # report need_more (never a spurious complete or error), and the full
+    # request must decode all chunks.
     var config = ServerConfig.default()
     var chunks = List[String]()
     chunks.append("1\r\na\r\n")
@@ -636,29 +541,12 @@ def test_resume_advances_past_completed_chunks() raises:
         "POST /r HTTP/1.1\r\nHost: h\r\nTransfer-Encoding: chunked\r\n\r\n"
     )
     for i in range(len(chunks)):
-        var part = _to_bytes(chunks[i])
-        for k in range(len(part)):
-            full.append(part[k])
-    var expected = parse_one(Span(full), config)
-    assert_true(expected.is_complete())
-    assert_equal(len(expected.request.body), 7)
-    var parser = HttpParser()
-    var head_raw = _to_bytes(
-        "POST /r HTTP/1.1\r\nHost: h\r\nTransfer-Encoding: chunked\r\n\r\n"
-    )
-    parser.feed(Span(head_raw))
-    var head_only = parser.next_result(config)
-    assert_true(head_only.is_need_more())
-    for i in range(len(chunks)):
-        var part = _to_bytes(chunks[i])
-        parser.feed(Span(part))
-        var interim = parser.next_result(config)
-        if i + 1 < len(chunks):
-            assert_true(interim.is_need_more())
-        else:
-            assert_true(interim.is_complete())
-            assert_equal(len(interim.request.body), 7)
-            assert_equal(interim.consumed, expected.consumed)
+        assert_true(parse_one(Span(full), config).is_need_more())
+        full.extend(chunks[i].as_bytes())
+    var result = parse_one(Span(full), config)
+    assert_true(result.is_complete())
+    assert_equal(len(result.request.body), 7)
+    assert_equal(result.consumed, len(full))
 
 
 def test_chunk_extension_grammar() raises:

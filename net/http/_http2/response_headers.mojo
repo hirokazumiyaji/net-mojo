@@ -1,7 +1,9 @@
 """HTTP/2 response field validation and shared response adaptation."""
 
-from net.http.headers import Headers
+from net.http.headers import Headers, _parse_decimal
 from net.http.response import ResponseWriter, has_body_for_status
+
+from .request_headers import _is_connection_specific
 
 
 @fieldwise_init
@@ -47,10 +49,8 @@ def _append_field[
     output.append(Byte((len(value) >> 16) & 0xFF))
     output.append(Byte((len(value) >> 8) & 0xFF))
     output.append(Byte(len(value) & 0xFF))
-    for i in range(len(name_bytes)):
-        output.append(name_bytes[i])
-    for i in range(len(value)):
-        output.append(value[i])
+    output.extend(name_bytes)
+    output.extend(value)
     return True
 
 
@@ -59,21 +59,7 @@ def _field_size(name_length: Int, value_length: Int) -> Int:
 
 
 def _content_length_matches(value: String, expected: Int) -> Bool:
-    if expected < 0:
-        return False
-    var bytes = value.as_bytes()
-    if len(bytes) == 0:
-        return False
-    var parsed = 0
-    for i in range(len(bytes)):
-        var byte = bytes[i]
-        if byte < Byte(ord("0")) or byte > Byte(ord("9")):
-            return False
-        var digit = Int(byte - Byte(ord("0")))
-        if parsed > (expected - digit) // 10:
-            return False
-        parsed = parsed * 10 + digit
-    return parsed == expected
+    return expected >= 0 and _parse_decimal(value, expected) == expected
 
 
 def encode_http2_response_headers(
@@ -98,12 +84,7 @@ def encode_http2_response_headers(
     var field_count = 1
     var send_body = has_body_for_status(writer.status, is_head)
     var wire_length = -1
-    if (
-        writer.status >= 200
-        and writer.status != 204
-        and writer.status != 205
-        and writer.status != 304
-    ):
+    if has_body_for_status(writer.status, False):
         wire_length = len(writer.body)
 
     var declared_lengths = writer.headers.get_all("content-length")
@@ -119,16 +100,9 @@ def encode_http2_response_headers(
         return Http2ResponseHeadersResult.error()
 
     for i in range(len(writer.headers)):
-        var name = writer.headers.name_at(i).lower()
-        var value = writer.headers.value_bytes_at(i)
-        if (
-            name == "connection"
-            or name == "proxy-connection"
-            or name == "keep-alive"
-            or name == "transfer-encoding"
-            or name == "upgrade"
-            or name == "te"
-        ):
+        ref name = writer.headers._lower_names[i]
+        var value = writer.headers._value_bytes_span(i)
+        if _is_connection_specific(name) or name == "te":
             return Http2ResponseHeadersResult.error()
         if name == "content-length":
             continue
@@ -137,7 +111,7 @@ def encode_http2_response_headers(
         if (
             field_count > max_fields
             or header_list_size > max_header_list_size
-            or not _append_field(fields, name, Span(value))
+            or not _append_field(fields, name, value)
         ):
             return Http2ResponseHeadersResult.error()
 

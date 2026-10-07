@@ -1,7 +1,7 @@
 """Validation and adaptation of decoded HTTP/2 request headers."""
 
 from net.http._authority import _host_is_valid
-from net.http.headers import Headers
+from net.http.headers import Headers, _is_tchar
 from net.http.request import HttpVersion, Request, split_path_query
 
 
@@ -105,32 +105,6 @@ def _bytes_equal[
     return True
 
 
-def _is_token_byte(byte: Byte) -> Bool:
-    if (
-        (byte >= Byte(ord("a")) and byte <= Byte(ord("z")))
-        or (byte >= Byte(ord("A")) and byte <= Byte(ord("Z")))
-        or (byte >= Byte(ord("0")) and byte <= Byte(ord("9")))
-    ):
-        return True
-    return (
-        byte == Byte(ord("!"))
-        or byte == Byte(ord("#"))
-        or byte == Byte(ord("$"))
-        or byte == Byte(ord("%"))
-        or byte == Byte(ord("&"))
-        or byte == Byte(ord("'"))
-        or byte == Byte(ord("*"))
-        or byte == Byte(ord("+"))
-        or byte == Byte(ord("-"))
-        or byte == Byte(ord("."))
-        or byte == Byte(ord("^"))
-        or byte == Byte(ord("_"))
-        or byte == Byte(ord("`"))
-        or byte == Byte(ord("|"))
-        or byte == Byte(ord("~"))
-    )
-
-
 def _valid_value[origin: Origin](value: Span[Byte, origin]) -> Bool:
     for i in range(len(value)):
         var byte = value[i]
@@ -208,6 +182,36 @@ def _valid_path[origin: Origin](path: Span[Byte, origin]) -> Bool:
     return True
 
 
+def _field_length[
+    origin: Origin
+](encoded: Span[Byte, origin], offset: Int) -> Int:
+    return (
+        (Int(encoded[offset]) << 24)
+        | (Int(encoded[offset + 1]) << 16)
+        | (Int(encoded[offset + 2]) << 8)
+        | Int(encoded[offset + 3])
+    )
+
+
+def _is_lowercase_token[origin: Origin](name: Span[Byte, origin]) -> Bool:
+    for i in range(len(name)):
+        if not _is_tchar(name[i]) or (
+            name[i] >= Byte(ord("A")) and name[i] <= Byte(ord("Z"))
+        ):
+            return False
+    return True
+
+
+def _is_connection_specific(name: String) -> Bool:
+    return (
+        name == "connection"
+        or name == "proxy-connection"
+        or name == "keep-alive"
+        or name == "transfer-encoding"
+        or name == "upgrade"
+    )
+
+
 def decode_http2_request_headers[
     origin: Origin
 ](
@@ -234,18 +238,8 @@ def decode_http2_request_headers[
     while offset < len(encoded):
         if len(encoded) - offset < 8:
             return Http2RequestHeadResult.error()
-        var name_length = (
-            (Int(encoded[offset]) << 24)
-            | (Int(encoded[offset + 1]) << 16)
-            | (Int(encoded[offset + 2]) << 8)
-            | Int(encoded[offset + 3])
-        )
-        var value_length = (
-            (Int(encoded[offset + 4]) << 24)
-            | (Int(encoded[offset + 5]) << 16)
-            | (Int(encoded[offset + 6]) << 8)
-            | Int(encoded[offset + 7])
-        )
+        var name_length = _field_length(encoded, offset)
+        var value_length = _field_length(encoded, offset + 4)
         offset += 8
         if (
             name_length == 0
@@ -270,7 +264,7 @@ def decode_http2_request_headers[
                 if method_seen or len(value) == 0:
                     return Http2RequestHeadResult.error()
                 for i in range(len(value)):
-                    if not _is_token_byte(value[i]):
+                    if not _is_tchar(value[i]):
                         return Http2RequestHeadResult.error()
                 method = String(from_utf8_lossy=value)
                 method_seen = True
@@ -293,21 +287,10 @@ def decode_http2_request_headers[
                 return Http2RequestHeadResult.error()
         else:
             regular_seen = True
-            for i in range(len(name)):
-                if name[i] >= Byte(127) or (
-                    name[i] >= Byte(ord("A")) and name[i] <= Byte(ord("Z"))
-                ):
-                    return Http2RequestHeadResult.error()
-                if not _is_token_byte(name[i]):
-                    return Http2RequestHeadResult.error()
+            if not _is_lowercase_token(name):
+                return Http2RequestHeadResult.error()
             var name_string = String(from_utf8_lossy=name)
-            if (
-                name_string == "connection"
-                or name_string == "proxy-connection"
-                or name_string == "keep-alive"
-                or name_string == "transfer-encoding"
-                or name_string == "upgrade"
-            ):
+            if _is_connection_specific(name_string):
                 return Http2RequestHeadResult.error()
             if name_string == "te" and not _is_te_trailers(value):
                 return Http2RequestHeadResult.error()
@@ -357,18 +340,8 @@ def decode_http2_trailers[
     while offset < len(encoded):
         if len(encoded) - offset < 8:
             return Http2TrailersResult.error()
-        var name_length = (
-            (Int(encoded[offset]) << 24)
-            | (Int(encoded[offset + 1]) << 16)
-            | (Int(encoded[offset + 2]) << 8)
-            | Int(encoded[offset + 3])
-        )
-        var value_length = (
-            (Int(encoded[offset + 4]) << 24)
-            | (Int(encoded[offset + 5]) << 16)
-            | (Int(encoded[offset + 6]) << 8)
-            | Int(encoded[offset + 7])
-        )
+        var name_length = _field_length(encoded, offset)
+        var value_length = _field_length(encoded, offset + 4)
         offset += 8
         if (
             name_length == 0
@@ -386,20 +359,11 @@ def decode_http2_trailers[
             return Http2TrailersResult.error()
         if not _valid_value(value):
             return Http2TrailersResult.error()
-        for i in range(len(name)):
-            if (
-                name[i] >= Byte(127)
-                or (name[i] >= Byte(ord("A")) and name[i] <= Byte(ord("Z")))
-                or not _is_token_byte(name[i])
-            ):
-                return Http2TrailersResult.error()
+        if not _is_lowercase_token(name):
+            return Http2TrailersResult.error()
         var name_string = String(from_utf8_lossy=name)
         if (
-            name_string == "connection"
-            or name_string == "proxy-connection"
-            or name_string == "keep-alive"
-            or name_string == "transfer-encoding"
-            or name_string == "upgrade"
+            _is_connection_specific(name_string)
             or name_string == "content-length"
             or name_string == "host"
             or name_string == "te"

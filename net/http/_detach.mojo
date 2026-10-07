@@ -277,6 +277,44 @@ def _create_detach_state(
     return Int(ptr)
 
 
+def _detach_state(addr: Int) -> Pointer[_SharedDetachState, MutUntrackedOrigin]:
+    return Pointer[Byte, MutUntrackedOrigin](
+        unsafe_from_address=addr
+    ).unsafe_bitcast[_SharedDetachState]()
+
+
+def _unlock_and_wake(state: Pointer[_SharedDetachState, MutUntrackedOrigin]):
+    var wakeup_fd = state[].wakeup_fd
+    state[].mutex.unlock()
+    signal_wakeup_fd(wakeup_fd)
+
+
+def _cancel_detach_state(addr: Int):
+    var state = _detach_state(addr)
+    state[].mutex.lock()
+    state[].cancelled = True
+    state[].mutex.unlock()
+    _release_detach_state(addr, from_sender=False)
+
+
+def _inactive_error(operation: String) -> NetError:
+    return NetError(
+        NetErrorKind.invalid_state(),
+        operation,
+        None,
+        "ResponseSender is inactive",
+    )
+
+
+def _cancelled_error(operation: String) -> NetError:
+    return NetError(
+        NetErrorKind.closed(),
+        operation,
+        None,
+        "response was cancelled (client disconnect, timeout, or shutdown)",
+    )
+
+
 def _release_detach_state(addr: Int, from_sender: Bool):
     """Decrements ref_count and destroys the state when reaching zero.
 
@@ -349,10 +387,7 @@ struct ResponseSender(Movable):
         or cancelled."""
         if self._addr == 0:
             return True
-        var ptr = Pointer[Byte, MutUntrackedOrigin](
-            unsafe_from_address=self._addr
-        )
-        var s_ptr = ptr.unsafe_bitcast[_SharedDetachState]()
+        var s_ptr = _detach_state(self._addr)
         s_ptr[].mutex.lock()
         var c = s_ptr[].cancelled
         s_ptr[].mutex.unlock()
@@ -371,30 +406,14 @@ struct ResponseSender(Movable):
         or if the connection has been cancelled (client disconnect, timeout, or shutdown).
         """
         if self._addr == 0:
-            raise NetError(
-                NetErrorKind.invalid_state(),
-                "respond",
-                None,
-                "ResponseSender is inactive",
-            )
-        var ptr = Pointer[Byte, MutUntrackedOrigin](
-            unsafe_from_address=self._addr
-        )
-        var s_ptr = ptr.unsafe_bitcast[_SharedDetachState]()
+            raise _inactive_error("respond")
+        var s_ptr = _detach_state(self._addr)
         s_ptr[].mutex.lock()
         if s_ptr[].cancelled:
             s_ptr[].responded = True
             s_ptr[].finished = True
             s_ptr[].mutex.unlock()
-            raise NetError(
-                NetErrorKind.closed(),
-                "respond",
-                None,
-                (
-                    "response was cancelled (client disconnect, timeout, or"
-                    " shutdown)"
-                ),
-            )
+            raise _cancelled_error("respond")
         if s_ptr[].responded or s_ptr[].started or s_ptr[].finished:
             s_ptr[].mutex.unlock()
             raise NetError(
@@ -422,9 +441,7 @@ struct ResponseSender(Movable):
             s_ptr[].cancelled = True
             s_ptr[].finished = True
             s_ptr[].terminal_kind = MSG_KIND_ABORT
-        var wakeup_fd = s_ptr[].wakeup_fd
-        s_ptr[].mutex.unlock()
-        signal_wakeup_fd(wakeup_fd)
+        _unlock_and_wake(s_ptr)
         if not admitted:
             raise NetError(
                 NetErrorKind.invalid_argument(),
@@ -440,12 +457,7 @@ struct ResponseSender(Movable):
     ) raises NetError:
         """Starts response streaming by sending the HTTP status and headers."""
         if self._addr == 0:
-            raise NetError(
-                NetErrorKind.invalid_state(),
-                "start",
-                None,
-                "ResponseSender is inactive",
-            )
+            raise _inactive_error("start")
         if headers.get_first("Content-Length"):
             raise NetError(
                 NetErrorKind.invalid_argument(),
@@ -453,24 +465,13 @@ struct ResponseSender(Movable):
                 None,
                 "Content-Length is not permitted with chunked streaming",
             )
-        var ptr = Pointer[Byte, MutUntrackedOrigin](
-            unsafe_from_address=self._addr
-        )
-        var s_ptr = ptr.unsafe_bitcast[_SharedDetachState]()
+        var s_ptr = _detach_state(self._addr)
         s_ptr[].mutex.lock()
         if s_ptr[].cancelled:
             s_ptr[].started = True
             s_ptr[].finished = True
             s_ptr[].mutex.unlock()
-            raise NetError(
-                NetErrorKind.closed(),
-                "start",
-                None,
-                (
-                    "response was cancelled (client disconnect, timeout, or"
-                    " shutdown)"
-                ),
-            )
+            raise _cancelled_error("start")
         if s_ptr[].responded or s_ptr[].started or s_ptr[].finished:
             s_ptr[].mutex.unlock()
             raise NetError(
@@ -490,9 +491,7 @@ struct ResponseSender(Movable):
             s_ptr[].cancelled = True
             s_ptr[].finished = True
             s_ptr[].terminal_kind = MSG_KIND_ABORT
-        var wakeup_fd = s_ptr[].wakeup_fd
-        s_ptr[].mutex.unlock()
-        signal_wakeup_fd(wakeup_fd)
+        _unlock_and_wake(s_ptr)
         if not admitted:
             raise NetError(
                 NetErrorKind.invalid_argument(),
@@ -506,18 +505,10 @@ struct ResponseSender(Movable):
     ](mut self, data: Span[Byte, origin]) raises NetError -> Bool:
         """Enqueues a body chunk for response streaming."""
         if self._addr == 0:
-            raise NetError(
-                NetErrorKind.invalid_state(),
-                "send",
-                None,
-                "ResponseSender is inactive",
-            )
+            raise _inactive_error("send")
         if len(data) == 0:
             return True
-        var ptr = Pointer[Byte, MutUntrackedOrigin](
-            unsafe_from_address=self._addr
-        )
-        var s_ptr = ptr.unsafe_bitcast[_SharedDetachState]()
+        var s_ptr = _detach_state(self._addr)
         s_ptr[].mutex.lock()
         if s_ptr[].cancelled:
             s_ptr[].mutex.unlock()
@@ -534,9 +525,7 @@ struct ResponseSender(Movable):
             s_ptr[].cancelled = True
             s_ptr[].finished = True
             s_ptr[].terminal_kind = MSG_KIND_ABORT
-            var wakeup_fd = s_ptr[].wakeup_fd
-            s_ptr[].mutex.unlock()
-            signal_wakeup_fd(wakeup_fd)
+            _unlock_and_wake(s_ptr)
             raise NetError(
                 NetErrorKind.invalid_argument(),
                 "send",
@@ -547,8 +536,7 @@ struct ResponseSender(Movable):
         var admitted = ticket._try_reserve(len(data))
         if admitted:
             var chunk_bytes = List[Byte](capacity=len(data))
-            for i in range(len(data)):
-                chunk_bytes.append(data[i])
+            chunk_bytes.extend(data)
             admitted = _append_message(
                 s_ptr, DetachMessage.chunk(chunk_bytes^, ticket^)
             )
@@ -558,9 +546,7 @@ struct ResponseSender(Movable):
             s_ptr[].terminal_kind = MSG_KIND_ABORT
         if admitted:
             s_ptr[].queued_bytes += len(data)
-        var wakeup_fd = s_ptr[].wakeup_fd
-        s_ptr[].mutex.unlock()
-        signal_wakeup_fd(wakeup_fd)
+        _unlock_and_wake(s_ptr)
         if not admitted:
             raise NetError(
                 NetErrorKind.invalid_argument(),
@@ -573,29 +559,13 @@ struct ResponseSender(Movable):
     def finish(mut self) raises NetError:
         """Finishes the streaming response."""
         if self._addr == 0:
-            raise NetError(
-                NetErrorKind.invalid_state(),
-                "finish",
-                None,
-                "ResponseSender is inactive",
-            )
-        var ptr = Pointer[Byte, MutUntrackedOrigin](
-            unsafe_from_address=self._addr
-        )
-        var s_ptr = ptr.unsafe_bitcast[_SharedDetachState]()
+            raise _inactive_error("finish")
+        var s_ptr = _detach_state(self._addr)
         s_ptr[].mutex.lock()
         if s_ptr[].cancelled:
             s_ptr[].finished = True
             s_ptr[].mutex.unlock()
-            raise NetError(
-                NetErrorKind.closed(),
-                "finish",
-                None,
-                (
-                    "response was cancelled (client disconnect, timeout, or"
-                    " shutdown)"
-                ),
-            )
+            raise _cancelled_error("finish")
         if not s_ptr[].started or s_ptr[].finished or s_ptr[].responded:
             s_ptr[].mutex.unlock()
             raise NetError(
@@ -606,25 +576,18 @@ struct ResponseSender(Movable):
             )
         s_ptr[].finished = True
         s_ptr[].terminal_kind = MSG_KIND_FINISH
-        var wakeup_fd = s_ptr[].wakeup_fd
-        s_ptr[].mutex.unlock()
-        signal_wakeup_fd(wakeup_fd)
+        _unlock_and_wake(s_ptr)
 
     def abort(mut self):
         """Aborts the response, causing the server to close or 500 the connection.
         """
         if self._addr == 0:
             return
-        var ptr = Pointer[Byte, MutUntrackedOrigin](
-            unsafe_from_address=self._addr
-        )
-        var s_ptr = ptr.unsafe_bitcast[_SharedDetachState]()
+        var s_ptr = _detach_state(self._addr)
         s_ptr[].mutex.lock()
         if s_ptr[].cancelled or s_ptr[].finished:
             s_ptr[].mutex.unlock()
             return
         s_ptr[].finished = True
         s_ptr[].terminal_kind = MSG_KIND_ABORT
-        var wakeup_fd = s_ptr[].wakeup_fd
-        s_ptr[].mutex.unlock()
-        signal_wakeup_fd(wakeup_fd)
+        _unlock_and_wake(s_ptr)

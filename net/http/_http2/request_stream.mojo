@@ -1,6 +1,6 @@
 """One HTTP/2 request stream's headers, body, and trailers."""
 
-from net.http.headers import Headers
+from net.http.headers import Headers, _parse_decimal
 from net.http.request import HttpVersion, Request
 
 from .data_frame import DataFrameResult
@@ -59,29 +59,13 @@ struct Http2RequestStreamResult(Movable):
         return self.kind == 6
 
 
-def _parse_content_length(value: String) -> Int:
-    var bytes = value.as_bytes()
-    if len(bytes) == 0:
-        return -1
-    var parsed = 0
-    for i in range(len(bytes)):
-        var byte = bytes[i]
-        if byte < Byte(ord("0")) or byte > Byte(ord("9")):
-            return -1
-        var digit = Int(byte - Byte(ord("0")))
-        if parsed > (Int.MAX - digit) // 10:
-            return -1
-        parsed = parsed * 10 + digit
-    return parsed
-
-
 def _content_length_matches_body(request: Request, body_len: Int) -> Bool:
     var values = request.headers.get_all("content-length")
     if len(values) == 0:
         return True
     var expected = -1
     for i in range(len(values)):
-        var parsed = _parse_content_length(values[i])
+        var parsed = _parse_decimal(values[i], Int.MAX)
         if parsed < 0:
             return False
         if expected < 0:

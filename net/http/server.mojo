@@ -67,9 +67,10 @@ from ._detach import (
     MSG_KIND_NONE,
     MSG_KIND_RESPOND,
     MSG_KIND_START,
+    _cancel_detach_state,
+    _detach_state,
     _release_detach_state,
     _take_batch,
-    _SharedDetachState,
     DetachMessage,
 )
 from ._encoder import (
@@ -81,7 +82,7 @@ from ._encoder import (
     _measure_error,
     _encode_response_budgeted,
 )
-from ._parser import ParseResult, parse_head, parse_one, _scan_chunked
+from ._parser import ParseResult, parse_body, parse_head, _scan_chunked
 from .config import ServerConfig
 from .handler import Handler
 from .headers import Headers, _check_value_bytes
@@ -188,14 +189,7 @@ struct Server(Movable):
             var addr = self._conns[idx].detach_state_addr
             if addr != 0:
                 self._conns[idx].detach_state_addr = 0
-                var ptr = Pointer[Byte, MutUntrackedOrigin](
-                    unsafe_from_address=addr
-                )
-                var s_ptr = ptr.unsafe_bitcast[_SharedDetachState]()
-                s_ptr[].mutex.lock()
-                s_ptr[].cancelled = True
-                s_ptr[].mutex.unlock()
-                _release_detach_state(addr, from_sender=False)
+                _cancel_detach_state(addr)
             var wire_capacity = (
                 self._conns[idx].buf.capacity()
                 + self._conns[idx].pending.capacity()
@@ -309,6 +303,8 @@ struct Server(Movable):
             self._finish_control()
             return False
         self._tick_id += 1
+        var wait_timeout = self._compute_timeout(now, timeout)
+        self._process_detached_messages(now)
         # Capped pipelines from the previous tick re-drive without a kernel
         # event; blocking up to the wait cap here would stall a pipelined
         # flood ~100ms per 16 requests.
@@ -319,18 +315,7 @@ struct Server(Movable):
                 urgent.append(idx)
             if idx >= 0 and idx < len(self._urgent_flag):
                 self._urgent_flag[idx] = False
-        var wait_timeout = self._compute_timeout(now, timeout)
-        self._process_detached_messages(now)
-        while len(self._urgent) > 0:
-            var nidx = self._urgent.pop(0)
-            if (
-                nidx >= 0
-                and nidx < len(self._urgent_flag)
-                and self._conns[nidx].active
-            ):
-                urgent.append(nidx)
-            if nidx >= 0 and nidx < len(self._urgent_flag):
-                self._urgent_flag[nidx] = False
+        self._urgent.clear()
         if len(urgent) > 0:
             wait_timeout = Timeout.nanoseconds(0)
         var events = self._reactor.wait(wait_timeout)
@@ -868,17 +853,7 @@ struct Server(Movable):
                     response.body.clear()
                 self._budget.release(body_size)
             if response.is_detached():
-                var addr = response._detach_state_addr
-                if addr != 0:
-                    var ptr = Pointer[Byte, MutUntrackedOrigin](
-                        unsafe_from_address=addr
-                    )
-                    var s_ptr = ptr.unsafe_bitcast[_SharedDetachState]()
-                    s_ptr[].mutex.lock()
-                    s_ptr[].cancelled = True
-                    s_ptr[].mutex.unlock()
-                    _release_detach_state(addr, from_sender=False)
-                    response._detach_state_addr = 0
+                response._cancel_detach()
                 response.status = 500
                 response.body.clear()
             if response.status < 100 or response.status > 599:
@@ -900,12 +875,7 @@ struct Server(Movable):
                 response.headers.clear()
                 response.body.clear()
             var wire_length = -1
-            if (
-                response.status >= 200
-                and response.status != 204
-                and response.status != 205
-                and response.status != 304
-            ):
+            if has_body_for_status(response.status, False):
                 wire_length = len(response.body)
             if wire_length >= 0:
                 var declared_lengths = response.headers.get_all(
@@ -921,28 +891,27 @@ struct Server(Movable):
                         wire_length = -1
                         break
             var headers = List[Byte]()
-            var header_count = 0
-            for i in range(len(response.headers)):
-                var name = response.headers.name_at(i)
-                if name.lower() == "content-length":
-                    continue
-                header_count += 1
+            var header_count = len(response.headers) - response.headers.count(
+                "content-length"
+            )
             if wire_length >= 0:
                 header_count += 1
             _append_quic_u32(headers, UInt32(header_count))
             for i in range(len(response.headers)):
-                var name = response.headers.name_at(i)
-                if name.lower() == "content-length":
+                if response.headers._lower_names[i] == "content-length":
                     continue
-                var name_bytes = name.as_bytes()
-                var value = response.headers.value_bytes_at(i)
-                _append_quic_field(headers, name_bytes)
-                _append_quic_field(headers, Span(value))
+                _append_quic_field(
+                    headers, response.headers._names[i].as_bytes()
+                )
+                _append_quic_field(
+                    headers, response.headers._value_bytes_span(i)
+                )
             if wire_length >= 0:
                 var length = String(wire_length)
                 _append_quic_field(headers, String("content-length").as_bytes())
                 _append_quic_field(headers, length.as_bytes())
-            var response_body = response.body.copy()
+            var response_body = response.body^
+            response.body = List[Byte]()
             if not has_body_for_status(response.status, is_head):
                 response_body.clear()
             if (
@@ -1515,7 +1484,8 @@ struct Server(Movable):
                 self._respond_http2(idx, result^, request_body_bytes, handler)
                 return
             if len(result.output) > 0:
-                var output = result.output.copy()
+                var output = result.output^
+                result.output = List[Byte]()
                 if not self._conns[idx].append_pending(output^, self._budget):
                     self._close_conn(idx)
                     return
@@ -1539,7 +1509,8 @@ struct Server(Movable):
         mut handler: H,
     ) raises NetError:
         var stream_id = result.stream_id
-        var control_output = result.output.copy()
+        var control_output = result.output^
+        result.output = List[Byte]()
         var request = result^.take_request()
         var is_head = request.method == "HEAD"
         var cap = self.config.max_response_body
@@ -1569,17 +1540,7 @@ struct Server(Movable):
         self._conns[idx].http2_body_reserved -= request_body_bytes
 
         if writer.is_detached():
-            var addr = writer._detach_state_addr
-            if addr != 0:
-                var ptr = Pointer[Byte, MutUntrackedOrigin](
-                    unsafe_from_address=addr
-                )
-                var s_ptr = ptr.unsafe_bitcast[_SharedDetachState]()
-                s_ptr[].mutex.lock()
-                s_ptr[].cancelled = True
-                s_ptr[].mutex.unlock()
-                _release_detach_state(addr, from_sender=False)
-                writer._detach_state_addr = 0
+            writer._cancel_detach()
             self._close_conn(idx)
             return
         if len(writer.body) > cap:
@@ -1656,10 +1617,12 @@ struct Server(Movable):
             self._close_conn(idx)
             return
 
-        var response_body = writer.body.copy()
+        var response_body = writer.body^
+        writer.body = List[Byte]()
         if not has_body_for_status(writer.status, is_head):
             response_body.clear()
-        var headers_wire = encoded.wire.copy()
+        var headers_wire = encoded.wire^
+        encoded.wire = List[Byte]()
         var response_reservation = len(headers_wire) + len(response_body)
         if not self._budget.try_reserve(response_reservation):
             self._close_conn(idx)
@@ -1713,7 +1676,8 @@ struct Server(Movable):
                 self.config.idle_timeout
             )
             return
-        var output = batch.wire.copy()
+        var output = batch.wire^
+        batch.wire = List[Byte]()
         if not self._conns[idx].append_pending(output^, self._budget):
             self._close_conn(idx)
             return
@@ -1813,7 +1777,6 @@ struct Server(Movable):
                 if self._conns[idx].read_eof:
                     self._close_conn(idx)
                     return
-                self._conns[idx].scanned_len = self._conns[idx].buffered_len()
                 break
             if head.is_error():
                 var head_status = head.take_error().status
@@ -1874,20 +1837,18 @@ struct Server(Movable):
                     if self._conns[idx].read_eof:
                         self._close_conn(idx)
                         return
-                    self._conns[idx].scanned_len = self._conns[
-                        idx
-                    ].buffered_len()
                     break
                 if not self._budget.try_reserve(scan.decoded):
                     self._send_error(idx, 503)
                     return
                 self._conns[idx].http1_body_reserved = scan.decoded
-            var result = parse_one(Span(self._conns[idx].buf), self.config)
+            var result = parse_body(
+                head^, Span(self._conns[idx].buf), self.config
+            )
             if result.is_need_more():
                 if self._conns[idx].read_eof:
                     self._close_conn(idx)
                     return
-                self._conns[idx].scanned_len = self._conns[idx].buffered_len()
                 break
             if result.is_error():
                 var body_status = result.take_error().status
@@ -1933,8 +1894,7 @@ struct Server(Movable):
                     self._close_conn(idx)
                     return False
                 var rest = List[Byte](capacity=capacity)
-                for i in range(written, len(cont)):
-                    rest.append(cont[i])
+                rest.extend(cont[written:])
                 self._conns[idx]._set_reserved_pending(rest^, self._budget)
                 self._conns[idx].state = STATE_SENDING_100
                 self._conns[idx].write_at = deadline_from_now(
@@ -1994,17 +1954,7 @@ struct Server(Movable):
             _ = req^
             self._release_http1_body(idx)
             if writer.is_detached():
-                var addr = writer._detach_state_addr
-                if addr != 0:
-                    var ptr = Pointer[Byte, MutUntrackedOrigin](
-                        unsafe_from_address=addr
-                    )
-                    var s_ptr = ptr.unsafe_bitcast[_SharedDetachState]()
-                    s_ptr[].mutex.lock()
-                    s_ptr[].cancelled = True
-                    s_ptr[].mutex.unlock()
-                    _release_detach_state(addr, from_sender=False)
-                    writer._detach_state_addr = 0
+                writer._cancel_detach()
             writer._drop_body()
             writer._drop_headers()
             self._send_error(idx, 500, is_head=is_head)
@@ -2234,10 +2184,7 @@ struct Server(Movable):
             return
         var addr = self._conns[idx].detach_state_addr
         if addr != 0:
-            var ptr = Pointer[Byte, MutUntrackedOrigin](
-                unsafe_from_address=addr
-            )
-            var s_ptr = ptr.unsafe_bitcast[_SharedDetachState]()
+            var s_ptr = _detach_state(addr)
             s_ptr[].mutex.lock()
             s_ptr[].cancelled = True
             s_ptr[].finished = True
@@ -2264,16 +2211,9 @@ struct Server(Movable):
 
     def _handle_detached_timeout(mut self, idx: Int) raises NetError:
         if self._conns[idx].state == STATE_STREAMING:
-            self._mark_detached_cancelled(idx)
-            self._cleanup_detached_state(idx)
-            self._remove_detached_conn(idx)
             self._close_conn(idx)
             return
-        var is_head = self._conns[idx].is_head
-        self._mark_detached_cancelled(idx)
-        self._cleanup_detached_state(idx)
-        self._remove_detached_conn(idx)
-        self._send_error(idx, 503, is_head=is_head)
+        self._send_error(idx, 503, is_head=self._conns[idx].is_head)
         self._arm_deadline(idx)
 
     def _process_detached_messages(mut self, now: Int) raises NetError:
@@ -2318,11 +2258,7 @@ struct Server(Movable):
                 _ = self._detached_conns.pop(i)
                 continue
 
-            var ptr = Pointer[Byte, MutUntrackedOrigin](
-                unsafe_from_address=addr
-            )
-            var s_ptr = ptr.unsafe_bitcast[_SharedDetachState]()
-            var batch = _take_batch(s_ptr)
+            var batch = _take_batch(_detach_state(addr))
             if (
                 len(batch.messages) == 0
                 and batch.terminal_kind == MSG_KIND_NONE
@@ -2330,8 +2266,9 @@ struct Server(Movable):
                 i += 1
                 continue
 
+            batch.messages.reverse()
             while len(batch.messages) > 0:
-                var msg = batch.messages.pop(0)
+                var msg = batch.messages.pop()
                 if not self._conns[idx].active:
                     break
                 if self._conns[idx].detach_state_addr != addr:
@@ -2409,8 +2346,6 @@ struct Server(Movable):
         rw.set_should_close(req_close or (self._shutdown_at != NO_DEADLINE))
 
         if len(rw.body) > self.config.max_response_body:
-            self._mark_detached_cancelled(idx)
-            self._cleanup_detached_state(idx)
             rw._drop_headers()
             self._send_error(idx, 500, is_head=is_head)
             self._arm_deadline(idx)
@@ -2420,8 +2355,6 @@ struct Server(Movable):
             self._inject_alt_svc_for_tls(idx, rw)
         except e:
             _ = e
-            self._mark_detached_cancelled(idx)
-            self._cleanup_detached_state(idx)
             rw._drop_headers()
             self._send_error(idx, 500, is_head=is_head)
             self._arm_deadline(idx)
@@ -2439,8 +2372,6 @@ struct Server(Movable):
             )
         except e:
             _ = e
-            self._mark_detached_cancelled(idx)
-            self._cleanup_detached_state(idx)
             rw._drop_headers()
             self._send_error(idx, 500, is_head=is_head)
             self._arm_deadline(idx)
@@ -2487,8 +2418,6 @@ struct Server(Movable):
             self._inject_alt_svc_for_tls(idx, rw)
         except e:
             _ = e
-            self._mark_detached_cancelled(idx)
-            self._cleanup_detached_state(idx)
             rw._drop_headers()
             self._send_error(idx, 500, is_head=is_head)
             self._arm_deadline(idx)
@@ -2506,16 +2435,12 @@ struct Server(Movable):
             )
         except e:
             _ = e
-            self._mark_detached_cancelled(idx)
-            self._cleanup_detached_state(idx)
             rw._drop_headers()
             self._send_error(idx, 500, is_head=is_head)
             self._arm_deadline(idx)
             return
 
         if not self._conns[idx]._append_reserved_pending(wire^, self._budget):
-            self._mark_detached_cancelled(idx)
-            self._cleanup_detached_state(idx)
             rw._drop_headers()
             self._send_error(idx, 500, is_head=is_head)
             self._arm_deadline(idx)
@@ -2563,9 +2488,6 @@ struct Server(Movable):
             self._handle_detached_abort(idx)
             return
         if not self._conns[idx]._append_reserved_pending(wire^, self._budget):
-            self._mark_detached_cancelled(idx)
-            self._cleanup_detached_state(idx)
-            self._remove_detached_conn(idx)
             self._close_conn(idx)
             return
 
@@ -2595,9 +2517,6 @@ struct Server(Movable):
             self._handle_detached_abort(idx)
             return
         if not self._conns[idx]._append_reserved_pending(wire^, self._budget):
-            self._mark_detached_cancelled(idx)
-            self._cleanup_detached_state(idx)
-            self._remove_detached_conn(idx)
             self._close_conn(idx)
             return
 
@@ -2610,9 +2529,6 @@ struct Server(Movable):
 
     def _handle_detached_abort(mut self, idx: Int) raises NetError:
         if self._conns[idx].state == STATE_STREAMING:
-            self._mark_detached_cancelled(idx)
-            self._cleanup_detached_state(idx)
-            self._remove_detached_conn(idx)
             self._close_conn(idx)
             return
         self._cleanup_detached_state(idx)
@@ -2690,8 +2606,7 @@ def _append_quic_field[
     origin: Origin
 ](mut output: List[Byte], value: Span[Byte, origin]):
     _append_quic_u32(output, UInt32(len(value)))
-    for i in range(len(value)):
-        output.append(value[i])
+    output.extend(value)
 
 
 def listen_and_serve[

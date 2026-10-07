@@ -67,7 +67,6 @@ struct HttpConnection(Movable):
     var requests_this_tick: Int
     var reserved: Int
     var http1_body_reserved: Int
-    var scanned_len: Int
     var more_work: Bool
     var active: Bool
     var _no_deadline: Int
@@ -128,7 +127,6 @@ struct HttpConnection(Movable):
         self.requests_this_tick = 0
         self.reserved = 0
         self.http1_body_reserved = 0
-        self.scanned_len = 0
         self.more_work = False
         self.active = True
         self.tls_handshake_at = handshake_at
@@ -244,8 +242,7 @@ struct HttpConnection(Movable):
         self.requests_this_tick = 0
 
     def append_bytes[origin: ImmOrigin](mut self, data: Span[Byte, origin]):
-        for i in range(len(data)):
-            self.buf.append(data[i])
+        self.buf.extend(data)
 
     def drain_prefix(mut self, count: Int):
         var remaining = len(self.buf) - count
@@ -255,12 +252,6 @@ struct HttpConnection(Movable):
             for i in range(remaining):
                 self.buf[i] = self.buf[count + i]
             self.buf.shrink(remaining)
-        # The drained prefix was necessarily scanned; the remainder
-        # keeps its scanned prefix length.
-        if self.scanned_len > count:
-            self.scanned_len -= count
-        else:
-            self.scanned_len = 0
 
     def _adopt_pending[
         B: _CapacityBudget
@@ -319,8 +310,7 @@ struct HttpConnection(Movable):
                 self.pending[i] = self.pending[self.pending_offset + i]
             self.pending.shrink(remaining)
             self.pending_offset = 0
-        for i in range(len(bytes)):
-            self.pending.append(bytes[i])
+        self.pending.extend(Span(bytes))
         _ = bytes^
         budget.release(incoming_capacity)
         return True
@@ -372,8 +362,9 @@ struct HttpConnection(Movable):
             self.tls_read_retry_length = 0
             if result.progress.is_closed():
                 return 0
-            for i in range(result.count):
-                output[i] = self.tls_read_buffer[i]
+            output[0 : result.count].copy_from(
+                Span(self.tls_read_buffer)[0 : result.count]
+            )
             if self.tls.value().pending() > 0:
                 self.more_work = True
             return result.count
