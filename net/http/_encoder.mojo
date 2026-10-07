@@ -11,6 +11,7 @@ from net.error import NetError, NetErrorKind
 
 from ._buffer import _CapacityBudget
 from .error import _status_reason
+from .headers import _trailer_forbidden
 from .response import ResponseWriter, has_body_for_status
 
 
@@ -189,6 +190,78 @@ def _append_response_string[
     _append_response_bytes[measure](out, data.as_bytes(), byte_count)
 
 
+def _append_hex_bytes[
+    measure: Bool
+](mut out: List[Byte], val: Int, mut byte_count: Int):
+    var digits = 1
+    var probe = val >> 4
+    while probe > 0:
+        digits += 1
+        probe >>= 4
+    comptime if measure:
+        byte_count += digits
+    else:
+        for i in range(digits):
+            var shift = (digits - 1 - i) * 4
+            var rem = (val >> shift) & 0xF
+            if rem < 10:
+                out.append(Byte(ord("0") + rem))
+            else:
+                out.append(Byte(ord("a") + rem - 10))
+
+
+def _render_chunk_frame[
+    measure: Bool, origin: ImmOrigin
+](mut out: List[Byte], data: Span[Byte, origin], mut byte_count: Int):
+    _append_hex_bytes[measure](out, len(data), byte_count)
+    _append_response_string[measure](out, "\r\n", byte_count)
+    _append_response_bytes[measure](out, data, byte_count)
+    _append_response_string[measure](out, "\r\n", byte_count)
+
+
+def _render_trailer_section[
+    measure: Bool
+](
+    writer: ResponseWriter,
+    mut out: List[Byte],
+    mut byte_count: Int,
+) raises NetError:
+    for i in range(len(writer.trailers)):
+        var name_bytes = writer.trailers._names[i].as_bytes()
+        var value_bytes = writer.trailers._value_bytes_span(i)
+        if _trailer_forbidden(writer.trailers._lower_names[i]):
+            raise NetError(
+                NetErrorKind.invalid_argument(),
+                "encode response",
+                None,
+                "trailer modifies framing, routing, or payload processing",
+            )
+        for k in range(len(name_bytes)):
+            if name_bytes[k] == Byte(ord("\r")) or name_bytes[k] == Byte(
+                ord("\n")
+            ):
+                raise NetError(
+                    NetErrorKind.invalid_argument(),
+                    "encode response",
+                    None,
+                    "response trailer contains CR or LF",
+                )
+        for k in range(len(value_bytes)):
+            if value_bytes[k] == Byte(ord("\r")) or value_bytes[k] == Byte(
+                ord("\n")
+            ):
+                raise NetError(
+                    NetErrorKind.invalid_argument(),
+                    "encode response",
+                    None,
+                    "response trailer contains CR or LF",
+                )
+        _append_response_bytes[measure](out, name_bytes, byte_count)
+        _append_response_string[measure](out, ": ", byte_count)
+        _append_response_bytes[measure](out, value_bytes, byte_count)
+        _append_response_string[measure](out, "\r\n", byte_count)
+
+
 def _render_response[
     measure: Bool
 ](
@@ -227,6 +300,35 @@ def _render_response[
             "response headers too large",
         )
     var send_body = has_body_for_status(writer.status, is_head)
+    # Trailers only reach the wire for responses that frame a body on
+    # this request (RFC 9112 §7.1.2); HEAD / 1xx / 204 / 205 / 304
+    # silently drop trailers so framing stays Content-Length.
+    var use_trailers = send_body and len(writer.trailers) > 0
+    if use_trailers:
+        if len(writer.trailers) > max_headers:
+            raise NetError(
+                NetErrorKind.invalid_argument(),
+                "encode response",
+                None,
+                "too many response trailers",
+            )
+        var trailer_bytes = 0
+        var trailer_list_bytes = 0
+        for i in range(len(writer.trailers)):
+            var name_len = writer.trailers._names[i].byte_length()
+            trailer_bytes += name_len
+            trailer_bytes += writer.trailers.value_byte_length(i)
+            trailer_bytes += 4
+            trailer_list_bytes += name_len
+            if i + 1 < len(writer.trailers):
+                trailer_list_bytes += 2
+        if header_bytes + trailer_bytes + trailer_list_bytes > max_bytes:
+            raise NetError(
+                NetErrorKind.invalid_argument(),
+                "encode response",
+                None,
+                "response trailers too large",
+            )
     # HEAD omits body bytes but keeps the GET-equivalent length.
     # 1xx / 204 / 205 / 304 omit both length and bytes.
     var wire_length = -1
@@ -246,7 +348,21 @@ def _render_response[
             None,
             "Transfer-Encoding is not supported on responses",
         )
+    if use_trailers and writer.headers._first_lower_index("trailer") >= 0:
+        raise NetError(
+            NetErrorKind.invalid_argument(),
+            "encode response",
+            None,
+            "Trailer header is managed by the encoder",
+        )
     var declared = writer.headers._first_lower_index("content-length")
+    if use_trailers and declared >= 0:
+        raise NetError(
+            NetErrorKind.invalid_argument(),
+            "encode response",
+            None,
+            "Content-Length is not permitted when response trailers are set",
+        )
     if declared >= 0 and wire_length >= 0:
         var parsed = 0
         var digits = writer.headers._value_bytes_span(declared)
@@ -329,7 +445,19 @@ def _render_response[
         _append_response_string[measure](out, "Date: ", byte_count)
         _append_response_string[measure](out, date, byte_count)
         _append_response_string[measure](out, "\r\n", byte_count)
-    if wire_length >= 0:
+    if use_trailers:
+        _append_response_string[measure](
+            out, "Transfer-Encoding: chunked\r\n", byte_count
+        )
+        _append_response_string[measure](out, "Trailer: ", byte_count)
+        for i in range(len(writer.trailers)):
+            if i > 0:
+                _append_response_string[measure](out, ", ", byte_count)
+            _append_response_bytes[measure](
+                out, writer.trailers._names[i].as_bytes(), byte_count
+            )
+        _append_response_string[measure](out, "\r\n", byte_count)
+    elif wire_length >= 0:
         _append_response_string[measure](
             out,
             String("Content-Length: ") + String(wire_length) + String("\r\n"),
@@ -347,7 +475,13 @@ def _render_response[
                 out, String("Connection: close\r\n"), byte_count
             )
     _append_response_string[measure](out, String("\r\n"), byte_count)
-    if send_body:
+    if use_trailers:
+        if len(writer.body) > 0:
+            _render_chunk_frame[measure](out, Span(writer.body), byte_count)
+        _append_response_string[measure](out, "0\r\n", byte_count)
+        _render_trailer_section[measure](writer, out, byte_count)
+        _append_response_string[measure](out, "\r\n", byte_count)
+    elif send_body:
         _append_response_bytes[measure](out, Span(writer.body), byte_count)
 
 

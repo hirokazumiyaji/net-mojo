@@ -8,7 +8,7 @@ pipelined next-request bytes for a body.
 
 from net.http import Headers, HttpError, HttpVersion, Request, ServerConfig
 from net.http import split_path_query
-from net.http.headers import _is_tchar, _parse_decimal
+from net.http.headers import _is_tchar, _parse_decimal, _trailer_forbidden
 from ._authority import _host_is_valid
 
 
@@ -344,29 +344,6 @@ def _parse_absolute_authority(
         # to `/` so root handlers see one path for both spellings.
         path = String("/")
     return True, authority^, path^, query^
-
-
-def _trailer_forbidden(name: StringSlice) -> Bool:
-    # RFC 9112 6.5.1 forbids trailers that change framing, routing,
-    # authentication, or payload processing.
-    var lowered = String(name).lower()
-    return (
-        lowered == "content-length"
-        or lowered == "transfer-encoding"
-        or lowered == "te"
-        or lowered == "trailer"
-        or lowered == "host"
-        or lowered == "expect"
-        or lowered == "connection"
-        or lowered == "keep-alive"
-        or lowered == "upgrade"
-        or lowered == "authorization"
-        or lowered == "proxy-authenticate"
-        or lowered == "proxy-authorization"
-        or lowered == "content-encoding"
-        or lowered == "content-type"
-        or lowered == "content-range"
-    )
 
 
 @fieldwise_init

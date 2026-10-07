@@ -860,5 +860,148 @@ def test_error_long_date_and_alt_svc_measure_exact_prepaid_head_wire() raises:
         assert_equal(_bytes_to_string(Span(prepaid)), expected)
 
 
+def test_trailers_switch_response_to_chunked_with_trailer_header() raises:
+    var writer = ResponseWriter(1024)
+    writer.headers.add(String("Content-Type"), String("text/plain"))
+    writer.write_string("hello")
+    writer.add_trailer(String("X-Checksum"), String("abc"))
+    writer.add_trailer(String("X-Count"), String("1"))
+    var wire = encode_response(
+        writer, False, "Thu, 01 Jan 1970 00:00:00 GMT", 100, 32768
+    )
+    var text = _bytes_to_string(Span(wire))
+    assert_true(text.find("Transfer-Encoding: chunked\r\n") >= 0)
+    assert_true(text.find("Trailer: X-Checksum, X-Count\r\n") >= 0)
+    assert_true(text.find("Content-Length") < 0)
+    assert_true(
+        text.endswith(
+            "\r\n\r\n5\r\nhello\r\n0\r\nX-Checksum: abc\r\nX-Count: 1\r\n\r\n"
+        )
+    )
+
+
+def test_trailers_empty_body_still_emits_zero_chunk_and_trailers() raises:
+    var writer = ResponseWriter(1024)
+    writer.add_trailer(String("X-Checksum"), String("abc"))
+    var wire = encode_response(
+        writer, False, "Thu, 01 Jan 1970 00:00:00 GMT", 100, 32768
+    )
+    var text = _bytes_to_string(Span(wire))
+    assert_true(text.find("Transfer-Encoding: chunked\r\n") >= 0)
+    assert_true(text.find("Trailer: X-Checksum\r\n") >= 0)
+    assert_true(text.endswith("\r\n\r\n0\r\nX-Checksum: abc\r\n\r\n"))
+
+
+def test_trailers_dropped_on_head_and_no_body_statuses() raises:
+    for scenario in range(4):
+        var writer = ResponseWriter(1024)
+        var is_head = False
+        if scenario == 0:
+            is_head = True
+            writer.write_string("hello")
+        else:
+            var statuses = [204, 205, 304]
+            writer.set_status(statuses[scenario - 1])
+        writer.add_trailer(String("X-Checksum"), String("abc"))
+        var wire = encode_response(
+            writer, is_head, "Thu, 01 Jan 1970 00:00:00 GMT", 100, 32768
+        )
+        var text = _bytes_to_string(Span(wire))
+        assert_true(text.find("Transfer-Encoding: chunked") < 0)
+        assert_true(text.find("Trailer:") < 0)
+        assert_true(text.find("X-Checksum") < 0)
+        assert_true(text.endswith("\r\n\r\n"))
+
+
+def test_add_trailer_rejects_forbidden_names() raises:
+    var forbidden: List[String] = [
+        String("Content-Length"),
+        String("Transfer-Encoding"),
+        String("Trailer"),
+        String("Content-Type"),
+        String("Host"),
+        String("Connection"),
+        String("Authorization"),
+    ]
+    for name in forbidden:
+        var writer = ResponseWriter(32)
+        var rejected = False
+        try:
+            writer.add_trailer(name.copy(), String("value"))
+        except e:
+            assert_equal(e.kind, NetErrorKind.invalid_argument())
+            rejected = True
+        assert_true(rejected)
+        assert_equal(len(writer.trailers), 0)
+
+
+def test_add_trailer_rejects_crlf_and_control_bytes() raises:
+    var writer = ResponseWriter(32)
+    var rejected = False
+    try:
+        writer.add_trailer(String("X-Name"), String("value\r\n"))
+    except e:
+        assert_equal(e.kind, NetErrorKind.invalid_argument())
+        rejected = True
+    assert_true(rejected)
+    assert_equal(len(writer.trailers), 0)
+    var rejected2 = False
+    try:
+        writer.add_trailer(String("Bad\r\nName"), String("value"))
+    except e:
+        assert_equal(e.kind, NetErrorKind.invalid_argument())
+        rejected2 = True
+    assert_true(rejected2)
+
+
+def test_trailers_reject_caller_content_length_and_trailer_header() raises:
+    for scenario in range(2):
+        var writer = ResponseWriter(32)
+        writer.write_string("hello")
+        if scenario == 0:
+            writer.headers.add(String("Content-Length"), String("5"))
+        else:
+            writer.headers.add(String("Trailer"), String("X-Checksum"))
+        writer.add_trailer(String("X-Checksum"), String("abc"))
+        var rejected = False
+        try:
+            _ = encode_response(writer, False, "date", 100, 32768)
+        except e:
+            assert_equal(e.kind, NetErrorKind.invalid_argument())
+            rejected = True
+        assert_true(rejected)
+
+
+def test_trailers_count_against_header_byte_budget() raises:
+    var writer = ResponseWriter(32)
+    writer.write_string("hello")
+    writer.add_trailer(String("X-Long"), String("x" * 2000))
+    var rejected = False
+    try:
+        _ = encode_response(writer, False, "date", 100, 100)
+    except e:
+        assert_equal(e.kind, NetErrorKind.invalid_argument())
+        rejected = True
+    assert_true(rejected)
+
+
+def test_trailers_wire_capacity_exact_matches_measure() raises:
+    var writer = ResponseWriter(1024)
+    writer.headers.add(String("Content-Type"), String("text/plain"))
+    writer.write_string("hello")
+    writer.add_trailer(String("X-Checksum"), String("abc"))
+    var expected = encode_response(writer, False, "date", 100, 32768)
+    var capacity = _measure_response(writer, False, "date", 100, 32768)
+    assert_equal(capacity, len(expected))
+    var budget = BufferBudget(1024)
+    assert_true(budget.try_reserve(writer.body.capacity()))
+    var wire = _encode_response_budgeted(
+        writer, False, "date", 100, 32768, budget
+    )
+    assert_equal(len(wire), capacity)
+    for i in range(len(expected)):
+        assert_equal(wire[i], expected[i])
+
+
 def main() raises:
     TestSuite.discover_tests[__functions_in_module()]().run()

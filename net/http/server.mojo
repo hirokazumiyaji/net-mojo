@@ -2088,6 +2088,9 @@ struct Server(Movable):
             or not writer.headers._adopt_capacity_budget(
                 writer._body_budget.copy()
             )
+            or not writer.trailers._adopt_capacity_budget(
+                writer._body_budget.copy()
+            )
         ):
             writer._drop_body()
             writer._drop_headers()
