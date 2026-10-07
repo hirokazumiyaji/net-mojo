@@ -1695,11 +1695,7 @@ struct Server(Movable):
                 trailer_room = 0
             if trailer_room > max_response_header_bytes:
                 trailer_room = max_response_header_bytes
-            var trailer_compressed = List[Byte](
-                length=compressed_capacity, fill=0
-            )
             var trailer_encoded = encode_http2_response_trailer_frames(
-                self._conns[idx].http2_deflater.value(),
                 writer,
                 is_head,
                 stream_id,
@@ -1707,13 +1703,13 @@ struct Server(Movable):
                 self.config.max_response_headers_count,
                 16384,
                 trailer_room,
-                Span(trailer_compressed),
             )
             if trailer_encoded.is_complete():
                 trailer_wire = trailer_encoded.wire^
                 trailer_encoded.wire = List[Byte]()
-            # Encoding uses no-indexing HPACK literals, so a failure never
-            # poisons the deflater; dropping the trailer section is safe.
+            # Trailer encoding never touches the HPACK deflater, so a
+            # failure cannot poison connection state; dropping the section
+            # is safe.
 
         var response_reservation = (
             len(headers_wire) + len(response_body) + len(trailer_wire)

@@ -34,10 +34,5 @@ int net_hpack_encode(net_hpack_deflater *deflater, const uint8_t *fields,
                     size_t fields_length, size_t max_header_list_size,
                     size_t max_fields, uint8_t *output,
                     size_t output_capacity, size_t *output_length);
-int net_hpack_encode_no_index(net_hpack_deflater *deflater,
-                              const uint8_t *fields, size_t fields_length,
-                              size_t max_header_list_size, size_t max_fields,
-                              uint8_t *output, size_t output_capacity,
-                              size_t *output_length);
 
 #endif

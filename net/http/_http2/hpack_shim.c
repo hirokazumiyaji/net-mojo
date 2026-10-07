@@ -204,12 +204,10 @@ static uint32_t read_u32(const uint8_t *input) {
            ((uint32_t)input[2] << 8) | (uint32_t)input[3];
 }
 
-static int encode_fields_with_flags(net_hpack_deflater *wrapper,
-                                    const uint8_t *fields, size_t fields_length,
-                                    size_t max_header_list_size,
-                                    size_t max_fields, uint8_t *output,
-                                    size_t output_capacity,
-                                    size_t *output_length, uint8_t nv_flags) {
+int net_hpack_encode(net_hpack_deflater *wrapper, const uint8_t *fields,
+                    size_t fields_length, size_t max_header_list_size,
+                    size_t max_fields, uint8_t *output,
+                    size_t output_capacity, size_t *output_length) {
     if (wrapper == NULL || (fields == NULL && fields_length != 0) ||
         (output == NULL && output_capacity != 0) || output_length == NULL) {
         return NET_HPACK_ENCODE_INVALID;
@@ -271,7 +269,7 @@ static int encode_fields_with_flags(net_hpack_deflater *wrapper,
         offset += name_length;
         nva[i].value = (uint8_t *)(fields + offset);
         nva[i].valuelen = value_length;
-        nva[i].flags = nv_flags;
+        nva[i].flags = NGHTTP2_NV_FLAG_NONE;
         offset += value_length;
     }
 
@@ -290,25 +288,4 @@ static int encode_fields_with_flags(net_hpack_deflater *wrapper,
     }
     *output_length = (size_t)encoded;
     return NET_HPACK_ENCODE_OK;
-}
-
-int net_hpack_encode(net_hpack_deflater *wrapper, const uint8_t *fields,
-                    size_t fields_length, size_t max_header_list_size,
-                    size_t max_fields, uint8_t *output,
-                    size_t output_capacity, size_t *output_length) {
-    return encode_fields_with_flags(wrapper, fields, fields_length,
-                                    max_header_list_size, max_fields, output,
-                                    output_capacity, output_length,
-                                    NGHTTP2_NV_FLAG_NONE);
-}
-
-int net_hpack_encode_no_index(net_hpack_deflater *wrapper, const uint8_t *fields,
-                              size_t fields_length, size_t max_header_list_size,
-                              size_t max_fields, uint8_t *output,
-                              size_t output_capacity,
-                              size_t *output_length) {
-    return encode_fields_with_flags(wrapper, fields, fields_length,
-                                    max_header_list_size, max_fields, output,
-                                    output_capacity, output_length,
-                                    NGHTTP2_NV_FLAG_NO_INDEX);
 }

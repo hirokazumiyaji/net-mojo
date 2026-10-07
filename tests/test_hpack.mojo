@@ -1395,13 +1395,10 @@ def test_http2_scheduler_peer_reset_after_headers_sent_removes_entry() raises:
 
 
 def _encode_trailer_wire(
-    mut deflater: Http2HpackDeflater,
     mut writer: ResponseWriter,
     stream_id: UInt32,
 ) raises -> List[Byte]:
-    var scratch = Array[Byte, 1024](fill=0)
     var encoded = encode_http2_response_trailer_frames(
-        deflater,
         writer,
         False,
         stream_id,
@@ -1409,7 +1406,6 @@ def _encode_trailer_wire(
         32,
         16384,
         1024,
-        Span[mut=True](scratch),
     )
     assert_true(encoded.is_complete())
     var wire = encoded.wire^
@@ -1421,13 +1417,12 @@ def _enqueue_with_trailers(
     mut scheduler: Http2ResponseScheduler,
     stream_id: UInt32,
     var body: List[Byte],
-    mut deflater: Http2HpackDeflater,
     mut writer: ResponseWriter,
 ) raises:
     var header_payload = List[Byte]()
     var headers = List[Byte]()
     _append_frame(headers, Byte(1), Byte(0), stream_id, Span(header_payload))
-    var trailers = _encode_trailer_wire(deflater, writer, stream_id)
+    var trailers = _encode_trailer_wire(writer, stream_id)
     assert_true(
         scheduler.enqueue(
             stream_id,
@@ -1454,14 +1449,13 @@ def test_http2_scheduler_sends_trailer_headers_after_data() raises:
     _append_frame(opening, Byte(1), Byte(5), UInt32(1), Span(opening_fields))
     assert_true(session.consume(Span(opening)).is_request())
 
-    var deflater = Http2HpackDeflater("build/http2/libnet_hpack", 4096)
     var writer = ResponseWriter(64)
     writer.set_status(200)
     writer.add_trailer(String("x-digest"), String("deadbeef"))
     var body: List[Byte] = [Byte(ord("A")), Byte(ord("B")), Byte(ord("C"))]
 
     var scheduler = Http2ResponseScheduler()
-    _enqueue_with_trailers(scheduler, UInt32(1), body^, deflater, writer)
+    _enqueue_with_trailers(scheduler, UInt32(1), body^, writer)
 
     var batch = scheduler.drain(session, 16384, 65536)
     assert_equal(len(batch.completed_streams), 1)
@@ -1524,7 +1518,6 @@ def test_http2_scheduler_withholds_trailers_until_credit_arrives() raises:
     _append_frame(wire, Byte(1), Byte(5), UInt32(1), Span(opening_fields))
     assert_true(session.consume(Span(wire)).is_request())
 
-    var deflater = Http2HpackDeflater("build/http2/libnet_hpack", 4096)
     var writer = ResponseWriter(64)
     writer.set_status(200)
     writer.add_trailer(String("x-digest"), String("ff"))
@@ -1536,7 +1529,7 @@ def test_http2_scheduler_withholds_trailers_until_credit_arrives() raises:
     ]
 
     var scheduler = Http2ResponseScheduler()
-    _enqueue_with_trailers(scheduler, UInt32(1), body^, deflater, writer)
+    _enqueue_with_trailers(scheduler, UInt32(1), body^, writer)
 
     var first = scheduler.drain(session, 16384, 65536)
     assert_equal(len(first.completed_streams), 0)
@@ -1635,8 +1628,8 @@ def test_http2_scheduler_interleaved_trailers_decode_in_order() raises:
     header_frames1.wire = List[Byte]()
     var header_wire3 = header_frames3.wire^
     header_frames3.wire = List[Byte]()
-    var trailers1 = _encode_trailer_wire(deflater, writer1, UInt32(1))
-    var trailers3 = _encode_trailer_wire(deflater, writer3, UInt32(3))
+    var trailers1 = _encode_trailer_wire(writer1, UInt32(1))
+    var trailers3 = _encode_trailer_wire(writer3, UInt32(3))
     assert_true(
         scheduler.enqueue(
             UInt32(1),
@@ -1676,6 +1669,189 @@ def test_http2_scheduler_interleaved_trailers_decode_in_order() raises:
         offset += frame.consumed
     # Two response HEADERS + two trailer HEADERS, all decoded consistently.
     assert_equal(header_blocks_seen, 4)
+
+
+def test_http2_scheduler_trailer_decodes_after_intervening_hpack_updates() raises:
+    # Regression: trailer HEADERS must decode to exactly the field the
+    # handler added even when the deflater's dynamic table has mutated
+    # between the trailer's encode time and its wire position. nghttp2's
+    # NGHTTP2_NV_FLAG_NO_INDEX still emits "Literal Header Field Never
+    # Indexed - Indexed Name" when the name is already present, so a
+    # later stream's response HEADERS inserting a new entry shifts the
+    # inflater's relative index and the trailer's name resolves to the
+    # wrong field. Our encoder sidesteps this by writing literal-name
+    # entries that reference no dynamic index.
+    var session = Http2RequestSession("build/http2/libnet_hpack", 4, 1024)
+    var wire = List[Byte]()
+    var preface = "PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n".as_bytes()
+    for i in range(len(preface)):
+        wire.append(preface[i])
+    var initial_window: List[Byte] = [
+        Byte(0),
+        Byte(4),
+        Byte(0),
+        Byte(0),
+        Byte(0),
+        Byte(0),
+    ]
+    _append_frame(wire, Byte(4), Byte(0), UInt32(0), Span(initial_window))
+    var compressed: List[Byte] = [
+        0x82,
+        0x86,
+        0x84,
+        0x01,
+        0x01,
+        Byte(ord("x")),
+    ]
+    _append_frame(wire, Byte(1), Byte(5), UInt32(1), Span(compressed))
+    _append_frame(wire, Byte(1), Byte(5), UInt32(3), Span(compressed))
+    var first = session.consume(Span(wire))
+    assert_true(first.is_request())
+    var second = session.consume(Span(wire)[first.consumed :])
+    assert_true(second.is_request())
+
+    var deflater = Http2HpackDeflater("build/http2/libnet_hpack", 4096)
+    var writer_a = ResponseWriter(64)
+    writer_a.set_status(200)
+    writer_a.headers.add("x-digest", "value-a")
+    writer_a.add_trailer(String("x-digest"), String("trailer-z"))
+    var writer_b = ResponseWriter(64)
+    writer_b.set_status(200)
+    writer_b.headers.add("x-other", "value-b")
+
+    var compressed_scratch_a = Array[Byte, 1024](fill=0)
+    var headers_a = encode_http2_response_header_frames(
+        deflater,
+        writer_a,
+        False,
+        "Thu, 01 Jan 1970 00:00:00 GMT",
+        UInt32(1),
+        4096,
+        32,
+        16384,
+        2048,
+        Span[mut=True](compressed_scratch_a),
+    )
+    assert_true(headers_a.is_complete())
+    var compressed_scratch_b = Array[Byte, 1024](fill=0)
+    var headers_b = encode_http2_response_header_frames(
+        deflater,
+        writer_b,
+        False,
+        "Thu, 01 Jan 1970 00:00:00 GMT",
+        UInt32(3),
+        4096,
+        32,
+        16384,
+        2048,
+        Span[mut=True](compressed_scratch_b),
+    )
+    assert_true(headers_b.is_complete())
+
+    var trailers_a = _encode_trailer_wire(writer_a, UInt32(1))
+
+    var body_a: List[Byte] = [Byte(ord("A")), Byte(ord("B"))]
+    var body_b = List[Byte]()
+    var headers_wire_a = headers_a.wire^
+    headers_a.wire = List[Byte]()
+    var headers_wire_b = headers_b.wire^
+    headers_b.wire = List[Byte]()
+
+    var scheduler = Http2ResponseScheduler()
+    assert_true(
+        scheduler.enqueue(
+            UInt32(1),
+            headers_wire_a^,
+            body_a^,
+            end_on_headers=False,
+            trailers=trailers_a^,
+        )
+    )
+    assert_true(
+        scheduler.enqueue(
+            UInt32(3),
+            headers_wire_b^,
+            body_b^,
+            end_on_headers=True,
+        )
+    )
+
+    var first_batch = scheduler.drain(session, 16384, 65536)
+    # Stream 1 is flow-blocked; stream 3 has no body and completes.
+    var completed_without_credit = List[UInt32]()
+    for i in range(len(first_batch.completed_streams)):
+        completed_without_credit.append(first_batch.completed_streams[i])
+    assert_equal(len(completed_without_credit), 1)
+    assert_equal(completed_without_credit[0], UInt32(3))
+
+    var credit = List[Byte]()
+    var increment: List[Byte] = [Byte(0), Byte(0), Byte(0), Byte(2)]
+    _append_frame(credit, Byte(8), Byte(0), UInt32(1), Span(increment))
+    assert_true(session.consume(Span(credit)).is_pending())
+    var second_batch = scheduler.drain(session, 16384, 65536)
+    assert_equal(len(second_batch.completed_streams), 1)
+    assert_equal(second_batch.completed_streams[0], UInt32(1))
+
+    var all_wire = first_batch.wire^
+    first_batch.wire = List[Byte]()
+    all_wire.extend(Span(second_batch.wire))
+    second_batch.wire = List[Byte]()
+
+    var inflater = Http2HpackInflater("build/http2/libnet_hpack", 4096)
+    var trailer_name = String()
+    var trailer_value = String()
+    var saw_trailer = False
+    var offset = 0
+    while offset < len(all_wire):
+        var frame = parse_frame(Span(all_wire)[offset:])
+        assert_true(frame.is_complete())
+        if frame.frame_type == Byte(1):
+            var decoded_fields = Array[Byte, 2048](fill=0)
+            var decoded = inflater.decode(
+                Span(all_wire)[offset + 9 : offset + frame.consumed],
+                4096,
+                32,
+                Span(decoded_fields),
+            )
+            assert_true(decoded.is_success())
+            if frame.stream_id == UInt32(1) and (frame.flags & Byte(1)) == Byte(
+                1
+            ):
+                saw_trailer = True
+                var cursor = 0
+                while cursor < decoded.output_length:
+                    var nlen = (
+                        (Int(decoded_fields[cursor]) << 24)
+                        | (Int(decoded_fields[cursor + 1]) << 16)
+                        | (Int(decoded_fields[cursor + 2]) << 8)
+                        | Int(decoded_fields[cursor + 3])
+                    )
+                    var vlen = (
+                        (Int(decoded_fields[cursor + 4]) << 24)
+                        | (Int(decoded_fields[cursor + 5]) << 16)
+                        | (Int(decoded_fields[cursor + 6]) << 8)
+                        | Int(decoded_fields[cursor + 7])
+                    )
+                    cursor += 8
+                    var name = String(
+                        from_utf8_lossy=Span(decoded_fields)[
+                            cursor : cursor + nlen
+                        ]
+                    )
+                    cursor += nlen
+                    var value = String(
+                        from_utf8_lossy=Span(decoded_fields)[
+                            cursor : cursor + vlen
+                        ]
+                    )
+                    cursor += vlen
+                    trailer_name = name^
+                    trailer_value = value^
+        offset += frame.consumed
+
+    assert_true(saw_trailer)
+    assert_equal(trailer_name, String("x-digest"))
+    assert_equal(trailer_value, String("trailer-z"))
 
 
 def main() raises:
