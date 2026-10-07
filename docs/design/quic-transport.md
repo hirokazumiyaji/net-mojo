@@ -161,7 +161,10 @@ priority updates that could recreate canceled state before peer final size.
 Peer resets consumed by either `poll()` or `recv_body()`, header/body deadlines
 and response aborts share this cleanup. Unexpected cancellation errors propagate
 or close the connection; they are not treated as an already-canceled request.
-QPACK table capacity and blocked-stream limits remain explicitly zero.
+QPACK table capacity and blocked-stream limits remain explicitly zero because
+quiche 0.29.3's QPACK decoder has no dynamic-table support (see
+`docs/design/http3-server.md` for the static-only invariant and the interop
+rejection test).
 
 `scripts/prepare_quiche_source.sh` verifies the exact Cargo.lock version and
 public crate SHA-256, stages fresh source, and applies the small patch before
