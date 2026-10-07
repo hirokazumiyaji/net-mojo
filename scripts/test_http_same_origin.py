@@ -1,7 +1,6 @@
 import asyncio
 import http.client
 import os
-from pathlib import Path
 import select
 import socket
 import ssl
@@ -89,12 +88,12 @@ async def dual_requests(client, port, authority):
             raise RuntimeError(f"expected graceful H3_NO_ERROR, got {code}")
 
 
-def run_mode(binary, mode):
+def run_mode(command, mode):
     context = ssl.create_default_context(cafile="build/tls/test-cert.pem")
     context.set_alpn_protocols(["http/1.1"])
     with tempfile.TemporaryFile(mode="w+") as errors:
         process = subprocess.Popen(
-            [str(binary)],
+            command,
             env={**os.environ, "NET_SAME_ORIGIN_MODE": mode},
             stdout=subprocess.PIPE,
             stderr=errors,
@@ -151,24 +150,16 @@ def run_mode(binary, mode):
 
 
 def main():
-    with tempfile.TemporaryDirectory(prefix="net-same-origin-") as directory:
-        binary = Path(directory) / "fixture"
-        subprocess.run(
-            [
-                "mojo",
-                "build",
-                "--Werror",
-                "-I",
-                ".",
-                "tests/http_same_origin_fixture.mojo",
-                "-o",
-                str(binary),
-            ],
-            check=True,
-            timeout=300,
-        )
-        for mode in ["dual", "https-only"]:
-            run_mode(binary, mode)
+    command = [
+        "mojo",
+        "run",
+        "--Werror",
+        "-I",
+        ".",
+        "tests/http_same_origin_fixture.mojo",
+    ]
+    for mode in ["dual", "https-only"]:
+        run_mode(command, mode)
 
 
 if __name__ == "__main__":
