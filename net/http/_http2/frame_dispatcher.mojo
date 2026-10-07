@@ -97,7 +97,7 @@ struct Http2FrameDispatcher(Movable):
         initial_settings: Http2PeerSettingsSnapshot,
         max_control_frames_per_second: Int = 1000,
         max_resets_per_second: Int = 100,
-        max_new_streams_per_second: Int = 1000000,
+        max_new_streams_per_second: Int = 10000,
     ):
         self._sequence = Http2ContinuationSequence()
         self._peer_settings = Http2PeerSettings()
@@ -188,10 +188,10 @@ struct Http2FrameDispatcher(Movable):
             if settings.is_error():
                 self._failed = True
                 return Http2DispatchResult.error()
-            if settings.is_ack():
-                return Http2DispatchResult.ignored()
             if self._control_exceeded():
                 return self._flood()
+            if settings.is_ack():
+                return Http2DispatchResult.ignored()
             var applied = self._peer_settings.apply(
                 Span(settings.parsed.settings)
             )
@@ -216,10 +216,10 @@ struct Http2FrameDispatcher(Movable):
             if ping.is_error():
                 self._failed = True
                 return Http2DispatchResult.error()
-            if ping.is_ack():
-                return Http2DispatchResult.ignored()
             if self._control_exceeded():
                 return self._flood()
+            if ping.is_ack():
+                return Http2DispatchResult.ignored()
             var ack = ping.encode_ack()
             if not ack.is_complete():
                 self._failed = True
@@ -259,6 +259,15 @@ struct Http2FrameDispatcher(Movable):
             )
 
         if frame.frame_type == Byte(2):
+            if self._control_exceeded():
+                return self._flood()
+            return Http2DispatchResult.ignored()
+
+        if (
+            frame.frame_type == Byte(0)
+            and frame.payload_length == 0
+            and (frame.flags & Byte(1)) == Byte(0)
+        ):
             if self._control_exceeded():
                 return self._flood()
             return Http2DispatchResult.ignored()

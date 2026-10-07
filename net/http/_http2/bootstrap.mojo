@@ -17,8 +17,13 @@ struct Http2ServerBootstrap(Movable):
     var error_code: UInt32
     var peer_settings: Http2PeerSettings
     var max_concurrent_streams: Int
+    var max_header_list_size: Int
 
-    def __init__(out self, max_concurrent_streams: Int = 100):
+    def __init__(
+        out self,
+        max_concurrent_streams: Int = 100,
+        max_header_list_size: Int = 32768,
+    ):
         self.preface_complete = False
         self.server_settings_sent = False
         self.client_settings_received = False
@@ -27,6 +32,7 @@ struct Http2ServerBootstrap(Movable):
         self.error_code = UInt32(0)
         self.peer_settings = Http2PeerSettings()
         self.max_concurrent_streams = max_concurrent_streams
+        self.max_header_list_size = max_header_list_size
 
     def consume_client_preface[
         origin: Origin
@@ -55,6 +61,12 @@ struct Http2ServerBootstrap(Movable):
             Setting(
                 identifier=UInt16(3),
                 value=UInt32(self.max_concurrent_streams),
+            )
+        )
+        settings.append(
+            Setting(
+                identifier=UInt16(6),
+                value=UInt32(self.max_header_list_size),
             )
         )
         var payload = encode_settings_payload(Span(settings))

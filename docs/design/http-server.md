@@ -449,7 +449,7 @@ struct ServerConfig(Copyable, Movable):
     var quic_send_crypto_bytes: Int             # 64 MiB
     var quic_send_crypto_slots: Int             # 524,288
     var max_http2_streams_per_connection: Int    # 100
-    var http2_max_new_streams_per_second: Int    # 1,000,000
+    var http2_max_new_streams_per_second: Int    # 10,000
     var http2_max_control_frames_per_second: Int # 1,000
     var http2_max_resets_per_second: Int         # 100
     var max_request_line: Int                   # 8 KiB

@@ -678,11 +678,6 @@ def test_http2_dispatcher_control_under_limit_succeeds() raises:
     assert_equal(result.output[4], Byte(1))
     result = dispatcher.accept(ping, Span(payload))
     assert_true(result.is_output())
-    result = dispatcher.accept(ping, Span(payload))
-    assert_true(result.is_output())
-    assert_false(dispatcher.is_failed())
-
-    # ACK frames do not count toward the control limit.
     result = dispatcher.accept(ack_ping, Span(payload))
     assert_true(result.is_ignored())
     assert_false(dispatcher.is_failed())
@@ -1028,7 +1023,7 @@ def test_http2_connection_input_bootstraps_then_acknowledges_coalesced_ping() ra
     var bootstrap = input.consume(Span(wire))
     assert_true(bootstrap.is_output())
     assert_equal(bootstrap.output[3], Byte(4))
-    assert_equal(bootstrap.output[18], Byte(4))
+    assert_equal(bootstrap.output[24], Byte(4))
     assert_equal(bootstrap.consumed, len(wire) - len(ping))
 
     var ping_result = input.consume(Span(wire)[bootstrap.consumed :])
@@ -1650,13 +1645,15 @@ def test_http2_bootstrap_waits_for_full_preface_before_server_settings() raises:
     assert_equal(server_frame.frame_type, Byte(4))
     assert_equal(server_frame.flags, Byte(0))
     assert_equal(server_frame.stream_id, UInt32(0))
-    assert_equal(server_frame.payload_length, 6)
+    assert_equal(server_frame.payload_length, 12)
     var settings = parse_settings_frame(
         server_frame, Span(server_settings.wire)[9:]
     )
     assert_true(settings.is_settings())
     assert_equal(settings.parsed.settings[0].identifier, UInt16(3))
     assert_equal(settings.parsed.settings[0].value, UInt32(100))
+    assert_equal(settings.parsed.settings[1].identifier, UInt16(6))
+    assert_equal(settings.parsed.settings[1].value, UInt32(32768))
     assert_true(bootstrap.server_settings().is_error())
 
 
@@ -1922,7 +1919,7 @@ def test_http2_connection_bootstrap_handles_fragmented_preface_and_settings() ra
     var result = bootstrap.consume(Span(input))
     assert_true(result.is_ready())
     assert_equal(result.consumed, 24 + len(client_settings))
-    assert_equal(len(result.output), 24)
+    assert_equal(len(result.output), 30)
     var server_settings = parse_frame(Span(result.output))
     assert_true(server_settings.is_complete())
     assert_equal(server_settings.frame_type, Byte(4))
@@ -1953,7 +1950,7 @@ def test_http2_connection_bootstrap_handles_fragmented_preface_and_settings() ra
             ready = True
             break
     assert_true(ready)
-    assert_equal(len(output), 24)
+    assert_equal(len(output), 30)
 
 
 def test_http2_connection_bootstrap_rejects_bad_preface_and_initial_ack() raises:
@@ -2267,6 +2264,98 @@ def test_http2_request_session_peer_goaway_drains_without_failing() raises:
             assert_equal(reset.error_code, UInt32(7))
         offset += frame.consumed
     assert_true(saw_rst)
+
+
+def test_http2_dispatcher_counts_ping_ack_toward_control_budget() raises:
+    var dispatcher = Http2FrameDispatcher(
+        Http2PeerSettings().snapshot(),
+        max_control_frames_per_second=2,
+        max_resets_per_second=100,
+    )
+    var payload: List[Byte] = [
+        Byte(1),
+        Byte(2),
+        Byte(3),
+        Byte(4),
+        Byte(5),
+        Byte(6),
+        Byte(7),
+        Byte(8),
+    ]
+    var ack = FrameParseResult.complete(Byte(6), Byte(1), UInt32(0), 8)
+    assert_true(dispatcher.accept(ack, Span(payload)).is_ignored())
+    assert_true(dispatcher.accept(ack, Span(payload)).is_ignored())
+    _assert_enhance_your_calm_goaway(dispatcher.accept(ack, Span(payload)))
+
+
+def test_http2_dispatcher_counts_settings_ack_toward_control_budget() raises:
+    var dispatcher = Http2FrameDispatcher(
+        Http2PeerSettings().snapshot(),
+        max_control_frames_per_second=2,
+        max_resets_per_second=100,
+    )
+    var empty = List[Byte]()
+    var ack = FrameParseResult.complete(Byte(4), Byte(1), UInt32(0), 0)
+    assert_true(dispatcher.accept(ack, Span(empty)).is_ignored())
+    assert_true(dispatcher.accept(ack, Span(empty)).is_ignored())
+    _assert_enhance_your_calm_goaway(dispatcher.accept(ack, Span(empty)))
+
+
+def test_http2_dispatcher_counts_empty_data_without_end_stream() raises:
+    var dispatcher = Http2FrameDispatcher(
+        Http2PeerSettings().snapshot(),
+        max_control_frames_per_second=2,
+        max_resets_per_second=100,
+    )
+    var empty = List[Byte]()
+    var data = FrameParseResult.complete(Byte(0), Byte(0), UInt32(1), 0)
+    assert_true(dispatcher.accept(data, Span(empty)).is_ignored())
+    assert_true(dispatcher.accept(data, Span(empty)).is_ignored())
+    _assert_enhance_your_calm_goaway(dispatcher.accept(data, Span(empty)))
+
+
+def test_http2_dispatcher_empty_data_with_end_stream_does_not_count() raises:
+    var dispatcher = Http2FrameDispatcher(
+        Http2PeerSettings().snapshot(),
+        max_control_frames_per_second=1,
+        max_resets_per_second=100,
+    )
+    var empty = List[Byte]()
+    var closing = FrameParseResult.complete(Byte(0), Byte(1), UInt32(1), 0)
+    for _ in range(4):
+        assert_true(dispatcher.accept(closing, Span(empty)).is_ignored())
+    assert_false(dispatcher.is_failed())
+
+
+def test_header_block_rejects_continuation_flood() raises:
+    var block = Http2HeaderBlock(1024, max_continuation_frames=2)
+    var payload: List[Byte] = [Byte(1)]
+    var headers = FrameParseResult.complete(Byte(1), Byte(0), UInt32(1), 1)
+    assert_true(block.begin(headers, Span(payload)).is_pending())
+    var cont = FrameParseResult.complete(Byte(9), Byte(0), UInt32(1), 1)
+    assert_true(block.continue_with(cont, Span(payload)).is_pending())
+    assert_true(block.continue_with(cont, Span(payload)).is_pending())
+    assert_true(block.continue_with(cont, Span(payload)).is_error())
+
+
+def test_http2_bootstrap_advertises_configured_max_header_list_size() raises:
+    var bootstrap = Http2ServerBootstrap(
+        max_concurrent_streams=50, max_header_list_size=16384
+    )
+    var preface = "PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n".as_bytes()
+    assert_true(bootstrap.consume_client_preface(preface).is_complete())
+    var server_settings = bootstrap.server_settings()
+    assert_true(server_settings.is_complete())
+    var server_frame = parse_frame(Span(server_settings.wire))
+    assert_true(server_frame.is_complete())
+    var parsed = parse_settings_frame(
+        server_frame, Span(server_settings.wire)[9:]
+    )
+    assert_true(parsed.is_settings())
+    assert_equal(parsed.parsed.settings[0].identifier, UInt16(3))
+    assert_equal(parsed.parsed.settings[0].value, UInt32(50))
+    assert_equal(parsed.parsed.settings[1].identifier, UInt16(6))
+    assert_equal(parsed.parsed.settings[1].value, UInt32(16384))
 
 
 def main() raises:

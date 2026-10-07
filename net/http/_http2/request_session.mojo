@@ -137,13 +137,14 @@ struct Http2RequestSession(Movable):
         body_deadline: Timeout = Timeout.nanoseconds(30_000_000_000),
         max_control_frames_per_second: Int = 1000,
         max_resets_per_second: Int = 100,
-        max_new_streams_per_second: Int = 1000000,
+        max_new_streams_per_second: Int = 10000,
     ):
         self._input = Http2ServerConnectionInput(
             max_concurrent_streams=max_active_streams,
             max_control_frames_per_second=max_control_frames_per_second,
             max_resets_per_second=max_resets_per_second,
             max_new_streams_per_second=max_new_streams_per_second,
+            max_header_list_size=max_headers_bytes,
         )
         self._decoder = None
         self._library_path = library_path^

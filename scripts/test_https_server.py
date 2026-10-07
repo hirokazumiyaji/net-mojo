@@ -61,8 +61,8 @@ def _h2_bootstrap(client):
         b"\x00\x00\x00\x04\x00\x00\x00\x00\x00"
     )
     bootstrap = bytearray()
-    while len(bootstrap) < 24:
-        chunk = client.recv(24 - len(bootstrap))
+    while len(bootstrap) < 30:
+        chunk = client.recv(30 - len(bootstrap))
         if not chunk:
             raise RuntimeError("incomplete HTTP/2 bootstrap")
         bootstrap.extend(chunk)
@@ -497,12 +497,12 @@ try:
                 b"\x00\x00\x00\x04\x00\x00\x00\x00\x00"
             )
             response = bytearray()
-            while len(response) < 24:
-                chunk = client.recv(24 - len(response))
+            while len(response) < 30:
+                chunk = client.recv(30 - len(response))
                 if not chunk:
                     break
                 response.extend(chunk)
-            if len(response) != 24:
+            if len(response) != 30:
                 raise RuntimeError(
                     f"incomplete HTTP/2 bootstrap response: {bytes(response)!r}"
                 )
@@ -510,8 +510,9 @@ try:
                 response[3] != 4
                 or response[10] != 3
                 or response[14] != 100
-                or response[18] != 4
-                or response[19] != 1
+                or response[16] != 6
+                or response[24] != 4
+                or response[25] != 1
             ):
                 raise RuntimeError(
                     f"unexpected HTTP/2 bootstrap frames: {bytes(response)!r}"
@@ -578,12 +579,12 @@ try:
                 b"\x00\x04\x00\x00\x00\x00"
             )
             bootstrap = bytearray()
-            while len(bootstrap) < 24:
-                chunk = client.recv(24 - len(bootstrap))
+            while len(bootstrap) < 30:
+                chunk = client.recv(30 - len(bootstrap))
                 if not chunk:
                     break
                 bootstrap.extend(chunk)
-            if len(bootstrap) != 24:
+            if len(bootstrap) != 30:
                 raise RuntimeError("incomplete HTTP/2 SETTINGS response")
             compressed_headers = b"\x82\x86\x84\x41\x0fwww.example.com"
             client.sendall(

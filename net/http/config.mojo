@@ -79,7 +79,7 @@ struct ServerConfig(Copyable, Movable):
             quic_send_crypto_bytes=67108864,
             quic_send_crypto_slots=524288,
             max_http2_streams_per_connection=100,
-            http2_max_new_streams_per_second=1000000,
+            http2_max_new_streams_per_second=10000,
             http2_max_control_frames_per_second=1000,
             http2_max_resets_per_second=100,
             max_request_line=8192,

@@ -163,10 +163,11 @@ struct Http2ServerConnectionInput(Movable):
         max_concurrent_streams: Int = 100,
         max_control_frames_per_second: Int = 1000,
         max_resets_per_second: Int = 100,
-        max_new_streams_per_second: Int = 1000000,
+        max_new_streams_per_second: Int = 10000,
+        max_header_list_size: Int = 32768,
     ):
         self._bootstrap = Http2ConnectionBootstrap(
-            max_frame_size, max_concurrent_streams
+            max_frame_size, max_concurrent_streams, max_header_list_size
         )
         self._reader = Http2FrameReader(max_frame_size)
         self._max_control_frames_per_second = max_control_frames_per_second

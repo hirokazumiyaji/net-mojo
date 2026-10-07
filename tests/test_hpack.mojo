@@ -702,13 +702,15 @@ def test_http2_request_session_refuses_over_limit_stream_without_failing_connect
     var server_settings = parse_frame(Span(refused.output))
     assert_true(server_settings.is_complete())
     assert_equal(server_settings.frame_type, Byte(4))
-    assert_equal(server_settings.payload_length, 6)
+    assert_equal(server_settings.payload_length, 12)
     assert_equal(Span(refused.output)[9], Byte(0))
     assert_equal(Span(refused.output)[10], Byte(3))
     assert_equal(Span(refused.output)[11], Byte(0))
     assert_equal(Span(refused.output)[12], Byte(0))
     assert_equal(Span(refused.output)[13], Byte(0))
     assert_equal(Span(refused.output)[14], Byte(1))
+    assert_equal(Span(refused.output)[15], Byte(0))
+    assert_equal(Span(refused.output)[16], Byte(6))
     var server_ack = parse_frame(
         Span(refused.output)[server_settings.consumed :]
     )
@@ -834,7 +836,7 @@ def test_http2_request_session_bootstraps_before_loading_hpack() raises:
 
     var result = session.consume(Span(wire))
     assert_true(result.is_pending())
-    assert_equal(len(result.output), 24)
+    assert_equal(len(result.output), 30)
 
 
 def test_http2_request_session_returns_data_receive_credit() raises:
@@ -873,14 +875,14 @@ def test_http2_request_session_returns_data_receive_credit() raises:
 
     var result = session.consume(Span(wire))
     assert_true(result.is_pending())
-    assert_equal(len(result.output), 50)
-    var connection_update = parse_frame(Span(result.output)[24:])
+    assert_equal(len(result.output), 56)
+    var connection_update = parse_frame(Span(result.output)[30:])
     assert_equal(connection_update.frame_type, Byte(8))
     assert_equal(connection_update.stream_id, UInt32(0))
     assert_equal(connection_update.payload_length, 4)
-    assert_equal(result.output[33], Byte(0))
-    assert_equal(result.output[36], Byte(3))
-    var stream_update = parse_frame(Span(result.output)[37:])
+    assert_equal(result.output[39], Byte(0))
+    assert_equal(result.output[42], Byte(3))
+    var stream_update = parse_frame(Span(result.output)[43:])
     assert_equal(stream_update.frame_type, Byte(8))
     assert_equal(stream_update.stream_id, UInt32(1))
 
@@ -1305,9 +1307,9 @@ def test_http2_request_session_returns_padding_flow_credit() raises:
     var result = session.consume(Span(wire))
     assert_true(result.is_request())
     assert_equal(len(result.request.body), 1)
-    assert_equal(len(result.output), 50)
-    assert_equal(result.output[36], Byte(4))
-    assert_equal(result.output[49], Byte(4))
+    assert_equal(len(result.output), 56)
+    assert_equal(result.output[42], Byte(4))
+    assert_equal(result.output[55], Byte(4))
 
 
 def _bootstrap_session(mut session: Http2RequestSession) raises:

@@ -31,18 +31,26 @@ struct HeaderBlockResult(Movable):
 
 struct Http2HeaderBlock(Movable):
     var max_compressed_size: Int
+    var max_continuation_frames: Int
     var stream_id: UInt32
     var end_stream: Bool
     var pending: Bool
     var failed: Bool
+    var continuation_count: Int
     var bytes: List[Byte]
 
-    def __init__(out self, max_compressed_size: Int):
+    def __init__(
+        out self,
+        max_compressed_size: Int,
+        max_continuation_frames: Int = 32,
+    ):
         self.max_compressed_size = max_compressed_size
+        self.max_continuation_frames = max_continuation_frames
         self.stream_id = UInt32(0)
         self.end_stream = False
         self.pending = False
-        self.failed = max_compressed_size < 0
+        self.failed = max_compressed_size < 0 or max_continuation_frames < 0
+        self.continuation_count = 0
         self.bytes = List[Byte]()
 
     def begin[
@@ -65,6 +73,7 @@ struct Http2HeaderBlock(Movable):
             return HeaderBlockResult.error()
 
         self.bytes.clear()
+        self.continuation_count = 0
         self.stream_id = frame.stream_id
         self.end_stream = (frame.flags & Byte(1)) != Byte(0)
         var fragment = Self._headers_fragment(frame.flags, payload)
@@ -96,6 +105,12 @@ struct Http2HeaderBlock(Movable):
             or frame.stream_id != self.stream_id
             or frame.payload_length != len(payload)
         ):
+            self.failed = True
+            self.pending = False
+            return HeaderBlockResult.error()
+
+        self.continuation_count += 1
+        if self.continuation_count > self.max_continuation_frames:
             self.failed = True
             self.pending = False
             return HeaderBlockResult.error()
