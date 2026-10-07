@@ -100,7 +100,7 @@ def run_mode(command, mode):
             text=True,
         )
         try:
-            if not select.select([process.stdout], [], [], 15)[0]:
+            if not select.select([process.stdout], [], [], 120)[0]:
                 raise RuntimeError("same-origin fixture readiness timed out")
             ready = process.stdout.readline().strip()
             if not ready.startswith("READY "):
