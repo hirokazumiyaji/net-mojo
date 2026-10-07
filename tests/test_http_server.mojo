@@ -2874,9 +2874,26 @@ struct _BigResponseHandler(Handler):
             writer.body.append(Byte(ord("y") + (i % 8)))
 
 
+def _stall_server_write[
+    H: Handler
+](mut server: Server, mut handler: H, mut client: TCPConn) raises:
+    client.set_read_buffer(1024)
+    _tick_n(server, handler, 2)
+    assert_equal(server.active_connections(), 1)
+    server._conns[0].conn.value().set_write_buffer(1024)
+    client.write_all(
+        String("GET /big HTTP/1.1\r\nHost: x\r\n\r\n").as_bytes(),
+        Timeout.seconds(2),
+    )
+    _tick_n(server, handler, 50)
+    assert_equal(server.active_connections(), 1)
+    assert_true(server._conns[0].pending_remaining() > 0)
+    assert_true(server._conns[0].write_at != NO_DEADLINE)
+
+
 def test_write_deadline_closes_stalled_client() raises:
     var config = ServerConfig.default()
-    config.write_deadline = Timeout.milliseconds(80)
+    config.write_deadline = Timeout.milliseconds(50)
     config.max_response_body = 4194304
     var server = Server(config^)
     server.add_listener(listen_tcp("127.0.0.1:0"))
@@ -2885,25 +2902,17 @@ def test_write_deadline_closes_stalled_client() raises:
     var client = dial_tcp(
         String("127.0.0.1:") + String(port), Timeout.seconds(2)
     )
-    client.set_read_buffer(1024)
-    client.write_all(
-        String("GET /big HTTP/1.1\r\nHost: x\r\n\r\n").as_bytes(),
-        Timeout.seconds(2),
-    )
-    _tick_n(server, handler, 20)
-    assert_equal(server.active_connections(), 1)
-    for _ in range(200):
-        _ = server.tick(handler, Timeout.nanoseconds(0))
-        if server.active_connections() == 0:
-            break
-        sleep(0.005)
+    _stall_server_write(server, handler, client)
+    server._conns[0].write_at = 1
+    server._arm_deadline(0)
+    server._expire_deadlines(now_ns())
     assert_equal(server.active_connections(), 0)
     client.close()
 
 
 def test_shutdown_grace_expires_closes_in_flight() raises:
     var config = ServerConfig.default()
-    config.shutdown_grace = Timeout.milliseconds(60)
+    config.shutdown_grace = Timeout.milliseconds(50)
     config.write_deadline = Timeout.seconds(5)
     config.max_response_body = 4194304
     var server = Server(config^)
@@ -2913,18 +2922,12 @@ def test_shutdown_grace_expires_closes_in_flight() raises:
     var client = dial_tcp(
         String("127.0.0.1:") + String(port), Timeout.seconds(2)
     )
-    client.set_read_buffer(1024)
-    client.write_all(
-        String("GET /big HTTP/1.1\r\nHost: x\r\n\r\n").as_bytes(),
-        Timeout.seconds(2),
-    )
-    _tick_n(server, handler, 10)
-    assert_equal(server.active_connections(), 1)
+    _stall_server_write(server, handler, client)
     server.request_shutdown()
-    for _ in range(400):
-        _ = server.tick(handler, Timeout.milliseconds(1))
-        if server.active_connections() == 0:
-            break
+    _ = server.tick(handler, Timeout.nanoseconds(0))
+    assert_true(server._shutdown_at != NO_DEADLINE)
+    server._shutdown_at = 1
+    server._expire_deadlines(now_ns())
     assert_equal(server.active_connections(), 0)
     client.close()
 
