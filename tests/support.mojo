@@ -148,7 +148,7 @@ def _content_length_of(buf: List[Byte]) -> Int:
     if end < 0:
         return -1
     var head = String(from_utf8_lossy=Span(buf)[0:end]).lower()
-    var needle = String("content-length:")
+    var needle = String("\r\ncontent-length:")
     var at = head.find(needle)
     if at < 0:
         return -1

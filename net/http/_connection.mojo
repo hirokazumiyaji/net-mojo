@@ -14,6 +14,7 @@ from net.tls import TLSConnection, TLSIOResult
 from net.http._http2.hpack import Http2HpackDeflater
 from net.http._http2.request_session import Http2RequestSession
 from net.http._http2.response_scheduler import Http2ResponseScheduler
+from net.http._parser import HeadOutcome, _RequestScan
 from net.http._buffer import (
     _CapacityBudget,
     _CapacityTicket,
@@ -67,6 +68,8 @@ struct HttpConnection(Movable):
     var requests_this_tick: Int
     var reserved: Int
     var http1_body_reserved: Int
+    var request_head: Optional[HeadOutcome]
+    var request_scan: _RequestScan
     var more_work: Bool
     var active: Bool
     var _no_deadline: Int
@@ -127,6 +130,8 @@ struct HttpConnection(Movable):
         self.requests_this_tick = 0
         self.reserved = 0
         self.http1_body_reserved = 0
+        self.request_head = None
+        self.request_scan = _RequestScan.start()
         self.more_work = False
         self.active = True
         self.tls_handshake_at = handshake_at
@@ -230,6 +235,11 @@ struct HttpConnection(Movable):
             and self.tls_write_would_block
             and self.tls_write_wants_read
         )
+
+    def http2_failed(self) -> Bool:
+        if not self.http2_session:
+            return False
+        return self.http2_session.value().is_failed()
 
     def buffered_len(self) -> Int:
         return len(self.buf)

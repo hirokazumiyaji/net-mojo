@@ -82,7 +82,14 @@ from ._encoder import (
     _measure_error,
     _encode_response_budgeted,
 )
-from ._parser import ParseResult, parse_body, parse_head, _scan_chunked
+from ._parser import (
+    ParseResult,
+    _RequestScan,
+    _scan_chunked,
+    _scan_head,
+    parse_body,
+    parse_head,
+)
 from .config import ServerConfig
 from .handler import Handler
 from .headers import Headers, _check_value_bytes
@@ -683,7 +690,7 @@ struct Server(Movable):
                     self._sync_interests(idx)
                     continue
                 if (
-                    self._conns[idx].http2_session.value().is_failed()
+                    self._conns[idx].http2_failed()
                     and self._conns[idx].pending_remaining() == 0
                 ):
                     self._close_conn(idx)
@@ -1036,10 +1043,7 @@ struct Server(Movable):
             return
         if not self._conns[idx].active:
             return
-        if self._conns[idx].detach_state_addr != 0:
-            self._mark_detached_cancelled(idx)
-            self._cleanup_detached_state(idx)
-            self._remove_detached_conn(idx)
+        self._discard_detached(idx)
         var token = self._conns[idx].token.copy()
         _ = self._reactor.remove(token)
         if token.slot >= 0 and token.slot < len(self._slot_map):
@@ -1089,10 +1093,7 @@ struct Server(Movable):
         mut self, idx: Int, status: Int, is_head: Bool = False
     ) raises NetError:
         self._release_http1_body(idx)
-        if self._conns[idx].detach_state_addr != 0:
-            self._mark_detached_cancelled(idx)
-            self._cleanup_detached_state(idx)
-            self._remove_detached_conn(idx)
+        self._discard_detached(idx)
         # TLS error responses also advertise Alt-Svc when configured,
         # matching the handler path (_inject_alt_svc_for_tls).
         var alt_svc = String("")
@@ -1129,8 +1130,7 @@ struct Server(Movable):
         var want_read = self._conns[idx].wants_read()
         if (
             self._conns[idx].protocol == PROTOCOL_HTTP2
-            and self._conns[idx].http2_session
-            and self._conns[idx].http2_session.value().is_failed()
+            and self._conns[idx].http2_failed()
             and self._conns[idx].pending_remaining() > 0
         ):
             # A failed HTTP/2 session is draining its GOAWAY: it never
@@ -1267,16 +1267,12 @@ struct Server(Movable):
                 if not self._conns[idx].active:
                     return
             if (
-                self._conns[idx].http2_session
-                and self._conns[idx].http2_session.value().is_failed()
+                self._conns[idx].http2_failed()
                 and self._conns[idx].pending_remaining() == 0
             ):
                 self._close_conn(idx)
                 return
-            if (
-                self._conns[idx].http2_session
-                and self._conns[idx].http2_session.value().is_failed()
-            ):
+            if self._conns[idx].http2_failed():
                 # Failed session draining GOAWAY: flush pending output only.
                 # Do not read or parse further bytes; the failed session can
                 # never drain them and they would consume shared budget.
@@ -1312,8 +1308,7 @@ struct Server(Movable):
                     if not self._conns[idx].active:
                         return
                 if (
-                    self._conns[idx].http2_session
-                    and self._conns[idx].http2_session.value().is_failed()
+                    self._conns[idx].http2_failed()
                     and self._conns[idx].pending_remaining() == 0
                 ):
                     self._close_conn(idx)
@@ -1752,6 +1747,30 @@ struct Server(Movable):
         self._conns[idx].drain_prefix(count)
         self._budget.release(old_capacity - self._conns[idx].buf.capacity())
 
+    def _advance_head(mut self, idx: Int) -> Int:
+        """Resumes the head scan and caches the parsed head once complete.
+        Returns the error status for a rejected head, else 0."""
+        var progress = self._conns[idx].request_scan
+        var scan = _scan_head(
+            Span(self._conns[idx].buf),
+            self.config,
+            progress.head_wire,
+            progress.head_bytes,
+            progress.head_lines,
+            progress.in_headers,
+        )
+        if scan.is_error():
+            return scan.status
+        if scan.is_complete():
+            var head = parse_head(Span(self._conns[idx].buf), self.config)
+            if head.is_error():
+                return head.take_error().status
+            if head.is_complete():
+                progress.body_wire = head.head.header_end
+                self._conns[idx].request_head = head^
+        self._conns[idx].request_scan = progress
+        return 0
+
     def _admit_over_budget(mut self, idx: Int) raises NetError:
         # The kernel still holds the unread bytes; answer from what is
         # already buffered when possible, otherwise close bare.
@@ -1772,17 +1791,22 @@ struct Server(Movable):
                 break
             if self._conns[idx].buffered_len() == 0:
                 break
-            var head = parse_head(Span(self._conns[idx].buf), self.config)
-            if head.is_need_more():
-                if self._conns[idx].read_eof:
-                    self._close_conn(idx)
+            if not self._conns[idx].request_head:
+                var head_status = self._advance_head(idx)
+                if head_status != 0:
+                    self._send_error(idx, head_status)
                     return
-                break
-            if head.is_error():
-                var head_status = head.take_error().status
-                self._send_error(idx, head_status)
-                return
-            var content_length = head.head.content_length
+                if not self._conns[idx].request_head:
+                    if self._conns[idx].read_eof:
+                        self._close_conn(idx)
+                        return
+                    break
+            var header_end = (
+                self._conns[idx].request_head.value().head.header_end
+            )
+            var content_length = (
+                self._conns[idx].request_head.value().head.content_length
+            )
             if content_length > 0 and self._conns[idx].http1_body_reserved == 0:
                 if not self._budget.try_reserve(content_length):
                     self._send_error(idx, 503)
@@ -1790,9 +1814,7 @@ struct Server(Movable):
                 self._conns[idx].http1_body_reserved = content_length
             var outstanding = max(
                 0,
-                head.head.header_end
-                + content_length
-                - self._conns[idx].buf.capacity(),
+                header_end + content_length - self._conns[idx].buf.capacity(),
             )
             var unreserved = self._budget.used() - self._conns[idx].reserved
             if (
@@ -1807,7 +1829,10 @@ struct Server(Movable):
                     self._send_error(idx, 503)
                     return
                 self._conns[idx].reserved += outstanding
-            if head.head.expect_100 and not self._conns[idx].sent_100:
+            if (
+                self._conns[idx].request_head.value().head.expect_100
+                and not self._conns[idx].sent_100
+            ):
                 if not self._send_100(idx):
                     return
             if self._conns[idx].body_at == NO_DEADLINE:
@@ -1819,17 +1844,16 @@ struct Server(Movable):
                 # the short header deadline kill a slow but admitted
                 # upload.
                 self._conns[idx].header_at = NO_DEADLINE
-            if head.head.chunked:
-                var wire = head.head.header_end
-                var meta = 0
-                var decoded = 0
+            if self._conns[idx].request_head.value().head.chunked:
+                var progress = self._conns[idx].request_scan
                 var scan = _scan_chunked(
                     Span(self._conns[idx].buf),
                     self.config,
-                    wire,
-                    meta,
-                    decoded,
+                    progress.body_wire,
+                    progress.body_meta,
+                    progress.body_decoded,
                 )
+                self._conns[idx].request_scan = progress
                 if scan.is_error():
                     self._send_error(idx, scan.error.status)
                     return
@@ -1842,6 +1866,16 @@ struct Server(Movable):
                     self._send_error(idx, 503)
                     return
                 self._conns[idx].http1_body_reserved = scan.decoded
+            elif (
+                header_end + max(content_length, 0)
+                > self._conns[idx].buffered_len()
+            ):
+                if self._conns[idx].read_eof:
+                    self._close_conn(idx)
+                    return
+                break
+            var head = self._conns[idx].request_head.take()
+            self._conns[idx].request_scan = _RequestScan.start()
             var result = parse_body(
                 head^, Span(self._conns[idx].buf), self.config
             )
@@ -2127,11 +2161,7 @@ struct Server(Movable):
                 self._conns[idx].idle_at = deadline_from_now(
                     self.config.idle_timeout
                 )
-            var http2_failed = (
-                self._conns[idx].http2_session
-                and self._conns[idx].http2_session.value().is_failed()
-            )
-            if http2_failed:
+            if self._conns[idx].http2_failed():
                 # Flooded session: the control flush (ACK + ENHANCE_YOUR_CALM
                 # GOAWAY) is all the peer will get. Do not schedule more
                 # application responses; the connection closes once pending
@@ -2202,6 +2232,19 @@ struct Server(Movable):
             self._conns[idx].detach_state_addr = 0
             self._conns[idx].detach_at = NO_DEADLINE
             _release_detach_state(addr, from_sender=False)
+
+    def _discard_detached(mut self, idx: Int):
+        if self._conns[idx].detach_state_addr != 0:
+            self._mark_detached_cancelled(idx)
+            self._cleanup_detached_state(idx)
+            self._remove_detached_conn(idx)
+
+    def _fail_detached(
+        mut self, idx: Int, is_head: Bool, mut rw: ResponseWriter
+    ) raises NetError:
+        rw._drop_headers()
+        self._send_error(idx, 500, is_head=is_head)
+        self._arm_deadline(idx)
 
     def _remove_detached_conn(mut self, idx: Int):
         for i in range(len(self._detached_conns)):
@@ -2346,18 +2389,14 @@ struct Server(Movable):
         rw.set_should_close(req_close or (self._shutdown_at != NO_DEADLINE))
 
         if len(rw.body) > self.config.max_response_body:
-            rw._drop_headers()
-            self._send_error(idx, 500, is_head=is_head)
-            self._arm_deadline(idx)
+            self._fail_detached(idx, is_head, rw)
             return
 
         try:
             self._inject_alt_svc_for_tls(idx, rw)
         except e:
             _ = e
-            rw._drop_headers()
-            self._send_error(idx, 500, is_head=is_head)
-            self._arm_deadline(idx)
+            self._fail_detached(idx, is_head, rw)
             return
 
         var wire: List[Byte]
@@ -2372,9 +2411,7 @@ struct Server(Movable):
             )
         except e:
             _ = e
-            rw._drop_headers()
-            self._send_error(idx, 500, is_head=is_head)
-            self._arm_deadline(idx)
+            self._fail_detached(idx, is_head, rw)
             return
 
         self._conns[idx]._set_reserved_pending(wire^, self._budget)
@@ -2418,9 +2455,7 @@ struct Server(Movable):
             self._inject_alt_svc_for_tls(idx, rw)
         except e:
             _ = e
-            rw._drop_headers()
-            self._send_error(idx, 500, is_head=is_head)
-            self._arm_deadline(idx)
+            self._fail_detached(idx, is_head, rw)
             return
 
         var wire: List[Byte]
@@ -2435,15 +2470,11 @@ struct Server(Movable):
             )
         except e:
             _ = e
-            rw._drop_headers()
-            self._send_error(idx, 500, is_head=is_head)
-            self._arm_deadline(idx)
+            self._fail_detached(idx, is_head, rw)
             return
 
         if not self._conns[idx]._append_reserved_pending(wire^, self._budget):
-            rw._drop_headers()
-            self._send_error(idx, 500, is_head=is_head)
-            self._arm_deadline(idx)
+            self._fail_detached(idx, is_head, rw)
             return
 
         self._conns[idx].state = STATE_STREAMING
@@ -2532,6 +2563,7 @@ struct Server(Movable):
             self._close_conn(idx)
             return
         self._cleanup_detached_state(idx)
+        self._remove_detached_conn(idx)
         self._send_error(idx, 500, is_head=self._conns[idx].is_head)
         self._arm_deadline(idx)
 

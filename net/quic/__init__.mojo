@@ -5,7 +5,7 @@ from std.time import perf_counter_ns
 
 from net._sys.common import _copy_c_string
 from net.address import SocketAddress
-from net.error import NetError, NetErrorKind
+from net.error import NetError, NetErrorKind, _require_handle
 from net.timeout import Timeout
 from net.udp import UDPConn
 
@@ -30,34 +30,28 @@ struct QuicProvider(Movable):
     ) raises -> QuicServerConfig:
         var certificate = certificate_path.as_c_string_span()
         var private_key = private_key_path.as_c_string_span()
-        var config = self._library.call[
-            "net_quic_config_new",
-            Optional[Pointer[Byte, MutUntrackedOrigin]],
-        ](certificate.ptr(), private_key.ptr())
-        if config == None:
-            raise NetError(
-                NetErrorKind.system_error(),
-                "create QUIC server config",
-                None,
-                "quiche could not load the certificate and private key",
-            )
+        var config = _require_handle(
+            self._library.call[
+                "net_quic_config_new",
+                Optional[Pointer[Byte, MutUntrackedOrigin]],
+            ](certificate.ptr(), private_key.ptr()),
+            "create QUIC server config",
+            "quiche could not load the certificate and private key",
+        )
         var library = OwnedDLHandle(self._library_path)
-        return QuicServerConfig(library^, config.value())
+        return QuicServerConfig(library^, config)
 
     def server(mut self, var config: QuicServerConfig) raises -> QuicServer:
-        var server = config._library.call[
-            "net_quic_create",
-            Optional[Pointer[Byte, MutUntrackedOrigin]],
-        ](config._config)
-        if server == None:
-            raise NetError(
-                NetErrorKind.system_error(),
-                "create QUIC server",
-                None,
-                "quiche could not create a server",
-            )
+        var server = _require_handle(
+            config._library.call[
+                "net_quic_create",
+                Optional[Pointer[Byte, MutUntrackedOrigin]],
+            ](config._config),
+            "create QUIC server",
+            "quiche could not create a server",
+        )
         var library = OwnedDLHandle(self._library_path)
-        return QuicServer(library^, server.value())
+        return QuicServer(library^, server)
 
 
 struct QuicServerConfig(Movable):

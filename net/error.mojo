@@ -115,3 +115,18 @@ def _invalid_backlog_error(operation: String) -> NetError:
         None,
         "backlog is out of range",
     )
+
+
+def _require_handle(
+    handle: Optional[Pointer[Byte, MutUntrackedOrigin]],
+    operation: StaticString,
+    message: StaticString,
+) raises NetError -> Pointer[Byte, MutUntrackedOrigin]:
+    if not handle:
+        raise NetError(
+            NetErrorKind.system_error(),
+            String(operation),
+            None,
+            String(message),
+        )
+    return handle.value()

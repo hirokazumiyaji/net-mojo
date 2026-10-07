@@ -259,42 +259,25 @@ struct _EventQueue(Movable):
         # wrappers mis-lower through FFI and fail with EINVAL.
         var use_timeout = not deadline.is_indefinite()
         while True:
-            var rc: Int32
+            var spec = _Timespec(tv_sec=86400, tv_nsec=0)
             if use_timeout:
                 # Refresh the remaining time across EINTR restarts.
                 var remaining_ns = deadline.remaining_milliseconds() * 1_000_000
-                var spec = _Timespec(
+                spec = _Timespec(
                     tv_sec=Int64(remaining_ns // 1_000_000_000),
                     tv_nsec=Int64(remaining_ns % 1_000_000_000),
                 )
-                var dummy_change = darwin._Kevent(
-                    ident=0, filter=0, flags=0, fflags=0, data=0, udata=0
-                )
-                rc = external_call["kevent", c_int](
-                    c_int(self._fd._value),
-                    Pointer(to=dummy_change),
-                    c_int(0),
-                    Pointer(to=self._scratch[0]).unsafe_bitcast[
-                        darwin._Kevent
-                    ](),
-                    c_int(_MAX_EVENTS),
-                    Pointer(to=spec),
-                )
-            else:
-                var dummy_change = darwin._Kevent(
-                    ident=0, filter=0, flags=0, fflags=0, data=0, udata=0
-                )
-                var day = _Timespec(tv_sec=86400, tv_nsec=0)
-                rc = external_call["kevent", c_int](
-                    c_int(self._fd._value),
-                    Pointer(to=dummy_change),
-                    c_int(0),
-                    Pointer(to=self._scratch[0]).unsafe_bitcast[
-                        darwin._Kevent
-                    ](),
-                    c_int(_MAX_EVENTS),
-                    Pointer(to=day),
-                )
+            var dummy_change = darwin._Kevent(
+                ident=0, filter=0, flags=0, fflags=0, data=0, udata=0
+            )
+            var rc = external_call["kevent", c_int](
+                c_int(self._fd._value),
+                Pointer(to=dummy_change),
+                c_int(0),
+                Pointer(to=self._scratch[0]).unsafe_bitcast[darwin._Kevent](),
+                c_int(_MAX_EVENTS),
+                Pointer(to=spec),
+            )
             if rc == -1:
                 var errno = get_errno().value
                 if errno == EINTR:

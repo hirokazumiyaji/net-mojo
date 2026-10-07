@@ -1628,6 +1628,52 @@ def test_partial_chunked_body_does_not_reserve_decoded_allocation() raises:
     client.close()
 
 
+def _tick_until_buffered[
+    H: Handler
+](mut server: Server, mut handler: H, want: Int) raises:
+    for _ in range(200):
+        _ = server.tick(handler, Timeout.nanoseconds(0))
+        if server._conns[0].buffered_len() >= want:
+            return
+    raise Error("server never buffered the dripped bytes")
+
+
+def test_dripped_request_parses_head_once_and_resumes_chunk_scan() raises:
+    # One byte per read must cost O(new bytes): the head is parsed once,
+    # when its terminator arrives, and the chunk scan resumes from its
+    # frontier instead of rescanning the buffered body.
+    var server = Server(ServerConfig.default())
+    server.add_listener(listen_tcp("127.0.0.1:0"))
+    var handler = _EchoHandler()
+    var client = dial_tcp(
+        String("127.0.0.1:") + String(server.local_address().port),
+        Timeout.seconds(1),
+    )
+    _tick_n(server, handler, 2)
+    assert_equal(len(server._conns), 1)
+    var head = String(
+        "POST /echo HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n"
+        "Connection: close\r\n\r\n"
+    )
+    var request = head + String("2\r\nbo\r\n3\r\ndy!\r\n0\r\n\r\n")
+    var bytes = request.as_bytes()
+    for i in range(len(bytes) - 1):
+        client.write_all(bytes[i : i + 1], Timeout.seconds(1))
+        _tick_until_buffered(server, handler, i + 1)
+        assert_equal(
+            Bool(server._conns[0].request_head),
+            i + 1 >= head.byte_length(),
+        )
+    assert_true(
+        server._conns[0].request_scan.body_wire
+        >= head.byte_length() + "2\r\nbo\r\n3\r\ndy!\r\n".byte_length()
+    )
+    var out = _exchange(server, handler, client, "\n")
+    assert_equal(_status_of(out), 200)
+    _assert_body(out, "body!")
+    client.close()
+
+
 def test_request_copy_peak_is_rejected_before_receiving_body() raises:
     var config = ServerConfig.default()
     config.total_buffer_budget = 8192 + H1_ERROR_CAPACITY

@@ -1,7 +1,12 @@
 from std.testing import assert_equal, assert_false, assert_true, TestSuite
 
 from net.http import ServerConfig
-from net.http._parser import parse_one
+from net.http._parser import (
+    _RequestScan,
+    _scan_chunked,
+    _scan_head,
+    parse_one,
+)
 from tests.support import _to_bytes
 
 
@@ -452,19 +457,34 @@ def test_expect_comma_list_all_supported() raises:
 
 def test_chunk_extension_fragment_no_double_count() raises:
     # A size line larger than half the metadata cap, cut right after its
-    # CRLF: the prefix must report need_more (not an error), and the
-    # whole request must complete (not a spurious 413 from counting the
-    # same line twice).
+    # CRLF: resuming the chunk scan must count that line once (a double
+    # count is a spurious 413), and the whole request must decode.
     var config = ServerConfig.default()
-    var full = _to_bytes(
-        "POST /a HTTP/1.1\r\nHost: h\r\nTransfer-Encoding: chunked\r\n\r\n5;"
+    var head = _to_bytes(
+        "POST /a HTTP/1.1\r\nHost: h\r\nTransfer-Encoding: chunked\r\n\r\n"
     )
+    var full = head.copy()
+    full.extend("5;".as_bytes())
     var padding = String("e") * 40000
     full.extend(padding.as_bytes())
     full.extend("\r\n".as_bytes())
     var split = len(full)
     full.extend("hello\r\n0\r\n\r\n".as_bytes())
-    assert_true(parse_one(Span(full)[0:split], config).is_need_more())
+    var scan = _RequestScan.start()
+    scan.body_wire = len(head)
+    var first = _scan_chunked(
+        Span(full)[0:split],
+        config,
+        scan.body_wire,
+        scan.body_meta,
+        scan.body_decoded,
+    )
+    assert_true(first.is_need_more())
+    var second = _scan_chunked(
+        Span(full), config, scan.body_wire, scan.body_meta, scan.body_decoded
+    )
+    assert_true(second.is_complete())
+    assert_equal(second.decoded, 5)
     var result = parse_one(Span(full), config)
     assert_true(result.is_complete())
     assert_equal(len(result.request.body), 5)
@@ -489,47 +509,73 @@ def test_obs_text_header_value_preserved() raises:
 
 
 def test_dripped_headers_complete_identically() raises:
-    # Two thousand header bytes arriving one at a time: every prefix must
-    # ask for more, and the full head must reach the one-shot verdict.
+    # Two thousand header bytes arriving one at a time through one
+    # persistent head frontier: every scan before the terminator asks for
+    # more, and the completed head matches the one-shot parse.
     var config = ServerConfig.default()
     var full = _to_bytes("POST /drip HTTP/1.1\r\nHost: h\r\n")
     for i in range(40):
         var line = String("X-Pad-") + String(i) + String(": abcdefghij\r\n")
         full.extend(line.as_bytes())
     full.extend("Content-Length: 3\r\n\r\nabc".as_bytes())
-    for end in range(1, len(full)):
-        assert_true(parse_one(Span(full)[0:end], config).is_need_more())
-    var result = parse_one(Span(full), config)
-    assert_true(result.is_complete())
-    assert_equal(len(result.request.body), 3)
-    assert_equal(result.request.headers.count("X-Pad-7"), 1)
-    assert_equal(result.consumed, len(full))
+    var scan = _RequestScan.start()
+    var header_end = -1
+    for end in range(1, len(full) + 1):
+        var result = _scan_head(
+            Span(full)[0:end],
+            config,
+            scan.head_wire,
+            scan.head_bytes,
+            scan.head_lines,
+            scan.in_headers,
+        )
+        assert_false(result.is_error())
+        if result.is_complete():
+            header_end = result.header_end
+            break
+    assert_equal(header_end, len(full) - 3)
+    assert_equal(scan.head_lines, 42)
+    var expected = parse_one(Span(full), config)
+    assert_true(expected.is_complete())
+    assert_equal(len(expected.request.body), 3)
+    assert_equal(expected.request.headers.count("X-Pad-7"), 1)
 
 
 def test_dripped_tail_decodes_without_loss() raises:
-    # One completed chunk followed by byte-wise drips: slow arrival must
-    # neither lose bytes nor change the outcome.
+    # One completed chunk followed by byte-wise drips through a persistent
+    # frontier: slow arrival must neither lose nor double-count bytes.
     var config = ServerConfig.default()
-    var full = _to_bytes(
-        "POST /drip HTTP/1.1\r\nHost: h\r\nTransfer-Encoding:"
-        " chunked\r\n\r\n400\r\n"
+    var head = _to_bytes(
+        "POST /drip HTTP/1.1\r\nHost: h\r\nTransfer-Encoding: chunked\r\n\r\n"
     )
+    var full = head.copy()
+    full.extend("400\r\n".as_bytes())
     for _ in range(1024):
         full.append(Byte(ord("x")))
     var tail = "\r\n3\r\nabc\r\n0\r\nX-T: 1\r\n\r\n"
     full.extend(tail.as_bytes())
-    for end in range(len(full) - tail.byte_length(), len(full)):
-        assert_true(parse_one(Span(full)[0:end], config).is_need_more())
-    var result = parse_one(Span(full), config)
-    assert_true(result.is_complete())
-    assert_equal(len(result.request.body), 1027)
-    assert_equal(result.consumed, len(full))
+    var scan = _RequestScan.start()
+    scan.body_wire = len(head)
+    for end in range(len(full) - tail.byte_length(), len(full) + 1):
+        var result = _scan_chunked(
+            Span(full)[0:end],
+            config,
+            scan.body_wire,
+            scan.body_meta,
+            scan.body_decoded,
+        )
+        if end < len(full):
+            assert_true(result.is_need_more())
+        else:
+            assert_true(result.is_complete())
+            assert_equal(result.decoded, 1027)
+    assert_equal(len(parse_one(Span(full), config).request.body), 1027)
 
 
 def test_resume_advances_past_completed_chunks() raises:
-    # Five chunks arriving one at a time: every intermediate prefix must
-    # report need_more (never a spurious complete or error), and the full
-    # request must decode all chunks.
+    # Five chunks arriving one at a time through one persistent frontier:
+    # each intermediate scan reports need_more with the frontier moved past
+    # the completed chunk, and the final scan decodes all chunks.
     var config = ServerConfig.default()
     var chunks = List[String]()
     chunks.append("1\r\na\r\n")
@@ -540,13 +586,103 @@ def test_resume_advances_past_completed_chunks() raises:
     var full = _to_bytes(
         "POST /r HTTP/1.1\r\nHost: h\r\nTransfer-Encoding: chunked\r\n\r\n"
     )
+    var scan = _RequestScan.start()
+    scan.body_wire = len(full)
     for i in range(len(chunks)):
-        assert_true(parse_one(Span(full), config).is_need_more())
         full.extend(chunks[i].as_bytes())
-    var result = parse_one(Span(full), config)
-    assert_true(result.is_complete())
-    assert_equal(len(result.request.body), 7)
-    assert_equal(result.consumed, len(full))
+        var result = _scan_chunked(
+            Span(full),
+            config,
+            scan.body_wire,
+            scan.body_meta,
+            scan.body_decoded,
+        )
+        if i + 1 < len(chunks):
+            assert_true(result.is_need_more())
+            assert_equal(scan.body_wire, len(full))
+        else:
+            assert_true(result.is_complete())
+            assert_equal(result.decoded, 7)
+            assert_equal(result.consumed, len(full))
+
+
+def test_head_scan_resumes_from_its_frontier() raises:
+    # The server feeds every read through one persistent frontier: each
+    # call may only examine bytes past completed lines.
+    var config = ServerConfig.default()
+    var full = _to_bytes("GET /a HTTP/1.1\r\nHost: h\r\nX-A: 1\r\n\r\n")
+    var scan = _RequestScan.start()
+    var header_end = -1
+    for end in range(1, len(full) + 1):
+        var result = _scan_head(
+            Span(full)[0:end],
+            config,
+            scan.head_wire,
+            scan.head_bytes,
+            scan.head_lines,
+            scan.in_headers,
+        )
+        assert_false(result.is_error())
+        if result.is_complete():
+            assert_equal(end, len(full))
+            header_end = result.header_end
+    assert_equal(header_end, len(full))
+    assert_equal(scan.head_lines, 2)
+    assert_equal(scan.head_wire, len(full) - 2)
+
+
+def test_head_scan_rejects_before_the_terminator() raises:
+    var config = ServerConfig.default()
+    config.max_headers_bytes = 16
+    var cases = List[String]()
+    cases.append("GET /a HTTP/1.1\n")
+    cases.append("GET /a HTTP/1.1\r\nX-Long: 0123456789abcdef")
+    var statuses = [400, 431]
+    for i in range(len(cases)):
+        var full = _to_bytes(cases[i])
+        var scan = _RequestScan.start()
+        var status = 0
+        for end in range(1, len(full) + 1):
+            var result = _scan_head(
+                Span(full)[0:end],
+                config,
+                scan.head_wire,
+                scan.head_bytes,
+                scan.head_lines,
+                scan.in_headers,
+            )
+            if result.is_error():
+                status = result.status
+                break
+            assert_true(result.is_need_more())
+        assert_equal(status, statuses[i])
+
+
+def test_chunk_scan_resumes_from_its_frontier() raises:
+    var config = ServerConfig.default()
+    var head = _to_bytes(
+        "POST /c HTTP/1.1\r\nHost: h\r\nTransfer-Encoding: chunked\r\n\r\n"
+    )
+    var full = head.copy()
+    full.extend("4;e=x\r\nwxyz\r\n2\r\nab\r\n0\r\nX-T: 1\r\n\r\n".as_bytes())
+    var scan = _RequestScan.start()
+    scan.body_wire = len(head)
+    var completed = False
+    for end in range(len(head) + 1, len(full) + 1):
+        var result = _scan_chunked(
+            Span(full)[0:end],
+            config,
+            scan.body_wire,
+            scan.body_meta,
+            scan.body_decoded,
+        )
+        assert_false(result.is_error())
+        if result.is_complete():
+            assert_equal(end, len(full))
+            assert_equal(result.consumed, len(full))
+            assert_equal(result.decoded, 6)
+            completed = True
+    assert_true(completed)
 
 
 def test_chunk_extension_grammar() raises:

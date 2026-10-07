@@ -39,7 +39,6 @@ struct ReactorToken(Copyable, Equatable, Hashable, Writable):
 @fieldwise_init
 struct ReactorEvent(Copyable, Movable):
     var token: ReactorToken
-    var fd: Int32
     var readable: Bool
     var writable: Bool
     var has_error: Bool
@@ -214,10 +213,9 @@ struct Reactor(Movable, Sized):
                 writable = True
             if not readable and not writable:
                 continue
-            # On Linux the queue cannot report the fd; recover it from the
-            # slot. On Darwin the kernel ident must agree with the slot.
-            var fd = self._slots[slot].fd
-            if batch[i].fd >= 0 and batch[i].fd != fd:
+            # Darwin reports the kernel ident, which must still match the
+            # slot; Linux reports -1.
+            if batch[i].fd >= 0 and batch[i].fd != self._slots[slot].fd:
                 continue
             out.append(
                 ReactorEvent(
@@ -225,7 +223,6 @@ struct Reactor(Movable, Sized):
                         slot=slot,
                         generation=self._slots[slot].generation,
                     ),
-                    fd=fd,
                     readable=readable,
                     writable=writable,
                     has_error=batch[i].has_error,
