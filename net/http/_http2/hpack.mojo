@@ -149,6 +149,9 @@ struct Http2HpackDeflater(Movable):
     def fail(mut self):
         self._failed = True
 
+    def is_failed(self) -> Bool:
+        return self._failed
+
     def encode[
         field_origin: ImmOrigin,
         output_origin: MutOrigin,

@@ -1310,5 +1310,88 @@ def test_http2_request_session_returns_padding_flow_credit() raises:
     assert_equal(result.output[49], Byte(4))
 
 
+def _bootstrap_session(mut session: Http2RequestSession) raises:
+    var wire = List[Byte]()
+    var preface = "PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n".as_bytes()
+    for i in range(len(preface)):
+        wire.append(preface[i])
+    var empty = List[Byte]()
+    _append_frame(wire, Byte(4), Byte(0), UInt32(0), Span(empty))
+    assert_true(session.consume(Span(wire)).is_pending())
+
+
+def test_http2_scheduler_peer_reset_before_headers_sent_flushes_then_rsts() raises:
+    var session = Http2RequestSession("build/http2/libnet_hpack", 4, 1024)
+    _bootstrap_session(session)
+    var compressed: List[Byte] = [0x82, 0x86, 0x84, 0x01, 0x01, Byte(ord("x"))]
+    var opening = List[Byte]()
+    _append_frame(opening, Byte(1), Byte(5), UInt32(1), Span(compressed))
+    _append_frame(opening, Byte(1), Byte(5), UInt32(3), Span(compressed))
+    var opened = session.consume(Span(opening))
+    assert_true(opened.is_request())
+    var sibling = session.consume(Span(opening)[opened.consumed :])
+    assert_true(sibling.is_request())
+
+    var scheduler = Http2ResponseScheduler()
+    var header_payload = List[Byte]()
+    var h1 = List[Byte]()
+    var h3 = List[Byte]()
+    _append_frame(h1, Byte(1), Byte(0), UInt32(1), Span(header_payload))
+    _append_frame(h3, Byte(1), Byte(0), UInt32(3), Span(header_payload))
+    var body1: List[Byte] = [Byte(ord("a")), Byte(ord("b"))]
+    var body3: List[Byte] = [Byte(ord("c"))]
+    assert_true(scheduler.enqueue(UInt32(1), h1^, body1^, end_on_headers=False))
+    assert_true(scheduler.enqueue(UInt32(3), h3^, body3^, end_on_headers=False))
+
+    var reset = scheduler.on_peer_reset(UInt32(1))
+    assert_true(reset.kept_headers)
+    assert_equal(reset.released_bytes, 2)
+    assert_equal(scheduler.queued_count(), 2)
+
+    var batch = scheduler.drain(session, 16384, 65536)
+    assert_equal(scheduler.queued_count(), 0)
+    assert_equal(len(batch.completed_streams), 2)
+    # Both streams finished; stream 1's headers were still shipped so HPACK
+    # stays in sync, and the server-sent RST_STREAM(CANCEL) closed stream 1.
+    var saw_rst_on_one = False
+    var saw_headers_on_one = False
+    var offset = 0
+    while offset < len(batch.wire):
+        var frame = parse_frame(Span(batch.wire)[offset:])
+        if frame.frame_type == Byte(3) and frame.stream_id == UInt32(1):
+            saw_rst_on_one = True
+        if frame.frame_type == Byte(1) and frame.stream_id == UInt32(1):
+            saw_headers_on_one = True
+        offset += frame.consumed
+    assert_true(saw_headers_on_one)
+    assert_true(saw_rst_on_one)
+
+
+def test_http2_scheduler_peer_reset_after_headers_sent_removes_entry() raises:
+    var session = Http2RequestSession("build/http2/libnet_hpack", 4, 1024)
+    _bootstrap_session(session)
+    var compressed: List[Byte] = [0x82, 0x86, 0x84, 0x01, 0x01, Byte(ord("x"))]
+    var opening = List[Byte]()
+    _append_frame(opening, Byte(1), Byte(5), UInt32(1), Span(compressed))
+    var opened = session.consume(Span(opening))
+    assert_true(opened.is_request())
+
+    var scheduler = Http2ResponseScheduler()
+    var header_payload = List[Byte]()
+    var h1 = List[Byte]()
+    _append_frame(h1, Byte(1), Byte(0), UInt32(1), Span(header_payload))
+    var body1: List[Byte] = [Byte(ord("x")), Byte(ord("y"))]
+    assert_true(scheduler.enqueue(UInt32(1), h1^, body1^))
+
+    # Flush headers only (max_output_bytes stops drain after header wire).
+    var first = scheduler.drain(session, 2, 9)
+    assert_equal(len(first.completed_streams), 0)
+    assert_true(scheduler.queued_count() > 0)
+    var reset = scheduler.on_peer_reset(UInt32(1))
+    assert_false(reset.kept_headers)
+    assert_equal(reset.released_bytes, 11)
+    assert_equal(scheduler.queued_count(), 0)
+
+
 def main() raises:
     TestSuite.discover_tests[__functions_in_module()]().run()

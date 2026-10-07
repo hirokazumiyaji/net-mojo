@@ -400,6 +400,17 @@ struct Http2RequestSession(Movable):
                 return Http2RequestSessionResult.pending(
                     consumed, output^, input.stream_id
                 )
+            elif input.is_goaway():
+                # Peer stops accepting new streams above its last_stream_id;
+                # finish in-flight, refuse later HEADERS, and acknowledge with
+                # our own GOAWAY so the connection drains instead of lingering.
+                if not self._draining:
+                    self._draining = True
+                    var goaway = encode_goaway_frame(
+                        self._last_stream_id, UInt32(0)
+                    )
+                    if goaway.is_complete():
+                        output.extend(Span(goaway.wire))
             elif input.is_window_update():
                 if input.stream_id == UInt32(0):
                     if not self._send_window.apply_window_update(
@@ -579,6 +590,9 @@ struct Http2RequestSession(Movable):
     def is_draining(self) -> Bool:
         return self._draining
 
+    def has_active_streams(self) -> Bool:
+        return len(self._streams) > 0 or len(self._send_streams) > 0
+
     def peer_settings(self) -> Http2PeerSettingsSnapshot:
         return self._input.peer_settings()
 
@@ -605,6 +619,16 @@ struct Http2RequestSession(Movable):
             var last = self._send_streams.pop()
             if index < len(self._send_streams):
                 self._send_streams[index] = last^
+
+    def refuse_stream(
+        mut self, stream_id: UInt32, error_code: UInt32
+    ) -> List[Byte]:
+        self._remove_stream(stream_id)
+        var reset = encode_rst_stream_frame(stream_id, error_code)
+        var output = List[Byte]()
+        if reset.is_complete():
+            output.extend(Span(reset.wire))
+        return output^
 
     def _find_send_stream(self, stream_id: UInt32) -> Int:
         for i in range(len(self._send_streams)):

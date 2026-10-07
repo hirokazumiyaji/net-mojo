@@ -1,6 +1,6 @@
 """Encode a buffered shared response into HTTP/2 response frames."""
 
-from net.http.response import ResponseWriter
+from net.http.response import ResponseWriter, has_body_for_status
 
 from .frame_encoder import FrameEncodeResult
 from .hpack import Http2HpackDeflater
@@ -48,3 +48,11 @@ def encode_http2_response_header_frames[
     if not header_frames.is_complete():
         deflater.fail()
     return header_frames^
+
+
+def http2_response_end_on_headers(
+    writer: ResponseWriter, is_head: Bool
+) -> Bool:
+    return not has_body_for_status(writer.status, is_head) or (
+        len(writer.body) == 0
+    )

@@ -1,5 +1,6 @@
 """Fairly schedules queued HTTP/2 response bodies across streams."""
 
+from .control_frames import encode_rst_stream_frame
 from .frame_encoder import encode_frame
 from .request_session import Http2RequestSession
 
@@ -12,6 +13,8 @@ struct _PendingHttp2Response(Movable):
     var body_offset: Int
     var headers_offset: Int
     var headers_sent: Bool
+    var end_on_headers: Bool
+    var cancelled: Bool
 
 
 @fieldwise_init
@@ -19,6 +22,12 @@ struct Http2ScheduledOutput(Movable):
     var wire: List[Byte]
     var completed_streams: List[UInt32]
     var released_bytes: Int
+
+
+@fieldwise_init
+struct Http2PeerResetResult(Movable):
+    var released_bytes: Int
+    var kept_headers: Bool
 
 
 struct Http2ResponseScheduler(Movable):
@@ -34,6 +43,7 @@ struct Http2ResponseScheduler(Movable):
         stream_id: UInt32,
         var headers: List[Byte],
         var body: List[Byte],
+        end_on_headers: Bool = False,
     ) -> Bool:
         if stream_id == UInt32(0) or len(headers) == 0:
             return False
@@ -47,6 +57,8 @@ struct Http2ResponseScheduler(Movable):
             body_offset=0,
             headers_offset=0,
             headers_sent=False,
+            end_on_headers=end_on_headers,
+            cancelled=False,
         )
         self._responses.append(response^)
         return True
@@ -63,6 +75,28 @@ struct Http2ResponseScheduler(Movable):
         )
         self._remove(index)
         return released
+
+    def on_peer_reset(mut self, stream_id: UInt32) -> Http2PeerResetResult:
+        # Dropping the already-HPACK-encoded header block would desync the
+        # deflater; keep headers so drain still ships them and release only
+        # the body budget here. The body is replaced with an empty list and
+        # drain emits RST_STREAM(CANCEL) after headers to close the stream.
+        var index = self._find(stream_id)
+        if index < 0:
+            return Http2PeerResetResult(released_bytes=0, kept_headers=False)
+        if not self._responses[index].headers_sent:
+            var body_bytes = len(self._responses[index].body)
+            self._responses[index].body = List[Byte]()
+            self._responses[index].body_offset = 0
+            self._responses[index].cancelled = True
+            return Http2PeerResetResult(
+                released_bytes=body_bytes, kept_headers=True
+            )
+        var released = len(self._responses[index].headers) + len(
+            self._responses[index].body
+        )
+        self._remove(index)
+        return Http2PeerResetResult(released_bytes=released, kept_headers=False)
 
     def has_unsent_headers(self, stream_id: UInt32) -> Bool:
         var index = self._find(stream_id)
@@ -113,12 +147,28 @@ struct Http2ResponseScheduler(Movable):
                 ):
                     break
                 self._responses[index].headers_sent = True
-                if len(self._responses[index].body) == 0:
+                if len(self._responses[index].body) == 0 and (
+                    not self._responses[index].cancelled
+                ):
                     session.finish_response(stream_id)
                     completed.append(stream_id)
                     released += len(self._responses[index].headers)
                     self._remove(index)
                     continue
+
+            if self._responses[index].cancelled:
+                if not self._responses[index].end_on_headers:
+                    var rst = encode_rst_stream_frame(stream_id, UInt32(8))
+                    if not rst.is_complete() or len(rst.wire) > (
+                        max_output_bytes - len(output)
+                    ):
+                        break
+                    output.extend(Span(rst.wire))
+                session.finish_response(stream_id)
+                completed.append(stream_id)
+                released += len(self._responses[index].headers)
+                self._remove(index)
+                continue
 
             var remaining_body = len(self._responses[index].body) - (
                 self._responses[index].body_offset

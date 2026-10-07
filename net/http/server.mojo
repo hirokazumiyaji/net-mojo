@@ -108,7 +108,9 @@ from net.http._http2.request_session import (
 from net.http._http2.response_headers import _content_length_matches
 from net.http._http2.response_encoder import (
     encode_http2_response_header_frames,
+    http2_response_end_on_headers,
 )
+from net.http._http2.control_frames import encode_rst_stream_frame
 
 
 comptime _TICK_POLL_CAP_MS: Int = 100
@@ -1281,6 +1283,9 @@ struct Server(Movable):
                 # event a TLS write blocked on WANT_READ requires.
                 self._sync_interests(idx)
                 return
+            if self._http2_drained(idx):
+                self._close_conn(idx)
+                return
             var read_event = (
                 self._conns[idx].read_ready(readable, writable)
                 or self._conns[idx].tls_pending() > 0
@@ -1441,19 +1446,13 @@ struct Server(Movable):
             if result.consumed > 0:
                 self._consume_receive(idx, result.consumed)
             if result.reset_stream_id != UInt32(0):
-                var dropped_unsent = self._conns[
+                var reset_result = self._conns[
                     idx
-                ].http2_responses.has_unsent_headers(result.reset_stream_id)
-                var released = self._conns[idx].http2_responses.cancel(
-                    result.reset_stream_id
-                )
-                self._budget.release(released)
-                self._conns[idx].http2_response_bytes_reserved -= released
-                if dropped_unsent:
-                    # Encoded headers mutated the deflater but never reached
-                    # the peer; keep compression state consistent by closing.
-                    self._close_conn(idx)
-                    return
+                ].http2_responses.on_peer_reset(result.reset_stream_id)
+                self._budget.release(reset_result.released_bytes)
+                self._conns[
+                    idx
+                ].http2_response_bytes_reserved -= reset_result.released_bytes
             var request_body_bytes = 0
             if result.is_request():
                 request_body_bytes = len(result.request.body)
@@ -1535,9 +1534,13 @@ struct Server(Movable):
         self._conns[idx].http2_body_reserved -= request_body_bytes
 
         if writer.is_detached():
+            # Streaming/SSE on HTTP/2 would need per-stream credit tracking
+            # that the shared H1 writer cannot express; keep siblings alive by
+            # falling back to a stream-level 500 instead of closing.
             writer._cancel_detach()
-            self._close_conn(idx)
-            return
+            writer.set_status(500)
+            writer.headers.clear()
+            writer.body.clear()
         if len(writer.body) > cap:
             writer.set_status(500)
             writer.headers.clear()
@@ -1609,8 +1612,34 @@ struct Server(Movable):
             Span(compressed),
         )
         if not encoded.is_complete():
-            self._close_conn(idx)
-            return
+            if self._conns[idx].http2_deflater.value().is_failed():
+                # Deflater state is poisoned; the whole connection must close.
+                self._close_conn(idx)
+                return
+            # Headers failed before HPACK ran (bad field or over the peer's
+            # SETTINGS_MAX_HEADER_LIST_SIZE); retry a minimal 500 so sibling
+            # streams on the same connection stay alive.
+            writer.set_status(500)
+            writer.headers.clear()
+            writer.body.clear()
+            encoded = encode_http2_response_header_frames(
+                self._conns[idx].http2_deflater.value(),
+                writer,
+                is_head,
+                self._tick_date,
+                stream_id,
+                max_response_header_bytes,
+                self.config.max_response_headers_count,
+                16384,
+                available,
+                Span(compressed),
+            )
+            if not encoded.is_complete():
+                if self._conns[idx].http2_deflater.value().is_failed():
+                    self._close_conn(idx)
+                    return
+                self._refuse_http2_stream(idx, stream_id, UInt32(2))
+                return
 
         var response_body = writer.body^
         writer.body = List[Byte]()
@@ -1620,13 +1649,14 @@ struct Server(Movable):
         encoded.wire = List[Byte]()
         var response_reservation = len(headers_wire) + len(response_body)
         if not self._budget.try_reserve(response_reservation):
-            self._close_conn(idx)
+            self._refuse_http2_stream(idx, stream_id, UInt32(7))
             return
+        var end_on_headers = http2_response_end_on_headers(writer, is_head)
         if not self._conns[idx].http2_responses.enqueue(
-            stream_id, headers_wire^, response_body^
+            stream_id, headers_wire^, response_body^, end_on_headers
         ):
             self._budget.release(response_reservation)
-            self._close_conn(idx)
+            self._refuse_http2_stream(idx, stream_id, UInt32(7))
             return
         self._conns[idx].http2_response_bytes_reserved += response_reservation
         self._conns[idx].write_at = deadline_from_now(
@@ -1640,6 +1670,35 @@ struct Server(Movable):
                 return
             self._conns[idx].state = STATE_SENDING_HTTP2_CONTROL
         self._drain_http2_responses(idx)
+
+    def _http2_drained(self, idx: Int) -> Bool:
+        if not self._conns[idx].http2_session:
+            return False
+        if not self._conns[idx].http2_session.value().is_draining():
+            return False
+        return (
+            self._conns[idx].pending_remaining() == 0
+            and self._conns[idx].http2_responses.queued_count() == 0
+            and not self._conns[idx].http2_session.value().has_active_streams()
+        )
+
+    def _refuse_http2_stream(
+        mut self, idx: Int, stream_id: UInt32, error_code: UInt32
+    ) raises NetError:
+        var frame = (
+            self._conns[idx]
+            .http2_session.value()
+            .refuse_stream(stream_id, error_code)
+        )
+        if len(frame) == 0:
+            return
+        if not self._conns[idx].append_pending(frame^, self._budget):
+            self._close_conn(idx)
+            return
+        self._conns[idx].state = STATE_SENDING_HTTP2_CONTROL
+        self._conns[idx].write_at = deadline_from_now(
+            self.config.write_deadline
+        )
 
     def _drain_http2_responses(mut self, idx: Int) raises NetError:
         if (

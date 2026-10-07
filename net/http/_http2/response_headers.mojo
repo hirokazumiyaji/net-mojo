@@ -102,8 +102,11 @@ def encode_http2_response_headers(
     for i in range(len(writer.headers)):
         ref name = writer.headers._lower_names[i]
         var value = writer.headers._value_bytes_span(i)
+        # RFC 9113 §8.2.2: these are HTTP/1-specific hop-by-hop headers and
+        # must not appear in HTTP/2 responses; drop silently so a shared H1
+        # handler cannot kill an H2 connection by writing them.
         if _is_connection_specific(name) or name == "te":
-            return Http2ResponseHeadersResult.error()
+            continue
         if name == "content-length":
             continue
         header_list_size += _field_size(name.byte_length(), len(value))

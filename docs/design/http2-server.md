@@ -51,8 +51,31 @@ deflater and queues its HEADERS and DATA frames through the reactor-owned
 connection. The optional HPACK shim is loaded when the first request headers
 arrive. It returns connection and stream receive credit after request DATA is
 copied into the bounded body buffer. Responses stay within current connection
-send credit and the peer's initial stream window; response bodies that do not
-fit that credit become an empty 500 response.
+send credit and the peer's initial stream window; a response body that does not
+fit the shared budget at enqueue time is refused on that stream with
+RST_STREAM(REFUSED_STREAM) and sibling streams keep running.
+
+Stream-local errors do not escalate to connection errors. A client RST_STREAM
+on a stream whose HPACK-encoded HEADERS have not yet been written keeps the
+headers queued so they still ship (preserving the deflater's dynamic table),
+followed by a server-sent RST_STREAM(CANCEL) that closes the stream. A handler
+that writes connection-specific headers (`Connection`, `Keep-Alive`,
+`Transfer-Encoding`, `Upgrade`, `TE`) has those fields silently stripped per
+RFC 9113 §8.2.2 so a shared HTTP/1 handler cannot kill an HTTP/2 connection.
+When response headers still fail to encode (e.g. the field list exceeds the
+peer's `SETTINGS_MAX_HEADER_LIST_SIZE` or a `Content-Length` disagrees with the
+body) and the HPACK deflater state is still intact, the response is replaced
+with a minimal 500 and retried on the same stream; if the retry also fails the
+stream is reset with INTERNAL_ERROR. A handler that detaches/streams on
+HTTP/2 (SSE) also falls back to a stream-level 500 instead of closing the
+connection. A client-sent GOAWAY marks the session draining: new peer HEADERS
+are answered with RST_STREAM(REFUSED_STREAM), in-flight streams finish, the
+server emits its own acknowledging GOAWAY, and the connection closes once the
+scheduler and send-stream list drain. The one place where the connection still
+closes under budget pressure is the aggregate request-body reservation across
+all concurrent streams: that budget is shared and the server cannot know which
+single stream to refuse, so the connection drops once the sum exceeds the
+remaining capacity budget.
 
 ## Outbound frame encoding
 
