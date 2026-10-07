@@ -7,7 +7,7 @@ from net.http._parser import (
     _scan_head,
     parse_one,
 )
-from tests.support import _to_bytes
+from tests.support import _malformed_corpus, _to_bytes
 
 
 def test_content_length_body_capacity_is_exact_and_owned() raises:
@@ -220,26 +220,141 @@ def test_fragmentation_at_every_boundary() raises:
 
 
 def test_seed_recorded_fragmentation() raises:
-    # Deterministic pseudo-random splits (LCG, seed 42) over a chunked
-    # request with trailers. The seed is recorded so failures reproduce.
     var config = ServerConfig.default()
-    var full = _to_bytes(
-        (
-            "POST /seed HTTP/1.1\r\nHost: h\r\nTransfer-Encoding:"
-            " chunked\r\n\r\n4;e=x\r\nabcd\r\n2\r\nef\r\n0\r\nX-S: v\r\n\r\n"
-        ),
+    var binary_body = String("")
+    for i in range(32):
+        binary_body += String(chr(i))
+    var chunked = String(
+        "POST /seed HTTP/1.1\r\nHost: h\r\nTransfer-Encoding:"
+        " chunked\r\n\r\n4;e=x\r\nabcd\r\n2\r\nef\r\n0\r\nX-S: v\r\n\r\n"
     )
-    var expected = parse_one(Span(full), config)
-    assert_true(expected.is_complete())
-    assert_equal(len(expected.request.body), 6)
-    var state = UInt64(42)
-    for _ in range(5):
-        state = state * UInt64(6364136223846793005) + UInt64(
-            1442695040888963407
-        )
-        var point = Int(state % UInt64(len(full)))
-        if point > 0:
-            assert_true(parse_one(Span(full)[0:point], config).is_need_more())
+    var binary_cl = (
+        String("POST /binary HTTP/1.1\r\nHost: h\r\nContent-Length: ")
+        + String(binary_body.byte_length())
+        + String("\r\n\r\n")
+        + binary_body
+    )
+    var trailing = String("GET /tail HTTP/1.1\r\nHost: h\r\n\r\n")
+    var full = _to_bytes(chunked + binary_cl + trailing)
+    for seed_u in [42, 1337, 2025, 0xC0FFEE, 1_000_003]:
+        var state = UInt64(seed_u)
+        for step in range(32):
+            state = state * UInt64(6364136223846793005) + UInt64(
+                1442695040888963407
+            )
+            var point = Int(state % UInt64(len(full)))
+            if point == 0:
+                continue
+            var head = parse_one(Span(full)[0:point], config)
+            if point < chunked.byte_length():
+                if not head.is_need_more():
+                    print(
+                        "FAIL seed=",
+                        seed_u,
+                        " step=",
+                        step,
+                        " split=",
+                        point,
+                    )
+                    assert_true(head.is_need_more())
+            else:
+                if not head.is_complete():
+                    print(
+                        "FAIL seed=",
+                        seed_u,
+                        " step=",
+                        step,
+                        " split=",
+                        point,
+                    )
+                    assert_true(head.is_complete())
+                if head.consumed != chunked.byte_length():
+                    print("FAIL seed=", seed_u, " step=", step)
+                    assert_equal(head.consumed, chunked.byte_length())
+                if len(head.request.body) != 6:
+                    print("FAIL seed=", seed_u, " step=", step)
+                    assert_equal(len(head.request.body), 6)
+                var cursor = chunked.byte_length()
+                var second = parse_one(Span(full)[cursor:point], config)
+                var second_end = cursor + binary_cl.byte_length()
+                if point < second_end:
+                    if not second.is_need_more():
+                        print(
+                            "FAIL seed=",
+                            seed_u,
+                            " step=",
+                            step,
+                            " split=",
+                            point,
+                        )
+                        assert_true(second.is_need_more())
+                else:
+                    if not second.is_complete():
+                        print(
+                            "FAIL seed=",
+                            seed_u,
+                            " step=",
+                            step,
+                            " split=",
+                            point,
+                        )
+                        assert_true(second.is_complete())
+                    if second.consumed != binary_cl.byte_length():
+                        print("FAIL seed=", seed_u, " step=", step)
+                        assert_equal(second.consumed, binary_cl.byte_length())
+                    if len(second.request.body) != binary_body.byte_length():
+                        print("FAIL seed=", seed_u, " step=", step)
+                        assert_equal(
+                            len(second.request.body),
+                            binary_body.byte_length(),
+                        )
+                    var third = parse_one(Span(full)[second_end:point], config)
+                    var third_end = second_end + trailing.byte_length()
+                    if point < third_end:
+                        if not third.is_need_more():
+                            print(
+                                "FAIL seed=",
+                                seed_u,
+                                " step=",
+                                step,
+                                " split=",
+                                point,
+                            )
+                            assert_true(third.is_need_more())
+                    else:
+                        if not third.is_complete():
+                            print(
+                                "FAIL seed=",
+                                seed_u,
+                                " step=",
+                                step,
+                                " split=",
+                                point,
+                            )
+                            assert_true(third.is_complete())
+
+
+def test_malformed_corpus_matches_parser_status() raises:
+    var config = ServerConfig.default()
+    var corpus = _malformed_corpus()
+    for i in range(len(corpus)):
+        var entry = corpus[i].copy()
+        var buf = _to_bytes(entry.raw)
+        var result = parse_one(Span(buf), config)
+        if not result.is_error():
+            print("FAIL parser case=", entry.name)
+            assert_true(result.is_error())
+        if result.error.status != entry.status:
+            print(
+                "FAIL parser case=",
+                entry.name,
+                " got=",
+                result.error.status,
+                " want=",
+                entry.status,
+            )
+            assert_equal(result.error.status, entry.status)
+        assert_true(result.error.should_close)
 
 
 def test_host_missing_duplicate_invalid() raises:

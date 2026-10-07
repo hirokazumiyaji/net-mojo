@@ -186,6 +186,209 @@ def _response_complete(buf: List[Byte], expect_body: Bool = True) -> Bool:
     return len(buf) >= end + length
 
 
+@fieldwise_init
+struct _MalformedCase(Copyable, Movable):
+    var name: String
+    var raw: String
+    var status: Int
+
+
+def _malformed_corpus() -> List[_MalformedCase]:
+    var cases = List[_MalformedCase]()
+    cases.append(
+        _MalformedCase(
+            "bare_lf_request_line",
+            String("GET /a HTTP/1.1\nHost: h\n\n"),
+            400,
+        )
+    )
+    cases.append(
+        _MalformedCase(
+            "bare_cr_in_header_value",
+            String("GET /a HTTP/1.1\r\nHost: h\r\nX-A: 1\r2\r\n\r\n"),
+            400,
+        )
+    )
+    cases.append(
+        _MalformedCase(
+            "nul_in_header_value",
+            String("GET /a HTTP/1.1\r\nHost: h\r\nX-A: a\x00b\r\n\r\n"),
+            400,
+        )
+    )
+    cases.append(
+        _MalformedCase(
+            "bad_header_field_name",
+            String("GET /a HTTP/1.1\r\nHost: h\r\nBad Header: 1\r\n\r\n"),
+            400,
+        )
+    )
+    cases.append(
+        _MalformedCase(
+            "space_before_colon",
+            String("GET /a HTTP/1.1\r\nHost: h\r\nX-A : 1\r\n\r\n"),
+            400,
+        )
+    )
+    cases.append(
+        _MalformedCase(
+            "obs_fold_header",
+            String("GET /a HTTP/1.1\r\nHost: h\r\nX-A: 1\r\n 2\r\n\r\n"),
+            400,
+        )
+    )
+    cases.append(
+        _MalformedCase(
+            "missing_host",
+            String("GET /a HTTP/1.1\r\n\r\n"),
+            400,
+        )
+    )
+    cases.append(
+        _MalformedCase(
+            "duplicate_host",
+            String("GET /a HTTP/1.1\r\nHost: a\r\nHost: b\r\n\r\n"),
+            400,
+        )
+    )
+    cases.append(
+        _MalformedCase(
+            "empty_host",
+            String("GET /a HTTP/1.1\r\nHost:\r\n\r\n"),
+            400,
+        )
+    )
+    cases.append(
+        _MalformedCase(
+            "host_with_space",
+            String("GET /a HTTP/1.1\r\nHost: a b\r\n\r\n"),
+            400,
+        )
+    )
+    cases.append(
+        _MalformedCase(
+            "duplicate_same_content_length",
+            String(
+                "POST /a HTTP/1.1\r\nHost: h\r\nContent-Length: 3\r\n"
+                "Content-Length: 3\r\n\r\nabc"
+            ),
+            400,
+        )
+    )
+    cases.append(
+        _MalformedCase(
+            "content_length_and_transfer_encoding",
+            String(
+                "POST /a HTTP/1.1\r\nHost: h\r\nContent-Length: 3\r\n"
+                "Transfer-Encoding: chunked\r\n\r\n"
+            ),
+            400,
+        )
+    )
+    cases.append(
+        _MalformedCase(
+            "non_numeric_content_length",
+            String(
+                "POST /a HTTP/1.1\r\nHost: h\r\nContent-Length: 12x\r\n\r\n"
+            ),
+            400,
+        )
+    )
+    cases.append(
+        _MalformedCase(
+            "unknown_transfer_encoding",
+            String(
+                "POST /a HTTP/1.1\r\nHost: h\r\nTransfer-Encoding: gzip\r\n\r\n"
+            ),
+            400,
+        )
+    )
+    cases.append(
+        _MalformedCase(
+            "bad_chunk_size_hex",
+            String(
+                "POST /a HTTP/1.1\r\nHost: h\r\nTransfer-Encoding:"
+                " chunked\r\n\r\nzz\r\nabc\r\n0\r\n\r\n"
+            ),
+            400,
+        )
+    )
+    cases.append(
+        _MalformedCase(
+            "bad_chunk_extension_quoted",
+            String(
+                "POST /a HTTP/1.1\r\nHost: h\r\nTransfer-Encoding:"
+                ' chunked\r\n\r\n5;e="a\\\r"\r\nhello\r\n0\r\n\r\n'
+            ),
+            400,
+        )
+    )
+    cases.append(
+        _MalformedCase(
+            "unsupported_http_version",
+            String("GET /a HTTP/2.0\r\nHost: h\r\n\r\n"),
+            505,
+        )
+    )
+    cases.append(
+        _MalformedCase(
+            "unknown_http_version_shape",
+            String("GET /a HTTP/foo\r\nHost: h\r\n\r\n"),
+            400,
+        )
+    )
+    cases.append(
+        _MalformedCase(
+            "fragment_in_target",
+            String("GET /a#frag HTTP/1.1\r\nHost: h\r\n\r\n"),
+            400,
+        )
+    )
+    cases.append(
+        _MalformedCase(
+            "request_target_over_limit",
+            String("GET /")
+            + String("a") * 8200
+            + String(" HTTP/1.1\r\nHost: h\r\n\r\n"),
+            414,
+        )
+    )
+    cases.append(
+        _MalformedCase(
+            "header_bytes_over_limit",
+            String("GET /a HTTP/1.1\r\nHost: h\r\nX-Big: ")
+            + String("y") * 33000
+            + String("\r\n\r\n"),
+            431,
+        )
+    )
+    cases.append(
+        _MalformedCase(
+            "connect_rejected",
+            String("CONNECT h:443 HTTP/1.1\r\nHost: h\r\n\r\n"),
+            400,
+        )
+    )
+    cases.append(
+        _MalformedCase(
+            "upgrade_rejected",
+            String("GET /a HTTP/1.1\r\nHost: h\r\nUpgrade: h2c\r\n\r\n"),
+            400,
+        )
+    )
+    cases.append(
+        _MalformedCase(
+            "unknown_expectation",
+            String(
+                "POST /a HTTP/1.1\r\nHost: h\r\nContent-Length: 3\r\nExpect:"
+                " 418-teapot\r\n\r\nabc"
+            ),
+            417,
+        )
+    )
+    return cases^
+
+
 def _append_hpack_field(mut wire: List[Byte], name: String, value: String):
     var name_bytes = name.as_bytes()
     var value_bytes = value.as_bytes()
