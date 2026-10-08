@@ -36,6 +36,8 @@ jobs:
         run: pixi run -e tls-http2 hpack-mojo-test
       - name: Test TLS and independent HTTP/2 client
         run: pixi run -e tls-http2 tls-suite
+      - name: Test independent hyper-h2 interop
+        run: pixi run -e tls-http2 https-h2-interop-test
       - name: Test packaged HTTP/2 provider
         run: pixi run -e tls-http2 http2-package-smoke
       - name: Build HTTP/2 example
@@ -67,6 +69,8 @@ jobs:
         run: pixi run -e tls-http3 quic-suite
       - name: Test independent HTTP/3 client
         run: pixi run -e tls-http3 http3-client-test
+      - name: Test HTTP same-origin fallback
+        run: pixi run -e tls-http3 http-same-origin-test
       - name: Test packaged HTTP/3 provider
         run: pixi run -e tls-http3 http3-package-smoke
       - name: Build HTTP/3 example
@@ -182,8 +186,20 @@ jobs:
         run: pixi run sanitize-udp
       - name: Sanitize Unix sockets
         run: pixi run sanitize-unix
+      - name: Sanitize Reactor readiness
+        run: pixi run sanitize-reactor
       - name: Sanitize actor primitives
         run: pixi run sanitize-actor
+      - name: Sanitize HTTP API probe
+        run: pixi run sanitize-http-api
+      - name: Sanitize HTTP control
+        run: pixi run sanitize-http-control
+      - name: Sanitize HTTP parser
+        run: pixi run sanitize-http-parser
+      - name: Sanitize HTTP response
+        run: pixi run sanitize-http-response
+      - name: Sanitize HTTP server
+        run: pixi run sanitize-http-server
       - name: Sanitize HTTP/2 frame parser
         run: pixi run sanitize-http2
       - name: Sanitize HTTP detach
