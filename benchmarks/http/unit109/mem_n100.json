@@ -1,0 +1,18 @@
+{
+  "connections": 100,
+  "hold_seconds": 3.0,
+  "server_pid": 15719,
+  "rss_bytes": {
+    "before": 17170432,
+    "after_handshake": 25100288,
+    "after_idle_hold": 25100288,
+    "after_one_request": 25542656,
+    "after_close": 25542656
+  },
+  "per_connection_bytes": {
+    "handshake": 79298.56,
+    "idle_hold": 79298.56,
+    "post_one_request": 83722.24
+  },
+  "bytes_received_total": 6400
+}

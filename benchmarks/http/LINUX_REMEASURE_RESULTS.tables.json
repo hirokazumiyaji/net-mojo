@@ -1,0 +1,459 @@
+{
+  "procedure": {
+    "shortened": true,
+    "pairs": 3,
+    "warmup_s": 5,
+    "measure_s": 15,
+    "note": "Not a replacement for the published 10s/30s/5-pair procedure."
+  },
+  "host": {
+    "platform": "Apple M2 Pro Docker Desktop Linux VM, aarch64",
+    "container_image": "net-mojo-http-netem:issue42",
+    "container_image_sha": "bd84096f4b17",
+    "cpus": "0-5",
+    "memory_gib": 4,
+    "cap_drop": "ALL",
+    "security_opt": "no-new-privileges"
+  },
+  "toolchain": {
+    "mojo": "1.1.0 (8189361e)",
+    "go": "go1.26.4 linux/arm64",
+    "h2load": "nghttp2/1.59.0",
+    "repo_sha": "7f80f55e4f70f7468bd0a077d29b057bfd77d65e"
+  },
+  "binary_sha256": {
+    "http1_server": "acf44ed8cf44ee8297436a8f14e32872d8ee0493ba510ab03159afafabd086cb",
+    "http2_server": "ac8c3595f0b193eb023580807cafbce75e0486e2281181706dedc0ef0a4cb36a",
+    "http_go": "0dcb3d7ab2d82f24c6b14dcc3364f75cdaf4a2baad2ec9e26cb36f767cc5e3b6",
+    "http_load": "d2b690eaed82a71c4448872538d8fbe1d0ccd2f2e5d6ec928b0a821ae572b89a",
+    "go_memstats_server": "274da2cb8de52f57e340fb28e58d14ca76d85f0c71115a6c99de1dab5d83149a",
+    "libmalloc_count_so_u111_whole_lifetime": "168b78827b65df94c1ae35a67f50c74d1f7383c3b33f58d702b11cd30f72aec7",
+    "libmalloc_count_so": "12aabe25cf9167a89f6b6586e853f1fd6db83b34bc653073f1a1abe9b64e7c6b",
+    "http_load_u112": "f9b9afd00337bdbfd6f2c05934a35fbf373a24a3f68a31a495685976537a95d2"
+  },
+  "h1_cells": {
+    "F64": {
+      "pairs": 3,
+      "go_req_s_median": 110197.0,
+      "mojo_req_s_median": 149508.33333333334,
+      "go_p99_median": 1.471542,
+      "mojo_p99_median": 1.301958,
+      "paired_throughput_ratio": {
+        "median": 1.3567368742645747,
+        "min": 1.353675726220106,
+        "max": 1.3682630008044907,
+        "pairs": 3
+      },
+      "paired_p99_ratio": {
+        "median": 0.8792059069416288,
+        "min": 0.8747308497973597,
+        "max": 0.8884387941356754,
+        "pairs": 3
+      },
+      "runs": [
+        {
+          "pair": "1",
+          "go_req_s": "109468.86666666667",
+          "go_p50_ms": "0.564792",
+          "go_p95_ms": "1.13975",
+          "go_p99_ms": "1.480834",
+          "go_samples": "1642033",
+          "go_errors": "0",
+          "go_cutoff": "64",
+          "go_valid": "True",
+          "mojo_req_s": "149782.2",
+          "mojo_p50_ms": "0.385542",
+          "mojo_p95_ms": "0.810333",
+          "mojo_p99_ms": "1.301958",
+          "mojo_samples": "2246733",
+          "mojo_errors": "0",
+          "mojo_cutoff": "64",
+          "mojo_valid": "True"
+        },
+        {
+          "pair": "2",
+          "go_req_s": "110197",
+          "go_p50_ms": "0.561083",
+          "go_p95_ms": "1.133417",
+          "go_p99_ms": "1.471542",
+          "go_samples": "1652955",
+          "go_errors": "0",
+          "go_cutoff": "64",
+          "go_valid": "True",
+          "mojo_req_s": "149508.33333333334",
+          "mojo_p50_ms": "0.386792",
+          "mojo_p95_ms": "0.809042",
+          "mojo_p99_ms": "1.307375",
+          "mojo_samples": "2242625",
+          "mojo_errors": "0",
+          "mojo_cutoff": "64",
+          "mojo_valid": "True"
+        },
+        {
+          "pair": "3",
+          "go_req_s": "110437.13333333333",
+          "go_p50_ms": "0.560083",
+          "go_p95_ms": "1.129708",
+          "go_p99_ms": "1.470833",
+          "go_samples": "1656557",
+          "go_errors": "0",
+          "go_cutoff": "64",
+          "go_valid": "True",
+          "mojo_req_s": "149496.06666666668",
+          "mojo_p50_ms": "0.387833",
+          "mojo_p95_ms": "0.809708",
+          "mojo_p99_ms": "1.286583",
+          "mojo_samples": "2242441",
+          "mojo_errors": "0",
+          "mojo_cutoff": "64",
+          "mojo_valid": "True"
+        }
+      ]
+    },
+    "F1024": {
+      "pairs": 3,
+      "go_req_s_median": 94540.6,
+      "mojo_req_s_median": 145714.0,
+      "go_p99_median": 15.786833,
+      "mojo_p99_median": 11.723292,
+      "paired_throughput_ratio": {
+        "median": 1.5456625689562649,
+        "min": 1.5409958579360183,
+        "max": 1.5467678115707897,
+        "pairs": 3
+      },
+      "paired_p99_ratio": {
+        "median": 0.7433145710732483,
+        "min": 0.7270037359118451,
+        "max": 0.746940427138869,
+        "pairs": 3
+      },
+      "runs": [
+        {
+          "pair": "1",
+          "go_req_s": "94540.6",
+          "go_p50_ms": "10.586666",
+          "go_p95_ms": "14.413708",
+          "go_p99_ms": "15.786833",
+          "go_samples": "1418109",
+          "go_errors": "0",
+          "go_cutoff": "1024",
+          "go_valid": "True",
+          "mojo_req_s": "146127.86666666667",
+          "mojo_p50_ms": "7.136333",
+          "mojo_p95_ms": "9.528417",
+          "mojo_p99_ms": "11.734583",
+          "mojo_samples": "2191918",
+          "mojo_errors": "0",
+          "mojo_cutoff": "1024",
+          "mojo_valid": "True"
+        },
+        {
+          "pair": "2",
+          "go_req_s": "93964.2",
+          "go_p50_ms": "10.64025",
+          "go_p95_ms": "14.514375",
+          "go_p99_ms": "15.9265",
+          "go_samples": "1409463",
+          "go_errors": "0",
+          "go_cutoff": "1024",
+          "go_valid": "True",
+          "mojo_req_s": "145340.8",
+          "mojo_p50_ms": "7.167125",
+          "mojo_p95_ms": "9.431333",
+          "mojo_p99_ms": "11.578625",
+          "mojo_samples": "2180112",
+          "mojo_errors": "0",
+          "mojo_cutoff": "1024",
+          "mojo_valid": "True"
+        },
+        {
+          "pair": "3",
+          "go_req_s": "94558.33333333333",
+          "go_p50_ms": "10.582834",
+          "go_p95_ms": "14.390709",
+          "go_p99_ms": "15.695083",
+          "go_samples": "1418375",
+          "go_errors": "0",
+          "go_cutoff": "1024",
+          "go_valid": "True",
+          "mojo_req_s": "145714",
+          "mojo_p50_ms": "7.148166",
+          "mojo_p95_ms": "9.545292",
+          "mojo_p99_ms": "11.723292",
+          "mojo_samples": "2185710",
+          "mojo_errors": "0",
+          "mojo_cutoff": "1024",
+          "mojo_valid": "True"
+        }
+      ]
+    },
+    "LATENCY": {
+      "pairs": 3,
+      "go_req_s_median": 250.0,
+      "mojo_req_s_median": 250.0,
+      "go_p99_median": 5.236546,
+      "mojo_p99_median": 5.531961,
+      "paired_throughput_ratio": {
+        "median": 1.0,
+        "min": 1.0,
+        "max": 1.0,
+        "pairs": 3
+      },
+      "paired_p99_ratio": {
+        "median": 1.128511809119981,
+        "min": 1.0211922988134263,
+        "max": 1.4192226494343978,
+        "pairs": 3
+      },
+      "runs": [
+        {
+          "pair": "1",
+          "go_req_s": "250",
+          "go_p50_ms": "1.174879",
+          "go_p95_ms": "1.853793",
+          "go_p99_ms": "5.236546",
+          "go_samples": "3750",
+          "go_errors": "0",
+          "go_cutoff": "0",
+          "go_valid": "True",
+          "mojo_req_s": "250",
+          "mojo_p50_ms": "1.219169",
+          "mojo_p95_ms": "1.955084",
+          "mojo_p99_ms": "5.909504",
+          "mojo_samples": "3750",
+          "mojo_errors": "0",
+          "mojo_cutoff": "0",
+          "mojo_valid": "True"
+        },
+        {
+          "pair": "2",
+          "go_req_s": "250",
+          "go_p50_ms": "1.129919",
+          "go_p95_ms": "1.801294",
+          "go_p99_ms": "3.897881",
+          "go_samples": "3750",
+          "go_errors": "0",
+          "go_cutoff": "0",
+          "go_valid": "True",
+          "mojo_req_s": "250",
+          "mojo_p50_ms": "1.092338",
+          "mojo_p95_ms": "1.869836",
+          "mojo_p99_ms": "5.531961",
+          "mojo_samples": "3750",
+          "mojo_errors": "0",
+          "mojo_cutoff": "0",
+          "mojo_valid": "True"
+        },
+        {
+          "pair": "3",
+          "go_req_s": "250",
+          "go_p50_ms": "1.117337",
+          "go_p95_ms": "1.926464",
+          "go_p99_ms": "5.41475",
+          "go_samples": "3750",
+          "go_errors": "0",
+          "go_cutoff": "0",
+          "go_valid": "True",
+          "mojo_req_s": "250",
+          "mojo_p50_ms": "1.170923",
+          "mojo_p95_ms": "1.864001",
+          "mojo_p99_ms": "5.529501",
+          "mojo_samples": "3750",
+          "mojo_errors": "0",
+          "mojo_cutoff": "0",
+          "mojo_valid": "True"
+        }
+      ]
+    }
+  },
+  "h2_cells": {
+    "c64m10": {
+      "pairs": 3,
+      "go_req_s_median": 59546.33,
+      "mojo_req_s_median": 138426.27,
+      "go_p99_median": 26998.0,
+      "mojo_p99_median": 5547.0,
+      "paired_throughput_ratio": {
+        "median": 2.3269914367518534,
+        "min": 2.32307696697665,
+        "max": 2.3667546052339117,
+        "pairs": 3
+      },
+      "paired_p99_ratio": {
+        "median": 0.20893442314211458,
+        "min": 0.2041632713534336,
+        "max": 0.20968569125943293,
+        "pairs": 3
+      },
+      "runs": [
+        {
+          "pair": "1",
+          "go_req_s": "58487.8",
+          "go_p50_us": "10445",
+          "go_p95_us": "20796",
+          "go_p99_us": "27298",
+          "go_succeeded": "877317",
+          "go_failed": "0",
+          "go_errored": "0",
+          "go_timeout": "0",
+          "go_server_rss_kb": "24704",
+          "go_server_cpu": "99.6",
+          "mojo_req_s": "138426.27",
+          "mojo_p50_us": "4537",
+          "mojo_p95_us": "5002",
+          "mojo_p99_us": "5724",
+          "mojo_succeeded": "2076394",
+          "mojo_failed": "0",
+          "mojo_errored": "0",
+          "mojo_timeout": "0",
+          "mojo_server_rss_kb": "0",
+          "mojo_server_cpu": ""
+        },
+        {
+          "pair": "2",
+          "go_req_s": "59546.33",
+          "go_p50_us": "10382",
+          "go_p95_us": "20501",
+          "go_p99_us": "26998",
+          "go_succeeded": "893195",
+          "go_failed": "0",
+          "go_errored": "0",
+          "go_timeout": "0",
+          "go_server_rss_kb": "22952",
+          "go_server_cpu": "99.5",
+          "mojo_req_s": "138563.8",
+          "mojo_p50_us": "4573",
+          "mojo_p95_us": "4861",
+          "mojo_p99_us": "5512",
+          "mojo_succeeded": "2078457",
+          "mojo_failed": "0",
+          "mojo_errored": "0",
+          "mojo_timeout": "0",
+          "mojo_server_rss_kb": "0",
+          "mojo_server_cpu": ""
+        },
+        {
+          "pair": "3",
+          "go_req_s": "59576.33",
+          "go_p50_us": "10334",
+          "go_p95_us": "20312",
+          "go_p99_us": "26549",
+          "go_succeeded": "893645",
+          "go_failed": "0",
+          "go_errored": "0",
+          "go_timeout": "0",
+          "go_server_rss_kb": "25176",
+          "go_server_cpu": "99.4",
+          "mojo_req_s": "138400.4",
+          "mojo_p50_us": "4572",
+          "mojo_p95_us": "4876",
+          "mojo_p99_us": "5547",
+          "mojo_succeeded": "2076006",
+          "mojo_failed": "0",
+          "mojo_errored": "0",
+          "mojo_timeout": "0",
+          "mojo_server_rss_kb": "0",
+          "mojo_server_cpu": ""
+        }
+      ]
+    }
+  },
+  "alloc_count": {
+    "method": {
+      "mojo": "LD_PRELOAD malloc shim (benchmarks/http/alloc_count/malloc_count.c) with SIGUSR1/SIGUSR2 window controls; counters zeroed by SIGUSR1 after warmup and frozen by SIGUSR2 immediately after the measured load, so the dump covers only the measurement window",
+      "go": "runtime.MemStats via GET /_memstats endpoint on benchmarks/http_go/cmd/go-memstats-server, polled before and after the measurement window",
+      "mojo_shim_overhead_pct": -0.2
+    },
+    "workload": "10000 GET /fixed @ 1000 rps, -connections 32, -warmup 0 after a 3s warmup",
+    "window_scope": true,
+    "requests_mojo": 10000,
+    "requests_go": 10000,
+    "mojo_libc": {
+      "raw": {
+        "pid": 61,
+        "malloc_calls": 107,
+        "calloc_calls": 3,
+        "realloc_calls": 0,
+        "aligned_alloc_calls": 1,
+        "posix_memalign_calls": 2,
+        "memalign_calls": 0,
+        "free_calls": 88,
+        "malloc_bytes": 409618,
+        "calloc_bytes": 1580,
+        "realloc_bytes": 0,
+        "aligned_alloc_bytes": 896,
+        "posix_memalign_bytes": 1058,
+        "memalign_bytes": 0
+      },
+      "total_alloc_calls": 113,
+      "total_alloc_bytes": 413152,
+      "allocs_per_request": 0.0113,
+      "bytes_per_request": 41.3152,
+      "free_calls": 88
+    },
+    "go_runtime": {
+      "mallocs_delta": 210497,
+      "frees_delta": 227601,
+      "total_alloc_bytes_delta": 22686080,
+      "allocs_per_request": 21.0497,
+      "bytes_per_request": 2268.608
+    }
+  },
+  "syscall_count": {
+    "method": "strace -f -c over whole owned child lifetime; same workload as alloc_count",
+    "mojo": {
+      "total_syscalls": 400020,
+      "total_errors": 47,
+      "requests": 9999,
+      "syscalls_per_request": 40.006000600060005
+    },
+    "go": {
+      "total_syscalls": 388717,
+      "total_errors": 113379,
+      "requests": 10000,
+      "syscalls_per_request": 38.8717
+    }
+  },
+  "alloc_count_superseded": {
+    "note": "Whole-lifetime shim: counters started at process launch and were divided by measurement-window requests, so startup + warmup allocations were folded into per-request. Replaced by alloc_count below (window-scoped via SIGUSR1/SIGUSR2 handlers in the shim).",
+    "method": {
+      "mojo": "LD_PRELOAD malloc shim (benchmarks/http/alloc_count/malloc_count.c), libc malloc family + free",
+      "go": "runtime.MemStats via GET /_memstats endpoint on benchmarks/http_go/cmd/go-memstats-server",
+      "mojo_shim_overhead_pct": -0.2
+    },
+    "workload": "10000 GET /fixed @ 1000 rps, -connections 32, -warmup 0 after a 3s warmup",
+    "requests_mojo": 9999,
+    "requests_go": 10000,
+    "mojo_libc": {
+      "raw": {
+        "pid": 4746,
+        "malloc_calls": 114,
+        "calloc_calls": 3,
+        "realloc_calls": 0,
+        "aligned_alloc_calls": 1,
+        "posix_memalign_calls": 2,
+        "memalign_calls": 0,
+        "free_calls": 98,
+        "malloc_bytes": 410292,
+        "calloc_bytes": 1580,
+        "realloc_bytes": 0,
+        "aligned_alloc_bytes": 896,
+        "posix_memalign_bytes": 1058,
+        "memalign_bytes": 0
+      },
+      "total_alloc_calls": 120,
+      "total_alloc_bytes": 413826,
+      "allocs_per_request": 0.012001200120012,
+      "bytes_per_request": 41.386738673867384,
+      "free_calls": 98
+    },
+    "go_runtime": {
+      "mallocs_delta": 210549,
+      "frees_delta": 192776,
+      "total_alloc_bytes_delta": 22615472,
+      "allocs_per_request": 21.0549,
+      "bytes_per_request": 2261.5472
+    }
+  }
+}
