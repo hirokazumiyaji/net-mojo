@@ -180,8 +180,9 @@ level-triggered readiness set built on `poll(2)`: register each socket's
 `try_write` / `try_accept` / `try_recv_from` / `try_send_to` on the ready
 indices. This is the minimal multiplexing step — it reuses the package's
 existing non-blocking descriptors and per-fd `poll` logic, so an event loop
-needs no threads. `poll(2)` scans every registration on each call; an
-epoll/kqueue backend is a future optimization that keeps this API.
+needs no threads. `poll(2)` scans every registration on each call. The public `Poller`
+stays on `poll(2)` by design; `net/_reactor.mojo` is the epoll/kqueue
+backend used internally by `net.http`.
 
 `try_*` methods make exactly one syscall attempt: `EINTR` is retried and a
 would-block socket reports `NetErrorKind.timeout()` instead of waiting, so
@@ -324,7 +325,9 @@ section records only the package-level boundaries.
   the QUIC provider enforces its own transport-memory limit plus separate
   fixed 64 MiB request/response caps. Size the process for the sum of both
   stacks. HTTP/2 stream caps and the Issue #42 flood / QUIC transport-memory
-  knobs land on sibling PRs [#71](https://github.com/hirokazumiyaji/net-mojo/pull/71)–[#75](https://github.com/hirokazumiyaji/net-mojo/pull/75).
+  knobs live in `net/http/config.mojo` (`max_http2_streams_per_connection`,
+  `http2_max_new_streams_per_second`, `stream_queue_limit`, `stream_idle_timeout`,
+  and companion fields) and in the QUIC provider's soft transport-memory estimate.
 - `Alt-Svc` advertisement is opt-in ([PR #77](https://github.com/hirokazumiyaji/net-mojo/pull/77)):
   set `ServerConfig.alt_svc` (for example `h3=":443"; ma=86400`) when a QUIC
   endpoint is attached; leave it empty when QUIC is unavailable so HTTPS does
@@ -333,7 +336,9 @@ section records only the package-level boundaries.
 - Shutdown remains cooperative and single-threaded (`request_shutdown` between
   `tick`s): stop accepting, close idle TCP, drain in-flight work through
   `shutdown_grace`, and for HTTP/3 send staged GOAWAY then `H3_NO_ERROR` close.
-  Cross-thread shutdown with a wakeup fd is still future work.
+  Cross-thread shutdown with a wakeup fd is implemented in `net/http/_control.mojo`
+  (`ServerControl` / `serve_with_control`); `tests/test_http_control.mojo` exercises
+  the pthread + reactor wakeup paths.
 - Dependency updates: bump OpenSSL / libnghttp2 ranges in `pixi.toml` and
   refresh `pixi.lock`; bump quiche in `net/quic/provider` and refresh its
   `Cargo.lock`; rebuild optional `tls-http2` / `tls-http3` artifacts and re-run

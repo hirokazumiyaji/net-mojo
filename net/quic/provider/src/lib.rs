@@ -539,6 +539,7 @@ pub unsafe extern "C" fn net_quic_server_respond(
     let inner = &mut unsafe { &mut *server }._inner;
     if header_length > inner.max_response_headers_bytes
         || body_length > inner.max_response_body_bytes
+        || trailer_length > inner.max_response_headers_bytes
         || (header_length > 0 && header_data.is_null())
         || (body_length > 0 && body_data.is_null())
         || (trailer_length > 0 && trailer_data.is_null())

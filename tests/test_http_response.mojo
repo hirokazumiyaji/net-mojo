@@ -985,6 +985,22 @@ def test_trailers_count_against_header_byte_budget() raises:
     assert_true(rejected)
 
 
+def test_trailers_combined_count_matches_header_budget() raises:
+    var writer = ResponseWriter(1024)
+    writer.write_string("hello")
+    writer.headers.add(String("X-A"), String("1"))
+    writer.headers.add(String("X-B"), String("2"))
+    writer.add_trailer(String("X-C"), String("3"))
+    writer.add_trailer(String("X-D"), String("4"))
+    var rejected = False
+    try:
+        _ = encode_response(writer, False, "date", 3, 32768)
+    except e:
+        assert_equal(e.kind, NetErrorKind.invalid_argument())
+        rejected = True
+    assert_true(rejected)
+
+
 def test_trailers_wire_capacity_exact_matches_measure() raises:
     var writer = ResponseWriter(1024)
     writer.headers.add(String("Content-Type"), String("text/plain"))

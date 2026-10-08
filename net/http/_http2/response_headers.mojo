@@ -1,6 +1,6 @@
 """HTTP/2 response field validation and shared response adaptation."""
 
-from net.http.headers import Headers, _parse_decimal
+from net.http.headers import Headers, _parse_decimal, _trailer_forbidden
 from net.http.response import ResponseWriter, has_body_for_status
 
 from .request_headers import _is_connection_specific
@@ -167,8 +167,8 @@ def encode_http2_response_trailers(
     for i in range(len(writer.trailers)):
         ref name = writer.trailers._lower_names[i]
         var value = writer.trailers._value_bytes_span(i)
-        if _is_connection_specific(name) or name == "te":
-            continue
+        if _trailer_forbidden(name):
+            return Http2ResponseHeadersResult.error()
         header_list_size += _field_size(name.byte_length(), len(value))
         field_count += 1
         if (
