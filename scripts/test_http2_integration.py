@@ -517,8 +517,14 @@ def case_shutdown_goaway_drains_in_flight(port: int) -> None:
             stream_id = int.from_bytes(header[5:9], "big") & 0x7FFFFFFF
             payload = bytearray()
             while len(payload) < length:
+                remaining = max(0.0, deadline - time.perf_counter())
+                sock.settimeout(min(POLL_INTERVAL_S, remaining) if remaining else 0.0)
                 try:
                     chunk = sock.recv(length - len(payload))
+                except (socket.timeout, ssl.SSLWantReadError):
+                    if time.perf_counter() >= deadline:
+                        return READ_TIMEOUT  # type: ignore[return-value]
+                    continue
                 except (OSError, ssl.SSLError):
                     return None
                 if not chunk:
@@ -656,38 +662,68 @@ def case_shutdown_goaway_drains_in_flight(port: int) -> None:
 
 
 def case_client_sent_goaway(port: int) -> None:
-    """A client-initiated GOAWAY on the connection must let an in-flight
-    stream complete and then the server closes. We send a raw GOAWAY
-    frame (not hyper-h2's close_connection, which would transition the
-    client connection to CLOSED and reject in-flight DATA) and track
-    stream completion plus server EOF via raw frame parsing."""
-    peer = H2Peer(port, raise_conn_window=1 << 20)
-    try:
-        stream_id = peer.open_request("GET", "/sibling")
-        # Observe response headers via hyper-h2 first; the stream must
-        # still be open afterwards so GOAWAY exercises the drain path.
-        rec = peer.wait_response_only(stream_id, time.perf_counter() + TIMEOUT_S)
-        _assert(rec["status"] == 200, f"GOAWAY precondition status {rec['status']}")
+    """A client-initiated GOAWAY must let the in-flight stream complete
+    and then the server closes. Driven entirely with raw framing so
+    hyper-h2's ClientConnection cannot transition to CLOSED on the
+    server's reciprocating GOAWAY and reject legitimate in-flight DATA."""
+    from hpack import Decoder, Encoder  # type: ignore[import-not-found]
 
+    raw = socket.create_connection(("127.0.0.1", port), timeout=TIMEOUT_S)
+    sock = _h2_context().wrap_socket(raw, server_hostname="localhost")
+    try:
+        _assert(
+            sock.selected_alpn_protocol() == "h2",
+            f"ALPN not h2: {sock.selected_alpn_protocol()!r}",
+        )
+        sock.sendall(
+            b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n"
+            + (0).to_bytes(3, "big")
+            + bytes([0x04, 0x00])
+            + (0).to_bytes(4, "big")
+        )
+
+        encoder = Encoder()
+        decoder = Decoder()
+
+        def frame(kind: int, flags: int, stream: int, payload: bytes) -> bytes:
+            return (
+                len(payload).to_bytes(3, "big")
+                + bytes([kind, flags])
+                + stream.to_bytes(4, "big")
+                + payload
+            )
+
+        # Open /sibling with HEADERS+END_STREAM so the server queues an
+        # in-flight response. Flow-control credit stays untouched so the
+        # whole body + END_STREAM is sent in one scheduler drain.
+        stream_id = 1
+        block = encoder.encode(
+            [
+                (b":method", b"GET"),
+                (b":scheme", b"https"),
+                (b":authority", b"localhost"),
+                (b":path", b"/sibling"),
+            ]
+        )
+        sock.sendall(frame(0x01, 0x05, stream_id, block))
+
+        # Immediately follow with a GOAWAY so the server must drain the
+        # in-flight stream before closing.
         goaway = (
-            (8).to_bytes(3, "big")
-            + bytes([0x07, 0x00])
-            + (0).to_bytes(4, "big")
-            + (0).to_bytes(4, "big")
+            (0).to_bytes(4, "big")
             + (int(ErrorCodes.NO_ERROR)).to_bytes(4, "big")
         )
-        peer._sock.sendall(goaway)
+        sock.sendall(frame(0x07, 0x00, 0, goaway))
 
-        # Raw drain: look for END_STREAM on our stream, then server EOF.
         deadline = time.perf_counter() + TIMEOUT_S
         buf = bytearray()
-        stream_ended = rec["ended"]
+        stream_ended = False
         server_closed = False
         while time.perf_counter() < deadline and not (stream_ended and server_closed):
             remaining = max(0.0, deadline - time.perf_counter())
-            peer._sock.settimeout(min(0.1, remaining) if remaining else 0.0)
+            sock.settimeout(min(POLL_INTERVAL_S, remaining) if remaining else 0.0)
             try:
-                chunk = peer._sock.recv(65536)
+                chunk = sock.recv(65536)
             except (socket.timeout, ssl.SSLWantReadError):
                 continue
             except (OSError, ssl.SSLError):
@@ -705,16 +741,19 @@ def case_client_sent_goaway(port: int) -> None:
                 flags = buf[4]
                 frame_stream = int.from_bytes(buf[5:9], "big") & 0x7FFFFFFF
                 del buf[: 9 + length]
-                if (
-                    frame_type == 0x00
-                    and frame_stream == stream_id
-                    and (flags & 0x01)
-                ):
+                if frame_stream == stream_id and (flags & 0x01):
                     stream_ended = True
         _assert(stream_ended, "in-flight stream never finished with END_STREAM")
         _assert(server_closed, "server did not close after client GOAWAY drain")
     finally:
-        peer.close()
+        try:
+            sock.close()
+        except OSError:
+            pass
+        try:
+            raw.close()
+        except OSError:
+            pass
 
 
 def _attempt_alpn(port: int, protocols: List[str]) -> Tuple[Optional[str], Optional[Exception]]:

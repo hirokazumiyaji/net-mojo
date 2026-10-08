@@ -298,6 +298,10 @@ class H2Client:
                 continue
             if not chunk:
                 self._terminated = True
+                if not until():
+                    raise RuntimeError(
+                        "H2: connection closed before stream completed"
+                    )
                 return
             for event in self._conn.receive_data(chunk):
                 self._handle(event)
