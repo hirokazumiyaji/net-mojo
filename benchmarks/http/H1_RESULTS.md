@@ -592,7 +592,11 @@ Post-profile metadata identifies strace 6.8, executable SHA256
 That executable was hashed **after** the six trials, not independently
 before them. The paired source/tool/binary before/after checks cover the
 server/loader and Go/Mojo toolchains, not a claimed pre-profile strace hash.
-Allocation instrumentation remains unavailable.
+Separate shortened allocation and syscall counts for the Mojo H1 server and a
+parallel Go H1 baseline at the current main SHA are recorded in
+[LINUX_REMEASURE_RESULTS.md](LINUX_REMEASURE_RESULTS.md); they do not replace
+the published H1 series, and the two sets of allocator counts (Mojo libc
+malloc, Go runtime `MemStats`) measure different allocator layers.
 
 To reproduce the six-trial diagnostic, use the same original server and
 corrected loader inputs: for each server run F64 control-before, then launch
