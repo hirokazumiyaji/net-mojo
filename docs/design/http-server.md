@@ -202,7 +202,7 @@ Phase 6〜9 はそれぞれ実装前に詳細仕様と PR 単位の計画を作�
 ### Phase 3: HTTP server と上限付き接続管理
 
 - [x] `net/http/{server,handler,_connection,_buffer,_deadline}.mojo` に状態機械、buffer budget、公平性、deadline、shutdown control を実装する。
-- [x] `tests/test_http_server.mojo` に keep-alive、pipeline 順序、100-continue、partial I/O、EOF、slow reader、slow header/body、budget 超過、handler error、停止中の接続を追加する。
+- [ ] `tests/test_http_server.mojo` に keep-alive、pipeline 順序、100-continue、partial I/O、EOF、slow reader、slow header/body、budget 超過、handler error、停止中の接続を追加する。（slow body は [#194](https://github.com/hirokazumiyaji/net-mojo/pull/194)）
 - [x] control の重複要求、serve 完了後の要求、server エラー終了との競合、ResponseWriter 拡張時の全体 budget 超過をテストする。
 - [x] handler error は未送信 response を破棄して 500 と close とし、別接続の loop は継続する。エラー詳細は response に漏らさない。
 - [x] `examples/http_hello.mojo` と `examples/http_json.mojo` を追加し、raw TCP client と Go HTTP client で応答を確認する。
@@ -225,7 +225,7 @@ Phase 6〜9 はそれぞれ実装前に詳細仕様と PR 単位の計画を作�
 - [x] `pixi.toml` に `test-http-api`、`test-http-parser`、`test-http-response`、`test-reactor`、`test-http-server`、`benchmark-http-parse`、`benchmark-http-server` を追加する。
 - [x] `.github/workflows/ci.yml` の macOS arm64、Linux x86_64、Linux aarch64 で warning-clean tests と package smoke を実行する。
 - [x] `tests/package_smoke.mojo` に配布 artifact からの `net.http` import と codec の利用確認を追加する。
-- [x] parser の malformed corpus、seed を記録する randomized fragmentation tests、対応環境での sanitizer と長時間の fd／RSS leak tests を整備する。
+- [ ] parser の malformed corpus、seed を記録する randomized fragmentation tests、対応環境での sanitizer と長時間の fd／RSS leak tests を整備する。（corpus/fragmentation は [#194](https://github.com/hirokazumiyaji/net-mojo/pull/194)、HTTP/1 sanitizer は [#195](https://github.com/hirokazumiyaji/net-mojo/pull/195)、長時間 leak は手動 soak のみ: `benchmarks/http/H1_RESULTS.md`）
 - [x] `README.md`、`CHANGELOG.md`、`docs/design/net-package.md` に使い方、制限、ownership、性能再現手順を反映する。
 
 完了条件: `pixi run test`、`pixi run package`、`pixi run test-package` と HTTP integration tests が各 target で成功する。
