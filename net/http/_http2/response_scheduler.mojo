@@ -185,18 +185,28 @@ struct Http2ResponseScheduler(Movable):
                     )
                     self._remove(index)
                     continue
-                # HPACK compresses literal fields; the queued field block is
-                # a safe upper bound on the deflater's compressed output. The
-                # pre-allocated `compressed_capacity` can exceed one drain
-                # batch, so gate on this tighter per-response estimate so the
-                # drain never breaks before it can emit anything.
-                var field_bound = len(self._responses[index].header_fields)
+                # True upper bound on the compressed block matching
+                # nghttp2_hd_deflate_bound = sum(name+value+32) + 128.
+                # The queued buffer carries 8 bytes of (name_len,
+                # value_len) overhead per field, so add 24 bytes per
+                # field plus 128 bytes head room for a dynamic-table-
+                # size-update prefix (RFC 7541 §4.2) and nghttp2 slack.
+                # Cap by `compressed_capacity` so the gate never asks
+                # for more than the deflater can actually emit.
+                var raw_len = len(self._responses[index].header_fields)
+                var hpack_bound = (
+                    raw_len
+                    + 24 * self._responses[index].header_field_count
+                    + 128
+                )
+                if hpack_bound > self._responses[index].compressed_capacity:
+                    hpack_bound = self._responses[index].compressed_capacity
                 var worst_frames = (
-                    field_bound + max_frame_size - 1
+                    hpack_bound + max_frame_size - 1
                 ) // max_frame_size
                 if worst_frames < 1:
                     worst_frames = 1
-                var upper_bound = field_bound + worst_frames * 9
+                var upper_bound = hpack_bound + worst_frames * 9
                 if max_output_bytes - len(output) < upper_bound:
                     break
                 var emit_result = self._encode_and_emit_headers(
