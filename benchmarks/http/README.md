@@ -755,11 +755,11 @@ those are separate processes and therefore always separate connections;
 | Proto | Server | Scenario | Verdict | Detail |
 | --- | --- | --- | --- | --- |
 | h2 | Go | slow | pass | 1 conn: 8/8 siblings exact 64 B while the upload stream was still open; echo completed after release |
-| h2 | Mojo | slow | not run | see note below |
+| h2 | Mojo | slow | not run (historical) | see note below; current Mojo H2 slow result is in [H2_RESULTS.md](H2_RESULTS.md) §Slow/cancel wire outcomes |
 | h2 | Go | cancel | pass | 1 conn: 274 cancel cycles (unsent residual > 256 MiB budget); target+8 siblings FC-blocked across RST (65535 B at reset); siblings completed after release; post-reset full echo + GET /fixed OK |
-| h2 | Mojo | cancel | not run | see note below |
+| h2 | Mojo | cancel | not run (historical) | see note below; current Mojo H2 cancel result is in [H2_RESULTS.md](H2_RESULTS.md) §Slow/cancel wire outcomes |
 | h2 | Go | loss | skip | pf/dummynet needs root; no-loss reference 49,882 req/s |
-| h2 | Mojo | loss | skip | pf/dummynet needs root; no-loss reference 35,860 req/s |
+| h2 | Mojo | loss | skip (historical) | pf/dummynet needs root; no-loss reference 35,860 req/s. The current netem 16×10 loss row for Go vs Mojo is in [H2_RESULTS.md](H2_RESULTS.md) |
 | h3 | aioquic | slow | pass | 1 conn incomplete upload: 8/8 siblings exact 64 B while POST /echo was still open; echo completed after finish (`method=incomplete_upload`) |
 | h3 | Mojo | slow | pass † | held 262,144 B while 8/8 siblings completed |
 | h3 | aioquic | cancel | pass | 257 incomplete-reset cycles with peer-ACK'd 256 KiB each (> 64 MiB request-body budget); reset target in-flight; 8/8 siblings outstanding across the reset and completed; post-reset GET /fixed on the same connection OK |
@@ -813,9 +813,10 @@ kill "$server_pid"
 The provider also has an in-memory regression that cancels 105 requests against
 the 100-stream allowance, verifies pending request-byte release and completes a
 subsequent request. The older dagger-marked H3 rows above remain historical;
-the current checks supply the missing current-criteria H3 evidence. H2
-packet-loss measurements, full-duration comparisons and engine memory
-measurements remain separate work.
+the current checks supply the missing current-criteria H3 evidence. The
+current-criteria H2 packet-loss measurement is the netem 16×10 Go-vs-Mojo
+row in [H2_RESULTS.md](H2_RESULTS.md); full-duration comparisons and
+engine memory measurements remain separate work.
 
 The two `h2 | Mojo` rows in the earlier table are *not run* rather than carried over: the previous
 `pass` entries came from the `curl` + `h2load` version, which cannot exercise
@@ -941,7 +942,9 @@ That claim is scoped to the runs above. The current H2 and H3 validation
 sections provide Mojo's slow/cancel correctness evidence; the earlier
 `not run` and dagger-marked rows remain historical. The throughput matrix
 is unchanged. Loss via pf/dummynet is skipped on this host (no passwordless
-sudo). The current H3 validation at `349a1f6` records a 5% client-side
+sudo); the current-criteria H2 loss measurement uses netem instead and is
+recorded as the 16×10 Go-vs-Mojo row in [H2_RESULTS.md](H2_RESULTS.md).
+The current H3 validation at `349a1f6` records a 5% client-side
 datagram-drop check for Mojo with zero failures; the dagger-marked loss rows
 remain historical. This supplies correctness evidence under induced loss,
 without a pinned throughput comparison. When dummynet is available the
