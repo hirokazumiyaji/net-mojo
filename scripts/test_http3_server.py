@@ -17,6 +17,7 @@ from aioquic.quic.packet import QuicProtocolVersion
 H3_REQUEST_CANCELLED = 0x10C
 H3_REQUEST_REJECTED = 0x10B
 H3_NO_ERROR = 0x100
+QPACK_DECOMPRESSION_FAILED = 0x200
 
 
 def require_http3_alpn(alpn):
@@ -334,6 +335,65 @@ class _Http3Connection(H3Connection):
             await self.goaway_event.wait()
 
 
+class QpackRejectProtocol(QuicConnectionProtocol):
+    """Open H3 handshake, then send a HEADERS frame referencing dynamic index 0."""
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.http = H3Connection(self._quic)
+        self.terminated = self._loop.create_future()
+        self.alpn = None
+
+    def quic_event_received(self, event):
+        if isinstance(event, ProtocolNegotiated):
+            self.alpn = event.alpn_protocol
+        if isinstance(event, ConnectionTerminated) and not self.terminated.done():
+            self.terminated.set_result(event.error_code)
+        for _ in self.http.handle_event(event):
+            pass
+
+    def send_dynamic_reference_headers(self):
+        # Flush the H3 handshake (control stream type + SETTINGS, encoder /
+        # decoder stream types) before the crafted HEADERS so quiche's h3
+        # decoder reaches the field-section parser rather than failing on an
+        # unexpected stream type.
+        self.transmit()
+        stream_id = self._quic.get_next_available_stream_id()
+        # HEADERS frame (type 0x01, length 0x03) carrying a QPACK field section
+        # that references dynamic index 0: required-insert-count 0 (0x00), base
+        # 0 with sign bit 0 (0x00), then "Indexed Field Line" with T=0
+        # (dynamic) and index 0 (0x80). Quiche 0.29.3's static-only decoder
+        # rejects this with QPACK_DECOMPRESSION_FAILED = 0x200.
+        self._quic.send_stream_data(
+            stream_id, bytes([0x01, 0x03, 0x00, 0x00, 0x80]), end_stream=True
+        )
+        self.transmit()
+
+
+async def run_qpack_dynamic_reference_rejected(address):
+    host, port = address.rsplit(":", 1)
+    configuration = QuicConfiguration(
+        is_client=True, alpn_protocols=H3_ALPN,
+        server_name="localhost",
+    )
+    configuration.supported_versions = [QuicProtocolVersion.VERSION_1]
+    configuration.verify_mode = ssl.CERT_NONE
+    async with connect(
+        host,
+        int(port),
+        configuration=configuration,
+        create_protocol=QpackRejectProtocol,
+    ) as client:
+        require_http3_alpn(client.alpn)
+        client.send_dynamic_reference_headers()
+        error_code = await asyncio.wait_for(client.terminated, timeout=5)
+        if error_code != QPACK_DECOMPRESSION_FAILED:
+            raise RuntimeError(
+                "expected QPACK_DECOMPRESSION_FAILED (0x200) when peer sends a "
+                f"dynamic-table reference against capacity 0; got {error_code:#x}"
+            )
+
+
 async def run_client(address):
     host, port = address.rsplit(":", 1)
     configuration = QuicConfiguration(
@@ -431,13 +491,17 @@ try:
     if not ready.startswith("READY "):
         details = process.stderr.read()
         raise RuntimeError(f"HTTP/3 fixture did not start: {ready}\n{details}")
-    asyncio.run(run_client(ready.removeprefix("READY ")))
+    async def _drive(address):
+        await run_qpack_dynamic_reference_rejected(address)
+        await run_client(address)
+
+    asyncio.run(_drive(ready.removeprefix("READY ")))
     process.wait(timeout=5)
     if process.returncode != 0:
         raise RuntimeError(f"HTTP/3 fixture exited with {process.returncode}")
     print(
         "Independent aioquic HTTP/3 client roundtrips succeeded "
-        "(STOP_SENDING + reorder + reset-storm siblings + ALPN h3)"
+        "(QPACK dynamic-ref rejected + STOP_SENDING + reorder + reset-storm siblings + ALPN h3)"
     )
 finally:
     if process.poll() is None:
