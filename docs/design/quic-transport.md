@@ -289,8 +289,8 @@ for their advertised windows. Whole-engine allocated capacities remain separate.
 
 Still deferred: enabling 0-RTT and full path migration. macOS Mojo end-to-end
 HTTP/3 is covered in CI (`http3` job on `macos-14`, `http3-client-test` against
-the Mojo fixture); only packaged-artifact distribution verification remains
-optional.
+the Mojo fixture); packaged-artifact distribution verification also runs in CI
+via the `http3-package-smoke` step on the same matrix.
 
 ## Connection credit for critical streams
 
