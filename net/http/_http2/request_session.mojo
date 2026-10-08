@@ -293,6 +293,12 @@ struct Http2RequestSession(Movable):
                                 return Http2RequestSessionResult.error(
                                     consumed, output^
                                 )
+                            # Advance last_stream_id so DATA already in
+                            # flight on this stream (before the peer
+                            # sees our RST) is accounted for in connection
+                            # flow control instead of failing the session.
+                            if decoded.stream_id > self._last_stream_id:
+                                self._last_stream_id = decoded.stream_id
                             continue
                         var request_result = self._receive_headers(decoded)
                         if request_result.is_malformed():
