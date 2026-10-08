@@ -157,6 +157,12 @@ def _trailer_forbidden(name: StringSlice) -> Bool:
         or lowered == "content-encoding"
         or lowered == "content-type"
         or lowered == "content-range"
+        or lowered == "cache-control"
+        or lowered == "vary"
+        or lowered == "set-cookie"
+        or lowered == "age"
+        or lowered == "expires"
+        or lowered == "pragma"
     )
 
 
