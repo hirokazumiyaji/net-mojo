@@ -108,9 +108,7 @@ from net.http._http2.request_session import (
 from net.http._http2.response_headers import (
     _content_length_matches,
     encode_http2_response_headers,
-)
-from net.http._http2.response_encoder import (
-    encode_http2_response_trailer_frames,
+    encode_http2_response_trailers,
 )
 from net.http._http2.control_frames import encode_rst_stream_frame
 
@@ -1682,29 +1680,22 @@ struct Server(Movable):
         var field_count = fields_result.field_count
 
         var trailer_wire = List[Byte]()
+        var trailer_field_count = 0
         if len(writer.trailers) > 0:
-            var trailer_room = (
-                self._budget.remaining()
-                - len(control_output)
-                - len(field_bytes)
-                - len(response_body)
-            )
-            if trailer_room < 0:
-                trailer_room = 0
-            if trailer_room > max_response_header_bytes:
-                trailer_room = max_response_header_bytes
-            var trailer_encoded = encode_http2_response_trailer_frames(
+            # Keep trailer fields raw; the scheduler encodes them through
+            # the deflater at emission time so any pending HPACK dynamic
+            # table-size update emitted after a peer SETTINGS change
+            # (RFC 7541 §4.2) prefixes the trailer header block.
+            var trailer_encoded = encode_http2_response_trailers(
                 writer,
                 is_head,
-                stream_id,
                 max_response_header_bytes,
                 self.config.max_response_headers_count,
-                16384,
-                trailer_room,
             )
-            if trailer_encoded.is_complete():
-                trailer_wire = trailer_encoded.wire^
-                trailer_encoded.wire = List[Byte]()
+            if trailer_encoded.is_valid():
+                trailer_wire = trailer_encoded.fields^
+                trailer_encoded.fields = List[Byte]()
+                trailer_field_count = trailer_encoded.field_count
 
         var response_reservation = (
             len(field_bytes) + len(response_body) + len(trailer_wire)
@@ -1723,6 +1714,7 @@ struct Server(Movable):
             compressed_capacity,
             response_body^,
             trailer_wire^,
+            trailer_field_count,
         ):
             self._budget.release(response_reservation)
             if not self._flush_http2_control_output(idx, control_output^):
