@@ -92,7 +92,7 @@ from ._parser import (
 )
 from .config import ServerConfig
 from .handler import Handler
-from .headers import Headers, _check_value_bytes
+from .headers import Headers, _check_value_bytes, _trailer_forbidden
 from .response import (
     ResponseWriter,
     has_body_for_status,
@@ -952,6 +952,11 @@ struct Server(Movable):
                     or trailer_bytes > self.config.max_response_headers_bytes
                 ):
                     response.trailers.clear()
+            if len(response.trailers) > 0:
+                for i in range(len(response.trailers)):
+                    if _trailer_forbidden(response.trailers._lower_names[i]):
+                        response.trailers.clear()
+                        break
             if len(response.trailers) > 0:
                 _append_quic_u32(trailers, UInt32(len(response.trailers)))
                 for i in range(len(response.trailers)):
