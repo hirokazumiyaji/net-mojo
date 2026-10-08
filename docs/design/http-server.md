@@ -174,59 +174,59 @@ Phase 6〜9 はそれぞれ実装前に詳細仕様と PR 単位の計画を作�
 
 ### Phase 0: API と計測条件を固定する
 
-- [ ] `docs/design/http-server.md` に API の実 signature、borrow 寿命、エラー契約、HTTP conformance table を記録する。
-- [ ] HTTP/2 と HTTP/3 の pseudo-header mapping、stream 所有権、connection と stream の分離を確認し、HTTP/1.1 固有の前提が共通 API に漏れていないことをレビューする。
-- [ ] `tests/test_http_api.mojo` に handler trait、借用 Request、buffer 所有権、control handle の最小 compile probe を作る。対応 Mojo で成立しない API はこの段階で修正する。
-- [ ] `benchmarks/http_go/main.go` と `benchmarks/http/README.md` に Go baseline と測定条件を用意し、バージョン、CPU 制限、最適化設定を固定する。
-- [ ] baseline の出力を検証し、比較に使う request／response bytes と handler 処理を一致させる。
+- [x] `docs/design/http-server.md` に API の実 signature、borrow 寿命、エラー契約、HTTP conformance table を記録する。
+- [x] HTTP/2 と HTTP/3 の pseudo-header mapping、stream 所有権、connection と stream の分離を確認し、HTTP/1.1 固有の前提が共通 API に漏れていないことをレビューする。
+- [x] `tests/test_http_api.mojo` に handler trait、借用 Request、buffer 所有権、control handle の最小 compile probe を作る。対応 Mojo で成立しない API はこの段階で修正する。
+- [x] `benchmarks/http_go/main.go` と `benchmarks/http/README.md` に Go baseline と測定条件を用意し、バージョン、CPU 制限、最適化設定を固定する。
+- [x] baseline の出力を検証し、比較に使う request／response bytes と handler 処理を一致させる。
 
 完了条件: API のコンパイル確認、計測手順、対象機能と非対応機能がレビュー可能。
 
 ### Phase 1: ソケット非依存の HTTP codec
 
-- [ ] `net/http/{__init__,request,headers,response,error,_parser,_encoder}.mojo` を追加する。
-- [ ] `tests/test_http_parser.mojo` に全 byte 境界での分割、連結、binary body、chunked、Host、CL/TE、overflow、上限超過の table-driven tests を追加する。
-- [ ] `tests/test_http_response.mojo` で HEAD、204、304、Date、重複 headers、response injection、長さ整合性を確認する。
-- [ ] `benchmarks/http_parse.mojo` で parser の時間と入力サイズ別の結果を記録する。
+- [x] `net/http/{__init__,request,headers,response,error,_parser,_encoder}.mojo` を追加する。
+- [x] `tests/test_http_parser.mojo` に全 byte 境界での分割、連結、binary body、chunked、Host、CL/TE、overflow、上限超過の table-driven tests を追加する。
+- [x] `tests/test_http_response.mojo` で HEAD、204、304、Date、重複 headers、response injection、長さ整合性を確認する。
+- [x] `benchmarks/http_parse.mojo` で parser の時間と入力サイズ別の結果を記録する。
 
 完了条件: socket なしで任意の入力分割でも同じ結果と consumed byte 数を返す。次 request の bytes を body と誤認しない。
 
 ### Phase 2: reactor と TCP の前提を整える
 
-- [ ] `net/_reactor.mojo` に register／modify／remove／wait と stable token を実装する。Phase 3 の baseline 用には poll を使用する。
-- [ ] `net/tcp.mojo` の三つの accept 経路について、`tests/test_tcp.mojo` で TCP_NODELAY の実効値を getsockopt で確認し、必要な統一を行う。
-- [ ] `tests/test_reactor.mojo` に interest 変更、idle 時の待機、read/write 同時通知、fd 再利用、古い generation、EINTR、解除と close の tests を追加する。
+- [x] `net/_reactor.mojo` に register／modify／remove／wait と stable token を実装する。Phase 3 の baseline 用には poll を使用する。
+- [x] `net/tcp.mojo` の三つの accept 経路について、`tests/test_tcp.mojo` で TCP_NODELAY の実効値を getsockopt で確認し、必要な統一を行う。
+- [x] `tests/test_reactor.mojo` に interest 変更、idle 時の待機、read/write 同時通知、fd 再利用、古い generation、EINTR、解除と close の tests を追加する。
 
 完了条件: socket の単一所有を保ち、未送信データがない接続で writable busy loop が発生しない。
 
 ### Phase 3: HTTP server と上限付き接続管理
 
-- [ ] `net/http/{server,handler,_connection,_buffer,_deadline}.mojo` に状態機械、buffer budget、公平性、deadline、shutdown control を実装する。
-- [ ] `tests/test_http_server.mojo` に keep-alive、pipeline 順序、100-continue、partial I/O、EOF、slow reader、slow header/body、budget 超過、handler error、停止中の接続を追加する。
-- [ ] control の重複要求、serve 完了後の要求、server エラー終了との競合、ResponseWriter 拡張時の全体 budget 超過をテストする。
-- [ ] handler error は未送信 response を破棄して 500 と close とし、別接続の loop は継続する。エラー詳細は response に漏らさない。
-- [ ] `examples/http_hello.mojo` と `examples/http_json.mojo` を追加し、raw TCP client と Go HTTP client で応答を確認する。
-- [ ] poll 版 server の性能とメモリ使用量を保存する。
+- [x] `net/http/{server,handler,_connection,_buffer,_deadline}.mojo` に状態機械、buffer budget、公平性、deadline、shutdown control を実装する。
+- [x] `tests/test_http_server.mojo` に keep-alive、pipeline 順序、100-continue、partial I/O、EOF、slow reader、slow header/body、budget 超過、handler error、停止中の接続を追加する。
+- [x] control の重複要求、serve 完了後の要求、server エラー終了との競合、ResponseWriter 拡張時の全体 budget 超過をテストする。
+- [x] handler error は未送信 response を破棄して 500 と close とし、別接続の loop は継続する。エラー詳細は response に漏らさない。
+- [x] `examples/http_hello.mojo` と `examples/http_json.mojo` を追加し、raw TCP client と Go HTTP client で応答を確認する。
+- [x] poll 版 server の性能とメモリ使用量を保存する。
 
 完了条件: 一つの slow client が他の接続を待たせず、上限が実測とテストで守られ、停止後に fd と buffer が残らない。
 
 ### Phase 4: epoll／kqueue と性能検証
 
-- [ ] `net/_sys/{readiness,linux,darwin}.mojo` に OS event queue の bindings と ABI checks を追加する。HTTP に libc 直接呼び出しを追加しない。
-- [ ] reactor の内部を epoll／kqueue に変更し、ready batch のみを処理する。deadline と connection 管理も全登録走査を避ける。
-- [ ] Phase 2 と Phase 3 の同じ契約テストを両 OS で通す。kqueue の EOF と未読データ、epoll の packed ABI、queue fd のリークを検証する。
-- [ ] `benchmarks/http_server.mojo` と `benchmarks/http/README.md` に poll 版との差分、Go 比較、CPU profile、メモリ測定を保存する。
-- [ ] ボトルネックに対応する最適化だけを追加し、前後の測定を残す。
+- [x] `net/_sys/{readiness,linux,darwin}.mojo` に OS event queue の bindings と ABI checks を追加する。HTTP に libc 直接呼び出しを追加しない。
+- [x] reactor の内部を epoll／kqueue に変更し、ready batch のみを処理する。deadline と connection 管理も全登録走査を避ける。
+- [x] Phase 2 と Phase 3 の同じ契約テストを両 OS で通す。kqueue の EOF と未読データ、epoll の packed ABI、queue fd のリークを検証する。
+- [x] `benchmarks/http_server.mojo` と `benchmarks/http/README.md` に poll 版との差分、Go 比較、CPU profile、メモリ測定を保存する。
+- [x] ボトルネックに対応する最適化だけを追加し、前後の測定を残す。
 
 完了条件: 多数の idle 接続時に active event の処理が全接続数に比例する走査を含まず、下記の測定表と目標との差が示される。
 
 ### Phase 5: CI、配布、利用ドキュメント
 
-- [ ] `pixi.toml` に `test-http-api`、`test-http-parser`、`test-http-response`、`test-reactor`、`test-http-server`、`benchmark-http-parse`、`benchmark-http-server` を追加する。
-- [ ] `.github/workflows/ci.yml` の macOS arm64、Linux x86_64、Linux aarch64 で warning-clean tests と package smoke を実行する。
-- [ ] `tests/package_smoke.mojo` に配布 artifact からの `net.http` import と codec の利用確認を追加する。
-- [ ] parser の malformed corpus、seed を記録する randomized fragmentation tests、対応環境での sanitizer と長時間の fd／RSS leak tests を整備する。
-- [ ] `README.md`、`CHANGELOG.md`、`docs/design/net-package.md` に使い方、制限、ownership、性能再現手順を反映する。
+- [x] `pixi.toml` に `test-http-api`、`test-http-parser`、`test-http-response`、`test-reactor`、`test-http-server`、`benchmark-http-parse`、`benchmark-http-server` を追加する。
+- [x] `.github/workflows/ci.yml` の macOS arm64、Linux x86_64、Linux aarch64 で warning-clean tests と package smoke を実行する。
+- [x] `tests/package_smoke.mojo` に配布 artifact からの `net.http` import と codec の利用確認を追加する。
+- [x] parser の malformed corpus、seed を記録する randomized fragmentation tests、対応環境での sanitizer と長時間の fd／RSS leak tests を整備する。
+- [x] `README.md`、`CHANGELOG.md`、`docs/design/net-package.md` に使い方、制限、ownership、性能再現手順を反映する。
 
 完了条件: `pixi run test`、`pixi run package`、`pixi run test-package` と HTTP integration tests が各 target で成功する。
 性能の閾値は共有 CI の合否判定に使わない。
@@ -265,7 +265,7 @@ Phase 6〜9 はそれぞれ実装前に詳細仕様と PR 単位の計画を作�
 
 ### Phase 9: HTTP/3 の実装
 
-- [ ] `docs/design/http3-server.md`、`net/http/_http3/`、`tests/test_http3.mojo` を追加し、QUIC 上の ALPN `h3` で同じ handler を利用する。
+- [x] `docs/design/http3-server.md`、HTTP/3 実装、HTTP/3 integration tests を追加し、QUIC 上の ALPN `h3` で同じ handler を利用する。実装は `net/http/_http3/` ではなく quiche provider (`net/quic/provider/`、`net/quic/__init__.mojo`) に置かれる (後述の HTTP/2 と HTTP/3 の request 変換 §参照)。
 - [ ] control stream、SETTINGS、request stream の HEADERS／DATA、QPACK encoder／decoder stream、pseudo-header と trailer を実装する。採用 QUIC engine に HTTP/3 機能がある場合はそれを利用し、重複実装を避ける。
 - [ ] QPACK table と blocked stream 上限、stream cancel、connection error、GOAWAY、drain を実装する。server push は提供しない。
 - [ ] control／QPACK stream に必要な credit を確保し、request の flow control によって制御処理が deadlock しないことを検証する。
