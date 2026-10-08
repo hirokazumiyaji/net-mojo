@@ -1,0 +1,112 @@
+{
+  "schema_version": 1,
+  "host": {
+    "machine": "Apple M2 Pro",
+    "os": "macOS 27.0.1 (Darwin 27.0.0)",
+    "arch": "arm64"
+  },
+  "toolchain": {
+    "mojo": "1.1.0 (8189361e)",
+    "aioquic": "1.3.0",
+    "quiche": "0.29.3"
+  },
+  "provenance": {
+    "repo_sha": "7f80f55e4f70f7468bd0a077d29b057bfd77d65e",
+    "branch_at_measurement": "issue42/unit109 (based on origin/main)",
+    "mojo_h3_server_sha256": "8858bc4a15e193b5853c9c5c2ce0f1f6728c0b2be57ea461018092ba0d34a824",
+    "quiche_provider_sha256": "da9022facc3b265a9d557de935d0eae1f09bd317d3d7c70c53d855415cabe331",
+    "tls_shim_sha256": "32580bd75ca01e569f935f39d5d9c0bed8d110456445dba91344314c2de6aed7",
+    "script_sha256_sources": [
+      "benchmarks/http/quic_memory_calibration.py"
+    ]
+  },
+  "procedure": {
+    "idle_hold_seconds": 3.0,
+    "client": "benchmarks/http/quic_memory_calibration.py (aioquic serial dial loop)",
+    "server": "build/bin/http3_server (ServerConfig.default)",
+    "sampler": "ps -o rss= (resident set size, KiB * 1024)"
+  },
+  "runs": [
+    {
+      "connections": 1,
+      "server_pid": 15548,
+      "rss_bytes": {
+        "before": 17186816,
+        "after_handshake": 18563072,
+        "after_idle_hold": 18563072,
+        "after_one_request": 18563072,
+        "after_close": 18595840
+      },
+      "per_connection_bytes": {
+        "handshake": 1376256.0,
+        "idle_hold": 1376256.0,
+        "post_one_request": 1376256.0
+      },
+      "note": "N=1 is dominated by first-request/first-connection one-time allocations and is not representative"
+    },
+    {
+      "connections": 100,
+      "server_pid": 15719,
+      "rss_bytes": {
+        "before": 17170432,
+        "after_handshake": 25100288,
+        "after_idle_hold": 25100288,
+        "after_one_request": 25542656,
+        "after_close": 25542656
+      },
+      "per_connection_bytes": {
+        "handshake": 79298.56,
+        "idle_hold": 79298.56,
+        "post_one_request": 83722.24
+      },
+      "bytes_received_total": 6400
+    },
+    {
+      "connections": 500,
+      "server_pid": 15880,
+      "rss_bytes": {
+        "before": 17137664,
+        "after_handshake": 58867712,
+        "after_idle_hold": 58867712,
+        "after_one_request": 60669952,
+        "after_close": 48889856
+      },
+      "per_connection_bytes": {
+        "handshake": 83460.096,
+        "idle_hold": 83460.096,
+        "post_one_request": 87064.576
+      },
+      "bytes_received_total": 32000
+    },
+    {
+      "connections": 800,
+      "server_pid": 17252,
+      "rss_bytes": {
+        "before": 17252352,
+        "after_handshake": 69877760,
+        "after_idle_hold": 69877760,
+        "after_one_request": 72712192,
+        "after_close": 60866560
+      },
+      "per_connection_bytes": {
+        "handshake": 65781.76,
+        "idle_hold": 65781.76,
+        "post_one_request": 69324.8
+      },
+      "bytes_received_total": 51200
+    },
+    {
+      "connections": 1000,
+      "status": "aborted",
+      "note": "aioquic client timed out (serial handshakes); server stayed alive. Two attempts failed. A batched or multi-process dialer is required to reach N=1000 on this host."
+    }
+  ],
+  "summary": {
+    "documented_soft_estimate_bytes": 262144,
+    "documented_soft_estimate_source": "net/quic/provider/src/lib.rs:ESTIMATED_QUIC_TRANSPORT_BYTES_PER_CONNECTION",
+    "measured_per_connection_handshake_bytes_range": [65782, 83460],
+    "measured_per_connection_post_one_request_bytes_range": [69325, 87065],
+    "constant_updated": false,
+    "rationale": "Measurement captures idle + one small GET only. The soft estimate is intended to accommodate retransmission queues, large in-flight bodies, dynamic QPACK, and peak handshake bursts. The design doc describes it as an operator-tunable safety margin, not a tight RSS cap. Idle headroom alone is insufficient justification to shrink the constant; a complementary peak-load calibration should accompany any change."
+  }
+}
