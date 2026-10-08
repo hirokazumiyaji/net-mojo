@@ -94,19 +94,26 @@ run_mojo
 echo "=== alloc-count Go ==="
 run_go
 
-python3 - "$OUT_DIR" "$REQUESTS" <<'PY'
+python3 - "$OUT_DIR" <<'PY'
 import json, sys
 from pathlib import Path
 out = Path(sys.argv[1])
-reqs = int(sys.argv[2])
 mojo = json.loads((out / "mojo_alloc.json").read_text())
 mojo_load = json.loads((out / "mojo_load.json").read_text())
 pre = json.loads((out / "go_memstats_pre.json").read_text())
 post = json.loads((out / "go_memstats_post.json").read_text())
 go_load = json.loads((out / "go_load.json").read_text())
 
-mojo_success = int(mojo_load.get("samples") or mojo_load.get("success") or reqs)
-go_success = int(go_load.get("samples") or go_load.get("success") or reqs)
+def _success(label: str, data: dict) -> int:
+    for key in ("samples", "success"):
+        if key in data:
+            return int(data[key])
+    raise SystemExit(
+        f"{label} load output missing both 'samples' and 'success' fields"
+    )
+
+mojo_success = _success("mojo", mojo_load)
+go_success = _success("go", go_load)
 
 mojo_total_calls = sum(v for k, v in mojo.items() if k.endswith("_calls") and k != "free_calls")
 mojo_total_bytes = sum(v for k, v in mojo.items() if k.endswith("_bytes"))

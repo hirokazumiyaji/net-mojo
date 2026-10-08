@@ -75,9 +75,12 @@ void *malloc(size_t size) {
         resolve();
         if (!real_malloc) return bootstrap_alloc(size);
     }
-    atomic_fetch_add_explicit(&malloc_calls, 1, memory_order_relaxed);
-    atomic_fetch_add_explicit(&malloc_bytes, size, memory_order_relaxed);
-    return real_malloc(size);
+    void *p = real_malloc(size);
+    if (p) {
+        atomic_fetch_add_explicit(&malloc_calls, 1, memory_order_relaxed);
+        atomic_fetch_add_explicit(&malloc_bytes, size, memory_order_relaxed);
+    }
+    return p;
 }
 
 void *calloc(size_t n, size_t size) {
@@ -96,45 +99,60 @@ void *calloc(size_t n, size_t size) {
             return p;
         }
     }
-    atomic_fetch_add_explicit(&calloc_calls, 1, memory_order_relaxed);
-    atomic_fetch_add_explicit(&calloc_bytes, n * size, memory_order_relaxed);
-    return real_calloc(n, size);
+    void *p = real_calloc(n, size);
+    if (p) {
+        atomic_fetch_add_explicit(&calloc_calls, 1, memory_order_relaxed);
+        atomic_fetch_add_explicit(&calloc_bytes, n * size, memory_order_relaxed);
+    }
+    return p;
 }
 
 void *realloc(void *p, size_t size) {
     if (!real_realloc) {
         resolve();
     }
-    atomic_fetch_add_explicit(&realloc_calls, 1, memory_order_relaxed);
-    atomic_fetch_add_explicit(&realloc_bytes, size, memory_order_relaxed);
-    return real_realloc(p, size);
+    void *np = real_realloc(p, size);
+    if (np) {
+        atomic_fetch_add_explicit(&realloc_calls, 1, memory_order_relaxed);
+        atomic_fetch_add_explicit(&realloc_bytes, size, memory_order_relaxed);
+    }
+    return np;
 }
 
 void *aligned_alloc(size_t alignment, size_t size) {
     if (!real_aligned_alloc) {
         resolve();
     }
-    atomic_fetch_add_explicit(&aligned_calls, 1, memory_order_relaxed);
-    atomic_fetch_add_explicit(&aligned_bytes, size, memory_order_relaxed);
-    return real_aligned_alloc(alignment, size);
+    void *p = real_aligned_alloc(alignment, size);
+    if (p) {
+        atomic_fetch_add_explicit(&aligned_calls, 1, memory_order_relaxed);
+        atomic_fetch_add_explicit(&aligned_bytes, size, memory_order_relaxed);
+    }
+    return p;
 }
 
 int posix_memalign(void **out, size_t alignment, size_t size) {
     if (!real_posix_memalign) {
         resolve();
     }
-    atomic_fetch_add_explicit(&posix_memalign_calls, 1, memory_order_relaxed);
-    atomic_fetch_add_explicit(&posix_memalign_bytes, size, memory_order_relaxed);
-    return real_posix_memalign(out, alignment, size);
+    int rc = real_posix_memalign(out, alignment, size);
+    if (rc == 0) {
+        atomic_fetch_add_explicit(&posix_memalign_calls, 1, memory_order_relaxed);
+        atomic_fetch_add_explicit(&posix_memalign_bytes, size, memory_order_relaxed);
+    }
+    return rc;
 }
 
 void *memalign(size_t alignment, size_t size) {
     if (!real_memalign) {
         resolve();
     }
-    atomic_fetch_add_explicit(&memalign_calls, 1, memory_order_relaxed);
-    atomic_fetch_add_explicit(&memalign_bytes, size, memory_order_relaxed);
-    return real_memalign(alignment, size);
+    void *p = real_memalign(alignment, size);
+    if (p) {
+        atomic_fetch_add_explicit(&memalign_calls, 1, memory_order_relaxed);
+        atomic_fetch_add_explicit(&memalign_bytes, size, memory_order_relaxed);
+    }
+    return p;
 }
 
 void free(void *p) {
