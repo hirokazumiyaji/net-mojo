@@ -1338,6 +1338,13 @@ struct Server(Movable):
             ):
                 self._close_conn(idx)
                 return
+            if self._http2_drained(idx):
+                # Input/output processing can turn an idle session into a
+                # draining one (e.g. after acknowledging a peer GOAWAY).
+                # Re-check here or the connection would wait for a tick
+                # trigger that no further input will supply.
+                self._close_conn(idx)
+                return
             if (
                 self._conns[idx].active
                 and self._conns[idx].state == STATE_READING
@@ -1629,6 +1636,8 @@ struct Server(Movable):
                 self.config.max_response_headers_count,
             )
             if not fields_result.is_valid():
+                if not self._flush_http2_control_output(idx, control_output^):
+                    return
                 self._refuse_http2_stream(idx, stream_id, UInt32(2))
                 return
 
@@ -1642,7 +1651,9 @@ struct Server(Movable):
         var field_count = fields_result.field_count
         var response_reservation = len(field_bytes) + len(response_body)
         if not self._budget.try_reserve(response_reservation):
-            self._refuse_http2_stream(idx, stream_id, UInt32(7))
+            if not self._flush_http2_control_output(idx, control_output^):
+                return
+            self._refuse_http2_stream(idx, stream_id, UInt32(2))
             return
         if not self._conns[idx].http2_responses.enqueue(
             stream_id,
@@ -1655,7 +1666,9 @@ struct Server(Movable):
             end_on_headers,
         ):
             self._budget.release(response_reservation)
-            self._refuse_http2_stream(idx, stream_id, UInt32(7))
+            if not self._flush_http2_control_output(idx, control_output^):
+                return
+            self._refuse_http2_stream(idx, stream_id, UInt32(2))
             return
         self._conns[idx].http2_response_bytes_reserved += response_reservation
         self._conns[idx].write_at = deadline_from_now(
@@ -1669,6 +1682,17 @@ struct Server(Movable):
                 return
             self._conns[idx].state = STATE_SENDING_HTTP2_CONTROL
         self._drain_http2_responses(idx)
+
+    def _flush_http2_control_output(
+        mut self, idx: Int, var control_output: List[Byte]
+    ) raises NetError -> Bool:
+        if len(control_output) == 0:
+            return True
+        if not self._conns[idx].append_pending(control_output^, self._budget):
+            self._close_conn(idx)
+            return False
+        self._conns[idx].state = STATE_SENDING_HTTP2_CONTROL
+        return True
 
     def _http2_drained(self, idx: Int) -> Bool:
         if not self._conns[idx].http2_session:
