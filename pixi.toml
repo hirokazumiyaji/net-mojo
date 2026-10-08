@@ -107,6 +107,14 @@ http2-example-build = { cmd = "bash scripts/check_http2_example.sh", depends-on 
   "tls-build",
   "hpack-test",
 ] }
+http-app-contract-test = { cmd = "python3 scripts/test_http_app_contract.py", depends-on = [
+  "tls-build",
+  "hpack-test",
+] }
+http2-integration-test = { cmd = "python3 scripts/test_http2_integration.py", depends-on = [
+  "tls-build",
+  "hpack-test",
+] }
 
 [feature.http3.dependencies]
 binutils = "*"

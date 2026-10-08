@@ -40,6 +40,10 @@ jobs:
         run: pixi run -e tls-http2 http2-package-smoke
       - name: Build HTTP/2 example
         run: pixi run -e tls-http2 http2-example-build
+      - name: Test shared HTTP/1.1 and HTTP/2 application contract
+        run: pixi run -e tls-http2 http-app-contract-test
+      - name: Test HTTP/2 integration gaps
+        run: pixi run -e tls-http2 http2-integration-test
 
   http3:
     name: HTTP/3 (${{ matrix.os }})
