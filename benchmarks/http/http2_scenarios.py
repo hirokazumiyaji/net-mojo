@@ -34,7 +34,9 @@ from __future__ import annotations
 import argparse
 import socket
 import ssl
+import statistics
 import sys
+import threading
 import time
 from typing import Dict, List, Optional
 from urllib.parse import urlparse
@@ -426,6 +428,125 @@ def connect_h2(host: str, port: int, timeout: float) -> ssl.SSLSocket:
     return sock
 
 
+# Churn mode: open a fresh TLS+h2 connection per request. No session
+# resumption client-side because every connect uses a new SSLContext with
+# an empty session cache.
+CHURN_REQUEST_TIMEOUT_S = 10.0
+
+
+def churn_one_request(
+    host: str, port: int, authority: bytes
+) -> tuple[bool, float, Optional[str]]:
+    """Open a new TLS+h2 connection, send GET /fixed, read the body.
+
+    Returns (ok, elapsed_s, tls_info). tls_info is set on the first
+    successful connection and is ``alpn/version/cipher``.
+    """
+    begin = time.perf_counter()
+    try:
+        sock = connect_h2(host, port, CHURN_REQUEST_TIMEOUT_S)
+    except (OSError, ssl.SSLError, ScenarioError):
+        return False, time.perf_counter() - begin, None
+    tls_info = (
+        f"{sock.selected_alpn_protocol()}/{sock.version()}/{sock.cipher()[0]}"
+        if sock.cipher() is not None
+        else f"{sock.selected_alpn_protocol()}/{sock.version()}/"
+    )
+    try:
+        client = H2ScenarioClient(sock, authority)
+        deadline = time.perf_counter() + CHURN_REQUEST_TIMEOUT_S
+        stream_id = client.get(FIXED_PATH)
+        if not client.wait_stream(stream_id, deadline):
+            return False, time.perf_counter() - begin, tls_info
+        if not client.fixed_ok(stream_id):
+            return False, time.perf_counter() - begin, tls_info
+        return True, time.perf_counter() - begin, tls_info
+    except (H2Error, OSError, ssl.SSLError, ScenarioError):
+        return False, time.perf_counter() - begin, tls_info
+    finally:
+        try:
+            sock.close()
+        except OSError:
+            pass
+
+
+def run_churn(
+    url: str, clients: int, warmup_s: float, duration_s: float
+) -> dict:
+    parsed = urlparse(url)
+    host = parsed.hostname or "127.0.0.1"
+    port = parsed.port or 443
+    authority = f"{host}:{port}".encode()
+    if clients < 1:
+        raise ScenarioError(f"--clients must be >= 1, got {clients}")
+
+    latencies: List[float] = []
+    counters = {"ok": 0, "failed": 0, "warmup_ok": 0}
+    tls_info: List[Optional[str]] = [None]
+    lock = threading.Lock()
+
+    anchor_before = time.perf_counter()
+    anchor_unix_s = time.time()
+    start = time.perf_counter()
+    anchor_span_s = start - anchor_before
+    load_start_unix_s = anchor_unix_s + anchor_span_s / 2
+    warmup_until = start + warmup_s
+    stop_at = warmup_until + duration_s
+
+    def worker() -> None:
+        while time.perf_counter() < stop_at:
+            ok, elapsed, info = churn_one_request(host, port, authority)
+            done_at = time.perf_counter()
+            with lock:
+                if info is not None and tls_info[0] is None:
+                    tls_info[0] = info
+                if not ok:
+                    counters["failed"] += 1
+                    continue
+                if done_at > stop_at:
+                    continue
+                if done_at >= warmup_until:
+                    counters["ok"] += 1
+                    latencies.append(elapsed * 1_000_000.0)
+                else:
+                    counters["warmup_ok"] += 1
+
+    threads = [threading.Thread(target=worker, daemon=True) for _ in range(clients)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+
+    latencies.sort()
+    measure_s = max(1e-9, duration_s)
+    req_s = counters["ok"] / measure_s
+
+    def _p(values: List[float], p: float) -> float:
+        if not values:
+            return float("nan")
+        idx = max(0, min(len(values) - 1, int(round((p / 100.0) * (len(values) - 1)))))
+        return values[idx]
+
+    return {
+        "scenario": "churn",
+        "verdict": "pass" if counters["failed"] == 0 and counters["ok"] > 0 else "fail",
+        "req_s": req_s,
+        "ok": counters["ok"],
+        "failed": counters["failed"],
+        "warmup_successes": counters["warmup_ok"],
+        "samples": len(latencies),
+        "p50_us": _p(latencies, 50),
+        "p95_us": _p(latencies, 95),
+        "p99_us": _p(latencies, 99),
+        "mean_us": statistics.fmean(latencies) if latencies else float("nan"),
+        "load_start_unix_s": load_start_unix_s,
+        "measurement_start_unix_s": load_start_unix_s + warmup_s,
+        "measurement_end_unix_s": load_start_unix_s + warmup_s + duration_s,
+        "clients": clients,
+        "tls_info": tls_info[0] or "",
+    }
+
+
 def _target_and_siblings(
     client: H2ScenarioClient, siblings: int, deadline: float
 ) -> tuple[int, List[int], bytes, tuple]:
@@ -646,15 +767,25 @@ def run_cancel(url: str, siblings: int) -> dict:
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--url", required=True)
-    parser.add_argument("--scenario", required=True, choices=("slow", "cancel"))
+    parser.add_argument(
+        "--scenario", required=True, choices=("slow", "cancel", "churn")
+    )
     parser.add_argument("--siblings", type=int, default=8)
+    parser.add_argument(
+        "--clients", type=int, default=1,
+        help="churn: concurrent workers (each opens a new TLS+h2 connection per request)",
+    )
+    parser.add_argument("--warmup", type=float, default=5.0, help="churn: warmup seconds")
+    parser.add_argument("--duration", type=float, default=10.0, help="churn: measure seconds")
     args = parser.parse_args()
 
     try:
         if args.scenario == "slow":
             stats = run_slow(args.url, args.siblings)
-        else:
+        elif args.scenario == "cancel":
             stats = run_cancel(args.url, args.siblings)
+        else:
+            stats = run_churn(args.url, args.clients, args.warmup, args.duration)
     except (ScenarioError, H2Error, OSError) as exc:
         # A protocol or transport failure is a scenario failure, not a
         # harness crash: record it so the summary still explains the run.
