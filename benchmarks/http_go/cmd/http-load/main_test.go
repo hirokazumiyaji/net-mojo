@@ -31,6 +31,7 @@ func TestRejectInvalidConfigurations(t *testing.T) {
 		func(c *config) { c.BodySize = 1<<20 + 1 },
 		func(c *config) { c.Method = "POST" },
 		func(c *config) { c.Chunked = true },
+		func(c *config) { c.Churn = true },
 	} {
 		c := testConfig("http://localhost/fixed")
 		change(&c)
@@ -174,6 +175,37 @@ func TestWarmupValidatesResponseDrainedAfterDeadline(t *testing.T) {
 	r, err := run(c)
 	if err == nil || r.Started != 0 || r.WarmupCounts.Errors != 1 || r.WarmupCounts.Cutoff != 0 {
 		t.Fatalf("late warmup validation failure hidden: %+v %v", r, err)
+	}
+}
+
+func TestChurnOpensANewConnectionPerRequest(t *testing.T) {
+	var mu sync.Mutex
+	addresses := map[string]bool{}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		addresses[r.RemoteAddr] = true
+		mu.Unlock()
+		io.WriteString(w, strings.Repeat("a", 64))
+	}))
+	defer server.Close()
+
+	c := testConfig(server.URL + "/fixed")
+	c.Churn, c.KeepAlive = true, false
+	c.Duration = 50 * time.Millisecond
+	result, err := run(c)
+	if err != nil || !result.Valid || result.Success < 2 {
+		t.Fatalf("churn baseline run failed: %+v %v", result, err)
+	}
+	mu.Lock()
+	addressCount := len(addresses)
+	mu.Unlock()
+	if uint64(addressCount) < result.Success {
+		t.Fatalf("churn reused connections: %d addrs for %d successes", addressCount, result.Success)
+	}
+
+	c.KeepAlive = true
+	if _, err := run(c); err == nil {
+		t.Fatalf("churn with -keepalive=true accepted")
 	}
 }
 

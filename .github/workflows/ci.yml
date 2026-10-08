@@ -42,6 +42,8 @@ jobs:
         run: pixi run -e tls-http2 http2-package-smoke
       - name: Build HTTP/2 example
         run: pixi run -e tls-http2 http2-example-build
+      - name: Run HTTP/2 example with independent client
+        run: pixi run -e tls-http2 http2-example-run
 
   http3:
     name: HTTP/3 (${{ matrix.os }})
@@ -71,6 +73,8 @@ jobs:
         run: pixi run -e tls-http3 http3-package-smoke
       - name: Build HTTP/3 example
         run: pixi run -e tls-http3 http3-example-build
+      - name: Run HTTP/3 example with independent client
+        run: pixi run -e tls-http3 http3-example-run
 
   test:
     name: Test (${{ matrix.os }})
