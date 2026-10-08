@@ -27,7 +27,9 @@
     "http_go": "0dcb3d7ab2d82f24c6b14dcc3364f75cdaf4a2baad2ec9e26cb36f767cc5e3b6",
     "http_load": "d2b690eaed82a71c4448872538d8fbe1d0ccd2f2e5d6ec928b0a821ae572b89a",
     "go_memstats_server": "274da2cb8de52f57e340fb28e58d14ca76d85f0c71115a6c99de1dab5d83149a",
-    "libmalloc_count_so": "168b78827b65df94c1ae35a67f50c74d1f7383c3b33f58d702b11cd30f72aec7"
+    "libmalloc_count_so_u111_whole_lifetime": "168b78827b65df94c1ae35a67f50c74d1f7383c3b33f58d702b11cd30f72aec7",
+    "libmalloc_count_so": "12aabe25cf9167a89f6b6586e853f1fd6db83b34bc653073f1a1abe9b64e7c6b",
+    "http_load_u112": "f9b9afd00337bdbfd6f2c05934a35fbf373a24a3f68a31a495685976537a95d2"
   },
   "h1_cells": {
     "F64": {
@@ -359,6 +361,63 @@
   },
   "alloc_count": {
     "method": {
+      "mojo": "LD_PRELOAD malloc shim (benchmarks/http/alloc_count/malloc_count.c) with SIGUSR1/SIGUSR2 window controls; counters zeroed by SIGUSR1 after warmup and frozen by SIGUSR2 immediately after the measured load, so the dump covers only the measurement window",
+      "go": "runtime.MemStats via GET /_memstats endpoint on benchmarks/http_go/cmd/go-memstats-server, polled before and after the measurement window",
+      "mojo_shim_overhead_pct": -0.2
+    },
+    "workload": "10000 GET /fixed @ 1000 rps, -connections 32, -warmup 0 after a 3s warmup",
+    "window_scope": true,
+    "requests_mojo": 10000,
+    "requests_go": 10000,
+    "mojo_libc": {
+      "raw": {
+        "pid": 61,
+        "malloc_calls": 107,
+        "calloc_calls": 3,
+        "realloc_calls": 0,
+        "aligned_alloc_calls": 1,
+        "posix_memalign_calls": 2,
+        "memalign_calls": 0,
+        "free_calls": 88,
+        "malloc_bytes": 409618,
+        "calloc_bytes": 1580,
+        "realloc_bytes": 0,
+        "aligned_alloc_bytes": 896,
+        "posix_memalign_bytes": 1058,
+        "memalign_bytes": 0
+      },
+      "total_alloc_calls": 113,
+      "total_alloc_bytes": 413152,
+      "allocs_per_request": 0.0113,
+      "bytes_per_request": 41.3152,
+      "free_calls": 88
+    },
+    "go_runtime": {
+      "mallocs_delta": 210497,
+      "frees_delta": 227601,
+      "total_alloc_bytes_delta": 22686080,
+      "allocs_per_request": 21.0497,
+      "bytes_per_request": 2268.608
+    }
+  },
+  "syscall_count": {
+    "method": "strace -f -c over whole owned child lifetime; same workload as alloc_count",
+    "mojo": {
+      "total_syscalls": 400020,
+      "total_errors": 47,
+      "requests": 9999,
+      "syscalls_per_request": 40.006000600060005
+    },
+    "go": {
+      "total_syscalls": 388717,
+      "total_errors": 113379,
+      "requests": 10000,
+      "syscalls_per_request": 38.8717
+    }
+  },
+  "alloc_count_superseded": {
+    "note": "Whole-lifetime shim: counters started at process launch and were divided by measurement-window requests, so startup + warmup allocations were folded into per-request. Replaced by alloc_count below (window-scoped via SIGUSR1/SIGUSR2 handlers in the shim).",
+    "method": {
       "mojo": "LD_PRELOAD malloc shim (benchmarks/http/alloc_count/malloc_count.c), libc malloc family + free",
       "go": "runtime.MemStats via GET /_memstats endpoint on benchmarks/http_go/cmd/go-memstats-server",
       "mojo_shim_overhead_pct": -0.2
@@ -395,21 +454,6 @@
       "total_alloc_bytes_delta": 22615472,
       "allocs_per_request": 21.0549,
       "bytes_per_request": 2261.5472
-    }
-  },
-  "syscall_count": {
-    "method": "strace -f -c over whole owned child lifetime; same workload as alloc_count",
-    "mojo": {
-      "total_syscalls": 400020,
-      "total_errors": 47,
-      "requests": 9999,
-      "syscalls_per_request": 40.006000600060005
-    },
-    "go": {
-      "total_syscalls": 388717,
-      "total_errors": 113379,
-      "requests": 10000,
-      "syscalls_per_request": 38.8717
     }
   }
 }

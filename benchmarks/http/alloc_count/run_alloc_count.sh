@@ -63,10 +63,14 @@ run_mojo() {
     taskset -c 1,2 "$HTTP_LOAD_BIN" -url "http://$MOJO_ADDR/fixed" \
         -connections "$CONNECTIONS" -warmup 0 -duration "${WARMUP_S}s" \
         > "$OUT_DIR/mojo_warmup.json" 2>&1 || true
+    kill -USR1 $pid
+    sleep 0.2
     local dur=$((REQUESTS / RATE))
     taskset -c 1,2 "$HTTP_LOAD_BIN" -url "http://$MOJO_ADDR/fixed" \
         -connections "$CONNECTIONS" -warmup 0 -rate "$RATE" -duration "${dur}s" \
         > "$OUT_DIR/mojo_load.json" 2>&1
+    kill -USR2 $pid
+    sleep 0.2
     terminate_pid $pid
 }
 

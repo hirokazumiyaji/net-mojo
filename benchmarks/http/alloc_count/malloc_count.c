@@ -1,5 +1,6 @@
 #define _GNU_SOURCE
 #include <dlfcn.h>
+#include <signal.h>
 #include <stdatomic.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -20,6 +21,7 @@ static atomic_uint_fast64_t realloc_bytes;
 static atomic_uint_fast64_t aligned_bytes;
 static atomic_uint_fast64_t posix_memalign_bytes;
 static atomic_uint_fast64_t memalign_bytes;
+static atomic_int frozen;
 
 typedef void *(*malloc_fn)(size_t);
 typedef void *(*calloc_fn)(size_t, size_t);
@@ -76,7 +78,7 @@ void *malloc(size_t size) {
         if (!real_malloc) return bootstrap_alloc(size);
     }
     void *p = real_malloc(size);
-    if (p) {
+    if (p && !atomic_load_explicit(&frozen, memory_order_relaxed)) {
         atomic_fetch_add_explicit(&malloc_calls, 1, memory_order_relaxed);
         atomic_fetch_add_explicit(&malloc_bytes, size, memory_order_relaxed);
     }
@@ -100,7 +102,7 @@ void *calloc(size_t n, size_t size) {
         }
     }
     void *p = real_calloc(n, size);
-    if (p) {
+    if (p && !atomic_load_explicit(&frozen, memory_order_relaxed)) {
         atomic_fetch_add_explicit(&calloc_calls, 1, memory_order_relaxed);
         atomic_fetch_add_explicit(&calloc_bytes, n * size, memory_order_relaxed);
     }
@@ -120,13 +122,15 @@ void *realloc(void *p, size_t size) {
             size_t avail = (size_t)((bootstrap_buf + sizeof bootstrap_buf) - (char *)p);
             size_t copy = size < avail ? size : avail;
             memcpy(np, p, copy);
-            atomic_fetch_add_explicit(&realloc_calls, 1, memory_order_relaxed);
-            atomic_fetch_add_explicit(&realloc_bytes, size, memory_order_relaxed);
+            if (!atomic_load_explicit(&frozen, memory_order_relaxed)) {
+                atomic_fetch_add_explicit(&realloc_calls, 1, memory_order_relaxed);
+                atomic_fetch_add_explicit(&realloc_bytes, size, memory_order_relaxed);
+            }
         }
         return np;
     }
     void *np = real_realloc(p, size);
-    if (np) {
+    if (np && !atomic_load_explicit(&frozen, memory_order_relaxed)) {
         atomic_fetch_add_explicit(&realloc_calls, 1, memory_order_relaxed);
         atomic_fetch_add_explicit(&realloc_bytes, size, memory_order_relaxed);
     }
@@ -138,7 +142,7 @@ void *aligned_alloc(size_t alignment, size_t size) {
         resolve();
     }
     void *p = real_aligned_alloc(alignment, size);
-    if (p) {
+    if (p && !atomic_load_explicit(&frozen, memory_order_relaxed)) {
         atomic_fetch_add_explicit(&aligned_calls, 1, memory_order_relaxed);
         atomic_fetch_add_explicit(&aligned_bytes, size, memory_order_relaxed);
     }
@@ -150,7 +154,7 @@ int posix_memalign(void **out, size_t alignment, size_t size) {
         resolve();
     }
     int rc = real_posix_memalign(out, alignment, size);
-    if (rc == 0) {
+    if (rc == 0 && !atomic_load_explicit(&frozen, memory_order_relaxed)) {
         atomic_fetch_add_explicit(&posix_memalign_calls, 1, memory_order_relaxed);
         atomic_fetch_add_explicit(&posix_memalign_bytes, size, memory_order_relaxed);
     }
@@ -162,7 +166,7 @@ void *memalign(size_t alignment, size_t size) {
         resolve();
     }
     void *p = real_memalign(alignment, size);
-    if (p) {
+    if (p && !atomic_load_explicit(&frozen, memory_order_relaxed)) {
         atomic_fetch_add_explicit(&memalign_calls, 1, memory_order_relaxed);
         atomic_fetch_add_explicit(&memalign_bytes, size, memory_order_relaxed);
     }
@@ -175,7 +179,9 @@ void free(void *p) {
     if (!real_free) {
         resolve();
     }
-    atomic_fetch_add_explicit(&free_calls, 1, memory_order_relaxed);
+    if (!atomic_load_explicit(&frozen, memory_order_relaxed)) {
+        atomic_fetch_add_explicit(&free_calls, 1, memory_order_relaxed);
+    }
     real_free(p);
 }
 
@@ -220,7 +226,39 @@ static void dump_counts(void) {
     fclose(f);
 }
 
+static void reset_handler(int sig) {
+    (void)sig;
+    atomic_store_explicit(&malloc_calls, 0, memory_order_relaxed);
+    atomic_store_explicit(&calloc_calls, 0, memory_order_relaxed);
+    atomic_store_explicit(&realloc_calls, 0, memory_order_relaxed);
+    atomic_store_explicit(&aligned_calls, 0, memory_order_relaxed);
+    atomic_store_explicit(&posix_memalign_calls, 0, memory_order_relaxed);
+    atomic_store_explicit(&memalign_calls, 0, memory_order_relaxed);
+    atomic_store_explicit(&free_calls, 0, memory_order_relaxed);
+    atomic_store_explicit(&malloc_bytes, 0, memory_order_relaxed);
+    atomic_store_explicit(&calloc_bytes, 0, memory_order_relaxed);
+    atomic_store_explicit(&realloc_bytes, 0, memory_order_relaxed);
+    atomic_store_explicit(&aligned_bytes, 0, memory_order_relaxed);
+    atomic_store_explicit(&posix_memalign_bytes, 0, memory_order_relaxed);
+    atomic_store_explicit(&memalign_bytes, 0, memory_order_relaxed);
+    atomic_store_explicit(&frozen, 0, memory_order_relaxed);
+}
+
+static void freeze_handler(int sig) {
+    (void)sig;
+    atomic_store_explicit(&frozen, 1, memory_order_relaxed);
+    dump_counts();
+}
+
 __attribute__((constructor)) static void init(void) {
     resolve();
+    struct sigaction sa;
+    memset(&sa, 0, sizeof sa);
+    sigemptyset(&sa.sa_mask);
+    sa.sa_flags = SA_RESTART;
+    sa.sa_handler = reset_handler;
+    sigaction(SIGUSR1, &sa, NULL);
+    sa.sa_handler = freeze_handler;
+    sigaction(SIGUSR2, &sa, NULL);
     atexit(dump_counts);
 }

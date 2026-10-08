@@ -28,9 +28,11 @@ and is not pooled with them. Thresholds are unchanged.
 | Mojo H1 binary SHA256 | `acf44ed8cf44ee8297436a8f14e32872d8ee0493ba510ab03159afafabd086cb` |
 | Mojo H2 binary SHA256 | `ac8c3595f0b193eb023580807cafbce75e0486e2281181706dedc0ef0a4cb36a` |
 | Go H1/H2 binary SHA256 | `0dcb3d7ab2d82f24c6b14dcc3364f75cdaf4a2baad2ec9e26cb36f767cc5e3b6` |
-| http-load SHA256 | `d2b690eaed82a71c4448872538d8fbe1d0ccd2f2e5d6ec928b0a821ae572b89a` |
+| http-load SHA256 (u111 whole-lifetime run) | `d2b690eaed82a71c4448872538d8fbe1d0ccd2f2e5d6ec928b0a821ae572b89a` |
+| http-load SHA256 (u112 window-scoped alloc re-run) | `f9b9afd00337bdbfd6f2c05934a35fbf373a24a3f68a31a495685976537a95d2` |
 | Go memstats server SHA256 | `274da2cb8de52f57e340fb28e58d14ca76d85f0c71115a6c99de1dab5d83149a` |
-| malloc_count shim SHA256 | `168b78827b65df94c1ae35a67f50c74d1f7383c3b33f58d702b11cd30f72aec7` |
+| malloc_count shim SHA256 (u111 whole-lifetime shim) | `168b78827b65df94c1ae35a67f50c74d1f7383c3b33f58d702b11cd30f72aec7` |
+| malloc_count shim SHA256 (u112 window-scoped shim) | `12aabe25cf9167a89f6b6586e853f1fd6db83b34bc653073f1a1abe9b64e7c6b` |
 
 Server pinned to CPU 0 (`GOMAXPROCS=1` for Go, `taskset -c 0` for Mojo);
 loader on CPUs 1–5. Both servers use `-idle-timeout 1h` where applicable.
@@ -127,13 +129,24 @@ server and a parallel Go H1 baseline on this host.
   `posix_memalign`, `memalign` call counts, their requested-byte sums
   and `free` call count. It bootstraps a 64 KiB arena so `dlsym(RTLD_NEXT, ...)`
   can resolve the real allocators before any instrumented allocation
-  returns, and dumps a JSON summary at `atexit`. Overhead against the
-  Mojo H1 server under saturated F64 load (`warmup 3 s / measure 10 s`,
-  `c=64`): `150,266` req/s unshimmed vs `150,573` req/s shimmed
-  (−0.20 %, within run-to-run noise). The shim measures libc-level
-  allocations only; Mojo's internal arena/free-list allocators may
-  satisfy allocations without reaching libc malloc, so the Mojo counts
-  are a lower bound on total allocation work per request.
+  returns, and dumps a JSON summary at `atexit`. The shim installs
+  async-signal-safe `sigaction` handlers in its constructor:
+  **SIGUSR1** zeros every counter (atomic relaxed stores) and clears
+  the `frozen` flag; **SIGUSR2** sets the atomic `frozen` flag so each
+  wrapper skips counter updates on subsequent calls, and then dumps
+  the current counters to the output path. The driver script sends
+  SIGUSR1 after warmup and SIGUSR2 immediately after the measured
+  load, so the dumped counts cover **only the measurement window**
+  (startup, shim load, dlsym bootstrap, warmup load and shutdown are
+  excluded). Overhead against the Mojo H1 server under saturated F64
+  load (`warmup 3 s / measure 10 s`, `c=64`): `150,266` req/s unshimmed
+  vs `150,573` req/s shimmed (−0.20 %, within run-to-run noise;
+  measured against the earlier whole-lifetime shim and still applies
+  because the per-wrapper hot path adds only one relaxed atomic load).
+  The shim measures libc-level allocations only; Mojo's internal
+  arena/free-list allocators may satisfy allocations without reaching
+  libc malloc, so the Mojo counts are a lower bound on total allocation
+  work per request.
 - **Go runtime MemStats**: `benchmarks/http_go/cmd/go-memstats-server`
   serves the same 64-byte `/fixed` payload plus `GET /_memstats`
   returning `runtime.MemStats.{Mallocs,Frees,TotalAlloc,HeapAlloc,
@@ -155,24 +168,48 @@ Measurement conditions for the allocation and syscall counts:
 - 32 keep-alive connections.
 - Driver `taskset -c 1,2`; server `taskset -c 0`.
 
-### Allocation counts
+### Allocation counts (window-scoped)
 
-Full report in `workspace/u111/alloc_report.json`.
+Full report in `workspace/u112/alloc_report.json` (window-scoped);
+`workspace/u111/alloc_report.json` keeps the earlier whole-lifetime
+numbers for provenance.
+
+Both servers are measured over the same 10 s / 10,000-request measured
+load after the 3 s warmup. Mojo numbers are now bounded to the SIGUSR1
+→ SIGUSR2 window (see **Method and overhead**); Go numbers come from
+the `/_memstats` delta between the two `http_get` calls bracketing the
+measured load.
 
 | Server | Count scope | Allocations per request | Bytes per request |
 | --- | --- | ---: | ---: |
-| Mojo H1 | libc malloc family (`malloc`+`calloc`+`realloc`+`aligned_alloc`+`posix_memalign`+`memalign`) | 0.012 | 41.4 |
-| Go H1 | `runtime.MemStats.Mallocs` delta | 21.05 | 2,261.5 |
+| Mojo H1 | libc malloc family (`malloc`+`calloc`+`realloc`+`aligned_alloc`+`posix_memalign`+`memalign`), measurement window | 0.0113 | 41.3 |
+| Go H1 | `runtime.MemStats.Mallocs` delta over the measurement window | 21.05 | 2,268.6 |
 
-Mojo totals over the 9,999 successful requests: 114 malloc, 3 calloc,
-0 realloc, 1 aligned_alloc, 2 posix_memalign, 0 memalign; 98 free.
-Mojo's near-zero libc allocation rate under this workload is consistent
-with the server using an internal arena/free-list for per-request state
-and keep-alive connections, so the libc counters capture process-wide
-startup allocations rather than per-request work. Go's `Mallocs` delta
-(210,549 new objects, 192,776 freed, 22,615,472 bytes of `TotalAlloc`
-growth) counts every runtime allocation and includes
+Mojo totals over the 10,000 successful requests in the measurement
+window: 107 malloc, 3 calloc, 0 realloc, 1 aligned_alloc, 2
+posix_memalign, 0 memalign; 88 free. Mojo's near-zero libc allocation
+rate under this workload is consistent with the server using an
+internal arena/free-list for per-request state and keep-alive
+connections. Even bounded to the measurement window, the libc counters
+remain dominated by whatever libc allocations happen outside Mojo's
+arena/free-list (background threads, dynamic buffer growth, etc.), not
+by per-request work; a Mojo-side arena/allocation profiler would be
+needed to measure Mojo's internal allocation work per request. Go's
+`Mallocs` delta (210,497 new objects, 227,601 freed, 22,686,080 bytes
+of `TotalAlloc` growth) counts every runtime allocation and includes
 HTTP/net/http/http.ResponseWriter bookkeeping.
+
+Superseded (whole-lifetime, u111) Mojo numbers kept here for
+transparency: 114 malloc, 3 calloc, 0 realloc, 1 aligned_alloc, 2
+posix_memalign, 0 memalign; 98 free, over 9,999 successful requests;
+120 total alloc calls, 413,826 total alloc bytes; 0.012 allocs/req,
+41.4 bytes/req. The prior shim counted from process start through
+shutdown and attributed startup + warmup allocations to the per-request
+divisor; the u112 numbers above correct that. The Go `MemStats` delta
+was already window-scoped at u111 (210,549 mallocs delta, 21.05
+allocs/req, 2,261.5 bytes/req) because `/_memstats` was polled before
+and after the measurement window; the u112 Go numbers are a paired
+re-run of the same shape.
 
 These numbers are not an apples-to-apples comparison of allocator work:
 libc malloc counts (Mojo) and Go runtime object counts (Go) are different
