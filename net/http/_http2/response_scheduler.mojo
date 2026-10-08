@@ -108,10 +108,8 @@ struct Http2ResponseScheduler(Movable):
         var index = self._find(stream_id)
         if index < 0:
             return 0
-        var released = (
-            len(self._responses[index].header_fields)
-            + len(self._responses[index].compressed_block)
-            + len(self._responses[index].body)
+        var released = len(self._responses[index].header_fields) + len(
+            self._responses[index].body
         )
         self._remove(index)
         return released
@@ -142,7 +140,7 @@ struct Http2ResponseScheduler(Movable):
             return Http2PeerResetResult(
                 released_bytes=body_bytes, kept_headers=True
             )
-        var released = len(self._responses[index].compressed_block) + len(
+        var released = len(self._responses[index].header_fields) + len(
             self._responses[index].body
         )
         self._remove(index)
@@ -187,6 +185,15 @@ struct Http2ResponseScheduler(Movable):
                     )
                     self._remove(index)
                     continue
+                var capacity = self._responses[index].compressed_capacity
+                var worst_frames = (
+                    capacity + max_frame_size - 1
+                ) // max_frame_size
+                if worst_frames < 1:
+                    worst_frames = 1
+                var upper_bound = capacity + worst_frames * 9
+                if max_output_bytes - len(output) < upper_bound:
+                    break
                 var encode_result = self._encode_pending_headers(
                     index, deflater, date, max_frame_size
                 )
@@ -199,10 +206,11 @@ struct Http2ResponseScheduler(Movable):
                     )
                 if encode_result == _ENCODE_RST:
                     var rst = encode_rst_stream_frame(stream_id, UInt32(2))
-                    if rst.is_complete() and len(rst.wire) <= (
+                    if not rst.is_complete() or len(rst.wire) > (
                         max_output_bytes - len(output)
                     ):
-                        output.extend(Span(rst.wire))
+                        break
+                    output.extend(Span(rst.wire))
                     session.finish_response(stream_id)
                     completed.append(stream_id)
                     released += len(self._responses[index].header_fields) + len(
@@ -249,7 +257,7 @@ struct Http2ResponseScheduler(Movable):
                 ):
                     session.finish_response(stream_id)
                     completed.append(stream_id)
-                    released += len(self._responses[index].compressed_block)
+                    released += len(self._responses[index].header_fields)
                     self._remove(index)
                     continue
 
@@ -263,7 +271,7 @@ struct Http2ResponseScheduler(Movable):
                     output.extend(Span(rst.wire))
                 session.finish_response(stream_id)
                 completed.append(stream_id)
-                released += len(self._responses[index].compressed_block)
+                released += len(self._responses[index].header_fields)
                 self._remove(index)
                 continue
 
@@ -310,7 +318,7 @@ struct Http2ResponseScheduler(Movable):
             if end_stream:
                 session.finish_response(stream_id)
                 completed.append(stream_id)
-                released += len(self._responses[index].compressed_block) + len(
+                released += len(self._responses[index].header_fields) + len(
                     self._responses[index].body
                 )
                 self._remove(index)

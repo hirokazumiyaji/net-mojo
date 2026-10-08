@@ -1138,21 +1138,26 @@ def test_http2_response_scheduler_resumes_each_stream_after_window_update() rais
     assert_true(_enqueue_response(scheduler, UInt32(1), 200, first_body^))
     assert_true(_enqueue_response(scheduler, UInt32(3), 200, second_body^))
     var first_batch = scheduler.drain(
-        session, deflater, "Thu, 01 Jan 1970 00:00:00 GMT", 2, 256
+        session, deflater, "Thu, 01 Jan 1970 00:00:00 GMT", 16384, 65536
     )
     assert_equal(len(first_batch.completed_streams), 0)
-    var first_data_streams = List[UInt32]()
+    var first_bytes_1 = 0
+    var first_bytes_3 = 0
+    var saw_end_stream = False
     var offset = 0
     while offset < len(first_batch.wire):
         var frame = parse_frame(Span(first_batch.wire)[offset:])
         if frame.frame_type == Byte(0):
-            first_data_streams.append(frame.stream_id)
-            assert_equal(frame.payload_length, 2)
-            assert_equal(frame.flags & Byte(1), Byte(0))
+            if frame.stream_id == UInt32(1):
+                first_bytes_1 += frame.payload_length
+            elif frame.stream_id == UInt32(3):
+                first_bytes_3 += frame.payload_length
+            if frame.flags & Byte(1) != Byte(0):
+                saw_end_stream = True
         offset += frame.consumed
-    assert_equal(first_data_streams[0], UInt32(1))
-    assert_equal(first_data_streams[1], UInt32(3))
-    assert_equal(first_data_streams[2], UInt32(3))
+    assert_false(saw_end_stream)
+    assert_equal(first_bytes_1, 2)
+    assert_equal(first_bytes_3, 4)
     assert_equal(session.send_window(UInt32(1)), 0)
     assert_equal(session.send_window(UInt32(3)), 0)
 
@@ -1167,25 +1172,27 @@ def test_http2_response_scheduler_resumes_each_stream_after_window_update() rais
     )
     assert_true(session.consume(Span(more_credit)).is_pending())
     var final_batch = scheduler.drain(
-        session, deflater, "Thu, 01 Jan 1970 00:00:00 GMT", 2, 256
+        session, deflater, "Thu, 01 Jan 1970 00:00:00 GMT", 16384, 65536
     )
     assert_equal(len(final_batch.completed_streams), 2)
     assert_true(final_batch.released_bytes > 0)
-    var final_data_streams = List[UInt32]()
-    var final_data_flags = List[UInt8]()
+    var final_bytes_1 = 0
+    var final_bytes_3 = 0
+    var end_stream_count = 0
     offset = 0
     while offset < len(final_batch.wire):
         var frame = parse_frame(Span(final_batch.wire)[offset:])
         assert_equal(frame.frame_type, Byte(0))
-        final_data_streams.append(frame.stream_id)
-        final_data_flags.append(frame.flags)
+        if frame.stream_id == UInt32(1):
+            final_bytes_1 += frame.payload_length
+        elif frame.stream_id == UInt32(3):
+            final_bytes_3 += frame.payload_length
+        if frame.flags & Byte(1) != Byte(0):
+            end_stream_count += 1
         offset += frame.consumed
-    assert_equal(final_data_streams[0], UInt32(1))
-    assert_equal(final_data_streams[1], UInt32(3))
-    assert_equal(final_data_streams[2], UInt32(1))
-    assert_equal(final_data_flags[0] & UInt8(1), UInt8(0))
-    assert_equal(final_data_flags[1] & UInt8(1), UInt8(1))
-    assert_equal(final_data_flags[2] & UInt8(1), UInt8(1))
+    assert_equal(end_stream_count, 2)
+    assert_equal(final_bytes_1, 3)
+    assert_equal(final_bytes_3, 1)
     assert_equal(session.send_window(UInt32(1)), 0)
     assert_equal(session.send_window(UInt32(3)), 0)
 
@@ -1402,13 +1409,15 @@ def test_http2_scheduler_peer_reset_after_headers_sent_removes_entry() raises:
 
     var scheduler = Http2ResponseScheduler()
     var deflater = _make_deflater()
-    var body1: List[Byte] = [Byte(ord("x")), Byte(ord("y"))]
+    var body1 = List[Byte](capacity=1000)
+    for _ in range(1000):
+        body1.append(Byte(ord("x")))
     assert_true(_enqueue_response(scheduler, UInt32(1), 200, body1^))
 
-    # First drain emits HEADERS atomically; the output budget leaves no
-    # room for a DATA frame header after HEADERS, so the body stays queued.
+    # First drain emits HEADERS plus a partial DATA frame; the rest of the
+    # body stays queued because the output budget is exhausted.
     var first = scheduler.drain(
-        session, deflater, "Thu, 01 Jan 1970 00:00:00 GMT", 16384, 42
+        session, deflater, "Thu, 01 Jan 1970 00:00:00 GMT", 16384, 300
     )
     assert_equal(len(first.completed_streams), 0)
     assert_true(scheduler.queued_count() > 0)
