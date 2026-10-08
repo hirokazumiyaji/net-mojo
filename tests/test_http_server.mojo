@@ -2073,6 +2073,10 @@ def test_unknown_expectation_is_417() raises:
         ),
     )
     assert_equal(_status_of(out), 417)
+    var wire = String(from_utf8_lossy=Span(out))
+    assert_true(wire.find("Connection: close") >= 0)
+    _tick_n(server, handler, 20)
+    assert_equal(server.active_connections(), 0)
     client.close()
 
 
@@ -2816,6 +2820,172 @@ def test_expired_entry_rearms_current_connection_deadline() raises:
     server._expire_deadlines(base + 20_000_000)
     assert_equal(server.active_connections(), 0)
     client.close()
+
+
+def test_slow_body_times_out() raises:
+    var config = ServerConfig.default()
+    config.body_deadline = Timeout.milliseconds(200)
+    var server = Server(config^)
+    server.add_listener(listen_tcp("127.0.0.1:0"))
+    var port = server.local_address().port
+    var handler = _EchoHandler()
+    var client = dial_tcp(
+        String("127.0.0.1:") + String(port), Timeout.seconds(2)
+    )
+    client.write_all(
+        String(
+            "POST /echo HTTP/1.1\r\nHost: x\r\nContent-Length: 10\r\n\r\nabc"
+        ).as_bytes(),
+        Timeout.seconds(2),
+    )
+    _tick_n(server, handler, 10)
+    assert_equal(server.active_connections(), 1)
+    sleep(0.4)
+    _tick_n(server, handler, 10)
+    assert_equal(server.active_connections(), 0)
+    var out = List[Byte]()
+    var tmp = Array[Byte, 4096](fill=0)
+    var saw_eof = False
+    for _ in range(50):
+        try:
+            var n = client.try_read(Span(tmp))
+            if n == 0:
+                saw_eof = True
+                break
+            for i in range(n):
+                out.append(tmp[i])
+        except e:
+            _ = e
+        sleep(0.002)
+    assert_true(saw_eof)
+    assert_equal(len(out), 0)
+    client.close()
+
+
+struct _BigResponseHandler(Handler):
+    var size: Int
+
+    def __init__(out self, size: Int = 4194304):
+        self.size = size
+
+    def handle(mut self, req: Request, mut writer: ResponseWriter) raises:
+        writer.set_status(200)
+        for i in range(self.size):
+            writer.body.append(Byte(ord("y") + (i % 8)))
+
+
+def _stall_server_write[
+    H: Handler
+](mut server: Server, mut handler: H, mut client: TCPConn) raises:
+    client.set_read_buffer(1024)
+    _tick_n(server, handler, 2)
+    assert_equal(server.active_connections(), 1)
+    server._conns[0].conn.value().set_write_buffer(1024)
+    client.write_all(
+        String("GET /big HTTP/1.1\r\nHost: x\r\n\r\n").as_bytes(),
+        Timeout.seconds(2),
+    )
+    _tick_n(server, handler, 50)
+    assert_equal(server.active_connections(), 1)
+    assert_true(server._conns[0].pending_remaining() > 0)
+    assert_true(server._conns[0].write_at != NO_DEADLINE)
+
+
+def test_write_deadline_closes_stalled_client() raises:
+    var config = ServerConfig.default()
+    config.write_deadline = Timeout.milliseconds(50)
+    config.max_response_body = 4194304
+    var server = Server(config^)
+    server.add_listener(listen_tcp("127.0.0.1:0"))
+    var port = server.local_address().port
+    var handler = _BigResponseHandler(4194304)
+    var client = dial_tcp(
+        String("127.0.0.1:") + String(port), Timeout.seconds(2)
+    )
+    _stall_server_write(server, handler, client)
+    server._conns[0].write_at = 1
+    server._arm_deadline(0)
+    server._expire_deadlines(now_ns())
+    assert_equal(server.active_connections(), 0)
+    client.close()
+
+
+def test_shutdown_grace_expires_closes_in_flight() raises:
+    var config = ServerConfig.default()
+    config.shutdown_grace = Timeout.milliseconds(50)
+    config.write_deadline = Timeout.seconds(5)
+    config.max_response_body = 4194304
+    var server = Server(config^)
+    server.add_listener(listen_tcp("127.0.0.1:0"))
+    var port = server.local_address().port
+    var handler = _BigResponseHandler(4194304)
+    var client = dial_tcp(
+        String("127.0.0.1:") + String(port), Timeout.seconds(2)
+    )
+    _stall_server_write(server, handler, client)
+    server.request_shutdown()
+    _ = server.tick(handler, Timeout.nanoseconds(0))
+    assert_true(server._shutdown_at != NO_DEADLINE)
+    server._shutdown_at = 1
+    server._expire_deadlines(now_ns())
+    assert_equal(server.active_connections(), 0)
+    client.close()
+
+
+def _wire_status_of(buf: List[Byte]) -> Int:
+    return _status_of(buf)
+
+
+def test_malformed_corpus_wire_closes_connection() raises:
+    from tests.support import _malformed_corpus
+
+    var server = Server(ServerConfig.default())
+    server.add_listener(listen_tcp("127.0.0.1:0"))
+    var port = server.local_address().port
+    var handler = _EchoHandler()
+    var corpus = _malformed_corpus()
+    for i in range(len(corpus)):
+        var entry = corpus[i].copy()
+        var client = dial_tcp(
+            String("127.0.0.1:") + String(port), Timeout.seconds(2)
+        )
+        client.write_all(entry.raw.as_bytes(), Timeout.seconds(2))
+        var out = List[Byte]()
+        var tmp = Array[Byte, 8192](fill=0)
+        var saw_eof = False
+        for _ in range(1000):
+            _ = server.tick(handler, Timeout.nanoseconds(0))
+            try:
+                var n = client.try_read(Span(tmp))
+                if n == 0:
+                    saw_eof = True
+                    break
+                for k in range(n):
+                    out.append(tmp[k])
+            except e:
+                _ = e
+                continue
+        if not saw_eof:
+            print("FAIL wire case=", entry.name, " no eof")
+            assert_true(saw_eof)
+        var status = _status_of(out)
+        if status != entry.status:
+            print(
+                "FAIL wire case=",
+                entry.name,
+                " got=",
+                status,
+                " want=",
+                entry.status,
+            )
+            assert_equal(status, entry.status)
+        var wire = String(from_utf8_lossy=Span(out))
+        if wire.find("Connection: close") < 0:
+            print("FAIL wire case=", entry.name, " no close header")
+            assert_true(wire.find("Connection: close") >= 0)
+        client.close()
+    _tick_n(server, handler, 20)
+    assert_equal(server.active_connections(), 0)
 
 
 def main() raises:

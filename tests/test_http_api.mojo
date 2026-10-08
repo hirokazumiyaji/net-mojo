@@ -1333,6 +1333,8 @@ def test_response_writer_detach_api() raises:
     assert_true(writer.is_detached())
     assert_true(sender.is_active())
     assert_false(sender.is_cancelled())
+    writer._cancel_detach()
+    assert_true(sender.is_cancelled())
 
 
 def test_alt_svc_empty_handler_value_still_suppresses_configured_injection() raises:
