@@ -111,8 +111,9 @@ hpack-test = "bash scripts/build_hpack_shim.sh"
 hpack-mojo-test = { cmd = "mojo run --Werror -I . tests/test_hpack.mojo", depends-on = [
   "hpack-test",
 ] }
-http2-package-smoke = { cmd = "mojo run --Werror -I build tests/http2_package_smoke.mojo", depends-on = [
+http2-package-smoke = { cmd = "python3 scripts/test_http2_package_smoke.py", depends-on = [
   "package",
+  "tls-build",
   "hpack-test",
 ] }
 http2-example-build = { cmd = "bash scripts/check_http2_example.sh", depends-on = [
@@ -124,6 +125,10 @@ http-app-contract-test = { cmd = "python3 scripts/test_http_app_contract.py", de
   "hpack-test",
 ] }
 http2-integration-test = { cmd = "python3 scripts/test_http2_integration.py", depends-on = [
+  "tls-build",
+  "hpack-test",
+] }
+http2-example-run = { cmd = "python3 scripts/run_http2_example.py", depends-on = [
   "tls-build",
   "hpack-test",
 ] }
@@ -169,12 +174,16 @@ http-same-origin-test = { cmd = "python3 scripts/test_http_same_origin.py", depe
   "tls-build",
   "quic-build",
 ] }
-http3-package-smoke = { cmd = "mojo run --Werror -I build tests/http3_package_smoke.mojo", depends-on = [
+http3-package-smoke = { cmd = "python3 scripts/test_http3_package_smoke.py", depends-on = [
   "package",
   "tls-build",
   "quic-build",
 ] }
 http3-example-build = { cmd = "bash scripts/check_http3_example.sh", depends-on = [
+  "tls-build",
+  "quic-build",
+] }
+http3-example-run = { cmd = "python3 scripts/run_http3_example.py", depends-on = [
   "tls-build",
   "quic-build",
 ] }
@@ -196,12 +205,16 @@ https-alt-svc-invalid-test = { cmd = "python3 scripts/test_https_alt_svc_invalid
 https-example-build = { cmd = "bash scripts/check_https_example.sh", depends-on = [
   "tls-build",
 ] }
+https-example-run = { cmd = "python3 scripts/run_https_example.py", depends-on = [
+  "tls-build",
+] }
 tls-suite = { depends-on = [
   "tls-test",
   "https-state-test",
   "https-client-test",
   "https-alt-svc-invalid-test",
   "https-example-build",
+  "https-example-run",
 ] }
 example-https-hello = { cmd = "mojo run --Werror -I . examples/https_hello.mojo", depends-on = [
   "tls-build",

@@ -28,6 +28,7 @@ type config struct {
 	BodySize        int           `json:"body_size"`
 	Chunked         bool          `json:"chunked"`
 	KeepAlive       bool          `json:"keepalive"`
+	Churn           bool          `json:"churn"`
 	Timeout         time.Duration `json:"request_timeout_ns"`
 	Rate            int           `json:"rate_requests_per_second"`
 	IdleConnections int           `json:"idle_connections"`
@@ -95,6 +96,9 @@ func prepare(c config) (workload, error) {
 	}
 	if c.Connections <= 0 || c.Duration <= 0 || c.Warmup < 0 || c.Timeout <= 0 || c.BodySize < 0 || c.BodySize > 1<<20 {
 		return workload{}, errors.New("connections/duration/timeout must be positive; warmup >= 0; body-size 0..1048576")
+	}
+	if c.Churn && (c.KeepAlive || c.IdleConnections > 0 || c.SlowHeaders+c.SlowBodies+c.SlowReaders > 0) {
+		return workload{}, errors.New("churn requires -keepalive=false and no idle/slow cohorts (one new connection per request)")
 	}
 	if c.Rate < 0 {
 		return workload{}, errors.New("rate must be nonnegative")
@@ -269,7 +273,7 @@ func run(c config) (result, error) {
 	protocols := new(http.Protocols)
 	protocols.SetHTTP1(true)
 	transport := &http.Transport{
-		Protocols: protocols, DisableCompression: true, DisableKeepAlives: !c.KeepAlive,
+		Protocols: protocols, DisableCompression: true, DisableKeepAlives: !c.KeepAlive || c.Churn,
 		MaxConnsPerHost: c.Connections, MaxIdleConns: c.Connections, MaxIdleConnsPerHost: c.Connections,
 		DialContext: benchmarkDialer(c.Timeout).DialContext,
 	}
@@ -367,6 +371,7 @@ func main() {
 	flag.IntVar(&c.BodySize, "body-size", 64, "echo request body bytes (0..1048576)")
 	flag.BoolVar(&c.Chunked, "chunked", false, "send echo request with chunked framing")
 	flag.BoolVar(&c.KeepAlive, "keepalive", true, "reuse connections")
+	flag.BoolVar(&c.Churn, "churn", false, "open a new connection per request (requires -keepalive=false)")
 	flag.DurationVar(&c.Timeout, "timeout", 5*time.Second, "maximum individual request duration")
 	flag.IntVar(&c.Rate, "rate", 0, "fixed requests/second (0 uses saturated closed loop)")
 	flag.IntVar(&c.IdleConnections, "idle-connections", 0, "additional original idle keepalive sockets (/fixed only)")
