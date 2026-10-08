@@ -8,7 +8,9 @@ use std::slice;
 use std::time::{Duration, Instant};
 
 use quiche::h3::NameValue;
-use quiche::{Connection, ConnectionId, ReceiveBudget, ReceiveLimit, ReceiveLimits, RecvInfo, SendInfo};
+use quiche::{
+    Connection, ConnectionId, ReceiveBudget, ReceiveLimit, ReceiveLimits, RecvInfo, SendInfo,
+};
 
 /// Whether provider quiche configs enable TLS early data (0-RTT).
 ///
@@ -30,12 +32,28 @@ fn disable_quic_early_data(_config: &mut quiche::Config) {
     // Intentionally do not call Config::enable_early_data().
 }
 
+/// QPACK dynamic-table capacity advertised by the provider.
+///
+/// Quiche 0.29.3's QPACK decoder has no dynamic-table support (`// TODO: implement
+/// dynamic table` in `h3::qpack::decoder`; any dynamic reference returns
+/// `InvalidHeaderValue` and the h3 layer closes the connection with
+/// `QPACK_DECOMPRESSION_FAILED` = 0x200). The provider therefore advertises a
+/// zero-byte capacity so a conformant peer only emits static-table references.
+/// Keep this at zero while quiche remains static-only; a nonzero value would
+/// invite dynamic references the decoder immediately rejects.
+pub(crate) const PROVIDER_QPACK_MAX_TABLE_CAPACITY: u64 = 0;
+
+/// Blocked-stream budget advertised by the provider.
+///
+/// With `PROVIDER_QPACK_MAX_TABLE_CAPACITY` at zero, no field section can block
+/// on insertions, so the only correct advertisement is zero.
+pub(crate) const PROVIDER_QPACK_BLOCKED_STREAMS: u64 = 0;
+
 const PROVIDER_PEER_BIDI_STREAMS: u64 = 100;
 const PROVIDER_PEER_UNI_STREAMS: u64 = 3;
 const PROVIDER_MAX_STREAM_WINDOW: u64 = 16 * 1024 * 1024;
 const PROVIDER_CONNECTION_WINDOW: u64 =
-    2 * (PROVIDER_PEER_BIDI_STREAMS + PROVIDER_PEER_UNI_STREAMS)
-        * PROVIDER_MAX_STREAM_WINDOW;
+    2 * (PROVIDER_PEER_BIDI_STREAMS + PROVIDER_PEER_UNI_STREAMS) * PROVIDER_MAX_STREAM_WINDOW;
 
 /// Apply shared provider transport settings (including explicit 0-RTT disable).
 fn apply_provider_quic_transport_settings(config: &mut quiche::Config) {
@@ -1162,8 +1180,8 @@ impl QuicServer {
         config.set_send_budget(quiche::SendBudget::new(default_send_limits()));
         let mut http3_config = quiche::h3::Config::new().unwrap();
         http3_config.set_max_field_section_size(32_768);
-        http3_config.set_qpack_max_table_capacity(0);
-        http3_config.set_qpack_blocked_streams(0);
+        http3_config.set_qpack_max_table_capacity(PROVIDER_QPACK_MAX_TABLE_CAPACITY);
+        http3_config.set_qpack_blocked_streams(PROVIDER_QPACK_BLOCKED_STREAMS);
         Ok(Self {
             receive_budget,
             receive_budget_locked: false,
@@ -2607,11 +2625,23 @@ mod tests {
 
     use super::{
         MAX_HTTP3_BUFFERED_RESPONSE_BYTES, MAX_HTTP3_REQUEST_BODY_BYTES, NetQuicServerConfig,
-        PendingRequest, append_bytes, append_request_body, append_u32,
-        completed_request_retained_bytes, net_quic_server_free, net_quic_server_new,
-        reserve_response_bytes,
+        PROVIDER_QPACK_BLOCKED_STREAMS, PROVIDER_QPACK_MAX_TABLE_CAPACITY, PendingRequest,
+        append_bytes, append_request_body, append_u32, completed_request_retained_bytes,
+        net_quic_server_free, net_quic_server_new, reserve_response_bytes,
     };
     use quiche::h3::NameValue;
+
+    #[test]
+    fn qpack_decoder_is_static_only() {
+        assert_eq!(
+            PROVIDER_QPACK_MAX_TABLE_CAPACITY, 0,
+            "quiche 0.29.3 QPACK decoder has no dynamic-table support; capacity must stay 0"
+        );
+        assert_eq!(
+            PROVIDER_QPACK_BLOCKED_STREAMS, 0,
+            "zero capacity makes QPACK blocking impossible; advertise 0 blocked streams"
+        );
+    }
 
     fn insert_idle_transports(server: &mut super::QuicServer, count: u16) {
         let local: SocketAddr = "127.0.0.1:4433".parse().unwrap();
