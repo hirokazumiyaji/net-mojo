@@ -393,6 +393,21 @@ struct Http2ResponseScheduler(Movable):
                 var trailer_bound = (
                     len(trailer_fields) + 32 * trailer_count + 160
                 )
+                # Gate on the worst-case wire bound BEFORE calling the
+                # stateful deflater: deflater.encode mutates the shared
+                # dynamic table, so a deferred emission from a tight
+                # drain would make the next drain re-encode against
+                # entries the peer never received.
+                var trailer_worst_frames = (
+                    trailer_bound + max_frame_size - 1
+                ) // max_frame_size
+                if trailer_worst_frames < 1:
+                    trailer_worst_frames = 1
+                var trailer_worst_bound = (
+                    trailer_bound + trailer_worst_frames * 9
+                )
+                if max_output_bytes - len(output) < trailer_worst_bound:
+                    break
                 var trailer_compressed = List[Byte](
                     length=trailer_bound, fill=0
                 )

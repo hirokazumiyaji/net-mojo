@@ -946,10 +946,18 @@ struct Server(Movable):
                         + response.trailers.value_byte_length(i)
                         + 8
                     )
+                # Response headers and trailers share the local response
+                # header budget; a shared enforcement keeps a handler
+                # that fills the full budget with each from bypassing
+                # the configured limits even when both pass on their own.
+                var combined_count = header_count + len(response.trailers)
+                var combined_bytes = len(headers) + trailer_bytes
                 if (
                     len(response.trailers)
                     > self.config.max_response_headers_count
                     or trailer_bytes > self.config.max_response_headers_bytes
+                    or combined_count > self.config.max_response_headers_count
+                    or combined_bytes > self.config.max_response_headers_bytes
                 ):
                     response.trailers.clear()
             if len(response.trailers) > 0:
@@ -1682,15 +1690,24 @@ struct Server(Movable):
         var trailer_wire = List[Byte]()
         var trailer_field_count = 0
         if len(writer.trailers) > 0:
-            # Keep trailer fields raw; the scheduler encodes them through
-            # the deflater at emission time so any pending HPACK dynamic
-            # table-size update emitted after a peer SETTINGS change
-            # (RFC 7541 §4.2) prefixes the trailer header block.
+            # Share the configured response-header limits between the
+            # response HEADERS and the trailer block: a handler cannot
+            # fill the full budget with each so the combined sections
+            # bypass the local cap. Peer-advertised max_header_list_size
+            # (header_list_size) is enforced separately by the deflater.
+            var trailer_byte_room = max_response_header_bytes - len(field_bytes)
+            if trailer_byte_room < 0:
+                trailer_byte_room = 0
+            var trailer_field_room = (
+                self.config.max_response_headers_count - field_count
+            )
+            if trailer_field_room < 1:
+                trailer_field_room = 1
             var trailer_encoded = encode_http2_response_trailers(
                 writer,
                 is_head,
-                max_response_header_bytes,
-                self.config.max_response_headers_count,
+                trailer_byte_room,
+                trailer_field_room,
             )
             if trailer_encoded.is_valid():
                 trailer_wire = trailer_encoded.fields^
