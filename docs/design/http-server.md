@@ -647,7 +647,8 @@ parser と encoder の単体 fixture は wire bytes を入力または出力し�
 | C10 | buffered response は確定 CL と Date を出力する。HEAD は body を省略し、1xx／204／205／304 は body と CL を省略する。detached streaming は chunked を使う | 9112 §6.3、§7.1。9110 §6.6.1、§8.6、§9.3.2、§15.3.5、§15.3.6、§15.4.5 | R `test_normal_response_has_length_and_date`、`test_head_keeps_length_but_omits_body`、`test_no_body_statuses_drop_body_and_length` は出力 header と body 終端を確認。D `test_detached_response_streaming_chunks` は 3 chunks、zero 終端、接続再利用。304 で CL を省略するのは現在の方針で、条件付き GET の処理を証明しない |
 | C11 | 完全 request 後の EOF は応答後に close、未完 body の EOF は成功応答にしない | 9112 §6.3、§8、§9.6 | S `test_eof_after_complete_responds_then_closes` は 200、body、EOF、接続消滅。`test_eof_after_pipelined_batch_serves_all` は 3 応答。`test_eof_mid_request_closes_without_success` は CL 100 に 3 bytes だけ送り、接続消滅と応答 bytes なしを確認 |
 
-未検証の範囲は、全 request の全分割点、malformed corpus 全件の wire 上の status と close、全 trailer field 定義、全 method／status の意味規則である。
+未検証の範囲は、全 request の全分割点、全 trailer field 定義、全 method／status の意味規則である。
+malformed corpus は `tests/support._malformed_corpus()` を共有辞書とし、`P test_malformed_corpus_matches_parser_status` が parser の status を、`S test_malformed_corpus_wire_closes_connection` が wire 上の status 行と `Connection: close` と EOF をそれぞれ全件確認する。
 HTTP/1 の `scheme` は接続の TLS 状態を表し、平文では `http`、TLS では `https` になる。
 absolute-form の記載 scheme をそのまま公開する契約ではなく、target URI 全体の再構築（9112 §3.3）への適合は別に検証する。
 CONNECT／Upgrade の 400 と、未対応 transfer-coding の一律 400 は実装方針であり、RFC の要求する唯一の応答ではない（9112 §6.1 は未理解 coding に 501 を推奨する）。
