@@ -105,9 +105,11 @@ from net.http._http2.request_session import (
     Http2RequestSession,
     Http2RequestSessionResult,
 )
-from net.http._http2.response_headers import _content_length_matches
+from net.http._http2.response_headers import (
+    _content_length_matches,
+    encode_http2_response_headers,
+)
 from net.http._http2.response_encoder import (
-    encode_http2_response_header_frames,
     encode_http2_response_trailer_frames,
 )
 from net.http._http2.control_frames import encode_rst_stream_frame
@@ -1623,7 +1625,6 @@ struct Server(Movable):
                 self._close_conn(idx)
                 return
 
-        var available = self._budget.remaining() - len(control_output)
         var max_response_header_bytes = self.config.max_response_headers_bytes
         var peer_header_list_size = Int(
             self._conns[idx]
@@ -1636,24 +1637,14 @@ struct Server(Movable):
         var compressed_capacity = max_response_header_bytes
         if compressed_capacity < 256:
             compressed_capacity = 256
-        var compressed = List[Byte](length=compressed_capacity, fill=0)
-        var encoded = encode_http2_response_header_frames(
-            self._conns[idx].http2_deflater.value(),
+        var fields_result = encode_http2_response_headers(
             writer,
             is_head,
             self._tick_date,
-            stream_id,
             max_response_header_bytes,
             self.config.max_response_headers_count,
-            16384,
-            available,
-            Span(compressed),
         )
-        if not encoded.is_complete():
-            if self._conns[idx].http2_deflater.value().is_failed():
-                # Deflater state is poisoned; the whole connection must close.
-                self._close_conn(idx)
-                return
+        if not fields_result.is_valid():
             # Headers failed before HPACK ran (bad field or over the peer's
             # SETTINGS_MAX_HEADER_LIST_SIZE); retry a minimal 500 so sibling
             # streams on the same connection stay alive.
@@ -1661,40 +1652,32 @@ struct Server(Movable):
             writer.headers.clear()
             writer.trailers.clear()
             writer.body.clear()
-            encoded = encode_http2_response_header_frames(
-                self._conns[idx].http2_deflater.value(),
+            fields_result = encode_http2_response_headers(
                 writer,
                 is_head,
                 self._tick_date,
-                stream_id,
                 max_response_header_bytes,
                 self.config.max_response_headers_count,
-                16384,
-                available,
-                Span(compressed),
             )
-            if not encoded.is_complete():
-                if self._conns[idx].http2_deflater.value().is_failed():
-                    self._close_conn(idx)
-                    return
+            if not fields_result.is_valid():
                 self._refuse_http2_stream(idx, stream_id, UInt32(2))
                 return
 
-        var end_on_headers = http2_response_end_on_headers(writer, is_head)
         var response_body = writer.body^
         writer.body = List[Byte]()
         if not has_body_for_status(writer.status, is_head):
             response_body.clear()
             writer.trailers.clear()
-        var headers_wire = encoded.wire^
-        encoded.wire = List[Byte]()
+        var field_bytes = fields_result.fields^
+        fields_result.fields = List[Byte]()
+        var field_count = fields_result.field_count
 
         var trailer_wire = List[Byte]()
         if len(writer.trailers) > 0:
             var trailer_room = (
                 self._budget.remaining()
                 - len(control_output)
-                - len(headers_wire)
+                - len(field_bytes)
                 - len(response_body)
             )
             if trailer_room < 0:
@@ -1713,21 +1696,21 @@ struct Server(Movable):
             if trailer_encoded.is_complete():
                 trailer_wire = trailer_encoded.wire^
                 trailer_encoded.wire = List[Byte]()
-            # Trailer encoding never touches the HPACK deflater, so a
-            # failure cannot poison connection state; dropping the section
-            # is safe.
 
         var response_reservation = (
-            len(headers_wire) + len(response_body) + len(trailer_wire)
+            len(field_bytes) + len(response_body) + len(trailer_wire)
         )
         if not self._budget.try_reserve(response_reservation):
             self._refuse_http2_stream(idx, stream_id, UInt32(7))
             return
         if not self._conns[idx].http2_responses.enqueue(
             stream_id,
-            headers_wire^,
+            field_bytes^,
+            field_count,
+            max_response_header_bytes,
+            self.config.max_response_headers_count,
+            compressed_capacity,
             response_body^,
-            end_on_headers,
             trailer_wire^,
         ):
             self._budget.release(response_reservation)
@@ -1781,14 +1764,23 @@ struct Server(Movable):
             or self._conns[idx].pending_remaining() > 0
         ):
             return
+        if not self._conns[idx].http2_deflater:
+            return
         var batch = self._conns[idx].http2_responses.drain(
-            self._conns[idx].http2_session.value(), 16384, 65536
+            self._conns[idx].http2_session.value(),
+            self._conns[idx].http2_deflater.value(),
+            self._tick_date,
+            16384,
+            65536,
         )
         if batch.released_bytes > 0:
             self._budget.release(batch.released_bytes)
             self._conns[
                 idx
             ].http2_response_bytes_reserved -= batch.released_bytes
+        if batch.deflater_failed:
+            self._close_conn(idx)
+            return
         if len(batch.wire) == 0:
             if self._conns[idx].http2_responses.queued_count() > 0:
                 # Still waiting for WINDOW_UPDATE credit; keep the write
