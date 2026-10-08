@@ -28,6 +28,8 @@ struct _PendingHttp2Response(Movable):
     var stream_id: UInt32
     var header_fields: List[Byte]
     var header_field_count: Int
+    var reserved_header_bytes: Int
+    var reserved_body_bytes: Int
     var max_header_list_size: Int
     var max_header_fields: Int
     var compressed_capacity: Int
@@ -80,10 +82,14 @@ struct Http2ResponseScheduler(Movable):
         for i in range(len(self._responses)):
             if self._responses[i].stream_id == stream_id:
                 return False
+        var reserved_header_bytes = len(header_fields)
+        var reserved_body_bytes = len(body)
         var response = _PendingHttp2Response(
             stream_id=stream_id,
             header_fields=header_fields^,
             header_field_count=header_field_count,
+            reserved_header_bytes=reserved_header_bytes,
+            reserved_body_bytes=reserved_body_bytes,
             max_header_list_size=max_header_list_size,
             max_header_fields=max_header_fields,
             compressed_capacity=compressed_capacity,
@@ -103,8 +109,9 @@ struct Http2ResponseScheduler(Movable):
         var index = self._find(stream_id)
         if index < 0:
             return 0
-        var released = len(self._responses[index].header_fields) + len(
-            self._responses[index].body
+        var released = (
+            self._responses[index].reserved_header_bytes
+            + self._responses[index].reserved_body_bytes
         )
         self._remove(index)
         return released
@@ -121,18 +128,18 @@ struct Http2ResponseScheduler(Movable):
         if index < 0:
             return Http2PeerResetResult(released_bytes=0, kept_headers=False)
         if not self._responses[index].headers_sent:
-            var released = len(self._responses[index].header_fields) + len(
-                self._responses[index].body
+            var released = (
+                self._responses[index].reserved_header_bytes
+                + self._responses[index].reserved_body_bytes
             )
             self._remove(index)
             return Http2PeerResetResult(
                 released_bytes=released, kept_headers=False
             )
-        var body_bytes = len(self._responses[index].body) - (
-            self._responses[index].body_offset
-        )
+        var body_bytes = self._responses[index].reserved_body_bytes
         self._responses[index].body = List[Byte]()
         self._responses[index].body_offset = 0
+        self._responses[index].reserved_body_bytes = 0
         self._responses[index].cancelled = True
         return Http2PeerResetResult(
             released_bytes=body_bytes, kept_headers=True
@@ -172,8 +179,9 @@ struct Http2ResponseScheduler(Movable):
 
             if not self._responses[index].headers_sent:
                 if self._responses[index].cancelled:
-                    released += len(self._responses[index].header_fields) + len(
-                        self._responses[index].body
+                    released += (
+                        self._responses[index].reserved_header_bytes
+                        + self._responses[index].reserved_body_bytes
                     )
                     self._remove(index)
                     continue
@@ -205,20 +213,24 @@ struct Http2ResponseScheduler(Movable):
                     output.extend(Span(rst.wire))
                     session.finish_response(stream_id)
                     completed.append(stream_id)
-                    released += len(self._responses[index].header_fields) + len(
-                        self._responses[index].body
+                    released += (
+                        self._responses[index].reserved_header_bytes
+                        + self._responses[index].reserved_body_bytes
                     )
                     self._remove(index)
                     skipped = 0
                     continue
                 self._responses[index].headers_sent = True
                 skipped = 0
-                if len(self._responses[index].body) == 0 and (
+                if self._responses[index].end_on_headers and (
                     not self._responses[index].cancelled
                 ):
                     session.finish_response(stream_id)
                     completed.append(stream_id)
-                    released += len(self._responses[index].header_fields)
+                    released += (
+                        self._responses[index].reserved_header_bytes
+                        + self._responses[index].reserved_body_bytes
+                    )
                     self._remove(index)
                     continue
 
@@ -232,7 +244,10 @@ struct Http2ResponseScheduler(Movable):
                     output.extend(Span(rst.wire))
                 session.finish_response(stream_id)
                 completed.append(stream_id)
-                released += len(self._responses[index].header_fields)
+                released += (
+                    self._responses[index].reserved_header_bytes
+                    + self._responses[index].reserved_body_bytes
+                )
                 self._remove(index)
                 continue
 
@@ -279,8 +294,9 @@ struct Http2ResponseScheduler(Movable):
             if end_stream:
                 session.finish_response(stream_id)
                 completed.append(stream_id)
-                released += len(self._responses[index].header_fields) + len(
-                    self._responses[index].body
+                released += (
+                    self._responses[index].reserved_header_bytes
+                    + self._responses[index].reserved_body_bytes
                 )
                 self._remove(index)
             elif len(self._responses) > 0:
@@ -335,8 +351,6 @@ struct Http2ResponseScheduler(Movable):
             self._responses[index].header_fields = retry_fields^
             self._responses[index].header_field_count = retry_count
             self._responses[index].end_on_headers = True
-            self._responses[index].body = List[Byte]()
-            self._responses[index].body_offset = 0
             attempt = retry.copy()
         var compressed_len = attempt.output_length
         var frame_count = (
