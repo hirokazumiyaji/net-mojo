@@ -11,9 +11,11 @@ from net.http._http2.control_frames import parse_goaway_frame
 from net.http._http2.window_update import parse_window_update_frame
 from net.http._http2.response_encoder import (
     encode_http2_response_header_frames,
-    encode_http2_response_trailer_frames,
 )
-from net.http._http2.response_headers import encode_http2_response_headers
+from net.http._http2.response_headers import (
+    encode_http2_response_headers,
+    encode_http2_response_trailers,
+)
 from net.http._http2.request_headers import decode_http2_request_headers
 from net.http.response import ResponseWriter
 from net.http.request import HttpVersion
@@ -1484,32 +1486,19 @@ def test_http2_scheduler_lazy_encode_keeps_single_inflater_in_sync() raises:
     assert_equal(decoded_streams[1], UInt32(3))
 
 
-def _encode_trailer_wire(
-    mut writer: ResponseWriter,
-    stream_id: UInt32,
-) raises -> List[Byte]:
-    var encoded = encode_http2_response_trailer_frames(
-        writer,
-        False,
-        stream_id,
-        4096,
-        32,
-        16384,
-        1024,
-    )
-    assert_true(encoded.is_complete())
-    var wire = encoded.wire^
-    encoded.wire = List[Byte]()
-    return wire^
-
-
 def _enqueue_from_writer(
     mut scheduler: Http2ResponseScheduler,
     stream_id: UInt32,
     var body: List[Byte],
     mut writer: ResponseWriter,
 ) raises -> Bool:
-    var trailers = _encode_trailer_wire(writer, stream_id)
+    var trailer_encoded = encode_http2_response_trailers(
+        writer, False, 4096, 32
+    )
+    assert_true(trailer_encoded.is_valid())
+    var trailer_fields = trailer_encoded.fields^
+    trailer_encoded.fields = List[Byte]()
+    var trailer_count = trailer_encoded.field_count
     writer.write(Span(body))
     var fields = encode_http2_response_headers(
         writer, False, "Thu, 01 Jan 1970 00:00:00 GMT", 4096, 32
@@ -1526,7 +1515,8 @@ def _enqueue_from_writer(
         32,
         4096,
         body^,
-        trailers=trailers^,
+        trailers=trailer_fields^,
+        trailer_field_count=trailer_count,
     )
 
 
@@ -1912,6 +1902,69 @@ def test_http2_scheduler_empty_body_with_trailers_emits_both_blocks() raises:
     assert_equal(header_frames, 2)
     assert_equal(header_end_streams, 0)
     assert_equal(trailer_end_streams, 1)
+
+
+def test_http2_scheduler_defers_trailer_block_when_output_room_is_tight() raises:
+    # Regression (RFC 9113 §6.10): the trailer HEADERS block must appear
+    # on the wire contiguously. If the drain batch cannot fit the full
+    # block, the scheduler must defer it rather than emit a prefix that
+    # a later control frame could interleave.
+    var session = Http2RequestSession("build/http2/libnet_hpack", 4, 1024)
+    _bootstrap_session(session)
+    var compressed: List[Byte] = [0x82, 0x86, 0x84, 0x01, 0x01, Byte(ord("x"))]
+    var opening = List[Byte]()
+    _append_frame(opening, Byte(1), Byte(5), UInt32(1), Span(compressed))
+    assert_true(session.consume(Span(opening)).is_request())
+
+    # A ~700-byte trailer value makes the trailer block bigger than any
+    # per-drain residual the body phase leaves below.
+    var writer = ResponseWriter(2048)
+    writer.set_status(200)
+    writer.add_trailer(String("x-digest"), String("Z") * 700)
+
+    var scheduler = Http2ResponseScheduler()
+    var deflater = _make_deflater()
+    # Body: 300 bytes. First drain: budget 500. Enough for response
+    # HEADERS (~120 B) + DATA(300 B) + its 9-byte frame = ~429 B, but
+    # not enough left (~70 B) for the ~730-byte trailer block.
+    var body = List[Byte]()
+    for _ in range(300):
+        body.append(Byte(ord("A")))
+    _enqueue_with_trailers(scheduler, UInt32(1), body^, writer)
+
+    var tight = scheduler.drain(
+        session, deflater, "Thu, 01 Jan 1970 00:00:00 GMT", 16384, 500
+    )
+    assert_equal(len(tight.completed_streams), 0)
+    var tight_header_frames = 0
+    var tight_offset = 0
+    while tight_offset < len(tight.wire):
+        var frame = parse_frame(Span(tight.wire)[tight_offset:])
+        assert_true(frame.is_complete())
+        if frame.frame_type == Byte(1):
+            tight_header_frames += 1
+        tight_offset += frame.consumed
+    # Only response HEADERS went out; the trailer block was deferred.
+    assert_equal(tight_header_frames, 1)
+
+    # Second drain has full room, so the deferred trailer block emits
+    # atomically and the stream completes.
+    var completing = scheduler.drain(
+        session, deflater, "Thu, 01 Jan 1970 00:00:00 GMT", 16384, 65536
+    )
+    assert_equal(len(completing.completed_streams), 1)
+    assert_equal(completing.completed_streams[0], UInt32(1))
+    var trailer_header_frames = 0
+    var trailer_offset = 0
+    while trailer_offset < len(completing.wire):
+        var frame = parse_frame(Span(completing.wire)[trailer_offset:])
+        assert_true(frame.is_complete())
+        if frame.frame_type == Byte(1):
+            trailer_header_frames += 1
+            assert_equal(frame.flags & Byte(1), Byte(1))
+            assert_equal(frame.flags & Byte(4), Byte(4))
+        trailer_offset += frame.consumed
+    assert_equal(trailer_header_frames, 1)
 
 
 def main() raises:

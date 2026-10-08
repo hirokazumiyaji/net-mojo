@@ -40,6 +40,7 @@ struct _PendingHttp2Response(Movable):
     var body: List[Byte]
     var body_offset: Int
     var trailers: List[Byte]
+    var trailer_field_count: Int
     var trailers_offset: Int
     var trailers_sent: Bool
     var cancelled: Bool
@@ -77,6 +78,7 @@ struct Http2ResponseScheduler(Movable):
         compressed_capacity: Int,
         var body: List[Byte],
         var trailers: List[Byte] = List[Byte](),
+        trailer_field_count: Int = 0,
     ) -> Bool:
         if stream_id == UInt32(0) or header_field_count <= 0:
             return False
@@ -104,6 +106,7 @@ struct Http2ResponseScheduler(Movable):
             body=body^,
             body_offset=0,
             trailers=trailers^,
+            trailer_field_count=trailer_field_count,
             trailers_offset=0,
             trailers_sent=False,
             cancelled=False,
@@ -201,18 +204,28 @@ struct Http2ResponseScheduler(Movable):
                     )
                     self._remove(index)
                     continue
-                # HPACK compresses literal fields; the queued field block is
-                # a safe upper bound on the deflater's compressed output. The
-                # pre-allocated `compressed_capacity` can exceed one drain
-                # batch, so gate on this tighter per-response estimate so the
-                # drain never breaks before it can emit anything.
-                var field_bound = len(self._responses[index].header_fields)
+                # True upper bound on the compressed block matching
+                # nghttp2_hd_deflate_bound = sum(name+value+32) + 128.
+                # The queued buffer carries 8 bytes of (name_len,
+                # value_len) overhead per field, so add 24 bytes per
+                # field plus 128 bytes head room for a dynamic-table-
+                # size-update prefix (RFC 7541 §4.2) and nghttp2 slack.
+                # Cap by `compressed_capacity` so the gate never asks
+                # for more than the deflater can actually emit.
+                var raw_len = len(self._responses[index].header_fields)
+                var hpack_bound = (
+                    raw_len
+                    + 24 * self._responses[index].header_field_count
+                    + 128
+                )
+                if hpack_bound > self._responses[index].compressed_capacity:
+                    hpack_bound = self._responses[index].compressed_capacity
                 var worst_frames = (
-                    field_bound + max_frame_size - 1
+                    hpack_bound + max_frame_size - 1
                 ) // max_frame_size
                 if worst_frames < 1:
                     worst_frames = 1
-                var upper_bound = field_bound + worst_frames * 9
+                var upper_bound = hpack_bound + worst_frames * 9
                 if max_output_bytes - len(output) < upper_bound:
                     break
                 var end_on_headers = (
@@ -355,30 +368,54 @@ struct Http2ResponseScheduler(Movable):
                     continue
 
             if body_done and len(self._responses[index].trailers) > 0:
-                var remaining_trailers = (
-                    len(self._responses[index].trailers)
-                    - self._responses[index].trailers_offset
+                # Encode the trailer header block through the deflater at
+                # emission time: any pending dynamic-table-size update
+                # (RFC 7541 §4.2) that followed a peer SETTINGS change
+                # prefixes the trailer block, and the HPACK dynamic-table
+                # state matches what the inflater will see because no
+                # other block runs between encode and send on the single
+                # connection deflater. The whole HEADERS + CONTINUATION
+                # chain is also written to `output` atomically so later
+                # control frames (PING/SETTINGS ACK, RST, other streams)
+                # cannot interleave inside the block (RFC 9113 §6.10).
+                ref trailer_fields = self._responses[index].trailers
+                var trailer_count = self._responses[index].trailer_field_count
+                var trailer_max_hls = self._responses[
+                    index
+                ].max_header_list_size
+                var trailer_max_fields = self._responses[
+                    index
+                ].max_header_fields
+                # nghttp2_hd_deflate_bound = sum(name+value+32) + 128.
+                # Add 32 bytes to cover a dynamic-table-size-update prefix
+                # (RFC 7541 §4.2) that nghttp2 may emit after a peer
+                # SETTINGS change (10-byte varint worst case).
+                var trailer_bound = (
+                    len(trailer_fields) + 32 * trailer_count + 160
                 )
-                var trailer_room = max_output_bytes - len(output)
-                if trailer_room <= 0:
-                    break
-                var trailer_chunk = remaining_trailers
-                if trailer_chunk > trailer_room:
-                    trailer_chunk = trailer_room
-                var trailer_start = self._responses[index].trailers_offset
-                output.extend(
-                    Span(self._responses[index].trailers)[
-                        trailer_start : trailer_start + trailer_chunk
-                    ]
+                var trailer_compressed = List[Byte](
+                    length=trailer_bound, fill=0
                 )
-                self._responses[index].trailers_offset = (
-                    trailer_start + trailer_chunk
+                var trailer_encode = deflater.encode(
+                    Span(trailer_fields),
+                    trailer_max_hls,
+                    trailer_max_fields,
+                    Span(trailer_compressed),
                 )
-                skipped = 0
-                if self._responses[index].trailers_offset == len(
-                    self._responses[index].trailers
-                ):
-                    self._responses[index].trailers_sent = True
+                if trailer_encode.is_invalid():
+                    return Http2ScheduledOutput(
+                        wire=output^,
+                        completed_streams=completed^,
+                        released_bytes=released,
+                        deflater_failed=True,
+                    )
+                if trailer_encode.is_too_large():
+                    var rst = encode_rst_stream_frame(stream_id, UInt32(2))
+                    if not rst.is_complete() or len(rst.wire) > (
+                        max_output_bytes - len(output)
+                    ):
+                        break
+                    output.extend(Span(rst.wire))
                     session.finish_response(stream_id)
                     completed.append(stream_id)
                     released += (
@@ -387,8 +424,51 @@ struct Http2ResponseScheduler(Movable):
                         + self._responses[index].reserved_trailer_bytes
                     )
                     self._remove(index)
+                    skipped = 0
                     continue
-                break
+                var trailer_compressed_len = trailer_encode.output_length
+                var trailer_frame_count = (
+                    trailer_compressed_len + max_frame_size - 1
+                ) // max_frame_size
+                if trailer_frame_count < 1:
+                    trailer_frame_count = 1
+                var trailer_wire_bound = (
+                    trailer_compressed_len + trailer_frame_count * 9
+                )
+                if max_output_bytes - len(output) < trailer_wire_bound:
+                    # Full block does not fit this drain; wait for the
+                    # next one. `trailer_count` and the fields buffer stay
+                    # intact so the next drain repeats this encode.
+                    break
+                var trailer_frames = encode_headers_block(
+                    stream_id,
+                    Span(trailer_compressed)[0:trailer_compressed_len],
+                    True,
+                    max_frame_size,
+                    trailer_wire_bound,
+                )
+                if not trailer_frames.is_complete():
+                    deflater.fail()
+                    return Http2ScheduledOutput(
+                        wire=output^,
+                        completed_streams=completed^,
+                        released_bytes=released,
+                        deflater_failed=True,
+                    )
+                _ = trailer_count
+                output.extend(Span(trailer_frames.wire))
+                self._responses[index].trailers_offset = len(trailer_fields)
+                skipped = 0
+                self._responses[index].trailers_sent = True
+                session.finish_response(stream_id)
+                completed.append(stream_id)
+                released += (
+                    self._responses[index].reserved_header_bytes
+                    + self._responses[index].reserved_body_bytes
+                    + self._responses[index].reserved_trailer_bytes
+                )
+                self._remove(index)
+                continue
 
         return Http2ScheduledOutput(
             wire=output^,
