@@ -132,6 +132,27 @@ measure the QUIC engine's total retained memory.
 
 The QUIC engine supplies HTTP/3 control and QPACK behavior; the application does
 not implement duplicate control streams or a second QPACK implementation.
+
+### QPACK: static-only, blocking impossible by design
+
+Quiche 0.29.3's QPACK decoder has no dynamic-table support (its
+`h3::qpack::decoder` module rejects every dynamic reference with
+`Error::InvalidHeaderValue`, which the h3 layer converts into a connection
+close with `QPACK_DECOMPRESSION_FAILED` = 0x200). The provider therefore
+advertises `SETTINGS_QPACK_MAX_TABLE_CAPACITY = 0` and
+`SETTINGS_QPACK_BLOCKED_STREAMS = 0` (see
+`PROVIDER_QPACK_MAX_TABLE_CAPACITY` / `PROVIDER_QPACK_BLOCKED_STREAMS` in
+`net/quic/provider/src/lib.rs`): conformant peers emit only static-table
+references and the server owns no QPACK dynamic-table or blocked-section
+memory, so the per-connection memory estimate below does not account for a
+decoder table. A peer that ignores the advertised zero capacity and emits a
+dynamic-table reference triggers the quiche decoder's rejection path; the
+server closes the connection with 0x200 and releases the connection state as
+part of normal connection teardown. `scripts/test_http3_server.py` includes an
+interop scenario that crafts a HEADERS frame referencing dynamic index 0 and
+asserts the server closes the connection with 0x200. Enabling a nonzero
+capacity would invite dynamic-table references the decoder cannot honor; keep
+the invariant until quiche gains a dynamic-table decoder.
 Interoperability coverage currently uses aioquic 1.3.0 and quiche. Issue #42
 remaining PRs close the previously open gaps on sibling branches (not all
 present in every worktree tip):
