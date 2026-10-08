@@ -924,6 +924,12 @@ def test_add_trailer_rejects_forbidden_names() raises:
         String("Authorization"),
         String("WWW-Authenticate"),
         String("Proxy-Authenticate"),
+        String("Cache-Control"),
+        String("Vary"),
+        String("Set-Cookie"),
+        String("Age"),
+        String("Expires"),
+        String("Pragma"),
     ]
     for name in forbidden:
         var writer = ResponseWriter(32)
