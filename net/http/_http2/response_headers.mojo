@@ -142,3 +142,20 @@ def encode_http2_response_headers(
             return Http2ResponseHeadersResult.error()
 
     return Http2ResponseHeadersResult.valid(fields^, field_count, send_body)
+
+
+def encode_http2_minimal_500_fields(
+    date: StringSlice, max_header_list_size: Int, max_fields: Int
+) -> Http2ResponseHeadersResult:
+    """Builds a fallback 500 field list for the scheduler to retry when
+    HPACK encoding of the normal headers does not fit the compressed
+    buffer. The 500 response carries no body, so the HEADERS frame can
+    close the stream and the dynamic table only sees the minimal fields.
+    """
+    if max_header_list_size < 0 or max_fields < 2:
+        return Http2ResponseHeadersResult.error()
+    var writer = ResponseWriter(0)
+    writer.status = 500
+    return encode_http2_response_headers(
+        writer, False, date, max_header_list_size, max_fields
+    )
