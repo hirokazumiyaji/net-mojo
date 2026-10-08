@@ -205,6 +205,7 @@ class H2Peer:
         self._conn.send_headers(stream_id, headers, end_stream=end_stream_on_headers)
         if body:
             off = 0
+            upload_deadline = time.perf_counter() + TIMEOUT_S
             while off < len(body):
                 size = min(MAX_FRAME, len(body) - off)
                 chunk = body[off : off + size]
@@ -215,12 +216,17 @@ class H2Peer:
                     )
                 except FlowControlError:
                     self._flush()
-                    deadline = time.perf_counter() + TIMEOUT_S
                     while (
                         self._conn.local_flow_control_window(stream_id) < size
-                        and time.perf_counter() < deadline
+                        and time.perf_counter() < upload_deadline
                     ):
-                        self.pump(deadline)
+                        self.pump(upload_deadline)
+                    if (
+                        self._conn.local_flow_control_window(stream_id) < size
+                    ):
+                        raise RuntimeError(
+                            "upload stalled: peer stopped granting flow control credit"
+                        )
                     continue
                 off += size
         self._flush()
