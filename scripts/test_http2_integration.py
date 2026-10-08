@@ -421,6 +421,221 @@ def case_stalled_stream_sibling_progresses(port: int) -> None:
         peer.close()
 
 
+def case_shutdown_goaway_drains_in_flight(port: int) -> None:
+    """Server-initiated shutdown: one in-flight flow-blocked response
+    completes after the client opens its window, a new stream submitted
+    after GOAWAY is refused, and the connection closes once the first
+    stream finishes.
+
+    Uses raw framing throughout so h2's client state machine (which marks
+    the connection CLOSED on GOAWAY) does not interfere with the drain."""
+    from hpack import Decoder, Encoder  # type: ignore[import-not-found]
+
+    raw = socket.create_connection(("127.0.0.1", port), timeout=TIMEOUT_S)
+    sock = _h2_context().wrap_socket(raw, server_hostname="localhost")
+    try:
+        sock.sendall(
+            b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n"
+            + b"\x00\x00\x00\x04\x00\x00\x00\x00\x00"
+        )
+        encoder = Encoder()
+        decoder = Decoder()
+        streams: Dict[int, Dict] = {}
+
+        def record(stream_id: int) -> Dict:
+            return streams.setdefault(
+                stream_id,
+                {"status": None, "body": bytearray(), "ended": False, "reset": None},
+            )
+
+        def frame(frame_type: int, flags: int, stream_id: int, payload: bytes) -> bytes:
+            return (
+                len(payload).to_bytes(3, "big")
+                + bytes([frame_type, flags])
+                + stream_id.to_bytes(4, "big")
+                + payload
+            )
+
+        def send_headers_frame(
+            stream_id: int, path: bytes, end_stream: bool = True
+        ) -> None:
+            block = encoder.encode(
+                [
+                    (b":method", b"GET"),
+                    (b":scheme", b"https"),
+                    (b":authority", b"localhost"),
+                    (b":path", path),
+                ]
+            )
+            flags = 0x04 | (0x01 if end_stream else 0x00)
+            sock.sendall(frame(0x01, flags, stream_id, block))
+
+        # Open a 1 MiB connection-level receive window so stall is
+        # bounded by the per-stream window alone.
+        sock.sendall(frame(0x08, 0x00, 0, (1 << 20).to_bytes(4, "big")))
+
+        goaway_last_id: Optional[int] = None
+        goaway_error: Optional[int] = None
+        connection_closed = False
+
+        def read_frame(deadline: float) -> Optional[Tuple[int, int, int, bytes]]:
+            header = bytearray()
+            while len(header) < 9:
+                remaining = max(0.0, deadline - time.perf_counter())
+                sock.settimeout(min(POLL_INTERVAL_S, remaining) if remaining else 0.0)
+                try:
+                    chunk = sock.recv(9 - len(header))
+                except (socket.timeout, ssl.SSLWantReadError):
+                    if time.perf_counter() >= deadline:
+                        return None
+                    continue
+                except (OSError, ssl.SSLError):
+                    return None
+                if not chunk:
+                    return None
+                header.extend(chunk)
+            length = int.from_bytes(header[:3], "big")
+            frame_type = header[3]
+            flags = header[4]
+            stream_id = int.from_bytes(header[5:9], "big") & 0x7FFFFFFF
+            payload = bytearray()
+            while len(payload) < length:
+                try:
+                    chunk = sock.recv(length - len(payload))
+                except (OSError, ssl.SSLError):
+                    return None
+                if not chunk:
+                    return None
+                payload.extend(chunk)
+            return frame_type, flags, stream_id, bytes(payload)
+
+        def drive(deadline: float, condition) -> None:
+            nonlocal goaway_last_id, goaway_error, connection_closed
+            while time.perf_counter() < deadline and not condition():
+                parsed = read_frame(deadline)
+                if parsed is None:
+                    connection_closed = True
+                    return
+                frame_type, flags, stream_id, payload = parsed
+                if frame_type == 0x04 and (flags & 0x01) == 0:
+                    sock.sendall(frame(0x04, 0x01, 0, b""))
+                elif frame_type == 0x04:
+                    pass
+                elif frame_type == 0x08:
+                    pass
+                elif frame_type == 0x06 and (flags & 0x01) == 0:
+                    sock.sendall(frame(0x06, 0x01, 0, payload))
+                elif frame_type == 0x01 and stream_id:
+                    decoded = decoder.decode(payload)
+                    rec = record(stream_id)
+                    for name, value in decoded:
+                        if name == ":status":
+                            rec["status"] = int(value)
+                    if flags & 0x01:
+                        rec["ended"] = True
+                elif frame_type == 0x00 and stream_id:
+                    rec = record(stream_id)
+                    rec["body"].extend(payload)
+                    if flags & 0x01:
+                        rec["ended"] = True
+                elif frame_type == 0x03 and stream_id:
+                    code = int.from_bytes(payload[:4], "big")
+                    rec = record(stream_id)
+                    rec["reset"] = code
+                    rec["ended"] = True
+                elif frame_type == 0x07 and stream_id == 0:
+                    goaway_last_id = int.from_bytes(payload[:4], "big") & 0x7FFFFFFF
+                    goaway_error = int.from_bytes(payload[4:8], "big")
+
+        # 1) Stall stream 1 on withheld credit (never ACK data for stream 1).
+        stall_id = 1
+        send_headers_frame(stall_id, b"/large", end_stream=True)
+        drive(
+            time.perf_counter() + 3.0,
+            lambda: streams.get(stall_id, {}).get("status") == 200
+            and len(streams.get(stall_id, {}).get("body") or b"") >= INITIAL_WINDOW,
+        )
+        rec1 = streams.get(stall_id)
+        _assert(rec1 is not None and rec1["status"] == 200, f"stall precondition {rec1!r}")
+        _assert(
+            len(rec1["body"]) >= INITIAL_WINDOW,
+            f"stall body only {len(rec1['body'])} bytes (want >= {INITIAL_WINDOW})",
+        )
+        _assert(not rec1["ended"], "stall stream ended before shutdown")
+
+        # 2) Trigger server shutdown via a short second stream.
+        trigger_id = 3
+        send_headers_frame(trigger_id, b"/trigger-shutdown", end_stream=True)
+        drive(
+            time.perf_counter() + TIMEOUT_S,
+            lambda: streams.get(trigger_id, {}).get("ended", False),
+        )
+        rec_trigger = streams.get(trigger_id)
+        _assert(
+            rec_trigger is not None and rec_trigger["status"] == 200,
+            f"trigger-shutdown status {rec_trigger!r}",
+        )
+        _assert(
+            bytes(rec_trigger["body"]) == b"shutdown requested",
+            f"trigger-shutdown body {rec_trigger['body']!r}",
+        )
+
+        # 3) Wait for GOAWAY from the server.
+        drive(
+            time.perf_counter() + TIMEOUT_S,
+            lambda: goaway_last_id is not None,
+        )
+        _assert(
+            goaway_error == 0,
+            f"shutdown GOAWAY error code {goaway_error!r}",
+        )
+        _assert(
+            goaway_last_id is not None and goaway_last_id >= trigger_id,
+            f"GOAWAY last_stream_id {goaway_last_id!r} < trigger {trigger_id}",
+        )
+
+        # 4) Open a new stream after GOAWAY and verify REFUSED_STREAM (7).
+        refused_id = (goaway_last_id or trigger_id) + 2
+        if refused_id % 2 == 0:
+            refused_id += 1
+        send_headers_frame(refused_id, b"/sibling", end_stream=True)
+        drive(
+            time.perf_counter() + TIMEOUT_S,
+            lambda: streams.get(refused_id, {}).get("reset") is not None,
+        )
+        rec_refused = streams.get(refused_id)
+        _assert(
+            rec_refused is not None and rec_refused["reset"] == 7,
+            f"post-GOAWAY stream reset {rec_refused!r} (want REFUSED_STREAM=7)",
+        )
+
+        # 5) Open the stream window generously so the stalled response
+        # can finish regardless of how much the server has already sent.
+        sock.sendall(frame(0x08, 0x00, stall_id, (1 << 20).to_bytes(4, "big")))
+        drive(
+            time.perf_counter() + TIMEOUT_S,
+            lambda: streams.get(stall_id, {}).get("ended", False),
+        )
+        rec1 = streams.get(stall_id)
+        _assert(
+            rec1["ended"] and rec1["reset"] is None,
+            f"stall stream after release {rec1!r}",
+        )
+        _assert(
+            len(rec1["body"]) == 128 * 1024,
+            f"stall final body {len(rec1['body'])} bytes",
+        )
+
+        # 6) Server closes the connection: EOF.
+        drive(time.perf_counter() + TIMEOUT_S, lambda: connection_closed)
+        _assert(connection_closed, "server did not close connection after drain")
+    finally:
+        try:
+            sock.close()
+        except OSError:
+            pass
+
+
 def case_client_sent_goaway(port: int) -> None:
     """A client-initiated GOAWAY on the connection must let an in-flight
     stream complete and then the server closes."""
@@ -528,6 +743,9 @@ def _run_cases(port: int) -> None:
     case_stalled_stream_sibling_progresses(port)
     case_client_sent_goaway(port)
     case_alpn_mismatch_and_absent(port)
+    # Terminal case: shuts the fixture down via /trigger-shutdown; no
+    # /shutdown call afterwards.
+    case_shutdown_goaway_drains_in_flight(port)
 
 
 def main() -> None:
@@ -540,7 +758,6 @@ def main() -> None:
     try:
         port = _wait_ready(proc)
         _run_cases(port)
-        _shutdown(port)
         rc = proc.wait(timeout=30)
         if rc != 0:
             raise RuntimeError(

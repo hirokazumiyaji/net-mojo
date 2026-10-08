@@ -17,6 +17,11 @@ struct _IntegrationHandler(Handler):
             writer.set_should_close(True)
             writer.write_string("bye")
             return
+        if req.path == "/trigger-shutdown":
+            self.shutdown = True
+            writer.set_status(200)
+            writer.write_string("shutdown requested")
+            return
         if req.path == "/echo":
             writer.set_status(200)
             writer.headers.add(String("Content-Type"), String("text/plain"))

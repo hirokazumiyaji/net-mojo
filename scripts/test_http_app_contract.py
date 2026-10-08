@@ -534,6 +534,41 @@ def case_body_over_limit(port: int) -> None:
         h2.close()
 
 
+def case_content_length_mismatch(port: int) -> None:
+    """H1: handler-set Content-Length that disagrees with the written body
+    is caught by the H1 encoder (NetError on the mismatch), the server
+    sends 500 and closes.  H2: the response-header encoder flags the same
+    disagreement, retries with an empty 500, and the sibling stream on the
+    same connection still succeeds."""
+    h1 = H1Client(port)
+    try:
+        r1 = h1.request("GET", "/cl-mismatch")
+        _assert(
+            r1.status == 500,
+            f"H1 CL mismatch: expected 500, got {r1.status}",
+        )
+    finally:
+        h1.close()
+    h2 = H2Client(port)
+    try:
+        r2 = h2.request("GET", "/cl-mismatch")
+        _assert(
+            r2.status == 500,
+            f"H2 CL mismatch: expected 500, got status={r2.status} reset={r2.reset_code}",
+        )
+        _assert(
+            not h2.terminated(),
+            "H2 CL mismatch unexpectedly closed the connection",
+        )
+        rsib = h2.request("GET", "/sibling")
+        _assert(
+            rsib.status == 200 and rsib.body == b"sibling ok",
+            f"H2 sibling after CL mismatch {rsib!r}",
+        )
+    finally:
+        h2.close()
+
+
 def case_hop_by_hop_headers(h1: H1Client, h2: H2Client) -> None:
     # Handler-set Connection and Keep-Alive are valid on H1 and must be
     # silently dropped on H2 without closing the connection (RFC 9113 §8.2.2).
@@ -597,6 +632,7 @@ def _run_cases(port: int) -> None:
     case_head_no_body(port)
     case_handler_error_sibling_survives(port)
     case_body_over_limit(port)
+    case_content_length_mismatch(port)
 
 
 def main() -> None:

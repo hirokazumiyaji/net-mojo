@@ -72,6 +72,11 @@ struct _ContractHandler(Handler):
             writer.set_status(200)
             writer.write_string("sibling ok")
             return
+        if req.path == "/cl-mismatch":
+            writer.set_status(200)
+            writer.headers.add(String("Content-Length"), String("100"))
+            writer.write_string("short")
+            return
         writer.set_status(404)
         writer.write_string("missing")
 
