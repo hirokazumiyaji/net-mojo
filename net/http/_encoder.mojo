@@ -322,7 +322,14 @@ def _render_response[
             trailer_list_bytes += name_len
             if i + 1 < len(writer.trailers):
                 trailer_list_bytes += 2
-        if header_bytes + trailer_bytes + trailer_list_bytes > max_bytes:
+        var trailer_framing_bytes = 28 + 11
+        if (
+            header_bytes
+            + trailer_bytes
+            + trailer_list_bytes
+            + trailer_framing_bytes
+            > max_bytes
+        ):
             raise NetError(
                 NetErrorKind.invalid_argument(),
                 "encode response",
