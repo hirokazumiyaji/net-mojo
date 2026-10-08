@@ -111,6 +111,20 @@ void *realloc(void *p, size_t size) {
     if (!real_realloc) {
         resolve();
     }
+    if (p && bootstrap_owned(p)) {
+        if (size == 0) {
+            return NULL;
+        }
+        void *np = real_malloc ? real_malloc(size) : NULL;
+        if (np) {
+            size_t avail = (size_t)((bootstrap_buf + sizeof bootstrap_buf) - (char *)p);
+            size_t copy = size < avail ? size : avail;
+            memcpy(np, p, copy);
+            atomic_fetch_add_explicit(&realloc_calls, 1, memory_order_relaxed);
+            atomic_fetch_add_explicit(&realloc_bytes, size, memory_order_relaxed);
+        }
+        return np;
+    }
     void *np = real_realloc(p, size);
     if (np) {
         atomic_fetch_add_explicit(&realloc_calls, 1, memory_order_relaxed);
