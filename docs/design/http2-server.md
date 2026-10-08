@@ -46,27 +46,36 @@ and negotiation remain with the connection state machine.
 
 After TLS selects ALPN `h2`, `Server` uses `Http2RequestSession` to exchange
 the client preface and SETTINGS, assemble bounded requests, and call the shared
-handler. It encodes each buffered response with a connection-owned HPACK
-deflater and queues its HEADERS and DATA frames through the reactor-owned
-connection. The optional HPACK shim is loaded when the first request headers
-arrive. It returns connection and stream receive credit after request DATA is
+handler. The server validates each buffered response into a field list at
+enqueue time but defers HPACK compression. `Http2ResponseScheduler` HPACK-encodes
+each stream's HEADERS lazily, at the moment it is about to emit them, using the
+connection-owned deflater. Because the scheduler is the only producer that
+advances the deflater, encode order equals wire order on the connection and the
+peer's single inflater stays in sync without storing pre-compressed blocks. The
+optional HPACK shim is loaded when the first request headers arrive. The
+session returns connection and stream receive credit after request DATA is
 copied into the bounded body buffer. Responses stay within current connection
 send credit and the peer's initial stream window; a response body that does not
 fit the shared budget at enqueue time is refused on that stream with
 RST_STREAM(REFUSED_STREAM) and sibling streams keep running.
 
 Stream-local errors do not escalate to connection errors. A client RST_STREAM
-on a stream whose HPACK-encoded HEADERS have not yet been written keeps the
-headers queued so they still ship (preserving the deflater's dynamic table),
-followed by a server-sent RST_STREAM(CANCEL) that closes the stream. A handler
-that writes connection-specific headers (`Connection`, `Keep-Alive`,
-`Transfer-Encoding`, `Upgrade`, `TE`) has those fields silently stripped per
-RFC 9113 §8.2.2 so a shared HTTP/1 handler cannot kill an HTTP/2 connection.
-When response headers still fail to encode (e.g. the field list exceeds the
-peer's `SETTINGS_MAX_HEADER_LIST_SIZE` or a `Content-Length` disagrees with the
-body) and the HPACK deflater state is still intact, the response is replaced
-with a minimal 500 and retried on the same stream; if the retry also fails the
-stream is reset with INTERNAL_ERROR. A handler that detaches/streams on
+received before the scheduler has encoded that stream's HEADERS simply drops
+the pending entry — nothing was written to the wire and the deflater's dynamic
+table was never touched, so no HEADERS or RST frame is sent on a stream the
+peer has already closed. A reset received after HEADERS have been HPACK-encoded
+keeps the compressed block queued so the next drain finishes shipping it
+atomically together with a server-sent RST_STREAM(CANCEL); dropping it would
+leave the peer's inflater out of sync with the deflater. A handler that writes
+connection-specific headers (`Connection`, `Keep-Alive`, `Transfer-Encoding`,
+`Upgrade`, `TE`) has those fields silently stripped per RFC 9113 §8.2.2 so a
+shared HTTP/1 handler cannot kill an HTTP/2 connection. When response fields
+fail validation at enqueue time (e.g. an invalid status, over the peer's
+`SETTINGS_MAX_HEADER_LIST_SIZE`, or a `Content-Length` disagreeing with the
+body), the server rebuilds a minimal 500 field list on the same stream and
+enqueues that; a stream whose compressed block exceeds the configured capacity
+at drain time retries with the same minimal 500 before the deflater runs on
+it, and only if that retry also fails is the stream reset with INTERNAL_ERROR. A handler that detaches/streams on
 HTTP/2 (SSE) also falls back to a stream-level 500 instead of closing the
 connection. A client-sent GOAWAY marks the session draining: new peer HEADERS
 are answered with RST_STREAM(REFUSED_STREAM), in-flight streams finish, the
