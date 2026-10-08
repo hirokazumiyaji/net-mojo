@@ -208,6 +208,45 @@ struct Http2ResponseScheduler(Movable):
                     worst_frames = 1
                 var upper_bound = hpack_bound + worst_frames * 9
                 if max_output_bytes - len(output) < upper_bound:
+                    # The response is admitted but its atomic drain
+                    # bound exceeds this batch outright, so the drain
+                    # loop would stall it forever. Rewrite it to the
+                    # minimal 500 so _encode_and_emit_headers finishes
+                    # the stream and sibling responses can progress.
+                    if upper_bound > max_output_bytes:
+                        var minimal = encode_http2_minimal_500_fields(
+                            date,
+                            self._responses[index].max_header_list_size,
+                            self._responses[index].max_header_fields,
+                        )
+                        if not minimal.is_valid():
+                            var rst = encode_rst_stream_frame(
+                                stream_id, UInt32(2)
+                            )
+                            if not rst.is_complete() or len(rst.wire) > (
+                                max_output_bytes - len(output)
+                            ):
+                                break
+                            output.extend(Span(rst.wire))
+                            session.finish_response(stream_id)
+                            completed.append(stream_id)
+                            released += (
+                                self._responses[index].reserved_header_bytes
+                                + self._responses[index].reserved_body_bytes
+                            )
+                            self._remove(index)
+                            skipped = 0
+                            continue
+                        self._responses[index].header_fields = minimal.fields^
+                        minimal.fields = List[Byte]()
+                        self._responses[
+                            index
+                        ].header_field_count = minimal.field_count
+                        self._responses[index].body = List[Byte]()
+                        self._responses[index].body_offset = 0
+                        # Fall through to the usual gate on the shrunk
+                        # response so the atomic emit path handles it.
+                        continue
                     break
                 var emit_result = self._encode_and_emit_headers(
                     index, deflater, date, max_frame_size, output
