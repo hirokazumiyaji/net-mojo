@@ -9,6 +9,7 @@ stay comparable.
 - [HTTP/1 results](H1_RESULTS.md): current matched TCP keepalive OFF comparison, separately retained historical results and maintained-cohort status.
 - [Current HTTP/2 results](H2_RESULTS.md): matched-policy numerical and wire comparisons, resource/counter limits and provenance.
 - [HTTP/2 and HTTP/3 epochs](MULTIPLEX_RESULTS.md): current H2 and retained original H3/historical H2 evidence without pooling epochs.
+- [Handshake-included (churn) H2/H3 cells](HANDSHAKE_RESULTS.md): shortened macOS loopback measurement of a new TLS/QUIC handshake per request, at c=1 and c=16; labelled shortened, descriptive only.
 
 The current full-precision tables are [H1_RESULTS.tables.json](H1_RESULTS.tables.json) and [H2_RESULTS.tables.json](H2_RESULTS.tables.json). Recorded conditions, verdicts and limitations remain distinct from illustrative entrypoint defaults; the separately identified maintained-cohort result does not replace historical failures or establish whole-Issue completion.
 
