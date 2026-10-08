@@ -185,13 +185,18 @@ struct Http2ResponseScheduler(Movable):
                     )
                     self._remove(index)
                     continue
-                var capacity = self._responses[index].compressed_capacity
+                # HPACK compresses literal fields; the queued field block is
+                # a safe upper bound on the deflater's compressed output. The
+                # pre-allocated `compressed_capacity` can exceed one drain
+                # batch, so gate on this tighter per-response estimate so the
+                # drain never breaks before it can emit anything.
+                var field_bound = len(self._responses[index].header_fields)
                 var worst_frames = (
-                    capacity + max_frame_size - 1
+                    field_bound + max_frame_size - 1
                 ) // max_frame_size
                 if worst_frames < 1:
                     worst_frames = 1
-                var upper_bound = capacity + worst_frames * 9
+                var upper_bound = field_bound + worst_frames * 9
                 if max_output_bytes - len(output) < upper_bound:
                     break
                 var emit_result = self._encode_and_emit_headers(
