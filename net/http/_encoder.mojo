@@ -305,7 +305,7 @@ def _render_response[
     # silently drop trailers so framing stays Content-Length.
     var use_trailers = send_body and len(writer.trailers) > 0
     if use_trailers:
-        if len(writer.trailers) > max_headers:
+        if len(writer.headers) + len(writer.trailers) > max_headers:
             raise NetError(
                 NetErrorKind.invalid_argument(),
                 "encode response",

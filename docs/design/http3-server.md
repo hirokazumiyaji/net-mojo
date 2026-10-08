@@ -159,7 +159,7 @@ present in every worktree tip):
 | Opt-in HTTPS `Alt-Svc` + same-origin TCP/UDP docs | Done — [PR #77](https://github.com/hirokazumiyaji/net-mojo/pull/77) + this ops PR |
 | Application datagram reorder + reset-storm siblings | Done — [PR #78](https://github.com/hirokazumiyaji/net-mojo/pull/78) |
 | Measured H2 / H3 benches | Done — [PR #79](https://github.com/hirokazumiyaji/net-mojo/pull/79)–[#80](https://github.com/hirokazumiyaji/net-mojo/pull/80) |
-| Multiplex matrix + special scenarios | Partially done — [PR #81](https://github.com/hirokazumiyaji/net-mojo/pull/81) records the H2/H3 throughput matrix and specials for Go/aioquic. The current H3 slow/cancel/loss checks pass after reset-credit cleanup; see the 2026-10-04 validation in `benchmarks/http/README.md`. H2 Mojo specials, valid H2 loss measurements and formal full-duration comparisons remain pending |
+| Multiplex matrix + special scenarios | Partially done — [PR #81](https://github.com/hirokazumiyaji/net-mojo/pull/81) records the H2/H3 throughput matrix and specials for Go/aioquic. The current H3 slow/cancel/loss checks pass after reset-credit cleanup; see the 2026-10-04 validation in `benchmarks/http/README.md`. Current-criteria Mojo H2 slow/cancel batch metrics and the netem 16×10 Go-vs-Mojo loss row are in `benchmarks/http/H2_RESULTS.md`, with the multiplex rollup in `benchmarks/http/MULTIPLEX_RESULTS.md`. Formal full-duration comparisons remain pending |
 
 Still deferred / out of scope for #42: server push, CONNECT, enabling 0-RTT,
 broader independent-client matrices beyond aioquic/quiche, and CI workflow edits.
