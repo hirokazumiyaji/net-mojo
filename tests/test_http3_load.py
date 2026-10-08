@@ -85,6 +85,35 @@ class LoaderWindowTests(unittest.TestCase):
         self.assertEqual(result["ok"], 1)
         self.assertEqual(result["samples"], 1)
 
+    def test_churn_flag_runs_a_worker_per_connection_slot_and_rejects_streams(self):
+        connections = 0
+
+        async def churn(host, port, path, authority, stop_at, warmup_until,
+                         latencies, counters):
+            nonlocal connections
+            connections += 1
+            counters["ok"] += 2
+            latencies.extend([150.0, 350.0])
+
+        with (
+            mock.patch.object(loader, "_churn_worker", churn),
+            mock.patch.object(
+                loader.time, "perf_counter", side_effect=[0.0, 0.0]
+            ),
+            mock.patch.object(loader.time, "time", return_value=1.0),
+        ):
+            result = asyncio.run(loader.run_load(
+                "https://127.0.0.1:18453/fixed", 3, 1, 1.0, 2.0, churn=True,
+            ))
+        self.assertEqual(connections, 3)
+        self.assertEqual(result["ok"], 6)
+        self.assertEqual(result["samples"], 6)
+
+        with self.assertRaises(RuntimeError):
+            asyncio.run(loader.run_load(
+                "https://127.0.0.1:18453/fixed", 1, 2, 1.0, 2.0, churn=True,
+            ))
+
     def test_cli_keeps_metric_prefix_and_appends_unambiguous_window_metadata(self):
         output = io.StringIO()
         with (

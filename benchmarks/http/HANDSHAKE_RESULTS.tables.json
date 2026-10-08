@@ -1,0 +1,633 @@
+{
+  "schema_version": 1,
+  "scope": "Shortened handshake-included (churn) H2/H3 cells on macOS loopback. Each measured request opens a new TLS/QUIC connection (no session resumption). Three alternating runs per cell, warmup 5 s / measure 15 s, c=1 and c=16. Descriptive; no acceptance gate.",
+  "host": {
+    "machine": "Apple M2 Pro",
+    "os": "macOS 27.0.1 (Darwin 27.0.0)",
+    "arch": "arm64"
+  },
+  "toolchain": {
+    "mojo": "1.1.0 (8189361e)",
+    "go": "go1.26.4 darwin/arm64",
+    "aioquic": "1.3.0",
+    "quiche": "0.29.3",
+    "libressl": "LibreSSL 3.3.6 (system)"
+  },
+  "provenance": {
+    "repo_sha": "7f80f55e4f70f7468bd0a077d29b057bfd77d65e",
+    "branch_at_measurement": "issue42/unit110 (based on origin/main)",
+    "mojo_h2_server_sha256": "4878707b30841a707fe7dbfdab6e96991b352945fe86a2ab0fb891698a26374f",
+    "mojo_h3_server_sha256": "c252f31c98c75577155e761738cdd1398f833a64e87d3f98abe3262f4e564bc3",
+    "go_h2_baseline_sha256": "59b2196488ce0a6ab4d974b1668089051a54d43e99330b60f6afdcedc3b638f6",
+    "harness_sources": {
+      "benchmarks/http3_load.py": "ed3451f473ccd867d0bd7e9f8930b05a1205feac5b8995a98ebbc6a54a9e65d3",
+      "benchmarks/http/http2_scenarios.py": "aa75e9ddf5c1d64e80b1ecd03f7a629494bb5744fddc7a9baa43b84a568abf69",
+      "benchmarks/http_go/cmd/http-load/main.go": "b451d5bd2920a9303dcf17004cfbebd37ee1d9860fd5c7f00a58654da1fa16c0"
+    }
+  },
+  "procedure": {
+    "warmup_s": 5,
+    "measure_s": 15,
+    "runs_per_cell": 3,
+    "alternation": "mojo-first on odd runs, baseline-first on even runs",
+    "fixed_endpoint": "GET /fixed (64 B)",
+    "resumption": "disabled client-side (fresh SSL/QUIC configuration per connection); server tickets ignored",
+    "zero_rtt": "disabled on server (not negotiated)",
+    "h2_client": "benchmarks/http/http2_scenarios.py --scenario churn (python ssl + hyper-h2)",
+    "h3_client": "benchmarks/http3_load.py --churn (aioquic client)"
+  },
+  "ports": {
+    "mojo_h2": "127.0.0.1:18443",
+    "go_h2": "127.0.0.1:18442",
+    "mojo_h3": "127.0.0.1:18453",
+    "aioquic_h3": "127.0.0.1:18452"
+  },
+  "cells": [
+    {
+      "proto": "h2",
+      "peer": "mojo",
+      "clients": 1,
+      "runs": 3,
+      "req_s_median": 15.733333333333333,
+      "p50_us_median": 63938.0409847945,
+      "p95_us_median": 67667.37496946007,
+      "p99_us_median": 74180.16600422561,
+      "ok_total": 712,
+      "failed_total": 0,
+      "cpu_pct_range": [
+        12.1,
+        15.9
+      ],
+      "rss_kb_range": [
+        18928,
+        19280
+      ],
+      "fd_count_range": [
+        10,
+        10
+      ],
+      "tls_info": "h2/TLSv1.3/TLS_AES_256_GCM_SHA384"
+    },
+    {
+      "proto": "h2",
+      "peer": "go",
+      "clients": 1,
+      "runs": 3,
+      "req_s_median": 16.133333333333333,
+      "p50_us_median": 62444.41692251712,
+      "p95_us_median": 65377.50002462417,
+      "p99_us_median": 67666.83293972164,
+      "ok_total": 726,
+      "failed_total": 0,
+      "cpu_pct_range": [
+        11.5,
+        13.3
+      ],
+      "rss_kb_range": [
+        17232,
+        17344
+      ],
+      "fd_count_range": [
+        6,
+        6
+      ],
+      "tls_info": "h2/TLSv1.3/TLS_AES_128_GCM_SHA256"
+    },
+    {
+      "proto": "h2",
+      "peer": "mojo",
+      "clients": 16,
+      "runs": 3,
+      "req_s_median": 219.2,
+      "p50_us_median": 73615.70908688009,
+      "p95_us_median": 76215.33388737589,
+      "p99_us_median": 77232.66701214015,
+      "ok_total": 9854,
+      "failed_total": 0,
+      "cpu_pct_range": [
+        28.6,
+        30.8
+      ],
+      "rss_kb_range": [
+        22240,
+        22368
+      ],
+      "fd_count_range": [
+        25,
+        25
+      ],
+      "tls_info": "h2/TLSv1.3/TLS_AES_256_GCM_SHA384"
+    },
+    {
+      "proto": "h2",
+      "peer": "go",
+      "clients": 16,
+      "runs": 3,
+      "req_s_median": 212.53333333333333,
+      "p50_us_median": 75265.04201814532,
+      "p95_us_median": 77894.33293510228,
+      "p99_us_median": 78676.04203056544,
+      "ok_total": 9546,
+      "failed_total": 0,
+      "cpu_pct_range": [
+        28.0,
+        30.0
+      ],
+      "rss_kb_range": [
+        17984,
+        18000
+      ],
+      "fd_count_range": [
+        21,
+        21
+      ],
+      "tls_info": "h2/TLSv1.3/TLS_AES_128_GCM_SHA256"
+    },
+    {
+      "proto": "h3",
+      "peer": "mojo",
+      "clients": 1,
+      "runs": 3,
+      "req_s_median": 8.667,
+      "p50_us_median": 20791.0,
+      "p95_us_median": 24384.0,
+      "p99_us_median": 25196.0,
+      "ok_total": 292,
+      "failed_total": 1,
+      "cpu_pct_range": [
+        0.1,
+        3.5
+      ],
+      "rss_kb_range": [
+        18720,
+        18864
+      ],
+      "fd_count_range": [
+        10,
+        10
+      ],
+      "tls_info": "h3/TLSv1.3/aioquic-1.3.0"
+    },
+    {
+      "proto": "h3",
+      "peer": "aioquic",
+      "clients": 1,
+      "runs": 3,
+      "req_s_median": 5.667,
+      "p50_us_median": 27268.0,
+      "p95_us_median": 32142.0,
+      "p99_us_median": 34246.0,
+      "ok_total": 255,
+      "failed_total": 0,
+      "cpu_pct_range": [
+        6.3,
+        7.0
+      ],
+      "rss_kb_range": [
+        49856,
+        51600
+      ],
+      "fd_count_range": [
+        7,
+        7
+      ],
+      "tls_info": "h3/TLSv1.3/aioquic-1.3.0"
+    },
+    {
+      "proto": "h3",
+      "peer": "mojo",
+      "clients": 16,
+      "runs": 3,
+      "req_s_median": 141.8,
+      "p50_us_median": 11046.0,
+      "p95_us_median": 29210.0,
+      "p99_us_median": 35503.0,
+      "ok_total": 6367,
+      "failed_total": 0,
+      "cpu_pct_range": [
+        11.9,
+        12.5
+      ],
+      "rss_kb_range": [
+        20240,
+        20240
+      ],
+      "fd_count_range": [
+        10,
+        10
+      ],
+      "tls_info": "h3/TLSv1.3/aioquic-1.3.0"
+    },
+    {
+      "proto": "h3",
+      "peer": "aioquic",
+      "clients": 16,
+      "runs": 3,
+      "req_s_median": 138.8,
+      "p50_us_median": 8682.0,
+      "p95_us_median": 18748.0,
+      "p99_us_median": 25246.0,
+      "ok_total": 6217,
+      "failed_total": 1,
+      "cpu_pct_range": [
+        32.4,
+        35.1
+      ],
+      "rss_kb_range": [
+        90592,
+        99200
+      ],
+      "fd_count_range": [
+        7,
+        7
+      ],
+      "tls_info": "h3/TLSv1.3/aioquic-1.3.0"
+    }
+  ],
+  "raw_rows": [
+    {
+      "proto": "h2",
+      "peer": "mojo",
+      "clients": 1,
+      "run": 1,
+      "req_s": 15.733333333333333,
+      "p50_us": 64016.9580001384,
+      "p95_us": 67667.37496946007,
+      "p99_us": 74180.16600422561,
+      "ok": 236,
+      "failed": 0,
+      "cpu_pct": 12.1,
+      "rss_kb": 18928,
+      "fd_count": 10,
+      "tls_info": "h2/TLSv1.3/TLS_AES_256_GCM_SHA384"
+    },
+    {
+      "proto": "h2",
+      "peer": "go",
+      "clients": 1,
+      "run": 1,
+      "req_s": 16.133333333333333,
+      "p50_us": 62444.41692251712,
+      "p95_us": 65377.50002462417,
+      "p99_us": 66259.16704069823,
+      "ok": 242,
+      "failed": 0,
+      "cpu_pct": 11.5,
+      "rss_kb": 17232,
+      "fd_count": 6,
+      "tls_info": "h2/TLSv1.3/TLS_AES_128_GCM_SHA256"
+    },
+    {
+      "proto": "h2",
+      "peer": "go",
+      "clients": 1,
+      "run": 2,
+      "req_s": 16.2,
+      "p50_us": 62190.37505798042,
+      "p95_us": 65016.457927413285,
+      "p99_us": 67666.83293972164,
+      "ok": 243,
+      "failed": 0,
+      "cpu_pct": 12.2,
+      "rss_kb": 17344,
+      "fd_count": 6,
+      "tls_info": "h2/TLSv1.3/TLS_AES_128_GCM_SHA256"
+    },
+    {
+      "proto": "h2",
+      "peer": "mojo",
+      "clients": 1,
+      "run": 2,
+      "req_s": 16.066666666666666,
+      "p50_us": 63225.87502654642,
+      "p95_us": 66945.29193919152,
+      "p99_us": 71364.25003409386,
+      "ok": 241,
+      "failed": 0,
+      "cpu_pct": 15.8,
+      "rss_kb": 19200,
+      "fd_count": 10,
+      "tls_info": "h2/TLSv1.3/TLS_AES_256_GCM_SHA384"
+    },
+    {
+      "proto": "h2",
+      "peer": "mojo",
+      "clients": 1,
+      "run": 3,
+      "req_s": 15.666666666666666,
+      "p50_us": 63938.0409847945,
+      "p95_us": 67764.33298364282,
+      "p99_us": 75117.62506328523,
+      "ok": 235,
+      "failed": 0,
+      "cpu_pct": 15.9,
+      "rss_kb": 19280,
+      "fd_count": 10,
+      "tls_info": "h2/TLSv1.3/TLS_AES_256_GCM_SHA384"
+    },
+    {
+      "proto": "h2",
+      "peer": "go",
+      "clients": 1,
+      "run": 3,
+      "req_s": 16.066666666666666,
+      "p50_us": 62453.08299548924,
+      "p95_us": 65384.62499156594,
+      "p99_us": 67852.83295903355,
+      "ok": 241,
+      "failed": 0,
+      "cpu_pct": 13.3,
+      "rss_kb": 17344,
+      "fd_count": 6,
+      "tls_info": "h2/TLSv1.3/TLS_AES_128_GCM_SHA256"
+    },
+    {
+      "proto": "h2",
+      "peer": "mojo",
+      "clients": 16,
+      "run": 1,
+      "req_s": 220.53333333333333,
+      "p50_us": 72872.249991633,
+      "p95_us": 75610.25000177324,
+      "p99_us": 77102.95799188316,
+      "ok": 3308,
+      "failed": 0,
+      "cpu_pct": 28.6,
+      "rss_kb": 22240,
+      "fd_count": 25,
+      "tls_info": "h2/TLSv1.3/TLS_AES_256_GCM_SHA384"
+    },
+    {
+      "proto": "h2",
+      "peer": "go",
+      "clients": 16,
+      "run": 1,
+      "req_s": 212.66666666666666,
+      "p50_us": 74957.12500531226,
+      "p95_us": 78690.74994232506,
+      "p99_us": 82526.33304800838,
+      "ok": 3190,
+      "failed": 0,
+      "cpu_pct": 30.0,
+      "rss_kb": 17984,
+      "fd_count": 21,
+      "tls_info": "h2/TLSv1.3/TLS_AES_128_GCM_SHA256"
+    },
+    {
+      "proto": "h2",
+      "peer": "go",
+      "clients": 16,
+      "run": 2,
+      "req_s": 212.53333333333333,
+      "p50_us": 75265.04201814532,
+      "p95_us": 77562.66603246331,
+      "p99_us": 78456.6659713164,
+      "ok": 3188,
+      "failed": 0,
+      "cpu_pct": 28.2,
+      "rss_kb": 18000,
+      "fd_count": 21,
+      "tls_info": "h2/TLSv1.3/TLS_AES_128_GCM_SHA256"
+    },
+    {
+      "proto": "h2",
+      "peer": "mojo",
+      "clients": 16,
+      "run": 2,
+      "req_s": 217.2,
+      "p50_us": 73783.16693939269,
+      "p95_us": 76215.33388737589,
+      "p99_us": 77232.66701214015,
+      "ok": 3258,
+      "failed": 0,
+      "cpu_pct": 29.5,
+      "rss_kb": 22320,
+      "fd_count": 25,
+      "tls_info": "h2/TLSv1.3/TLS_AES_256_GCM_SHA384"
+    },
+    {
+      "proto": "h2",
+      "peer": "mojo",
+      "clients": 16,
+      "run": 3,
+      "req_s": 219.2,
+      "p50_us": 73615.70908688009,
+      "p95_us": 76299.25000946969,
+      "p99_us": 78980.33305536956,
+      "ok": 3288,
+      "failed": 0,
+      "cpu_pct": 30.8,
+      "rss_kb": 22368,
+      "fd_count": 25,
+      "tls_info": "h2/TLSv1.3/TLS_AES_256_GCM_SHA384"
+    },
+    {
+      "proto": "h2",
+      "peer": "go",
+      "clients": 16,
+      "run": 3,
+      "req_s": 211.2,
+      "p50_us": 75678.95902320743,
+      "p95_us": 77894.33293510228,
+      "p99_us": 78676.04203056544,
+      "ok": 3168,
+      "failed": 0,
+      "cpu_pct": 28.0,
+      "rss_kb": 18000,
+      "fd_count": 21,
+      "tls_info": "h2/TLSv1.3/TLS_AES_128_GCM_SHA256"
+    },
+    {
+      "proto": "h3",
+      "peer": "mojo",
+      "clients": 1,
+      "run": 1,
+      "req_s": 2.067,
+      "p50_us": 21572.0,
+      "p95_us": 23508.0,
+      "p99_us": 25196.0,
+      "ok": 31,
+      "failed": 1,
+      "cpu_pct": 0.1,
+      "rss_kb": 18720,
+      "fd_count": 10,
+      "tls_info": "h3/TLSv1.3/aioquic-1.3.0"
+    },
+    {
+      "proto": "h3",
+      "peer": "aioquic",
+      "clients": 1,
+      "run": 1,
+      "req_s": 5.533,
+      "p50_us": 27269.0,
+      "p95_us": 32142.0,
+      "p99_us": 34246.0,
+      "ok": 83,
+      "failed": 0,
+      "cpu_pct": 6.3,
+      "rss_kb": 49856,
+      "fd_count": 7,
+      "tls_info": "h3/TLSv1.3/aioquic-1.3.0"
+    },
+    {
+      "proto": "h3",
+      "peer": "aioquic",
+      "clients": 1,
+      "run": 2,
+      "req_s": 5.667,
+      "p50_us": 27268.0,
+      "p95_us": 33702.0,
+      "p99_us": 36704.0,
+      "ok": 85,
+      "failed": 0,
+      "cpu_pct": 7.0,
+      "rss_kb": 50960,
+      "fd_count": 7,
+      "tls_info": "h3/TLSv1.3/aioquic-1.3.0"
+    },
+    {
+      "proto": "h3",
+      "peer": "mojo",
+      "clients": 1,
+      "run": 2,
+      "req_s": 8.667,
+      "p50_us": 20128.0,
+      "p95_us": 25080.0,
+      "p99_us": 28693.0,
+      "ok": 130,
+      "failed": 0,
+      "cpu_pct": 3.5,
+      "rss_kb": 18864,
+      "fd_count": 10,
+      "tls_info": "h3/TLSv1.3/aioquic-1.3.0"
+    },
+    {
+      "proto": "h3",
+      "peer": "mojo",
+      "clients": 1,
+      "run": 3,
+      "req_s": 8.733,
+      "p50_us": 20791.0,
+      "p95_us": 24384.0,
+      "p99_us": 25058.0,
+      "ok": 131,
+      "failed": 0,
+      "cpu_pct": 2.7,
+      "rss_kb": 18864,
+      "fd_count": 10,
+      "tls_info": "h3/TLSv1.3/aioquic-1.3.0"
+    },
+    {
+      "proto": "h3",
+      "peer": "aioquic",
+      "clients": 1,
+      "run": 3,
+      "req_s": 5.8,
+      "p50_us": 26889.0,
+      "p95_us": 31001.0,
+      "p99_us": 31546.0,
+      "ok": 87,
+      "failed": 0,
+      "cpu_pct": 6.6,
+      "rss_kb": 51600,
+      "fd_count": 7,
+      "tls_info": "h3/TLSv1.3/aioquic-1.3.0"
+    },
+    {
+      "proto": "h3",
+      "peer": "mojo",
+      "clients": 16,
+      "run": 1,
+      "req_s": 139.6,
+      "p50_us": 11592.0,
+      "p95_us": 30038.0,
+      "p99_us": 35503.0,
+      "ok": 2094,
+      "failed": 0,
+      "cpu_pct": 12.0,
+      "rss_kb": 20240,
+      "fd_count": 10,
+      "tls_info": "h3/TLSv1.3/aioquic-1.3.0"
+    },
+    {
+      "proto": "h3",
+      "peer": "aioquic",
+      "clients": 16,
+      "run": 1,
+      "req_s": 140.533,
+      "p50_us": 8682.0,
+      "p95_us": 18050.0,
+      "p99_us": 25246.0,
+      "ok": 2108,
+      "failed": 0,
+      "cpu_pct": 35.1,
+      "rss_kb": 90592,
+      "fd_count": 7,
+      "tls_info": "h3/TLSv1.3/aioquic-1.3.0"
+    },
+    {
+      "proto": "h3",
+      "peer": "aioquic",
+      "clients": 16,
+      "run": 2,
+      "req_s": 138.8,
+      "p50_us": 8693.0,
+      "p95_us": 20088.0,
+      "p99_us": 26910.0,
+      "ok": 2082,
+      "failed": 0,
+      "cpu_pct": 34.5,
+      "rss_kb": 97584,
+      "fd_count": 7,
+      "tls_info": "h3/TLSv1.3/aioquic-1.3.0"
+    },
+    {
+      "proto": "h3",
+      "peer": "mojo",
+      "clients": 16,
+      "run": 2,
+      "req_s": 143.067,
+      "p50_us": 9746.0,
+      "p95_us": 29210.0,
+      "p99_us": 36592.0,
+      "ok": 2146,
+      "failed": 0,
+      "cpu_pct": 11.9,
+      "rss_kb": 20240,
+      "fd_count": 10,
+      "tls_info": "h3/TLSv1.3/aioquic-1.3.0"
+    },
+    {
+      "proto": "h3",
+      "peer": "mojo",
+      "clients": 16,
+      "run": 3,
+      "req_s": 141.8,
+      "p50_us": 11046.0,
+      "p95_us": 28576.0,
+      "p99_us": 35031.0,
+      "ok": 2127,
+      "failed": 0,
+      "cpu_pct": 12.5,
+      "rss_kb": 20240,
+      "fd_count": 10,
+      "tls_info": "h3/TLSv1.3/aioquic-1.3.0"
+    },
+    {
+      "proto": "h3",
+      "peer": "aioquic",
+      "clients": 16,
+      "run": 3,
+      "req_s": 135.133,
+      "p50_us": 8453.0,
+      "p95_us": 18748.0,
+      "p99_us": 24896.0,
+      "ok": 2027,
+      "failed": 1,
+      "cpu_pct": 32.4,
+      "rss_kb": 99200,
+      "fd_count": 7,
+      "tls_info": "h3/TLSv1.3/aioquic-1.3.0"
+    }
+  ]
+}

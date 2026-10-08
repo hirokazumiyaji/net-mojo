@@ -89,6 +89,26 @@ class LoadProtocol(QuicConnectionProtocol):
             self._inflight.pop(stream_id, None)
 
 
+def _client_configuration() -> QuicConfiguration:
+    configuration = QuicConfiguration(
+        is_client=True,
+        alpn_protocols=H3_ALPN,
+        server_name="localhost",
+    )
+    configuration.supported_versions = [QuicProtocolVersion.VERSION_1]
+    configuration.verify_mode = ssl.CERT_NONE
+    return configuration
+
+
+async def _wait_alpn(client: "LoadProtocol") -> None:
+    for _ in range(50):
+        if client.alpn is not None:
+            break
+        await asyncio.sleep(0.01)
+    if client.alpn not in H3_ALPN and client.alpn != "h3":
+        raise RuntimeError(f"unexpected ALPN: {client.alpn!r}")
+
+
 async def _one_connection(
     host: str,
     port: int,
@@ -100,13 +120,7 @@ async def _one_connection(
     latencies: List[float],
     counters: dict,
 ) -> None:
-    configuration = QuicConfiguration(
-        is_client=True,
-        alpn_protocols=H3_ALPN,
-        server_name="localhost",
-    )
-    configuration.supported_versions = [QuicProtocolVersion.VERSION_1]
-    configuration.verify_mode = ssl.CERT_NONE
+    configuration = _client_configuration()
 
     async with connect(
         host,
@@ -115,13 +129,7 @@ async def _one_connection(
         create_protocol=LoadProtocol,
     ) as client:
         assert isinstance(client, LoadProtocol)
-        # Wait briefly for ALPN.
-        for _ in range(50):
-            if client.alpn is not None:
-                break
-            await asyncio.sleep(0.01)
-        if client.alpn not in H3_ALPN and client.alpn != "h3":
-            raise RuntimeError(f"unexpected ALPN: {client.alpn!r}")
+        await _wait_alpn(client)
 
         sem = asyncio.Semaphore(streams)
         # Per-connection tally so a connection whose handshake completed
@@ -182,6 +190,60 @@ async def _one_connection(
             counters["failed"] += 1
 
 
+async def _churn_worker(
+    host: str,
+    port: int,
+    path: bytes,
+    authority: bytes,
+    stop_at: float,
+    warmup_until: float,
+    latencies: List[float],
+    counters: dict,
+) -> None:
+    while time.perf_counter() < stop_at:
+        start = time.perf_counter()
+        ok = True
+        try:
+            async with connect(
+                host,
+                port,
+                configuration=_client_configuration(),
+                create_protocol=LoadProtocol,
+            ) as client:
+                assert isinstance(client, LoadProtocol)
+                await _wait_alpn(client)
+                result = await asyncio.wait_for(
+                    client.get(path, authority), timeout=30.0
+                )
+        except Exception:
+            ok = False
+            done_at = time.perf_counter()
+        else:
+            done_at = result["done_at"] or time.perf_counter()
+            if result["status"] != b"200":
+                ok = False
+            elif path == b"/fixed" and bytes(result["body"]) != b"a" * 64:
+                ok = False
+        elapsed = done_at - start
+        if done_at > stop_at:
+            if ok:
+                counters["late"] = counters.get("late", 0) + 1
+            else:
+                counters["late_failed"] = counters.get("late_failed", 0) + 1
+            continue
+        if done_at >= warmup_until:
+            if ok:
+                counters["ok"] += 1
+                latencies.append(elapsed * 1_000_000.0)
+            else:
+                counters["failed"] += 1
+        else:
+            if ok:
+                counters["warmup_ok"] += 1
+            else:
+                counters["warmup_failed"] = counters.get("warmup_failed", 0) + 1
+
+
 def _percentile(sorted_vals: List[float], p: float) -> float:
     if not sorted_vals:
         return float("nan")
@@ -198,12 +260,20 @@ async def run_load(
     streams: int,
     warmup_s: float,
     duration_s: float,
+    churn: bool = False,
 ) -> dict:
     parsed = urlparse(url)
     host = parsed.hostname or "127.0.0.1"
     port = parsed.port or 443
     path = (parsed.path or "/").encode()
     authority = f"{host}:{port}".encode()
+
+    if clients < 1:
+        raise RuntimeError(f"--clients must be >= 1, got {clients}")
+    if streams < 1:
+        raise RuntimeError(f"--streams must be >= 1, got {streams}")
+    if churn and streams != 1:
+        raise RuntimeError("--churn requires --streams 1 (one request per connection)")
 
     latencies: List[float] = []
     counters = {"ok": 0, "failed": 0, "warmup_ok": 0}
@@ -215,26 +285,33 @@ async def run_load(
     warmup_until = start + warmup_s
     stop_at = warmup_until + duration_s
 
-    tasks = [
-        asyncio.create_task(
-            _one_connection(
-                host,
-                port,
-                path,
-                authority,
-                streams,
-                stop_at,
-                warmup_until,
-                latencies,
-                counters,
+    if churn:
+        tasks = [
+            asyncio.create_task(
+                _churn_worker(
+                    host, port, path, authority,
+                    stop_at, warmup_until, latencies, counters,
+                )
             )
-        )
-        for _ in range(clients)
-    ]
-    if clients < 1:
-        raise RuntimeError(f"--clients must be >= 1, got {clients}")
-    if streams < 1:
-        raise RuntimeError(f"--streams must be >= 1, got {streams}")
+            for _ in range(clients)
+        ]
+    else:
+        tasks = [
+            asyncio.create_task(
+                _one_connection(
+                    host,
+                    port,
+                    path,
+                    authority,
+                    streams,
+                    stop_at,
+                    warmup_until,
+                    latencies,
+                    counters,
+                )
+            )
+            for _ in range(clients)
+        ]
 
     results = await asyncio.gather(*tasks, return_exceptions=True)
     measure_s = max(1e-9, duration_s)
@@ -250,7 +327,9 @@ async def run_load(
         "ok": counters["ok"],
         "failed": counters["failed"],
         "warmup_ok": counters["warmup_ok"],
+        "warmup_failed": counters.get("warmup_failed", 0),
         "late": counters.get("late", 0),
+        "late_failed": counters.get("late_failed", 0),
         "load_start_unix_s": load_start_unix_s,
         "measurement_start_unix_s": load_start_unix_s + warmup_s,
         "measurement_end_unix_s": load_start_unix_s + warmup_s + duration_s,
@@ -271,6 +350,11 @@ def main() -> None:
     parser.add_argument("--streams", type=int, default=1)
     parser.add_argument("--warmup", type=float, default=5.0)
     parser.add_argument("--duration", type=float, default=10.0)
+    parser.add_argument(
+        "--churn",
+        action="store_true",
+        help="open a new QUIC connection per request (full handshake, no resumption)",
+    )
     args = parser.parse_args()
 
     stats = asyncio.run(
@@ -280,6 +364,7 @@ def main() -> None:
             args.streams,
             args.warmup,
             args.duration,
+            churn=args.churn,
         )
     )
     # Machine-readable one-liner for the shell harness.

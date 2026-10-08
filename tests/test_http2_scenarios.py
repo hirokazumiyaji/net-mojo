@@ -4,8 +4,11 @@
 import importlib.util
 from pathlib import Path
 import socket
+import sys
+import threading
 import time
 import unittest
+from unittest import mock
 
 from h2.config import H2Configuration
 from h2.connection import H2Connection
@@ -13,6 +16,7 @@ from h2.events import DataReceived, RequestReceived, StreamEnded
 
 
 ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT / "benchmarks/http"))
 SPEC = importlib.util.spec_from_file_location(
     "http2_scenarios", ROOT / "benchmarks/http/http2_scenarios.py"
 )
@@ -84,6 +88,42 @@ class Http2ScenarioUploadTests(unittest.TestCase):
         self.socket.server.ping(b"drainh2!")
         self.client.pump(time.perf_counter() + 1)
         self.assertEqual(self.socket.events, ["recv", "send", "recv"])
+
+
+class Http2ChurnScenarioTests(unittest.TestCase):
+    def test_churn_opens_a_fresh_connection_per_request_and_reports_tls_info(self):
+        calls = []
+        gate = threading.Event()
+
+        def fake_request(host, port, authority):
+            calls.append((host, port, authority))
+            # Hold the first request long enough that short-duration workers
+            # cannot start a second one, keeping the sample count bounded.
+            if not gate.is_set():
+                gate.set()
+                time.sleep(0.3)
+            return True, 0.001, "h2/TLSv1.3/TLS_AES_128_GCM_SHA256"
+
+        with mock.patch.object(
+            scenarios, "churn_one_request", side_effect=fake_request
+        ):
+            result = scenarios.run_churn(
+                "https://127.0.0.1:18443/fixed", clients=2,
+                warmup_s=0.0, duration_s=0.05,
+            )
+        self.assertEqual(result["scenario"], "churn")
+        self.assertEqual(result["verdict"], "pass")
+        self.assertGreaterEqual(len(calls), 2)
+        self.assertEqual(result["failed"], 0)
+        self.assertEqual(len(set(calls)), 1)
+        self.assertEqual(result["tls_info"], "h2/TLSv1.3/TLS_AES_128_GCM_SHA256")
+
+    def test_churn_rejects_zero_clients(self):
+        with self.assertRaises(scenarios.ScenarioError):
+            scenarios.run_churn(
+                "https://127.0.0.1:18443/fixed", clients=0,
+                warmup_s=0.0, duration_s=0.1,
+            )
 
 
 if __name__ == "__main__":
