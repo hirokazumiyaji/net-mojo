@@ -941,12 +941,12 @@ struct Server(Movable):
                 response.trailers.clear()
             var trailers = List[Byte]()
             if len(response.trailers) > 0:
-                var trailer_bytes = 0
+                var trailer_bytes = 4
                 for i in range(len(response.trailers)):
                     trailer_bytes += (
                         response.trailers.name_at(i).byte_length()
                         + response.trailers.value_byte_length(i)
-                        + 4
+                        + 8
                     )
                 if (
                     len(response.trailers)

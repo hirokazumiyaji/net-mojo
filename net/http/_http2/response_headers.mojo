@@ -167,7 +167,11 @@ def encode_http2_response_trailers(
     for i in range(len(writer.trailers)):
         ref name = writer.trailers._lower_names[i]
         var value = writer.trailers._value_bytes_span(i)
-        if _trailer_forbidden(name):
+        if (
+            _trailer_forbidden(name)
+            or _is_connection_specific(name)
+            or name == "te"
+        ):
             return Http2ResponseHeadersResult.error()
         header_list_size += _field_size(name.byte_length(), len(value))
         field_count += 1
