@@ -329,6 +329,36 @@ def test_header_decoder_distinguishes_size_and_compression_errors() raises:
     assert_true(invalid.is_compression_error())
 
 
+def test_header_decoder_flags_continuation_flood() raises:
+    var decoder = Http2HeaderDecoder(
+        "build/http2/libnet_hpack",
+        4096,
+        1024,
+        max_continuation_frames=2,
+    )
+    var output = Array[Byte, 128](fill=0)
+    var first: List[Byte] = [Byte(0x82)]
+    var headers = FrameParseResult.complete(Byte(1), Byte(0), UInt32(1), 1)
+    var started = decoder.consume(headers, Span(first), 1024, 16, Span(output))
+    assert_true(started.is_pending())
+    var cont: List[Byte] = [Byte(0x86)]
+    var cont_frame = FrameParseResult.complete(Byte(9), Byte(0), UInt32(1), 1)
+    assert_true(
+        decoder.consume(
+            cont_frame, Span(cont), 1024, 16, Span(output)
+        ).is_pending()
+    )
+    assert_true(
+        decoder.consume(
+            cont_frame, Span(cont), 1024, 16, Span(output)
+        ).is_pending()
+    )
+    var flooded = decoder.consume(
+        cont_frame, Span(cont), 1024, 16, Span(output)
+    )
+    assert_true(flooded.is_flooded())
+
+
 def test_header_decoder_fails_connection_on_invalid_continuation_sequence() raises:
     var decoder = Http2HeaderDecoder("build/http2/libnet_hpack", 4096, 8)
     var first: List[Byte] = [Byte(0x82)]

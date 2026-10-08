@@ -2335,7 +2335,7 @@ def test_header_block_rejects_continuation_flood() raises:
     var cont = FrameParseResult.complete(Byte(9), Byte(0), UInt32(1), 1)
     assert_true(block.continue_with(cont, Span(payload)).is_pending())
     assert_true(block.continue_with(cont, Span(payload)).is_pending())
-    assert_true(block.continue_with(cont, Span(payload)).is_error())
+    assert_true(block.continue_with(cont, Span(payload)).is_flooded())
 
 
 def test_http2_bootstrap_advertises_configured_max_header_list_size() raises:

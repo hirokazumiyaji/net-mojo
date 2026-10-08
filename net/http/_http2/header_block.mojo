@@ -19,6 +19,10 @@ struct HeaderBlockResult(Movable):
     def error() -> Self:
         return Self(kind=2)
 
+    @staticmethod
+    def flooded() -> Self:
+        return Self(kind=3)
+
     def is_pending(self) -> Bool:
         return self.kind == 0
 
@@ -27,6 +31,9 @@ struct HeaderBlockResult(Movable):
 
     def is_error(self) -> Bool:
         return self.kind == 2
+
+    def is_flooded(self) -> Bool:
+        return self.kind == 3
 
 
 struct Http2HeaderBlock(Movable):
@@ -113,7 +120,7 @@ struct Http2HeaderBlock(Movable):
         if self.continuation_count > self.max_continuation_frames:
             self.failed = True
             self.pending = False
-            return HeaderBlockResult.error()
+            return HeaderBlockResult.flooded()
 
         if not self._append(payload, 0, len(payload)):
             self.failed = True

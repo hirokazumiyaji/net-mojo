@@ -354,6 +354,21 @@ struct Http2RequestSession(Movable):
                             )
                         self._remove_stream(stream_id)
                         continue
+                    elif decoded.is_flooded():
+                        self._pending_headers_at = NO_DEADLINE
+                        self._draining = True
+                        self._failed = True
+                        var goaway = encode_goaway_frame(
+                            self._last_stream_id, UInt32(11)
+                        )
+                        if not goaway.is_complete():
+                            return Http2RequestSessionResult.error(
+                                consumed, output^
+                            )
+                        output.extend(Span(goaway.wire))
+                        return Http2RequestSessionResult.pending(
+                            consumed, output^
+                        )
                     else:
                         self._failed = True
                         return Http2RequestSessionResult.error(
