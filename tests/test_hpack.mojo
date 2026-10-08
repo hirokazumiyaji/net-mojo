@@ -1422,9 +1422,22 @@ def test_http2_scheduler_peer_reset_after_headers_sent_removes_entry() raises:
     assert_equal(len(first.completed_streams), 0)
     assert_true(scheduler.queued_count() > 0)
     var reset = scheduler.on_peer_reset(UInt32(1))
-    assert_false(reset.kept_headers)
+    assert_true(reset.kept_headers)
     assert_true(reset.released_bytes > 0)
+    assert_equal(scheduler.queued_count(), 1)
+    var second = scheduler.drain(
+        session, deflater, "Thu, 01 Jan 1970 00:00:00 GMT", 16384, 65536
+    )
+    assert_equal(len(second.completed_streams), 1)
     assert_equal(scheduler.queued_count(), 0)
+    var saw_rst_on_one = False
+    var offset = 0
+    while offset < len(second.wire):
+        var frame = parse_frame(Span(second.wire)[offset:])
+        if frame.frame_type == Byte(3) and frame.stream_id == UInt32(1):
+            saw_rst_on_one = True
+        offset += frame.consumed
+    assert_true(saw_rst_on_one)
 
 
 def test_http2_scheduler_lazy_encode_keeps_single_inflater_in_sync() raises:

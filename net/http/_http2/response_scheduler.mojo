@@ -1,9 +1,10 @@
 """Fairly schedules queued HTTP/2 response bodies across streams.
 
 HEADERS are HPACK-encoded lazily, at the moment the scheduler is about to
-emit them. The invariant is that encode order equals wire order for the
-single connection deflater, so streams cancelled before their HEADERS
-reach the wire never touch the dynamic table.
+emit them. Encoding and wire emission happen atomically in the same drain
+step, so encode order equals wire order on the single connection deflater
+and streams cancelled before their HEADERS reach the wire never touch the
+dynamic table.
 """
 
 from .control_frames import encode_rst_stream_frame
@@ -17,9 +18,9 @@ from .response_headers import (
 )
 
 
-comptime _ENCODE_OK: Int = 0
-comptime _ENCODE_DEFLATER_FAILED: Int = 1
-comptime _ENCODE_RST: Int = 2
+comptime _EMIT_OK: Int = 0
+comptime _EMIT_DEFLATER_FAILED: Int = 1
+comptime _EMIT_RST: Int = 2
 
 
 @fieldwise_init
@@ -30,9 +31,6 @@ struct _PendingHttp2Response(Movable):
     var max_header_list_size: Int
     var max_header_fields: Int
     var compressed_capacity: Int
-    var compressed_block: List[Byte]
-    var compressed_length: Int
-    var headers_encoded: Bool
     var headers_sent: Bool
     var body: List[Byte]
     var body_offset: Int
@@ -89,9 +87,6 @@ struct Http2ResponseScheduler(Movable):
             max_header_list_size=max_header_list_size,
             max_header_fields=max_header_fields,
             compressed_capacity=compressed_capacity,
-            compressed_block=List[Byte](),
-            compressed_length=0,
-            headers_encoded=False,
             headers_sent=False,
             body=body^,
             body_offset=0,
@@ -115,16 +110,17 @@ struct Http2ResponseScheduler(Movable):
         return released
 
     def on_peer_reset(mut self, stream_id: UInt32) -> Http2PeerResetResult:
-        # HEADERS not yet encoded: drop the entry. HPACK state was never
-        # touched for this stream, so wire order stays consistent and no
-        # frame is sent on a stream the peer has already closed. HEADERS
-        # already encoded: keep them so the next drain finishes shipping
-        # the compressed block and emits a RST for us; dropping would
-        # desync the dynamic table.
+        # Encode and emission are atomic in `drain`, so a pending entry is
+        # either not-yet-emitted (headers_sent=False, deflater untouched)
+        # or already-emitted (headers_sent=True, HPACK dynamic table has
+        # the stream's fields). Not-yet-emitted means no frame has reached
+        # the wire for this stream: drop the entry with no HPACK or
+        # protocol consequence. After emission we clear the body so drain
+        # finishes the stream with a server-sent RST_STREAM(CANCEL).
         var index = self._find(stream_id)
         if index < 0:
             return Http2PeerResetResult(released_bytes=0, kept_headers=False)
-        if not self._responses[index].headers_encoded:
+        if not self._responses[index].headers_sent:
             var released = len(self._responses[index].header_fields) + len(
                 self._responses[index].body
             )
@@ -132,19 +128,15 @@ struct Http2ResponseScheduler(Movable):
             return Http2PeerResetResult(
                 released_bytes=released, kept_headers=False
             )
-        if not self._responses[index].headers_sent:
-            var body_bytes = len(self._responses[index].body)
-            self._responses[index].body = List[Byte]()
-            self._responses[index].body_offset = 0
-            self._responses[index].cancelled = True
-            return Http2PeerResetResult(
-                released_bytes=body_bytes, kept_headers=True
-            )
-        var released = len(self._responses[index].header_fields) + len(
-            self._responses[index].body
+        var body_bytes = len(self._responses[index].body) - (
+            self._responses[index].body_offset
         )
-        self._remove(index)
-        return Http2PeerResetResult(released_bytes=released, kept_headers=False)
+        self._responses[index].body = List[Byte]()
+        self._responses[index].body_offset = 0
+        self._responses[index].cancelled = True
+        return Http2PeerResetResult(
+            released_bytes=body_bytes, kept_headers=True
+        )
 
     def has_unsent_headers(self, stream_id: UInt32) -> Bool:
         var index = self._find(stream_id)
@@ -178,7 +170,7 @@ struct Http2ResponseScheduler(Movable):
             var index = self._next_index
             var stream_id = self._responses[index].stream_id
 
-            if not self._responses[index].headers_encoded:
+            if not self._responses[index].headers_sent:
                 if self._responses[index].cancelled:
                     released += len(self._responses[index].header_fields) + len(
                         self._responses[index].body
@@ -194,17 +186,17 @@ struct Http2ResponseScheduler(Movable):
                 var upper_bound = capacity + worst_frames * 9
                 if max_output_bytes - len(output) < upper_bound:
                     break
-                var encode_result = self._encode_pending_headers(
-                    index, deflater, date, max_frame_size
+                var emit_result = self._encode_and_emit_headers(
+                    index, deflater, date, max_frame_size, output
                 )
-                if encode_result == _ENCODE_DEFLATER_FAILED:
+                if emit_result == _EMIT_DEFLATER_FAILED:
                     return Http2ScheduledOutput(
                         wire=output^,
                         completed_streams=completed^,
                         released_bytes=released,
                         deflater_failed=True,
                     )
-                if encode_result == _ENCODE_RST:
+                if emit_result == _EMIT_RST:
                     var rst = encode_rst_stream_frame(stream_id, UInt32(2))
                     if not rst.is_complete() or len(rst.wire) > (
                         max_output_bytes - len(output)
@@ -219,37 +211,6 @@ struct Http2ResponseScheduler(Movable):
                     self._remove(index)
                     skipped = 0
                     continue
-                skipped = 0
-
-            if not self._responses[index].headers_sent:
-                var compressed_len = self._responses[index].compressed_length
-                var frame_count = (
-                    compressed_len + max_frame_size - 1
-                ) // max_frame_size
-                if frame_count < 1:
-                    frame_count = 1
-                var wire_bound = compressed_len + frame_count * 9
-                var header_room = max_output_bytes - len(output)
-                if header_room < wire_bound:
-                    break
-                var frames = encode_headers_block(
-                    stream_id,
-                    Span(self._responses[index].compressed_block)[
-                        0:compressed_len
-                    ],
-                    self._responses[index].end_on_headers,
-                    max_frame_size,
-                    wire_bound,
-                )
-                if not frames.is_complete():
-                    deflater.fail()
-                    return Http2ScheduledOutput(
-                        wire=output^,
-                        completed_streams=completed^,
-                        released_bytes=released,
-                        deflater_failed=True,
-                    )
-                output.extend(Span(frames.wire))
                 self._responses[index].headers_sent = True
                 skipped = 0
                 if len(self._responses[index].body) == 0 and (
@@ -332,17 +293,18 @@ struct Http2ResponseScheduler(Movable):
             deflater_failed=False,
         )
 
-    def _encode_pending_headers(
+    def _encode_and_emit_headers(
         mut self,
         index: Int,
         mut deflater: Http2HpackDeflater,
         date: StringSlice,
         max_frame_size: Int,
+        mut output: List[Byte],
     ) -> Int:
-        var compressed_capacity = self._responses[index].compressed_capacity
+        var capacity = self._responses[index].compressed_capacity
         var max_hls = self._responses[index].max_header_list_size
         var max_fields = self._responses[index].max_header_fields
-        var compressed = List[Byte](length=compressed_capacity, fill=0)
+        var compressed = List[Byte](length=capacity, fill=0)
         var attempt = deflater.encode(
             Span(self._responses[index].header_fields),
             max_hls,
@@ -350,13 +312,13 @@ struct Http2ResponseScheduler(Movable):
             Span(compressed),
         )
         if attempt.is_invalid():
-            return _ENCODE_DEFLATER_FAILED
+            return _EMIT_DEFLATER_FAILED
         if attempt.is_too_large():
             var fallback = encode_http2_minimal_500_fields(
                 date, max_hls, max_fields
             )
             if not fallback.is_valid():
-                return _ENCODE_RST
+                return _EMIT_RST
             var retry_fields = fallback.fields^
             fallback.fields = List[Byte]()
             var retry_count = fallback.field_count
@@ -367,19 +329,34 @@ struct Http2ResponseScheduler(Movable):
                 Span(compressed),
             )
             if retry.is_invalid():
-                return _ENCODE_DEFLATER_FAILED
+                return _EMIT_DEFLATER_FAILED
             if retry.is_too_large():
-                return _ENCODE_RST
+                return _EMIT_RST
             self._responses[index].header_fields = retry_fields^
             self._responses[index].header_field_count = retry_count
             self._responses[index].end_on_headers = True
             self._responses[index].body = List[Byte]()
             self._responses[index].body_offset = 0
             attempt = retry.copy()
-        self._responses[index].compressed_block = compressed^
-        self._responses[index].compressed_length = attempt.output_length
-        self._responses[index].headers_encoded = True
-        return _ENCODE_OK
+        var compressed_len = attempt.output_length
+        var frame_count = (
+            compressed_len + max_frame_size - 1
+        ) // max_frame_size
+        if frame_count < 1:
+            frame_count = 1
+        var wire_bound = compressed_len + frame_count * 9
+        var frames = encode_headers_block(
+            self._responses[index].stream_id,
+            Span(compressed)[0:compressed_len],
+            self._responses[index].end_on_headers,
+            max_frame_size,
+            wire_bound,
+        )
+        if not frames.is_complete():
+            deflater.fail()
+            return _EMIT_DEFLATER_FAILED
+        output.extend(Span(frames.wire))
+        return _EMIT_OK
 
     def _find(self, stream_id: UInt32) -> Int:
         for i in range(len(self._responses)):
