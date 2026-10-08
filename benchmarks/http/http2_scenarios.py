@@ -481,7 +481,14 @@ def run_churn(
         raise ScenarioError(f"--clients must be >= 1, got {clients}")
 
     latencies: List[float] = []
-    counters = {"ok": 0, "failed": 0, "warmup_ok": 0}
+    counters = {
+        "ok": 0,
+        "failed": 0,
+        "warmup_ok": 0,
+        "warmup_failed": 0,
+        "late": 0,
+        "late_failed": 0,
+    }
     tls_info: List[Optional[str]] = [None]
     lock = threading.Lock()
 
@@ -500,16 +507,23 @@ def run_churn(
             with lock:
                 if info is not None and tls_info[0] is None:
                     tls_info[0] = info
-                if not ok:
-                    counters["failed"] += 1
-                    continue
                 if done_at > stop_at:
+                    if ok:
+                        counters["late"] += 1
+                    else:
+                        counters["late_failed"] += 1
                     continue
                 if done_at >= warmup_until:
-                    counters["ok"] += 1
-                    latencies.append(elapsed * 1_000_000.0)
+                    if ok:
+                        counters["ok"] += 1
+                        latencies.append(elapsed * 1_000_000.0)
+                    else:
+                        counters["failed"] += 1
                 else:
-                    counters["warmup_ok"] += 1
+                    if ok:
+                        counters["warmup_ok"] += 1
+                    else:
+                        counters["warmup_failed"] += 1
 
     threads = [threading.Thread(target=worker, daemon=True) for _ in range(clients)]
     for thread in threads:
@@ -534,6 +548,9 @@ def run_churn(
         "ok": counters["ok"],
         "failed": counters["failed"],
         "warmup_successes": counters["warmup_ok"],
+        "warmup_failed": counters["warmup_failed"],
+        "late": counters["late"],
+        "late_failed": counters["late_failed"],
         "samples": len(latencies),
         "p50_us": _p(latencies, 50),
         "p95_us": _p(latencies, 95),

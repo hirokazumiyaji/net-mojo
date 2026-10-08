@@ -202,6 +202,7 @@ async def _churn_worker(
 ) -> None:
     while time.perf_counter() < stop_at:
         start = time.perf_counter()
+        ok = True
         try:
             async with connect(
                 host,
@@ -215,24 +216,32 @@ async def _churn_worker(
                     client.get(path, authority), timeout=30.0
                 )
         except Exception:
-            counters["failed"] += 1
-            continue
-        done_at = result["done_at"] or time.perf_counter()
+            ok = False
+            done_at = time.perf_counter()
+        else:
+            done_at = result["done_at"] or time.perf_counter()
+            if result["status"] != b"200":
+                ok = False
+            elif path == b"/fixed" and bytes(result["body"]) != b"a" * 64:
+                ok = False
         elapsed = done_at - start
-        if result["status"] != b"200":
-            counters["failed"] += 1
-            continue
-        if path == b"/fixed" and bytes(result["body"]) != b"a" * 64:
-            counters["failed"] += 1
-            continue
         if done_at > stop_at:
-            counters["late"] = counters.get("late", 0) + 1
+            if ok:
+                counters["late"] = counters.get("late", 0) + 1
+            else:
+                counters["late_failed"] = counters.get("late_failed", 0) + 1
             continue
         if done_at >= warmup_until:
-            counters["ok"] += 1
-            latencies.append(elapsed * 1_000_000.0)
+            if ok:
+                counters["ok"] += 1
+                latencies.append(elapsed * 1_000_000.0)
+            else:
+                counters["failed"] += 1
         else:
-            counters["warmup_ok"] += 1
+            if ok:
+                counters["warmup_ok"] += 1
+            else:
+                counters["warmup_failed"] = counters.get("warmup_failed", 0) + 1
 
 
 def _percentile(sorted_vals: List[float], p: float) -> float:
@@ -318,7 +327,9 @@ async def run_load(
         "ok": counters["ok"],
         "failed": counters["failed"],
         "warmup_ok": counters["warmup_ok"],
+        "warmup_failed": counters.get("warmup_failed", 0),
         "late": counters.get("late", 0),
+        "late_failed": counters.get("late_failed", 0),
         "load_start_unix_s": load_start_unix_s,
         "measurement_start_unix_s": load_start_unix_s + warmup_s,
         "measurement_end_unix_s": load_start_unix_s + warmup_s + duration_s,
