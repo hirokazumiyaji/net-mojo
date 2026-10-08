@@ -151,6 +151,7 @@ def _trailer_forbidden(name: StringSlice) -> Bool:
         or lowered == "keep-alive"
         or lowered == "upgrade"
         or lowered == "authorization"
+        or lowered == "www-authenticate"
         or lowered == "proxy-authenticate"
         or lowered == "proxy-authorization"
         or lowered == "content-encoding"

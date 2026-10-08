@@ -2277,7 +2277,7 @@ impl QuicServer {
                         }
                     }
                 }
-                if !response.body.is_empty() {
+                if response.body_offset < response.body.len() {
                     let body_fin = !has_trailers;
                     match http3.send_body(
                         &mut connection.transport,

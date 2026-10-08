@@ -201,13 +201,18 @@ struct Http2ResponseScheduler(Movable):
                     )
                     self._remove(index)
                     continue
-                var capacity = self._responses[index].compressed_capacity
+                # HPACK compresses literal fields; the queued field block is
+                # a safe upper bound on the deflater's compressed output. The
+                # pre-allocated `compressed_capacity` can exceed one drain
+                # batch, so gate on this tighter per-response estimate so the
+                # drain never breaks before it can emit anything.
+                var field_bound = len(self._responses[index].header_fields)
                 var worst_frames = (
-                    capacity + max_frame_size - 1
+                    field_bound + max_frame_size - 1
                 ) // max_frame_size
                 if worst_frames < 1:
                     worst_frames = 1
-                var upper_bound = capacity + worst_frames * 9
+                var upper_bound = field_bound + worst_frames * 9
                 if max_output_bytes - len(output) < upper_bound:
                     break
                 var end_on_headers = (
@@ -248,7 +253,14 @@ struct Http2ResponseScheduler(Movable):
                     continue
                 self._responses[index].headers_sent = True
                 skipped = 0
-                if end_on_headers and not self._responses[index].cancelled:
+                # Re-derive end_on_headers after emission: a fallback inside
+                # _encode_and_emit_headers may have cleared body and trailers
+                # to make the HEADERS frame close the stream.
+                var effective_end = (
+                    len(self._responses[index].body) == 0
+                    and len(self._responses[index].trailers) == 0
+                )
+                if effective_end and not self._responses[index].cancelled:
                     session.finish_response(stream_id)
                     completed.append(stream_id)
                     released += (
@@ -428,9 +440,8 @@ struct Http2ResponseScheduler(Movable):
                 return _EMIT_RST
             self._responses[index].header_fields = retry_fields^
             self._responses[index].header_field_count = retry_count
-            self._responses[index].reserved_header_bytes = len(
-                self._responses[index].header_fields
-            )
+            # Preserve the server's original reservation so release() refunds
+            # the full budget it charged; the fallback is strictly smaller.
             effective_end_on_headers = True
             self._responses[index].body = List[Byte]()
             self._responses[index].body_offset = 0
