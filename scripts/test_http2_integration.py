@@ -161,6 +161,10 @@ class H2Peer:
         rec = self._streams.get(stream_id)
         if rec is None:
             raise RuntimeError(f"stream {stream_id}: no response before deadline")
+        if not rec["ended"]:
+            raise RuntimeError(
+                f"stream {stream_id}: no END_STREAM before deadline"
+            )
         return rec
 
     def wait_terminated(self, deadline: float) -> None:
@@ -484,7 +488,14 @@ def case_shutdown_goaway_drains_in_flight(port: int) -> None:
         goaway_error: Optional[int] = None
         connection_closed = False
 
-        def read_frame(deadline: float) -> Optional[Tuple[int, int, int, bytes]]:
+        # Sentinel for a timeout — distinct from EOF (returned as None)
+        # so the drain-close check cannot pass just because the client
+        # read deadline expired while the server kept the socket open.
+        READ_TIMEOUT = object()
+
+        def read_frame(
+            deadline: float,
+        ) -> Optional[Tuple[int, int, int, bytes]]:
             header = bytearray()
             while len(header) < 9:
                 remaining = max(0.0, deadline - time.perf_counter())
@@ -493,7 +504,7 @@ def case_shutdown_goaway_drains_in_flight(port: int) -> None:
                     chunk = sock.recv(9 - len(header))
                 except (socket.timeout, ssl.SSLWantReadError):
                     if time.perf_counter() >= deadline:
-                        return None
+                        return READ_TIMEOUT  # type: ignore[return-value]
                     continue
                 except (OSError, ssl.SSLError):
                     return None
@@ -519,6 +530,8 @@ def case_shutdown_goaway_drains_in_flight(port: int) -> None:
             nonlocal goaway_last_id, goaway_error, connection_closed
             while time.perf_counter() < deadline and not condition():
                 parsed = read_frame(deadline)
+                if parsed is READ_TIMEOUT:
+                    return
                 if parsed is None:
                     connection_closed = True
                     return
@@ -644,26 +657,62 @@ def case_shutdown_goaway_drains_in_flight(port: int) -> None:
 
 def case_client_sent_goaway(port: int) -> None:
     """A client-initiated GOAWAY on the connection must let an in-flight
-    stream complete and then the server closes."""
+    stream complete and then the server closes. We send a raw GOAWAY
+    frame (not hyper-h2's close_connection, which would transition the
+    client connection to CLOSED and reject in-flight DATA) and track
+    stream completion plus server EOF via raw frame parsing."""
     peer = H2Peer(port, raise_conn_window=1 << 20)
     try:
         stream_id = peer.open_request("GET", "/sibling")
+        # Observe response headers via hyper-h2 first; the stream must
+        # still be open afterwards so GOAWAY exercises the drain path.
         rec = peer.wait_response_only(stream_id, time.perf_counter() + TIMEOUT_S)
         _assert(rec["status"] == 200, f"GOAWAY precondition status {rec['status']}")
-        peer._conn.close_connection(error_code=int(ErrorCodes.NO_ERROR))
-        peer._flush()
-        # Drain any residual frames; expect no error from server.
+
+        goaway = (
+            (8).to_bytes(3, "big")
+            + bytes([0x07, 0x00])
+            + (0).to_bytes(4, "big")
+            + (0).to_bytes(4, "big")
+            + (int(ErrorCodes.NO_ERROR)).to_bytes(4, "big")
+        )
+        peer._sock.sendall(goaway)
+
+        # Raw drain: look for END_STREAM on our stream, then server EOF.
         deadline = time.perf_counter() + TIMEOUT_S
-        peer._sock.settimeout(0.5)
-        while time.perf_counter() < deadline:
+        buf = bytearray()
+        stream_ended = rec["ended"]
+        server_closed = False
+        while time.perf_counter() < deadline and not (stream_ended and server_closed):
+            remaining = max(0.0, deadline - time.perf_counter())
+            peer._sock.settimeout(min(0.1, remaining) if remaining else 0.0)
             try:
                 chunk = peer._sock.recv(65536)
             except (socket.timeout, ssl.SSLWantReadError):
                 continue
-            if not chunk:
+            except (OSError, ssl.SSLError):
+                server_closed = True
                 break
-            for event in peer._conn.receive_data(chunk):
-                peer._handle(event)
+            if not chunk:
+                server_closed = True
+                break
+            buf.extend(chunk)
+            while len(buf) >= 9:
+                length = int.from_bytes(buf[:3], "big")
+                if len(buf) < 9 + length:
+                    break
+                frame_type = buf[3]
+                flags = buf[4]
+                frame_stream = int.from_bytes(buf[5:9], "big") & 0x7FFFFFFF
+                del buf[: 9 + length]
+                if (
+                    frame_type == 0x00
+                    and frame_stream == stream_id
+                    and (flags & 0x01)
+                ):
+                    stream_ended = True
+        _assert(stream_ended, "in-flight stream never finished with END_STREAM")
+        _assert(server_closed, "server did not close after client GOAWAY drain")
     finally:
         peer.close()
 
@@ -682,15 +731,28 @@ def _attempt_alpn(port: int, protocols: List[str]) -> Tuple[Optional[str], Optio
             return None, exc
         try:
             negotiated = sock.selected_alpn_protocol()
-            # Probe one byte of read to confirm no plaintext downgrade.
-            sock.settimeout(0.5)
+            # Send an HTTP/1.1 request and confirm the server never
+            # responds — otherwise an unprotected HTTP/1.1 fallback
+            # could silently serve clients that offered no (or wrong)
+            # ALPN. Inactivity alone is not enough: without a request
+            # a correctly-shutting-down server also stays silent.
             try:
-                payload = sock.recv(1)
+                sock.sendall(
+                    b"GET / HTTP/1.1\r\n"
+                    b"Host: localhost\r\n"
+                    b"Connection: close\r\n\r\n"
+                )
+            except (ssl.SSLError, OSError):
+                return negotiated, None
+            sock.settimeout(1.0)
+            try:
+                payload = sock.recv(1024)
             except (socket.timeout, ssl.SSLError, OSError):
                 payload = b""
             if payload:
                 raise RuntimeError(
-                    f"server sent data without a negotiated application protocol: {payload!r}"
+                    "server responded to an HTTP/1.1 request without a"
+                    f" negotiated application protocol: {payload!r}"
                 )
             return negotiated, None
         finally:

@@ -161,7 +161,21 @@ class H1Client:
         cl = next((int(v) for n, v in headers if n.lower() == "content-length"), None)
         te = next((v.lower() for n, v in headers if n.lower() == "transfer-encoding"), None)
         if no_body:
-            pass
+            # Drain through EOF so a framing regression that writes
+            # a forbidden payload after a 204/304 is visible to the
+            # caller rather than being silently discarded. The caller
+            # issues these with Connection: close so the server must
+            # close after the header line.
+            self._sock.settimeout(REQUEST_TIMEOUT_S)
+            while True:
+                try:
+                    chunk = self._sock.recv(4096)
+                except (socket.timeout, ssl.SSLError, OSError):
+                    break
+                if not chunk:
+                    break
+                body.extend(chunk)
+            body_bytes = bytes(body)
         elif cl is not None:
             while len(body) < cl:
                 chunk = self._sock.recv(4096)
@@ -199,10 +213,12 @@ class H1Client:
                 if not chunk:
                     break
                 body_bytes += chunk
-        if cl is not None and not no_body:
+        if no_body:
+            body = body_bytes
+        elif cl is not None:
             body = bytes(body)
         else:
-            body = body_bytes if no_body is False else b""
+            body = body_bytes
         return H1Response(resp_status, reason, headers, bytes(body), trailers)
 
     def _consume_line(self, buf: bytearray) -> Tuple[bytes, bytearray]:
