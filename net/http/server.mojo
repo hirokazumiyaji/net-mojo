@@ -1641,6 +1641,7 @@ struct Server(Movable):
                 self._refuse_http2_stream(idx, stream_id, UInt32(2))
                 return
 
+        var end_on_headers = http2_response_end_on_headers(writer, is_head)
         var response_body = writer.body^
         writer.body = List[Byte]()
         if not has_body_for_status(writer.status, is_head):
@@ -1651,7 +1652,6 @@ struct Server(Movable):
         if not self._budget.try_reserve(response_reservation):
             self._refuse_http2_stream(idx, stream_id, UInt32(7))
             return
-        var end_on_headers = http2_response_end_on_headers(writer, is_head)
         if not self._conns[idx].http2_responses.enqueue(
             stream_id, headers_wire^, response_body^, end_on_headers
         ):
