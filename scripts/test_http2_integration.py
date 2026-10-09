@@ -640,6 +640,10 @@ def case_shutdown_goaway_drains_in_flight(port: int) -> None:
             f"trigger-shutdown unexpected reset {rec_trigger['reset']!r}",
         )
         _assert(
+            rec_trigger.get("ended", False),
+            f"trigger-shutdown never finished with END_STREAM: {rec_trigger!r}",
+        )
+        _assert(
             bytes(rec_trigger["body"]) == b"shutdown requested",
             f"trigger-shutdown body {rec_trigger['body']!r}",
         )
@@ -678,8 +682,23 @@ def case_shutdown_goaway_drains_in_flight(port: int) -> None:
             f"post-GOAWAY stream received response data {rec_refused!r}",
         )
 
-        # 5) Open the stream window generously so the stalled response
-        # can finish regardless of how much the server has already sent.
+        # 5) Confirm the stalled stream still obeys the initial stream
+        # window: a server that bypassed flow control and already
+        # finished the 128 KiB /large response would make this probe
+        # pass without ever exercising drain-after-credit.
+        rec_before = streams.get(stall_id, {})
+        _assert(
+            not rec_before.get("ended", False)
+            and (rec_before.get("reset") is None),
+            f"stall stream closed before credit release {rec_before!r}",
+        )
+        _assert(
+            len(rec_before.get("body") or b"") <= INITIAL_WINDOW,
+            "server exceeded initial stream window before credit release:"
+            f" {len(rec_before.get('body') or b'')} bytes",
+        )
+        # Open the stream window generously so the stalled response can
+        # finish regardless of how much the server has already sent.
         sock.sendall(frame(0x08, 0x00, stall_id, (1 << 20).to_bytes(4, "big")))
         drive(
             time.perf_counter() + TIMEOUT_S,
@@ -765,6 +784,7 @@ def case_client_sent_goaway(port: int) -> None:
         server_closed = False
         goaway_sent = False
         credit_sent = False
+        server_goaway_error: Optional[int] = None
         while time.perf_counter() < deadline and not (stream_ended and server_closed):
             remaining = max(0.0, deadline - time.perf_counter())
             sock.settimeout(min(POLL_INTERVAL_S, remaining) if remaining else 0.0)
@@ -778,11 +798,15 @@ def case_client_sent_goaway(port: int) -> None:
                     and not stream_ended
                 ):
                     # /large is 128 KiB; a server that honored the
-                    # initial 65535 stream window must have stalled by
-                    # now with END_STREAM pending. Send GOAWAY so
-                    # draining engages while the response is still in
-                    # flight — the asserts below reject a probe that
-                    # sees the full response or END_STREAM beforehand.
+                    # initial 65535 stream window must have stalled at
+                    # exactly that boundary with END_STREAM pending.
+                    # If the body already exceeded the window, the
+                    # server bypassed flow control — fail outright.
+                    _assert(
+                        len(total_body) <= 65535,
+                        "server exceeded initial stream window before"
+                        f" GOAWAY: {len(total_body)} bytes",
+                    )
                     goaway = (
                         (0).to_bytes(4, "big")
                         + (int(ErrorCodes.NO_ERROR)).to_bytes(4, "big")
@@ -820,6 +844,8 @@ def case_client_sent_goaway(port: int) -> None:
                 elif frame_type == 0x03 and frame_stream == stream_id:
                     reset_code = int.from_bytes(payload[:4], "big")
                     stream_ended = True
+                elif frame_type == 0x07 and frame_stream == 0 and len(payload) >= 8:
+                    server_goaway_error = int.from_bytes(payload[4:8], "big")
             if goaway_sent and not credit_sent and headers_decoded:
                 sock.sendall(
                     frame(
@@ -840,6 +866,10 @@ def case_client_sent_goaway(port: int) -> None:
             f"GOAWAY-drained response body mismatch len={len(total_body)}",
         )
         _assert(server_closed, "server did not close after client GOAWAY drain")
+        _assert(
+            server_goaway_error == 0,
+            f"server did not acknowledge GOAWAY with NO_ERROR: {server_goaway_error!r}",
+        )
     finally:
         try:
             sock.close()
