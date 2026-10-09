@@ -93,7 +93,6 @@ def encode_http2_response_headers(
             if not _content_length_matches(declared_lengths[i], wire_length):
                 return Http2ResponseHeadersResult.error()
 
-    var has_date = Bool(writer.headers.get_first("date"))
     var has_content_length = wire_length >= 0
     var fields = List[Byte]()
     if not _append_field(fields, String(":status"), status_bytes):
@@ -127,6 +126,23 @@ def encode_http2_response_headers(
                             connection_hops.append(token^)
                     start = cursor + 1
                 cursor += 1
+
+    # `has_date` is determined after Connection-nominated stripping so
+    # a handler that writes `Connection: Date` plus `Date: ...` still
+    # yields the server-generated Date (RFC 9110 §6.6.1).
+    var has_date = False
+    for i in range(len(writer.headers)):
+        ref name = writer.headers._lower_names[i]
+        if name != "date":
+            continue
+        var is_connection_nominated = False
+        for h in connection_hops:
+            if h == name:
+                is_connection_nominated = True
+                break
+        if not is_connection_nominated:
+            has_date = True
+            break
 
     for i in range(len(writer.headers)):
         ref name = writer.headers._lower_names[i]
