@@ -501,13 +501,17 @@ struct Http2ResponseScheduler(Movable):
                 var trailer_max_fields = self._responses[
                     index
                 ].max_header_fields
-                # nghttp2_hd_deflate_bound = sum(name+value+32) + 128.
-                # Add 32 bytes to cover a dynamic-table-size-update prefix
-                # (RFC 7541 §4.2) that nghttp2 may emit after a peer
-                # SETTINGS change (10-byte varint worst case).
-                var trailer_bound = (
-                    len(trailer_fields) + 32 * trailer_count + 160
-                )
+                # Native deflate bound so a tighter conservative
+                # estimate does not reset valid trailer sections that
+                # the encoder would actually fit under the drain batch.
+                var trailer_bound = deflater.deflate_bound(Span(trailer_fields))
+                if trailer_bound < 0:
+                    return Http2ScheduledOutput(
+                        wire=output^,
+                        completed_streams=completed^,
+                        released_bytes=released,
+                        deflater_failed=True,
+                    )
                 # Gate on the worst-case wire bound BEFORE calling the
                 # stateful deflater: deflater.encode mutates the shared
                 # dynamic table, so a deferred emission from a tight
