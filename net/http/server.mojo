@@ -878,6 +878,11 @@ struct Server(Movable):
             if response.status < 100 or response.status > 599:
                 response.status = 500
                 response.body.clear()
+            if len(response.trailers) > 0:
+                response.status = 500
+                response.headers.clear()
+                response.body.clear()
+                response.trailers.clear()
             var response_header_bytes = 0
             for i in range(len(response.headers)):
                 response_header_bytes += (
@@ -1562,6 +1567,11 @@ struct Server(Movable):
             writer.set_status(500)
             writer.headers.clear()
             writer.body.clear()
+        if len(writer.trailers) > 0:
+            writer.set_status(500)
+            writer.headers.clear()
+            writer.body.clear()
+            writer.trailers.clear()
 
         try:
             self._inject_alt_svc_for_tls(idx, writer)
@@ -2136,6 +2146,9 @@ struct Server(Movable):
             len(writer.body) > cap
             or not writer._reconcile_body_budget()
             or not writer.headers._adopt_capacity_budget(
+                writer._body_budget.copy()
+            )
+            or not writer.trailers._adopt_capacity_budget(
                 writer._body_budget.copy()
             )
         ):

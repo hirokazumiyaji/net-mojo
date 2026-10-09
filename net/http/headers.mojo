@@ -136,6 +136,42 @@ def _reject_bad_value(value: StringSlice, operation: String) raises NetError:
     _check_value_bytes(value.as_bytes(), operation)
 
 
+def _trailer_forbidden(name: StringSlice) -> Bool:
+    # RFC 9110 §6.5.1 and RFC 9112 §6.5.1 forbid trailers that change
+    # framing, routing, authentication, or payload processing.
+    var lowered = String(name).lower()
+    return (
+        lowered == "content-length"
+        or lowered == "transfer-encoding"
+        or lowered == "te"
+        or lowered == "trailer"
+        or lowered == "host"
+        or lowered == "expect"
+        or lowered == "connection"
+        or lowered == "keep-alive"
+        or lowered == "upgrade"
+        or lowered == "authorization"
+        or lowered == "www-authenticate"
+        or lowered == "proxy-authenticate"
+        or lowered == "proxy-authorization"
+        or lowered == "content-encoding"
+        or lowered == "content-type"
+        or lowered == "content-range"
+        or lowered == "cache-control"
+        or lowered == "vary"
+        or lowered == "set-cookie"
+        or lowered == "age"
+        or lowered == "expires"
+        or lowered == "pragma"
+        or lowered == "location"
+        or lowered == "retry-after"
+        or lowered == "allow"
+        or lowered == "etag"
+        or lowered == "last-modified"
+        or lowered == "content-disposition"
+    )
+
+
 struct Headers(Movable, Sized):
     """Owned header list. The server owns it for the handler call."""
 

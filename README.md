@@ -125,6 +125,13 @@ Constraints (see `docs/design/http-server.md` for the full contract):
   HTTP/1 response streaming and deferred responses use
   `ResponseWriter.detach()` and `ResponseSender`; request body streaming,
   routers, and middleware frameworks are not included.
+- Response trailers: `writer.add_trailer(name, value)` queues a trailer
+  on a buffered HTTP/1.1 response. The encoder switches to
+  `Transfer-Encoding: chunked`, advertises the names in `Trailer:`, and
+  emits the trailer section after the body (RFC 9112 §7.1.2). Framing-,
+  routing-, authentication-, and payload-processing-sensitive names are
+  rejected (RFC 9110 §6.5.1); HEAD and 1xx/204/205/304 responses drop
+  trailers.
 - `Request` owns its decoded strings, headers and body. The handler borrows
   that request and mutates the writer during `handle`; copy request fields
   you want to keep. Views borrow their source values, while public header

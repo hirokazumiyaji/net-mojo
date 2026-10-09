@@ -37,6 +37,14 @@ underscore (see README "Versioning and compatibility"). Anything under
 
 ### Added
 
+- HTTP/1.1 response trailers via `ResponseWriter.add_trailer(name, value)`:
+  the buffered encoder switches to `Transfer-Encoding: chunked`, advertises
+  the names in `Trailer:`, and emits the trailer section after the body
+  (RFC 9112 §7.1.2). Names in the framing / routing / auth / payload
+  deny-list (RFC 9110 §6.5.1) and CR/LF/NUL are rejected; HEAD and
+  1xx/204/205/304 responses drop trailers. Trailer bytes count against the
+  response header byte limit and the shared buffer budget.
+
 - HTTP/2 server support over TLS ALPN `h2`, including bounded request streams,
   HPACK, connection and stream flow control, fair response scheduling, stream
   refusal, and GOAWAY during graceful shutdown. The optional libnghttp2 shim is

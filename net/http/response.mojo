@@ -21,7 +21,7 @@ from ._detach import (
     _create_detach_state,
 )
 from ._buffer import SharedBufferBudget, _reserve_capacity
-from .headers import Headers
+from .headers import Headers, _trailer_forbidden
 
 
 struct ResponseWriter(Movable, Sized):
@@ -29,6 +29,7 @@ struct ResponseWriter(Movable, Sized):
 
     var status: Int
     var headers: Headers
+    var trailers: Headers
     var body: List[Byte]
     var should_close: Bool
     var _limit: Int
@@ -51,6 +52,7 @@ struct ResponseWriter(Movable, Sized):
     ):
         self.status = 200
         self.headers = Headers()
+        self.trailers = Headers()
         self.body = List[Byte]()
         self.should_close = False
         self._limit = body_limit
@@ -69,6 +71,7 @@ struct ResponseWriter(Movable, Sized):
     def __init__(out self, *, deinit move: Self):
         self.status = move.status
         self.headers = move.headers^
+        self.trailers = move.trailers^
         self.body = move.body^
         self.should_close = move.should_close
         self._limit = move._limit
@@ -86,10 +89,12 @@ struct ResponseWriter(Movable, Sized):
 
     def _set_body_budget(mut self, var budget: SharedBufferBudget):
         _ = self.headers._adopt_capacity_budget(Optional(budget.copy()))
+        _ = self.trailers._adopt_capacity_budget(Optional(budget.copy()))
         self._body_budget = budget^
 
     def _drop_headers(mut self):
         self.headers = Headers()
+        self.trailers = Headers()
 
     def _reconcile_body_budget(mut self) -> Bool:
         var capacity = self.body.capacity()
@@ -190,6 +195,21 @@ struct ResponseWriter(Movable, Sized):
 
     def write_string(mut self, data: StringSlice) raises NetError:
         self.write(data.as_bytes())
+
+    def add_trailer(
+        mut self, var name: String, var value: String
+    ) raises NetError:
+        """Appends a response trailer after validating the name against
+        the RFC 9110 §6.5.1 trailer deny-list; the underlying Headers
+        store rejects CR/LF/NUL and non-token name bytes."""
+        if _trailer_forbidden(name):
+            raise NetError(
+                NetErrorKind.invalid_argument(),
+                "add trailer",
+                None,
+                "trailer modifies framing, routing, or payload processing",
+            )
+        self.trailers.add(name^, value^)
 
 
 def has_body_for_status(status: Int, is_head: Bool) -> Bool:

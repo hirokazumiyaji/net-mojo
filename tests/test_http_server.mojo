@@ -1083,6 +1083,18 @@ struct _EchoHandler(Handler):
             writer.write_string("missing")
 
 
+struct _TrailerHandler(Handler):
+    def __init__(out self):
+        pass
+
+    def handle(mut self, req: Request, mut writer: ResponseWriter) raises:
+        writer.set_status(200)
+        writer.headers.add(String("Content-Type"), String("text/plain"))
+        writer.write_string("hello")
+        writer.add_trailer(String("X-Checksum"), String("abc"))
+        writer.add_trailer(String("X-Count"), String("1"))
+
+
 struct _BodyCountHandler(Handler):
     def __init__(out self):
         pass
@@ -2525,6 +2537,50 @@ def test_chunked_echo_roundtrip() raises:
     )
     assert_equal(_status_of(out), 200)
     _assert_body(out, "hello")
+    client.close()
+
+
+def test_response_trailers_emit_chunked_trailer_section() raises:
+    var server = Server(ServerConfig.default())
+    server.add_listener(listen_tcp("127.0.0.1:0"))
+    var port = server.local_address().port
+    var handler = _TrailerHandler()
+    var client = dial_tcp(
+        String("127.0.0.1:") + String(port), Timeout.seconds(2)
+    )
+    client.write_all(
+        "GET /hello HTTP/1.1\r\nHost: x\r\n\r\n".as_bytes(), Timeout.seconds(2)
+    )
+    var out = List[Byte]()
+    var tmp = Array[Byte, 65536](fill=0)
+    var terminator = "\r\n0\r\nX-Checksum: abc\r\nX-Count: 1\r\n\r\n".as_bytes()
+    for _ in range(300):
+        _ = server.tick(handler, Timeout.nanoseconds(0))
+        try:
+            var n = client.try_read(Span(tmp))
+            if n == 0:
+                break
+            for i in range(n):
+                out.append(tmp[i])
+            if len(out) >= len(terminator):
+                var matches = True
+                var base = len(out) - len(terminator)
+                for i in range(len(terminator)):
+                    if out[base + i] != terminator[i]:
+                        matches = False
+                        break
+                if matches:
+                    break
+        except e:
+            _ = e
+            continue
+    assert_equal(_status_of(out), 200)
+    var text = String(from_utf8_lossy=Span(out))
+    assert_true(text.find("Transfer-Encoding: chunked\r\n") >= 0)
+    assert_true(text.find("Trailer: X-Checksum, X-Count\r\n") >= 0)
+    assert_true(text.find("Content-Length") < 0)
+    assert_true(text.endswith(String(from_utf8_lossy=terminator)))
+    assert_true(text.find("5\r\nhello\r\n") >= 0)
     client.close()
 
 

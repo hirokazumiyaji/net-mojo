@@ -379,6 +379,7 @@ def split_path_query(target: StringSlice) -> Tuple[String, String]
 struct ResponseWriter(Movable, Sized):
     var status: Int
     var headers: Headers
+    var trailers: Headers
     var body: List[Byte]
     var should_close: Bool
     def __init__(
@@ -394,6 +395,7 @@ struct ResponseWriter(Movable, Sized):
     def body_limit(self) -> Int
     def write[origin: ImmOrigin](mut self, data: Span[Byte, origin]) raises NetError
     def write_string(mut self, data: StringSlice) raises NetError
+    def add_trailer(mut self, var name: String, var value: String) raises NetError
     def is_detached(self) -> Bool
     def detach(mut self) raises NetError -> ResponseSender
 
@@ -580,6 +582,7 @@ handler が保持できるのは、呼び出し中に作った所有値のコピ
 | `Headers` の公開 getter の戻り値 | getter の呼び出し側 | `get_first`、`get_all`、`name_at`、`value_at`、`value_bytes_at` は所有値を返す。元の `Headers.clear()` 後も使える |
 | encoder 内部の `_value_bytes_span` | `Headers` 内部の value storage | immutable borrow 中のみ。元の header を移動、変更、破棄しない |
 | `ResponseWriter.body` | writer | `write` と `write_string` は入力をコピーする。handler 終了後、adapter が wire または provider の送信待ち状態へ変換する |
+| `ResponseWriter.trailers` | writer | `add_trailer` は RFC 9110 §6.5.1 の deny-list（framing／routing／auth／payload）と CR/LF/NUL を拒否する。bytes は response header budget と shared buffer budget に計上する。HTTP/1.1 は `Transfer-Encoding: chunked` と `Trailer:` を自動で付け、body の後に trailer section を送る（RFC 9112 §7.1.2）。HEAD／1xx／204／205／304 は trailer を落とす |
 | `ResponseSender` | handle が参照する共有 detached state | HTTP/1 の handler 終了後も使える。connection の終了や timeout は state を取消済みにする |
 | `TCPConn` / `TCPListener` | 単一 owner | `raw_fd()` は借用。登録解除から close まで owner を生存させる。thread 間は fd 番号のみを渡す |
 | `ServerControl` | 共有 control state（wakeup 資源と終了状態の寿命を管理） | server より長生き可。終了後の要求は no-op。冪等。通知と wakeup fd 破棄を同期し、close 済み fd に書かない |
