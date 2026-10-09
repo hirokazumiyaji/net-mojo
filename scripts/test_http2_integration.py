@@ -253,6 +253,9 @@ def case_large_request_body(port: int) -> None:
         peer.close()
 
 
+LARGE_RESPONSE_BODY = bytes((97 + i % 26) for i in range(128 * 1024))
+
+
 def case_large_response_body(port: int) -> None:
     peer = H2Peer(port, raise_conn_window=1 << 20)
     try:
@@ -260,8 +263,10 @@ def case_large_response_body(port: int) -> None:
         rec = peer.wait_stream(stream_id, time.perf_counter() + TIMEOUT_S)
         _assert(rec["status"] == 200, f"large resp status {rec['status']}")
         _assert(rec["reset"] is None, f"large resp reset {rec['reset']}")
-        _assert(len(rec["body"]) == 128 * 1024, f"large resp len {len(rec['body'])}")
-        _assert(rec["body"][0:1] == b"a", f"large resp first byte {rec['body'][:1]!r}")
+        _assert(
+            bytes(rec["body"]) == LARGE_RESPONSE_BODY,
+            f"large resp body mismatch len={len(rec['body'])}",
+        )
     finally:
         peer.close()
 
@@ -321,13 +326,21 @@ def case_continuation_header_block(port: int) -> None:
         got_status = None
         body = bytearray()
         got_end = False
-        sock.settimeout(0.5)
         deadline = time.perf_counter() + TIMEOUT_S
         header = bytearray()
         while time.perf_counter() < deadline and not got_end:
-            # Read a 9-byte frame header.
+            # Read a 9-byte frame header. Poll at POLL_INTERVAL_S but
+            # keep retrying until the overall `deadline` so a healthy
+            # server that pauses between frames does not fail the case.
             while len(header) < 9:
-                chunk = sock.recv(9 - len(header))
+                remaining = max(0.0, deadline - time.perf_counter())
+                if remaining <= 0:
+                    raise RuntimeError("continuation deadline before header")
+                sock.settimeout(min(POLL_INTERVAL_S, remaining))
+                try:
+                    chunk = sock.recv(9 - len(header))
+                except (socket.timeout, ssl.SSLWantReadError):
+                    continue
                 if not chunk:
                     raise RuntimeError("connection closed during continuation test")
                 header.extend(chunk)
@@ -337,7 +350,14 @@ def case_continuation_header_block(port: int) -> None:
             frame_stream = int.from_bytes(header[5:9], "big")
             payload = bytearray()
             while len(payload) < length:
-                chunk = sock.recv(length - len(payload))
+                remaining = max(0.0, deadline - time.perf_counter())
+                if remaining <= 0:
+                    raise RuntimeError("continuation deadline mid-payload")
+                sock.settimeout(min(POLL_INTERVAL_S, remaining))
+                try:
+                    chunk = sock.recv(length - len(payload))
+                except (socket.timeout, ssl.SSLWantReadError):
+                    continue
                 if not chunk:
                     raise RuntimeError("connection closed mid-frame")
                 payload.extend(chunk)
@@ -401,14 +421,22 @@ def case_stalled_stream_sibling_progresses(port: int) -> None:
     peer = H2Peer(port, raise_conn_window=1 << 20)
     try:
         stalled = peer.open_request("GET", "/large", withhold=True)
-        # Spin pumping briefly so the server starts sending the stalled
-        # response until the per-stream window closes.
-        deadline = time.perf_counter() + 1.0
+        # Spin pumping until the stalled response has filled its stream
+        # window. If this never happens, the scenario was never set up
+        # (a server that completes the sibling before starting /large
+        # would otherwise silently pass).
+        deadline = time.perf_counter() + TIMEOUT_S
         while time.perf_counter() < deadline:
             peer.pump(deadline)
             rec = peer._streams.get(stalled)
             if rec and len(rec["body"]) >= INITIAL_WINDOW:
                 break
+        rec = peer._streams.get(stalled) or {}
+        _assert(
+            len(rec.get("body") or b"") >= INITIAL_WINDOW,
+            f"/large never filled its initial window: got {len(rec.get('body') or b'')}",
+        )
+        _assert(not rec.get("ended", False), "/large ended before sibling probe")
         sib_id = peer.open_request("GET", "/sibling")
         sib = peer.wait_stream(sib_id, time.perf_counter() + TIMEOUT_S)
         _assert(sib["status"] == 200, f"sibling status under stall {sib['status']}")
@@ -429,8 +457,8 @@ def case_stalled_stream_sibling_progresses(port: int) -> None:
         _assert(rec["status"] == 200, f"stalled stream status after release {rec['status']}")
         _assert(rec["reset"] is None, f"stalled stream reset after release {rec['reset']!r}")
         _assert(
-            len(rec["body"]) == 128 * 1024,
-            f"stalled stream body length after release {len(rec['body'])}",
+            bytes(rec["body"]) == LARGE_RESPONSE_BODY,
+            f"stalled stream body mismatch len={len(rec['body'])}",
         )
     finally:
         peer.close()
@@ -652,8 +680,8 @@ def case_shutdown_goaway_drains_in_flight(port: int) -> None:
             f"stall stream after release {rec1!r}",
         )
         _assert(
-            len(rec1["body"]) == 128 * 1024,
-            f"stall final body {len(rec1['body'])} bytes",
+            bytes(rec1["body"]) == LARGE_RESPONSE_BODY,
+            f"stall final body mismatch len={len(rec1['body'])}",
         )
 
         # 6) Server closes the connection: EOF.
@@ -790,8 +818,8 @@ def case_client_sent_goaway(port: int) -> None:
         _assert(reset_code is None, f"in-flight stream reset: {reset_code!r}")
         _assert(status == 200, f"GOAWAY-drained response status {status!r}")
         _assert(
-            len(total_body) == 128 * 1024,
-            f"GOAWAY-drained response body length {len(total_body)}",
+            bytes(total_body) == LARGE_RESPONSE_BODY,
+            f"GOAWAY-drained response body mismatch len={len(total_body)}",
         )
         _assert(server_closed, "server did not close after client GOAWAY drain")
     finally:
