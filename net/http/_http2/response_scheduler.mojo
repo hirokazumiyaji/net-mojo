@@ -261,23 +261,29 @@ struct Http2ResponseScheduler(Movable):
                             fallback_bound + fallback_worst_frames * 9
                         )
                         if max_output_bytes - len(output) < fallback_bound_full:
-                            var rst = encode_rst_stream_frame(
-                                stream_id, UInt32(2)
-                            )
-                            if not rst.is_complete() or len(rst.wire) > (
-                                max_output_bytes - len(output)
-                            ):
-                                break
-                            output.extend(Span(rst.wire))
-                            session.finish_response(stream_id)
-                            completed.append(stream_id)
-                            released += (
-                                self._responses[index].reserved_header_bytes
-                                + self._responses[index].reserved_body_bytes
-                            )
-                            self._remove(index)
-                            skipped = 0
-                            continue
+                            if fallback_bound_full > max_output_bytes:
+                                # Even an empty batch cannot hold this
+                                # fallback; RST and remove.
+                                var rst = encode_rst_stream_frame(
+                                    stream_id, UInt32(2)
+                                )
+                                if not rst.is_complete() or len(rst.wire) > (
+                                    max_output_bytes - len(output)
+                                ):
+                                    break
+                                output.extend(Span(rst.wire))
+                                session.finish_response(stream_id)
+                                completed.append(stream_id)
+                                released += (
+                                    self._responses[index].reserved_header_bytes
+                                    + self._responses[index].reserved_body_bytes
+                                )
+                                self._remove(index)
+                                skipped = 0
+                                continue
+                            # Only this batch is tight; wait for the next
+                            # drain batch to retry the fallback.
+                            break
                         self._responses[index].header_fields = minimal.fields^
                         minimal.fields = List[Byte]()
                         self._responses[
@@ -334,13 +340,10 @@ struct Http2ResponseScheduler(Movable):
                     continue
 
             if self._responses[index].cancelled:
-                if not self._responses[index].end_on_headers:
-                    var rst = encode_rst_stream_frame(stream_id, UInt32(8))
-                    if not rst.is_complete() or len(rst.wire) > (
-                        max_output_bytes - len(output)
-                    ):
-                        break
-                    output.extend(Span(rst.wire))
+                # Peer already sent RST_STREAM: RFC 9113 §5.4.2 forbids
+                # replying with another RST_STREAM. Any HEADERS already
+                # on the wire keep the HPACK dynamic table in sync; the
+                # queued DATA is dropped by discarding the entry.
                 session.finish_response(stream_id)
                 completed.append(stream_id)
                 released += (
