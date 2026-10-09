@@ -168,6 +168,7 @@ def _trailer_forbidden(name: StringSlice) -> Bool:
         or lowered == "allow"
         or lowered == "etag"
         or lowered == "last-modified"
+        or lowered == "content-disposition"
     )
 
 

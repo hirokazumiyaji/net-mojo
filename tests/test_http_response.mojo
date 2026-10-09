@@ -935,6 +935,7 @@ def test_add_trailer_rejects_forbidden_names() raises:
         String("Allow"),
         String("ETag"),
         String("Last-Modified"),
+        String("Content-Disposition"),
     ]
     for name in forbidden:
         var writer = ResponseWriter(32)
