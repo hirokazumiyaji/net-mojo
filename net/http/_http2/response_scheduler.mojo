@@ -252,6 +252,7 @@ struct Http2ResponseScheduler(Movable):
                             released += (
                                 self._responses[index].reserved_header_bytes
                                 + self._responses[index].reserved_body_bytes
+                                + self._responses[index].reserved_trailer_bytes
                             )
                             self._remove(index)
                             skipped = 0
@@ -293,6 +294,7 @@ struct Http2ResponseScheduler(Movable):
                             released += (
                                 self._responses[index].reserved_header_bytes
                                 + self._responses[index].reserved_body_bytes
+                                + self._responses[index].reserved_trailer_bytes
                             )
                             self._remove(index)
                             skipped = 0
