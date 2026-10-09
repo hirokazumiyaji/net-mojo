@@ -134,11 +134,11 @@ class H1Client:
         elif body:
             self._sock.sendall(body)
         try:
-            return self._read_response()
+            return self._read_response(method)
         finally:
             self.close()
 
-    def _read_response(self) -> H1Response:
+    def _read_response(self, method: str = "GET") -> H1Response:
         buf = bytearray()
         while b"\r\n\r\n" not in buf:
             chunk = self._sock.recv(4096)
@@ -193,6 +193,10 @@ class H1Client:
             while len(body) < cl:
                 chunk = self._sock.recv(4096)
                 if not chunk:
+                    if method != "HEAD":
+                        raise RuntimeError(
+                            f"H1: EOF before Content-Length ({len(body)} of {cl})"
+                        )
                     break
                 body.extend(chunk)
             if len(body) > cl:
@@ -427,6 +431,7 @@ def case_routing(h1: H1Client, h2: H2Client) -> None:
         h2b = H2Client(h2._port) if hasattr(h2, "_port") else h2
         r2 = h2b.request(method, "/echo?a=1&b=2", body=b"ping" if method == "POST" else b"")
         _assert(r2.status == 200, f"H2 routing status {r2.status}")
+        _assert(r2.reset_code is None, f"H2 routing unexpected reset {r2.reset_code!r}")
         _assert(r2.header_values("x-method") == [method], f"H2 X-Method {r2.header_values('x-method')!r}")
         _assert(r2.header_values("x-path") == ["/echo"], f"H2 X-Path {r2.header_values('x-path')!r}")
         _assert(r2.header_values("x-query") == ["a=1&b=2"], f"H2 X-Query {r2.header_values('x-query')!r}")
@@ -439,6 +444,7 @@ def case_not_found(h1: H1Client, h2: H2Client) -> None:
     _assert(r1.status == 404 and r1.body == b"missing", f"H1 404 {r1!r}")
     r2 = h2.request("GET", "/does-not-exist")
     _assert(r2.status == 404 and r2.body == b"missing", f"H2 404 {r2!r}")
+    _assert(r2.reset_code is None, f"H2 404 unexpected reset {r2.reset_code!r}")
 
 
 def case_head_no_body(port: int) -> None:
@@ -498,6 +504,7 @@ def case_request_trailers(h1: H1Client, h2: H2Client) -> None:
         trailers=[(b"x-trailer-in", b"contract")],
     )
     _assert(r2.status == 200, f"H2 req trailers status {r2.status}")
+    _assert(r2.reset_code is None, f"H2 req trailers unexpected reset {r2.reset_code!r}")
     _assert(r2.body == b"trailer=contract", f"H2 req trailers body {r2.body!r}")
 
 
