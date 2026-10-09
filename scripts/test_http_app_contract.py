@@ -485,6 +485,7 @@ def case_duplicate_headers(h1: H1Client, h2: H2Client) -> None:
     r1 = h1.request("GET", "/dup")
     _assert(r1.header_values("x-dup") == ["one", "two"], f"H1 dup headers {r1.header_values('x-dup')!r}")
     r2 = h2.request("GET", "/dup")
+    _assert(r2.reset_code is None, f"H2 dup unexpected reset {r2.reset_code!r}")
     _assert(sorted(r2.header_values("x-dup")) == ["one", "two"], f"H2 dup headers {r2.header_values('x-dup')!r}")
 
 
@@ -599,6 +600,10 @@ def case_content_length_mismatch(port: int) -> None:
             f"H2 CL mismatch: expected 500, got status={r2.status} reset={r2.reset_code}",
         )
         _assert(
+            r2.reset_code is None,
+            f"H2 CL mismatch unexpected reset {r2.reset_code!r}",
+        )
+        _assert(
             not h2.terminated(),
             "H2 CL mismatch unexpectedly closed the connection",
         )
@@ -606,6 +611,10 @@ def case_content_length_mismatch(port: int) -> None:
         _assert(
             rsib.status == 200 and rsib.body == b"sibling ok",
             f"H2 sibling after CL mismatch {rsib!r}",
+        )
+        _assert(
+            rsib.reset_code is None,
+            f"H2 sibling after CL mismatch unexpected reset {rsib.reset_code!r}",
         )
     finally:
         h2.close()

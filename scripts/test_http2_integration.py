@@ -409,6 +409,7 @@ def case_rst_while_sibling_completes(port: int) -> None:
         peer._flush()
         rec = peer.wait_stream(sib_id, time.perf_counter() + TIMEOUT_S)
         _assert(rec["status"] == 200, f"sibling after RST status {rec['status']}")
+        _assert(rec["reset"] is None, f"sibling after RST unexpected reset {rec['reset']!r}")
         _assert(bytes(rec["body"]) == b"sibling ok", f"sibling body {rec['body']!r}")
         _assert(peer.terminated is None, "connection terminated after client RST")
     finally:
