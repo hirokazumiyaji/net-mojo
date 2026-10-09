@@ -186,3 +186,21 @@ struct Http2HpackDeflater(Movable):
         if result.is_invalid():
             self._failed = True
         return result^
+
+    def deflate_bound[
+        field_origin: ImmOrigin,
+    ](mut self, fields: Span[Byte, field_origin],) -> Int:
+        if self._failed:
+            return -1
+        var bound = c_size_t(0)
+        var bound_ptr = Pointer[c_size_t, origin_of(bound)](to=bound)
+        var status = self._library.call["net_hpack_deflate_bound", c_int](
+            self._deflater,
+            fields.unsafe_ptr(),
+            c_size_t(len(fields)),
+            bound_ptr,
+        )
+        if Int(status) != 0:
+            self._failed = True
+            return -1
+        return Int(bound)
