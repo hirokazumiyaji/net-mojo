@@ -2243,6 +2243,16 @@ impl QuicServer {
                 self.refresh_goaway_ready(&connection_key);
                 return true;
             };
+            if !is_valid_http_field_value(&value) {
+                self.buffered_response_bytes -= buffered_bytes;
+                let connection = self.connections.get_mut(&connection_key).unwrap();
+                cancel_http3_request(connection, stream_id, H3_GENERAL_PROTOCOL_ERROR);
+                self.refresh_transport_timeout(&connection_key);
+                self.remove_request_route(request_id);
+                self.refresh_response_ready(&connection_key);
+                self.refresh_goaway_ready(&connection_key);
+                return true;
+            }
             response_trailers.push(quiche::h3::Header::new(&normalized, &value));
         }
         let connection = self.connections.get_mut(&connection_key).unwrap();
