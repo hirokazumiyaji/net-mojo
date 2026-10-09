@@ -99,13 +99,28 @@ socket. Both modes use the shared handler, verify the generated certificate,
 and request cooperative shutdown after their responses. This test does not
 measure performance or impose an overall process-memory bound.
 
+## Response trailers
+
+When `ResponseWriter.trailers` is non-empty on a body-capable status, the
+provider receives both the body and a trailer section. Non-empty trailer
+sections flip the `fin` flag on the final `send_response` / `send_body`
+call to `false`, and the provider finishes the stream by calling
+`send_additional_headers(conn, stream_id, headers, is_trailer_section=true,
+fin=true)` once the body has been written. Trailer field names normalize the
+same way response header names do, and trailer wire bytes are reserved
+against the shared `buffered_response_bytes` budget on enqueue so a
+rejected or completed stream releases both sections together. HEAD and
+non-body statuses drop trailers before the request reaches the provider.
+
 ## Current verification
 
 The Rust provider test drives a Mojo server over localhost UDP using a separate
 quiche client connection. It confirms TLS negotiation with ALPN `h3`, dispatch
 to the shared handler, two concurrent request streams on one connection,
 stream-specific responses, and request trailer visibility through
-`Request.trailers`. A pinned aioquic client independently verifies concurrent
+`Request.trailers`. A dedicated unit test exercises `enqueue_response` with a
+trailer section and verifies the aioquic client observes the trailer HEADERS
+after the body. A pinned aioquic client independently verifies concurrent
 requests, recovery after a dropped client datagram, cancellation, trailers, and
 graceful shutdown. C and Mojo FFI smoke tests exercise the provider boundary.
 

@@ -92,7 +92,7 @@ from ._parser import (
 )
 from .config import ServerConfig
 from .handler import Handler
-from .headers import Headers, _check_value_bytes
+from .headers import Headers, _check_value_bytes, _trailer_forbidden
 from .response import (
     ResponseWriter,
     has_body_for_status,
@@ -108,9 +108,7 @@ from net.http._http2.request_session import (
 from net.http._http2.response_headers import (
     _content_length_matches,
     encode_http2_response_headers,
-)
-from net.http._http2.response_encoder import (
-    http2_response_end_on_headers,
+    encode_http2_response_trailers,
 )
 from net.http._http2.control_frames import encode_rst_stream_frame
 
@@ -866,21 +864,20 @@ struct Server(Movable):
                         _ = e
                         response.status = 500
                         response.body.clear()
+                        response.trailers.clear()
                 except e:
                     _ = e
                     response.status = 400
                     response.body.clear()
+                    response.trailers.clear()
                 self._budget.release(body_size)
             if response.is_detached():
                 response._cancel_detach()
                 response.status = 500
                 response.body.clear()
+                response.trailers.clear()
             if response.status < 100 or response.status > 599:
                 response.status = 500
-                response.body.clear()
-            if len(response.trailers) > 0:
-                response.status = 500
-                response.headers.clear()
                 response.body.clear()
                 response.trailers.clear()
             var response_header_bytes = 0
@@ -897,6 +894,7 @@ struct Server(Movable):
             ):
                 response.status = 500
                 response.headers.clear()
+                response.trailers.clear()
                 response.body.clear()
             var wire_length = -1
             if has_body_for_status(response.status, False):
@@ -912,6 +910,7 @@ struct Server(Movable):
                         response.status = 500
                         response.headers.clear()
                         response.body.clear()
+                        response.trailers.clear()
                         wire_length = -1
                         break
             var headers = List[Byte]()
@@ -938,6 +937,7 @@ struct Server(Movable):
             response.body = List[Byte]()
             if not has_body_for_status(response.status, is_head):
                 response_body.clear()
+                response.trailers.clear()
             if (
                 len(response_body) > self.config.max_response_body
                 or len(headers) > self.config.max_response_headers_bytes
@@ -947,12 +947,51 @@ struct Server(Movable):
                 headers.clear()
                 _append_quic_u32(headers, UInt32(0))
                 response_body.clear()
+                response.trailers.clear()
+            var trailers = List[Byte]()
+            if len(response.trailers) > 0:
+                var trailer_bytes = 4
+                for i in range(len(response.trailers)):
+                    trailer_bytes += (
+                        response.trailers.name_at(i).byte_length()
+                        + response.trailers.value_byte_length(i)
+                        + 8
+                    )
+                # Response headers and trailers share the local response
+                # header budget; a shared enforcement keeps a handler
+                # that fills the full budget with each from bypassing
+                # the configured limits even when both pass on their own.
+                var combined_count = header_count + len(response.trailers)
+                var combined_bytes = len(headers) + trailer_bytes
+                if (
+                    len(response.trailers)
+                    > self.config.max_response_headers_count
+                    or trailer_bytes > self.config.max_response_headers_bytes
+                    or combined_count > self.config.max_response_headers_count
+                    or combined_bytes > self.config.max_response_headers_bytes
+                ):
+                    response.trailers.clear()
+            if len(response.trailers) > 0:
+                for i in range(len(response.trailers)):
+                    if _trailer_forbidden(response.trailers._lower_names[i]):
+                        response.trailers.clear()
+                        break
+            if len(response.trailers) > 0:
+                _append_quic_u32(trailers, UInt32(len(response.trailers)))
+                for i in range(len(response.trailers)):
+                    _append_quic_field(
+                        trailers, response.trailers._names[i].as_bytes()
+                    )
+                    _append_quic_field(
+                        trailers, response.trailers._value_bytes_span(i)
+                    )
             try:
                 self._quic_endpoint.value().respond(
                     request_id,
                     response.status,
                     Span(headers),
                     Span(response_body),
+                    Span(trailers),
                 )
             except e:
                 _ = e
@@ -1550,6 +1589,7 @@ struct Server(Movable):
             _ = e
             writer.set_status(500)
             writer.headers.clear()
+            writer.trailers.clear()
             writer.body.clear()
 
         self._budget.release(request_body_bytes)
@@ -1562,16 +1602,13 @@ struct Server(Movable):
             writer._cancel_detach()
             writer.set_status(500)
             writer.headers.clear()
+            writer.trailers.clear()
             writer.body.clear()
         if len(writer.body) > cap:
             writer.set_status(500)
             writer.headers.clear()
-            writer.body.clear()
-        if len(writer.trailers) > 0:
-            writer.set_status(500)
-            writer.headers.clear()
-            writer.body.clear()
             writer.trailers.clear()
+            writer.body.clear()
 
         try:
             self._inject_alt_svc_for_tls(idx, writer)
@@ -1637,6 +1674,7 @@ struct Server(Movable):
             # streams on the same connection stay alive.
             writer.set_status(500)
             writer.headers.clear()
+            writer.trailers.clear()
             writer.body.clear()
             fields_result = encode_http2_response_headers(
                 writer,
@@ -1651,15 +1689,57 @@ struct Server(Movable):
                 self._refuse_http2_stream(idx, stream_id, UInt32(2))
                 return
 
-        var end_on_headers = http2_response_end_on_headers(writer, is_head)
         var response_body = writer.body^
         writer.body = List[Byte]()
         if not has_body_for_status(writer.status, is_head):
             response_body.clear()
+            writer.trailers.clear()
         var field_bytes = fields_result.fields^
         fields_result.fields = List[Byte]()
         var field_count = fields_result.field_count
-        var response_reservation = len(field_bytes) + len(response_body)
+
+        var trailer_wire = List[Byte]()
+        var trailer_field_count = 0
+        if len(writer.trailers) > 0:
+            # Local caps (configured) are shared across response HEADERS
+            # and the trailer block so a handler cannot fill the full
+            # allowance with each section. The peer's
+            # SETTINGS_MAX_HEADER_LIST_SIZE is a per-section limit
+            # (RFC 9113 §6.5.2) and is applied independently to each.
+            # `field_bytes` carries 8 bytes of prefix per field; the
+            # header-list size that both the local cap and
+            # `_field_size` charge is `name + value + 32` per field. The
+            # consumed header-list size is therefore
+            # `len(field_bytes) + 24 * field_count`.
+            var consumed_header_list = len(field_bytes) + 24 * field_count
+            var combined_local_bytes = (
+                self.config.max_response_headers_bytes - consumed_header_list
+            )
+            if combined_local_bytes < 0:
+                combined_local_bytes = 0
+            var trailer_byte_room = combined_local_bytes
+            if peer_header_list_size < trailer_byte_room:
+                trailer_byte_room = peer_header_list_size
+            var trailer_field_room = (
+                self.config.max_response_headers_count - field_count
+            )
+            if trailer_field_room < 0:
+                trailer_field_room = 0
+            if trailer_field_room > 0 and trailer_byte_room > 0:
+                var trailer_encoded = encode_http2_response_trailers(
+                    writer,
+                    is_head,
+                    trailer_byte_room,
+                    trailer_field_room,
+                )
+                if trailer_encoded.is_valid():
+                    trailer_wire = trailer_encoded.fields^
+                    trailer_encoded.fields = List[Byte]()
+                    trailer_field_count = trailer_encoded.field_count
+
+        var response_reservation = (
+            len(field_bytes) + len(response_body) + len(trailer_wire)
+        )
         if not self._budget.try_reserve(response_reservation):
             if not self._flush_http2_control_output(idx, control_output^):
                 return
@@ -1673,7 +1753,8 @@ struct Server(Movable):
             self.config.max_response_headers_count,
             compressed_capacity,
             response_body^,
-            end_on_headers,
+            trailer_wire^,
+            trailer_field_count,
         ):
             self._budget.release(response_reservation)
             if not self._flush_http2_control_output(idx, control_output^):
@@ -1741,11 +1822,10 @@ struct Server(Movable):
             return
         if not self._conns[idx].http2_deflater:
             return
-        # Re-apply the peer's current SETTINGS_HEADER_TABLE_SIZE before
-        # the scheduler encodes any deferred HEADERS (RFC 7541 §4.2).
-        # If the peer shrunk the table while a response was flow-blocked,
-        # the next encoded block must prefix the dynamic-table-size
-        # update or a compliant inflater rejects it.
+        # the scheduler encodes any deferred HEADERS or trailer blocks
+        # (RFC 7541 §4.2). If the peer shrunk the table while a response
+        # was flow-blocked, the next encoded block must prefix the
+        # dynamic-table-size update or a compliant inflater rejects it.
         var current_table_size = Int(
             self._conns[idx]
             .http2_session.value()

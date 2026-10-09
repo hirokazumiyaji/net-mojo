@@ -44,6 +44,20 @@ underscore (see README "Versioning and compatibility"). Anything under
   deny-list (RFC 9110 §6.5.1) and CR/LF/NUL are rejected; HEAD and
   1xx/204/205/304 responses drop trailers. Trailer bytes count against the
   response header byte limit and the shared buffer budget.
+- HTTP/2 response trailers: when `ResponseWriter.trailers` is non-empty on a
+  body-capable status, the server emits DATA frames without END_STREAM and a
+  final HEADERS frame carrying END_STREAM. Trailer blocks are hand-encoded as
+  RFC 7541 §6.2.3 Literal Header Field Never Indexed with literal names, so
+  they neither mutate the HPACK dynamic table nor reference any dynamic
+  index. Both ends of the connection decode the trailer block correctly
+  regardless of other streams' response HEADERS that may have inserted
+  dynamic entries between the trailer's encode time and its wire position.
+  Flow control still gates the body: trailers are only emitted after the
+  last DATA frame leaves the send window.
+- HTTP/3 response trailers: when `ResponseWriter.trailers` is non-empty on a
+  body-capable status, the quiche provider sends the trailer section after
+  the body via `send_additional_headers(is_trailer_section=true, fin=true)`.
+  Trailer bytes count against the shared buffered-response budget.
 
 - HTTP/2 server support over TLS ALPN `h2`, including bounded request streams,
   HPACK, connection and stream flow control, fair response scheduling, stream

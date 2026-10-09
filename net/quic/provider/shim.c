@@ -123,7 +123,9 @@ int32_t net_quic_next_request(
 int32_t net_quic_respond(
     struct NetQuicServer *server, uint64_t request_id, uint32_t status,
     const uint8_t *headers, size_t headers_length,
-    const uint8_t *body, size_t body_length) {
+    const uint8_t *body, size_t body_length,
+    const uint8_t *trailers, size_t trailers_length) {
     return net_quic_server_respond(server, request_id, status, headers,
-                                   headers_length, body, body_length);
+                                   headers_length, body, body_length,
+                                   trailers, trailers_length);
 }

@@ -60,7 +60,8 @@ int32_t net_quic_server_next_request(
 int32_t net_quic_server_respond(
     struct NetQuicServer *server, uint64_t request_id, uint32_t status,
     const uint8_t *headers, size_t headers_length,
-    const uint8_t *body, size_t body_length);
+    const uint8_t *body, size_t body_length,
+    const uint8_t *trailers, size_t trailers_length);
 struct NetQuicServer *net_quic_create(struct NetQuicServerConfig *config);
 void net_quic_free(struct NetQuicServer *server);
 int32_t net_quic_set_connection_limit(
@@ -105,6 +106,7 @@ int32_t net_quic_next_request(
 int32_t net_quic_respond(
     struct NetQuicServer *server, uint64_t request_id, uint32_t status,
     const uint8_t *headers, size_t headers_length,
-    const uint8_t *body, size_t body_length);
+    const uint8_t *body, size_t body_length,
+    const uint8_t *trailers, size_t trailers_length);
 
 #endif

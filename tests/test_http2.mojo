@@ -7,7 +7,10 @@ from net.http._http2.response_frames import encode_headers_block
 from net.http._http2.data_frame import parse_data_frame
 from net.http._http2.request_body import Http2RequestBody
 from net.http._http2.request_stream import Http2RequestStream
-from net.http._http2.response_headers import encode_http2_response_headers
+from net.http._http2.response_headers import (
+    encode_http2_response_headers,
+    encode_http2_response_trailers,
+)
 from net.http.response import ResponseWriter
 from net.http._http2.bootstrap import Http2ServerBootstrap
 from net.http._http2.connection_bootstrap import Http2ConnectionBootstrap
@@ -345,6 +348,20 @@ def test_http2_response_headers_reject_forbidden_and_mismatched_fields() raises:
             invalid_status, False, "date", 1024, 8
         ).is_error()
     )
+
+
+def test_http2_response_trailers_reject_forbidden_fields() raises:
+    var writer = ResponseWriter(16)
+    writer.write_string("hello")
+    writer.trailers.add("Content-Length", "5")
+    var result = encode_http2_response_trailers(writer, False, 1024, 8)
+    assert_true(result.is_error())
+
+    var writer2 = ResponseWriter(16)
+    writer2.write_string("hello")
+    writer2.trailers.add("Authorization", "Bearer x")
+    var result2 = encode_http2_response_trailers(writer2, False, 1024, 8)
+    assert_true(result2.is_error())
 
 
 def test_http2_response_headers_keep_head_length_and_drop_no_body_length() raises:

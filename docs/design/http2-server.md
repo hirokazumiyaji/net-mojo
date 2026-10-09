@@ -193,6 +193,40 @@ The shared response encoder composes header adaptation, connection-owned HPACK
 compression, and frame generation; output failure after compression makes that
 deflater terminal because the peer did not receive its updated table state.
 
+## Response trailers
+
+When `ResponseWriter.trailers` carries at least one entry on a body-capable
+status, the server emits DATA frames without END_STREAM and finishes the
+stream with a trailer HEADERS block (plus CONTINUATION frames when needed)
+that carries END_STREAM. HEAD responses and statuses that cannot carry a
+body (1xx/204/205/304) silently drop trailers before encoding. The trailer
+field list rejects HTTP/1-specific hop-by-hop names and `TE` the same way
+response headers do.
+
+Trailer blocks are hand-encoded as RFC 7541 §6.2.3 Literal Header Field
+Never Indexed with literal names (first byte `0x10`, literal name string,
+literal value string). Response HEADERS go through the connection HPACK
+deflater at enqueue time, so trailer HEADERS flushed later run against an
+inflater whose dynamic table has already shifted under other streams'
+inserted entries. nghttp2's `NGHTTP2_NV_FLAG_NO_INDEX` does not avoid this
+on its own: the deflater still prefers "Literal Header Field Never Indexed
+- Indexed Name" when the name exists in the static or dynamic table, and
+the dynamic index is relative to the newest entry at decode time. A
+subsequent HEADERS block that inserts into the dynamic table shifts that
+reference and the trailer's name resolves to the wrong field on the peer.
+Writing literal-name entries removes both failure modes: the trailer block
+inserts nothing into either table and references no dynamic index, so it
+decodes identically no matter how the deflater's state evolved after it
+was encoded. Trailer wire bytes are reserved against the shared response
+budget on enqueue and released when the stream completes.
+
+The response scheduler sends trailers only after the last DATA chunk leaves
+the per-stream send window, so flow-blocked streams keep the trailer section
+behind the final DATA frame. A client RST_STREAM before headers have been
+flushed clears the pending trailer bytes along with the body; after the
+headers block has been flushed, the whole entry (headers + body + trailers)
+is dropped on the subsequent reset notification.
+
 ## Integrated flow control and response scheduling
 
 The server tracks connection and stream send windows independently and applies
