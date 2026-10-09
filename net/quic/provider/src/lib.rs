@@ -622,6 +622,15 @@ pub unsafe extern "C" fn net_quic_server_respond(
             return -1;
         }
     }
+    // Local response-header budget is shared between the response
+    // HEADERS and the trailer section so a native caller cannot double
+    // the configured limits by filling each independently.
+    if headers.len() + trailers.len() > inner.max_response_headers_count {
+        return -1;
+    }
+    if header_length + trailer_length > inner.max_response_headers_bytes {
+        return -1;
+    }
     i32::from(inner.enqueue_response(
         request_id,
         status as u16,
