@@ -1808,7 +1808,6 @@ struct Server(Movable):
             return
         if not self._conns[idx].http2_deflater:
             return
-        # Re-apply the peer's current SETTINGS_HEADER_TABLE_SIZE before
         # the scheduler encodes any deferred HEADERS or trailer blocks
         # (RFC 7541 §4.2). If the peer shrunk the table while a response
         # was flow-blocked, the next encoded block must prefix the

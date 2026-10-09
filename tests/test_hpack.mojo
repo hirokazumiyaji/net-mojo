@@ -1431,6 +1431,9 @@ def test_http2_scheduler_peer_reset_after_headers_sent_removes_entry() raises:
     )
     assert_equal(len(second.completed_streams), 1)
     assert_equal(scheduler.queued_count(), 0)
+    # RFC 9113 §5.4.2 forbids replying to a peer RST_STREAM with another
+    # RST_STREAM; the scheduler must drop the entry without emitting
+    # another frame on the closed stream.
     var saw_rst_on_one = False
     var offset = 0
     while offset < len(second.wire):
@@ -1438,7 +1441,7 @@ def test_http2_scheduler_peer_reset_after_headers_sent_removes_entry() raises:
         if frame.frame_type == Byte(3) and frame.stream_id == UInt32(1):
             saw_rst_on_one = True
         offset += frame.consumed
-    assert_true(saw_rst_on_one)
+    assert_false(saw_rst_on_one)
 
 
 def test_http2_scheduler_lazy_encode_keeps_single_inflater_in_sync() raises:
