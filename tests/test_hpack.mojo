@@ -1916,24 +1916,29 @@ def test_http2_scheduler_defers_trailer_block_when_output_room_is_tight() raises
     _append_frame(opening, Byte(1), Byte(5), UInt32(1), Span(compressed))
     assert_true(session.consume(Span(opening)).is_request())
 
-    # A ~700-byte trailer value makes the trailer block bigger than any
-    # per-drain residual the body phase leaves below.
+    # ~300-byte trailer value makes the full trailer block fit within
+    # the production drain batch (65536) but not within the tight
+    # residual the body phase leaves below.
     var writer = ResponseWriter(2048)
     writer.set_status(200)
-    writer.add_trailer(String("x-digest"), String("Z") * 700)
+    writer.add_trailer(String("x-digest"), String("Z") * 300)
 
     var scheduler = Http2ResponseScheduler()
     var deflater = _make_deflater()
-    # Body: 300 bytes. First drain: budget 500. Enough for response
-    # HEADERS (~120 B) + DATA(300 B) + its 9-byte frame = ~429 B, but
-    # not enough left (~70 B) for the ~730-byte trailer block.
+    # Body: 300 bytes. First drain: budget 2048. Response HEADERS
+    # (~120 B) + DATA(300 B) + 9-byte frame header ~= 429 B, which
+    # leaves ~1619 B for a trailer worst bound of ~330+128+32 = ~490 B
+    # — but the trailer's gate on the pre-encode worst case
+    # (len(fields) + 32 + 160) is 300+8+32+160 = ~500 B. Combined with
+    # the frame overhead that still exceeds the residual room after
+    # the body, forcing deferral.
     var body = List[Byte]()
     for _ in range(300):
         body.append(Byte(ord("A")))
     _enqueue_with_trailers(scheduler, UInt32(1), body^, writer)
 
     var tight = scheduler.drain(
-        session, deflater, "Thu, 01 Jan 1970 00:00:00 GMT", 16384, 500
+        session, deflater, "Thu, 01 Jan 1970 00:00:00 GMT", 16384, 650
     )
     assert_equal(len(tight.completed_streams), 0)
     var tight_header_frames = 0

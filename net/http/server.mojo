@@ -856,10 +856,12 @@ struct Server(Movable):
                         _ = e
                         response.status = 500
                         response.body.clear()
+                        response.trailers.clear()
                 except e:
                     _ = e
                     response.status = 400
                     response.body.clear()
+                    response.trailers.clear()
                 self._budget.release(body_size)
             if response.is_detached():
                 response._cancel_detach()
@@ -900,6 +902,7 @@ struct Server(Movable):
                         response.status = 500
                         response.headers.clear()
                         response.body.clear()
+                        response.trailers.clear()
                         wire_length = -1
                         break
             var headers = List[Byte]()
@@ -1690,29 +1693,35 @@ struct Server(Movable):
         var trailer_wire = List[Byte]()
         var trailer_field_count = 0
         if len(writer.trailers) > 0:
-            # Share the configured response-header limits between the
-            # response HEADERS and the trailer block: a handler cannot
-            # fill the full budget with each so the combined sections
-            # bypass the local cap. Peer-advertised max_header_list_size
-            # (header_list_size) is enforced separately by the deflater.
-            var trailer_byte_room = max_response_header_bytes - len(field_bytes)
-            if trailer_byte_room < 0:
-                trailer_byte_room = 0
+            # Local caps (configured) are shared across response HEADERS
+            # and the trailer block so a handler cannot fill the full
+            # allowance with each section. The peer's
+            # SETTINGS_MAX_HEADER_LIST_SIZE is a per-section limit
+            # (RFC 9113 §6.5.2) and is applied independently to each.
+            var combined_local_bytes = (
+                self.config.max_response_headers_bytes - len(field_bytes)
+            )
+            if combined_local_bytes < 0:
+                combined_local_bytes = 0
+            var trailer_byte_room = combined_local_bytes
+            if peer_header_list_size < trailer_byte_room:
+                trailer_byte_room = peer_header_list_size
             var trailer_field_room = (
                 self.config.max_response_headers_count - field_count
             )
-            if trailer_field_room < 1:
-                trailer_field_room = 1
-            var trailer_encoded = encode_http2_response_trailers(
-                writer,
-                is_head,
-                trailer_byte_room,
-                trailer_field_room,
-            )
-            if trailer_encoded.is_valid():
-                trailer_wire = trailer_encoded.fields^
-                trailer_encoded.fields = List[Byte]()
-                trailer_field_count = trailer_encoded.field_count
+            if trailer_field_room < 0:
+                trailer_field_room = 0
+            if trailer_field_room > 0 and trailer_byte_room > 0:
+                var trailer_encoded = encode_http2_response_trailers(
+                    writer,
+                    is_head,
+                    trailer_byte_room,
+                    trailer_field_room,
+                )
+                if trailer_encoded.is_valid():
+                    trailer_wire = trailer_encoded.fields^
+                    trailer_encoded.fields = List[Byte]()
+                    trailer_field_count = trailer_encoded.field_count
 
         var response_reservation = (
             len(field_bytes) + len(response_body) + len(trailer_wire)
