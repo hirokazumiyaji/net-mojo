@@ -1698,8 +1698,14 @@ struct Server(Movable):
             # allowance with each section. The peer's
             # SETTINGS_MAX_HEADER_LIST_SIZE is a per-section limit
             # (RFC 9113 §6.5.2) and is applied independently to each.
+            # `field_bytes` carries 8 bytes of prefix per field; the
+            # header-list size that both the local cap and
+            # `_field_size` charge is `name + value + 32` per field. The
+            # consumed header-list size is therefore
+            # `len(field_bytes) + 24 * field_count`.
+            var consumed_header_list = len(field_bytes) + 24 * field_count
             var combined_local_bytes = (
-                self.config.max_response_headers_bytes - len(field_bytes)
+                self.config.max_response_headers_bytes - consumed_header_list
             )
             if combined_local_bytes < 0:
                 combined_local_bytes = 0

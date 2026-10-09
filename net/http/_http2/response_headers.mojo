@@ -197,6 +197,35 @@ def encode_http2_response_trailers(
             List[Byte](), 0, send_body=False
         )
 
+    # RFC 9110 §7.6.1 / RFC 9113 §8.2.2: fields nominated by any
+    # "Connection" header are hop-by-hop in trailers as well.
+    var connection_hops = List[String]()
+    for i in range(len(writer.headers)):
+        ref hname = writer.headers._lower_names[i]
+        if hname == "connection":
+            var raw = writer.headers._value_bytes_span(i)
+            var start = 0
+            var cursor = 0
+            while cursor <= len(raw):
+                var at_end = cursor == len(raw)
+                var is_sep = (not at_end) and (
+                    raw[cursor] == Byte(ord(","))
+                    or raw[cursor] == Byte(ord(" "))
+                    or raw[cursor] == Byte(ord("\t"))
+                )
+                if at_end or is_sep:
+                    if cursor > start:
+                        var token = String()
+                        for j in range(start, cursor):
+                            var b = raw[j]
+                            if b >= Byte(ord("A")) and b <= Byte(ord("Z")):
+                                b = Byte(Int(b) + 32)
+                            token += chr(Int(b))
+                        if token.byte_length() > 0:
+                            connection_hops.append(token^)
+                    start = cursor + 1
+                cursor += 1
+
     var header_list_size = 0
     var field_count = 0
     var fields = List[Byte]()
@@ -209,6 +238,13 @@ def encode_http2_response_trailers(
             or name == "te"
         ):
             return Http2ResponseHeadersResult.error()
+        var is_connection_nominated = False
+        for h in connection_hops:
+            if h == name:
+                is_connection_nominated = True
+                break
+        if is_connection_nominated:
+            continue
         header_list_size += _field_size(name.byte_length(), len(value))
         field_count += 1
         if (
