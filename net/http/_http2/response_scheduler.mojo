@@ -330,16 +330,23 @@ struct Http2ResponseScheduler(Movable):
                     skipped = 0
                     continue
                 self._responses[index].headers_sent = True
+                # Release the raw field block reservation and buffer:
+                # the compressed HEADERS are already in the drain's
+                # output, so the server owes no further pending bytes
+                # for this response's HEADERS.
+                var released_header_bytes = self._responses[
+                    index
+                ].reserved_header_bytes
+                released += released_header_bytes
+                self._responses[index].reserved_header_bytes = 0
+                self._responses[index].header_fields = List[Byte]()
                 skipped = 0
                 if self._responses[index].end_on_headers and (
                     not self._responses[index].cancelled
                 ):
                     session.finish_response(stream_id)
                     completed.append(stream_id)
-                    released += (
-                        self._responses[index].reserved_header_bytes
-                        + self._responses[index].reserved_body_bytes
-                    )
+                    released += self._responses[index].reserved_body_bytes
                     self._remove(index)
                     continue
 
