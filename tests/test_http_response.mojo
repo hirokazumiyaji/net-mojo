@@ -930,6 +930,11 @@ def test_add_trailer_rejects_forbidden_names() raises:
         String("Age"),
         String("Expires"),
         String("Pragma"),
+        String("Location"),
+        String("Retry-After"),
+        String("Allow"),
+        String("ETag"),
+        String("Last-Modified"),
     ]
     for name in forbidden:
         var writer = ResponseWriter(32)

@@ -256,6 +256,47 @@ struct Http2ResponseScheduler(Movable):
                             self._remove(index)
                             skipped = 0
                             continue
+                        # Validate the fallback itself fits this batch
+                        # before swapping it in. If even the minimal 500
+                        # does not fit, RST and remove the stream
+                        # instead of looping on the gate.
+                        var fallback_raw = len(minimal.fields)
+                        var fallback_bound = (
+                            fallback_raw + 24 * minimal.field_count + 128
+                        )
+                        if (
+                            fallback_bound
+                            > self._responses[index].compressed_capacity
+                        ):
+                            fallback_bound = self._responses[
+                                index
+                            ].compressed_capacity
+                        var fallback_worst_frames = (
+                            fallback_bound + max_frame_size - 1
+                        ) // max_frame_size
+                        if fallback_worst_frames < 1:
+                            fallback_worst_frames = 1
+                        var fallback_bound_full = (
+                            fallback_bound + fallback_worst_frames * 9
+                        )
+                        if max_output_bytes - len(output) < fallback_bound_full:
+                            var rst = encode_rst_stream_frame(
+                                stream_id, UInt32(2)
+                            )
+                            if not rst.is_complete() or len(rst.wire) > (
+                                max_output_bytes - len(output)
+                            ):
+                                break
+                            output.extend(Span(rst.wire))
+                            session.finish_response(stream_id)
+                            completed.append(stream_id)
+                            released += (
+                                self._responses[index].reserved_header_bytes
+                                + self._responses[index].reserved_body_bytes
+                            )
+                            self._remove(index)
+                            skipped = 0
+                            continue
                         self._responses[index].header_fields = minimal.fields^
                         minimal.fields = List[Byte]()
                         self._responses[
@@ -263,6 +304,18 @@ struct Http2ResponseScheduler(Movable):
                         ].header_field_count = minimal.field_count
                         self._responses[index].body = List[Byte]()
                         self._responses[index].body_offset = 0
+                        # The minimal 500 belongs to a different response
+                        # than the handler built. Drop any queued
+                        # trailers so metadata describing the discarded
+                        # body (digests, timings) is not emitted here.
+                        self._responses[index].trailers = List[Byte]()
+                        self._responses[index].trailers_offset = 0
+                        self._responses[index].trailer_field_count = 0
+                        # The minimal 500 carries no body and no
+                        # trailers; the drain's post-emit end_on_headers
+                        # re-derivation (len(body) == 0 and
+                        # len(trailers) == 0) therefore closes the
+                        # stream on its HEADERS frame.
                         # Fall through to the usual gate on the shrunk
                         # response so the atomic emit path handles it.
                         continue
@@ -446,6 +499,27 @@ struct Http2ResponseScheduler(Movable):
                     trailer_bound + trailer_worst_frames * 9
                 )
                 if max_output_bytes - len(output) < trailer_worst_bound:
+                    if trailer_worst_bound > max_output_bytes:
+                        # Trailer block larger than any drain batch:
+                        # finish the stream with RST(INTERNAL_ERROR)
+                        # instead of deferring forever and starving
+                        # queued sibling responses.
+                        var rst = encode_rst_stream_frame(stream_id, UInt32(2))
+                        if not rst.is_complete() or len(rst.wire) > (
+                            max_output_bytes - len(output)
+                        ):
+                            break
+                        output.extend(Span(rst.wire))
+                        session.finish_response(stream_id)
+                        completed.append(stream_id)
+                        released += (
+                            self._responses[index].reserved_header_bytes
+                            + self._responses[index].reserved_body_bytes
+                            + self._responses[index].reserved_trailer_bytes
+                        )
+                        self._remove(index)
+                        skipped = 0
+                        continue
                     break
                 var trailer_compressed = List[Byte](
                     length=trailer_bound, fill=0

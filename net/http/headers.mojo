@@ -163,6 +163,11 @@ def _trailer_forbidden(name: StringSlice) -> Bool:
         or lowered == "age"
         or lowered == "expires"
         or lowered == "pragma"
+        or lowered == "location"
+        or lowered == "retry-after"
+        or lowered == "allow"
+        or lowered == "etag"
+        or lowered == "last-modified"
     )
 
 
