@@ -105,10 +105,14 @@ from net.http._http2.request_session import (
     Http2RequestSession,
     Http2RequestSessionResult,
 )
-from net.http._http2.response_headers import _content_length_matches
-from net.http._http2.response_encoder import (
-    encode_http2_response_header_frames,
+from net.http._http2.response_headers import (
+    _content_length_matches,
+    encode_http2_response_headers,
 )
+from net.http._http2.response_encoder import (
+    http2_response_end_on_headers,
+)
+from net.http._http2.control_frames import encode_rst_stream_frame
 
 
 comptime _TICK_POLL_CAP_MS: Int = 100
@@ -1281,6 +1285,9 @@ struct Server(Movable):
                 # event a TLS write blocked on WANT_READ requires.
                 self._sync_interests(idx)
                 return
+            if self._http2_drained(idx):
+                self._close_conn(idx)
+                return
             var read_event = (
                 self._conns[idx].read_ready(readable, writable)
                 or self._conns[idx].tls_pending() > 0
@@ -1321,6 +1328,13 @@ struct Server(Movable):
                 and self._conns[idx].pending_remaining() == 0
                 and self._conns[idx].http2_responses.queued_count() == 0
             ):
+                self._close_conn(idx)
+                return
+            if self._http2_drained(idx):
+                # Input/output processing can turn an idle session into a
+                # draining one (e.g. after acknowledging a peer GOAWAY).
+                # Re-check here or the connection would wait for a tick
+                # trigger that no further input will supply.
                 self._close_conn(idx)
                 return
             if (
@@ -1441,19 +1455,13 @@ struct Server(Movable):
             if result.consumed > 0:
                 self._consume_receive(idx, result.consumed)
             if result.reset_stream_id != UInt32(0):
-                var dropped_unsent = self._conns[
+                var reset_result = self._conns[
                     idx
-                ].http2_responses.has_unsent_headers(result.reset_stream_id)
-                var released = self._conns[idx].http2_responses.cancel(
-                    result.reset_stream_id
-                )
-                self._budget.release(released)
-                self._conns[idx].http2_response_bytes_reserved -= released
-                if dropped_unsent:
-                    # Encoded headers mutated the deflater but never reached
-                    # the peer; keep compression state consistent by closing.
-                    self._close_conn(idx)
-                    return
+                ].http2_responses.on_peer_reset(result.reset_stream_id)
+                self._budget.release(reset_result.released_bytes)
+                self._conns[
+                    idx
+                ].http2_response_bytes_reserved -= reset_result.released_bytes
             var request_body_bytes = 0
             if result.is_request():
                 request_body_bytes = len(result.request.body)
@@ -1535,9 +1543,13 @@ struct Server(Movable):
         self._conns[idx].http2_body_reserved -= request_body_bytes
 
         if writer.is_detached():
+            # Streaming/SSE on HTTP/2 would need per-stream credit tracking
+            # that the shared H1 writer cannot express; keep siblings alive by
+            # falling back to a stream-level 500 instead of closing.
             writer._cancel_detach()
-            self._close_conn(idx)
-            return
+            writer.set_status(500)
+            writer.headers.clear()
+            writer.body.clear()
         if len(writer.body) > cap:
             writer.set_status(500)
             writer.headers.clear()
@@ -1582,7 +1594,6 @@ struct Server(Movable):
                 self._close_conn(idx)
                 return
 
-        var available = self._budget.remaining() - len(control_output)
         var max_response_header_bytes = self.config.max_response_headers_bytes
         var peer_header_list_size = Int(
             self._conns[idx]
@@ -1595,38 +1606,61 @@ struct Server(Movable):
         var compressed_capacity = max_response_header_bytes
         if compressed_capacity < 256:
             compressed_capacity = 256
-        var compressed = List[Byte](length=compressed_capacity, fill=0)
-        var encoded = encode_http2_response_header_frames(
-            self._conns[idx].http2_deflater.value(),
+        var fields_result = encode_http2_response_headers(
             writer,
             is_head,
             self._tick_date,
-            stream_id,
             max_response_header_bytes,
             self.config.max_response_headers_count,
-            16384,
-            available,
-            Span(compressed),
         )
-        if not encoded.is_complete():
-            self._close_conn(idx)
-            return
+        if not fields_result.is_valid():
+            # Headers failed before HPACK ran (bad field or over the peer's
+            # SETTINGS_MAX_HEADER_LIST_SIZE); retry a minimal 500 so sibling
+            # streams on the same connection stay alive.
+            writer.set_status(500)
+            writer.headers.clear()
+            writer.body.clear()
+            fields_result = encode_http2_response_headers(
+                writer,
+                is_head,
+                self._tick_date,
+                max_response_header_bytes,
+                self.config.max_response_headers_count,
+            )
+            if not fields_result.is_valid():
+                if not self._flush_http2_control_output(idx, control_output^):
+                    return
+                self._refuse_http2_stream(idx, stream_id, UInt32(2))
+                return
 
+        var end_on_headers = http2_response_end_on_headers(writer, is_head)
         var response_body = writer.body^
         writer.body = List[Byte]()
         if not has_body_for_status(writer.status, is_head):
             response_body.clear()
-        var headers_wire = encoded.wire^
-        encoded.wire = List[Byte]()
-        var response_reservation = len(headers_wire) + len(response_body)
+        var field_bytes = fields_result.fields^
+        fields_result.fields = List[Byte]()
+        var field_count = fields_result.field_count
+        var response_reservation = len(field_bytes) + len(response_body)
         if not self._budget.try_reserve(response_reservation):
-            self._close_conn(idx)
+            if not self._flush_http2_control_output(idx, control_output^):
+                return
+            self._refuse_http2_stream(idx, stream_id, UInt32(2))
             return
         if not self._conns[idx].http2_responses.enqueue(
-            stream_id, headers_wire^, response_body^
+            stream_id,
+            field_bytes^,
+            field_count,
+            max_response_header_bytes,
+            self.config.max_response_headers_count,
+            compressed_capacity,
+            response_body^,
+            end_on_headers,
         ):
             self._budget.release(response_reservation)
-            self._close_conn(idx)
+            if not self._flush_http2_control_output(idx, control_output^):
+                return
+            self._refuse_http2_stream(idx, stream_id, UInt32(2))
             return
         self._conns[idx].http2_response_bytes_reserved += response_reservation
         self._conns[idx].write_at = deadline_from_now(
@@ -1641,20 +1675,87 @@ struct Server(Movable):
             self._conns[idx].state = STATE_SENDING_HTTP2_CONTROL
         self._drain_http2_responses(idx)
 
+    def _flush_http2_control_output(
+        mut self, idx: Int, var control_output: List[Byte]
+    ) raises NetError -> Bool:
+        if len(control_output) == 0:
+            return True
+        if not self._conns[idx].append_pending(control_output^, self._budget):
+            self._close_conn(idx)
+            return False
+        self._conns[idx].state = STATE_SENDING_HTTP2_CONTROL
+        return True
+
+    def _http2_drained(self, idx: Int) -> Bool:
+        if not self._conns[idx].http2_session:
+            return False
+        if not self._conns[idx].http2_session.value().is_draining():
+            return False
+        return (
+            self._conns[idx].pending_remaining() == 0
+            and self._conns[idx].http2_responses.queued_count() == 0
+            and not self._conns[idx].http2_session.value().has_active_streams()
+        )
+
+    def _refuse_http2_stream(
+        mut self, idx: Int, stream_id: UInt32, error_code: UInt32
+    ) raises NetError:
+        var frame = (
+            self._conns[idx]
+            .http2_session.value()
+            .refuse_stream(stream_id, error_code)
+        )
+        if len(frame) == 0:
+            return
+        if not self._conns[idx].append_pending(frame^, self._budget):
+            self._close_conn(idx)
+            return
+        self._conns[idx].state = STATE_SENDING_HTTP2_CONTROL
+        self._conns[idx].write_at = deadline_from_now(
+            self.config.write_deadline
+        )
+
     def _drain_http2_responses(mut self, idx: Int) raises NetError:
         if (
             not self._conns[idx].active
             or self._conns[idx].pending_remaining() > 0
         ):
             return
+        if not self._conns[idx].http2_deflater:
+            return
+        # Re-apply the peer's current SETTINGS_HEADER_TABLE_SIZE before
+        # the scheduler encodes any deferred HEADERS (RFC 7541 §4.2).
+        # If the peer shrunk the table while a response was flow-blocked,
+        # the next encoded block must prefix the dynamic-table-size
+        # update or a compliant inflater rejects it.
+        var current_table_size = Int(
+            self._conns[idx]
+            .http2_session.value()
+            .peer_settings()
+            .header_table_size
+        )
+        if (
+            not self._conns[idx]
+            .http2_deflater.value()
+            .set_max_table_size(current_table_size)
+        ):
+            self._close_conn(idx)
+            return
         var batch = self._conns[idx].http2_responses.drain(
-            self._conns[idx].http2_session.value(), 16384, 65536
+            self._conns[idx].http2_session.value(),
+            self._conns[idx].http2_deflater.value(),
+            self._tick_date,
+            16384,
+            65536,
         )
         if batch.released_bytes > 0:
             self._budget.release(batch.released_bytes)
             self._conns[
                 idx
             ].http2_response_bytes_reserved -= batch.released_bytes
+        if batch.deflater_failed:
+            self._close_conn(idx)
+            return
         if len(batch.wire) == 0:
             if self._conns[idx].http2_responses.queued_count() > 0:
                 # Still waiting for WINDOW_UPDATE credit; keep the write

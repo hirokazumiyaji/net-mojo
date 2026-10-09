@@ -315,11 +315,19 @@ def test_http2_response_headers_map_shared_response() raises:
 def test_http2_response_headers_reject_forbidden_and_mismatched_fields() raises:
     var connection = ResponseWriter(16)
     connection.headers.add("Connection", "close")
-    assert_true(
-        encode_http2_response_headers(
-            connection, False, "date", 1024, 8
-        ).is_error()
+    connection.headers.add("Keep-Alive", "timeout=30")
+    connection.headers.add("Transfer-Encoding", "chunked")
+    connection.headers.add("Upgrade", "h2c")
+    connection.headers.add("TE", "trailers")
+    connection.headers.add("X-Keep", "yes")
+    var stripped = encode_http2_response_headers(
+        connection, False, "date", 1024, 8
     )
+    assert_true(stripped.is_valid())
+    # :status, X-Keep, date, content-length only; connection-specific fields
+    # are silently dropped so an H1 handler cannot kill a shared H2
+    # connection.
+    assert_equal(stripped.field_count, 4)
 
     var mismatch = ResponseWriter(16)
     mismatch.headers.add("Content-Length", "3")
@@ -2208,6 +2216,57 @@ def test_http2_zero_stream_creation_limit_rejects_first_new_headers() raises:
     var empty = List[Byte]()
     var headers = FrameParseResult.complete(Byte(1), Byte(5), UInt32(1), 0)
     _assert_enhance_your_calm_goaway(dispatcher.accept(headers, Span(empty)))
+
+
+def test_http2_request_session_peer_goaway_drains_without_failing() raises:
+    var session = Http2RequestSession("build/http2/libnet_hpack", 4, 1024)
+    var bootstrap = List[Byte]()
+    var preface = "PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n".as_bytes()
+    for i in range(len(preface)):
+        bootstrap.append(preface[i])
+    var empty = List[Byte]()
+    var settings = encode_frame(Byte(4), Byte(0), UInt32(0), Span(empty))
+    for i in range(len(settings.wire)):
+        bootstrap.append(settings.wire[i])
+    assert_true(session.consume(Span(bootstrap)).is_pending())
+
+    var goaway_payload: List[Byte] = [
+        Byte(0),
+        Byte(0),
+        Byte(0),
+        Byte(0),
+        Byte(0),
+        Byte(0),
+        Byte(0),
+        Byte(0),
+    ]
+    var goaway_wire = _frame(7, 0, 0, goaway_payload)
+    var after = session.consume(Span(goaway_wire))
+    assert_true(after.is_pending())
+    assert_false(session.is_failed())
+    assert_true(session.is_draining())
+    assert_true(_find_goaway_offset(after.output) >= 0)
+
+    var compressed: List[Byte] = [0x82, 0x86, 0x84, 0x01, 0x01, Byte(ord("x"))]
+    var new_stream = _frame(1, 5, 1, compressed)
+    var refused = session.consume(Span(new_stream))
+    assert_true(refused.is_pending())
+    assert_false(session.is_failed())
+    # Draining connections refuse newly opened streams with RST_STREAM
+    # (REFUSED_STREAM, code 7) rather than failing the whole session.
+    var saw_rst = False
+    var offset = 0
+    while offset + 9 <= len(refused.output):
+        var frame = parse_frame(Span(refused.output)[offset:])
+        if frame.frame_type == Byte(3) and frame.stream_id == UInt32(1):
+            saw_rst = True
+            var reset_payload = Span(refused.output)[
+                offset + 9 : offset + 9 + Int(frame.payload_length)
+            ]
+            var reset = parse_rst_stream_frame(frame, reset_payload)
+            assert_equal(reset.error_code, UInt32(7))
+        offset += frame.consumed
+    assert_true(saw_rst)
 
 
 def main() raises:

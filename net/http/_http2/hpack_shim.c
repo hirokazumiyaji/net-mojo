@@ -289,3 +289,57 @@ int net_hpack_encode(net_hpack_deflater *wrapper, const uint8_t *fields,
     *output_length = (size_t)encoded;
     return NET_HPACK_ENCODE_OK;
 }
+
+int net_hpack_deflate_bound(net_hpack_deflater *wrapper, const uint8_t *fields,
+                            size_t fields_length, size_t *bound) {
+    if (wrapper == NULL || (fields == NULL && fields_length != 0) ||
+        bound == NULL) {
+        return NET_HPACK_ENCODE_INVALID;
+    }
+    *bound = 0;
+    size_t count = 0;
+    size_t offset = 0;
+    while (offset < fields_length) {
+        if (fields_length - offset < 8) {
+            return NET_HPACK_ENCODE_INVALID;
+        }
+        uint32_t name_length = read_u32(fields + offset);
+        uint32_t value_length = read_u32(fields + offset + 4);
+        offset += 8;
+        if (name_length == 0 || name_length > fields_length - offset ||
+            value_length > fields_length - offset - name_length) {
+            return NET_HPACK_ENCODE_INVALID;
+        }
+        if (count == SIZE_MAX) {
+            return NET_HPACK_ENCODE_TOO_LARGE;
+        }
+        ++count;
+        offset += (size_t)name_length + value_length;
+    }
+    if (count > SIZE_MAX / sizeof(nghttp2_nv)) {
+        return NET_HPACK_ENCODE_TOO_LARGE;
+    }
+    nghttp2_nv *nva = NULL;
+    if (count != 0) {
+        nva = malloc(count * sizeof(*nva));
+        if (nva == NULL) {
+            return NET_HPACK_ENCODE_INVALID;
+        }
+    }
+    offset = 0;
+    for (size_t i = 0; i < count; ++i) {
+        uint32_t name_length = read_u32(fields + offset);
+        uint32_t value_length = read_u32(fields + offset + 4);
+        offset += 8;
+        nva[i].name = (uint8_t *)(fields + offset);
+        nva[i].namelen = name_length;
+        offset += name_length;
+        nva[i].value = (uint8_t *)(fields + offset);
+        nva[i].valuelen = value_length;
+        nva[i].flags = NGHTTP2_NV_FLAG_NONE;
+        offset += value_length;
+    }
+    *bound = nghttp2_hd_deflate_bound(wrapper->deflater, nva, count);
+    free(nva);
+    return NET_HPACK_ENCODE_OK;
+}

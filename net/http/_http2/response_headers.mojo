@@ -93,18 +93,73 @@ def encode_http2_response_headers(
             if not _content_length_matches(declared_lengths[i], wire_length):
                 return Http2ResponseHeadersResult.error()
 
-    var has_date = Bool(writer.headers.get_first("date"))
     var has_content_length = wire_length >= 0
     var fields = List[Byte]()
     if not _append_field(fields, String(":status"), status_bytes):
         return Http2ResponseHeadersResult.error()
 
+    # RFC 9110 §7.6.1 / RFC 9113 §8.2.2: fields named by any "Connection"
+    # header are hop-by-hop and must also be stripped from the response.
+    var connection_hops = List[String]()
+    for i in range(len(writer.headers)):
+        ref name = writer.headers._lower_names[i]
+        if name == "connection":
+            var raw = writer.headers._value_bytes_span(i)
+            var start = 0
+            var cursor = 0
+            while cursor <= len(raw):
+                var at_end = cursor == len(raw)
+                var is_sep = (not at_end) and (
+                    raw[cursor] == Byte(ord(","))
+                    or raw[cursor] == Byte(ord(" "))
+                    or raw[cursor] == Byte(ord("\t"))
+                )
+                if at_end or is_sep:
+                    if cursor > start:
+                        var token = String()
+                        for j in range(start, cursor):
+                            var b = raw[j]
+                            if b >= Byte(ord("A")) and b <= Byte(ord("Z")):
+                                b = Byte(Int(b) + 32)
+                            token += chr(Int(b))
+                        if token.byte_length() > 0:
+                            connection_hops.append(token^)
+                    start = cursor + 1
+                cursor += 1
+
+    # `has_date` is determined after Connection-nominated stripping so
+    # a handler that writes `Connection: Date` plus `Date: ...` still
+    # yields the server-generated Date (RFC 9110 §6.6.1).
+    var has_date = False
+    for i in range(len(writer.headers)):
+        ref name = writer.headers._lower_names[i]
+        if name != "date":
+            continue
+        var is_connection_nominated = False
+        for h in connection_hops:
+            if h == name:
+                is_connection_nominated = True
+                break
+        if not is_connection_nominated:
+            has_date = True
+            break
+
     for i in range(len(writer.headers)):
         ref name = writer.headers._lower_names[i]
         var value = writer.headers._value_bytes_span(i)
+        # RFC 9113 §8.2.2: these are HTTP/1-specific hop-by-hop headers and
+        # must not appear in HTTP/2 responses; drop silently so a shared H1
+        # handler cannot kill an H2 connection by writing them.
         if _is_connection_specific(name) or name == "te":
-            return Http2ResponseHeadersResult.error()
+            continue
         if name == "content-length":
+            continue
+        var is_connection_nominated = False
+        for h in connection_hops:
+            if h == name:
+                is_connection_nominated = True
+                break
+        if is_connection_nominated:
             continue
         header_list_size += _field_size(name.byte_length(), len(value))
         field_count += 1
@@ -139,3 +194,20 @@ def encode_http2_response_headers(
             return Http2ResponseHeadersResult.error()
 
     return Http2ResponseHeadersResult.valid(fields^, field_count, send_body)
+
+
+def encode_http2_minimal_500_fields(
+    date: StringSlice, max_header_list_size: Int, max_fields: Int
+) -> Http2ResponseHeadersResult:
+    """Builds a fallback 500 field list for the scheduler to retry when
+    HPACK encoding of the normal headers does not fit the compressed
+    buffer. The 500 response carries no body, so the HEADERS frame can
+    close the stream and the dynamic table only sees the minimal fields.
+    """
+    if max_header_list_size < 0 or max_fields < 2:
+        return Http2ResponseHeadersResult.error()
+    var writer = ResponseWriter(0)
+    writer.status = 500
+    return encode_http2_response_headers(
+        writer, False, date, max_header_list_size, max_fields
+    )
