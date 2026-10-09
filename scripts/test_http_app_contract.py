@@ -540,11 +540,13 @@ def case_handler_error_sibling_survives(port: int) -> None:
     try:
         rboom = h2.request("GET", "/boom")
         _assert(rboom.status == 500, f"H2 boom status {rboom.status}")
+        _assert(rboom.reset_code is None, f"H2 boom unexpected reset {rboom.reset_code!r}")
         rsib = h2.request("GET", "/sibling")
         _assert(
             rsib.status == 200 and rsib.body == b"sibling ok",
             f"H2 sibling after boom {rsib!r}",
         )
+        _assert(rsib.reset_code is None, f"H2 sibling after boom unexpected reset {rsib.reset_code!r}")
         _assert(not h2.terminated(), "H2 connection terminated after handler error")
     finally:
         h2.close()
@@ -573,6 +575,7 @@ def case_body_over_limit(port: int) -> None:
             r2sib.status == 200 and r2sib.body == b"sibling ok",
             f"H2 sibling after oversize {r2sib!r}",
         )
+        _assert(r2sib.reset_code is None, f"H2 sibling after oversize unexpected reset {r2sib.reset_code!r}")
     finally:
         h2.close()
 

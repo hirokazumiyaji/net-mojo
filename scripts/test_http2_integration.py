@@ -441,6 +441,7 @@ def case_stalled_stream_sibling_progresses(port: int) -> None:
         sib_id = peer.open_request("GET", "/sibling")
         sib = peer.wait_stream(sib_id, time.perf_counter() + TIMEOUT_S)
         _assert(sib["status"] == 200, f"sibling status under stall {sib['status']}")
+        _assert(sib["reset"] is None, f"sibling under stall unexpected reset {sib['reset']!r}")
         _assert(bytes(sib["body"]) == b"sibling ok", f"sibling body under stall {sib['body']!r}")
         _assert(peer.terminated is None, "connection terminated under stall")
         # Release withheld credit so stalled stream can finish.
@@ -761,11 +762,18 @@ def case_client_sent_goaway(port: int) -> None:
             try:
                 chunk = sock.recv(65536)
             except (socket.timeout, ssl.SSLWantReadError):
-                if not goaway_sent and headers_decoded and len(total_body) > 0:
-                    # Response is in flight (stalled on stream window
-                    # at some point under the initial 65535). Send
-                    # GOAWAY now so draining engages while the server
-                    # still has to finish /large.
+                if (
+                    not goaway_sent
+                    and headers_decoded
+                    and len(total_body) >= 65535
+                    and not stream_ended
+                ):
+                    # /large is 128 KiB; a server that honored the
+                    # initial 65535 stream window must have stalled by
+                    # now with END_STREAM pending. Send GOAWAY so
+                    # draining engages while the response is still in
+                    # flight — the asserts below reject a probe that
+                    # sees the full response or END_STREAM beforehand.
                     goaway = (
                         (0).to_bytes(4, "big")
                         + (int(ErrorCodes.NO_ERROR)).to_bytes(4, "big")
