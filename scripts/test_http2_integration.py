@@ -636,6 +636,10 @@ def case_shutdown_goaway_drains_in_flight(port: int) -> None:
             f"trigger-shutdown status {rec_trigger!r}",
         )
         _assert(
+            rec_trigger["reset"] is None,
+            f"trigger-shutdown unexpected reset {rec_trigger['reset']!r}",
+        )
+        _assert(
             bytes(rec_trigger["body"]) == b"shutdown requested",
             f"trigger-shutdown body {rec_trigger['body']!r}",
         )
@@ -667,6 +671,11 @@ def case_shutdown_goaway_drains_in_flight(port: int) -> None:
         _assert(
             rec_refused is not None and rec_refused["reset"] == 7,
             f"post-GOAWAY stream reset {rec_refused!r} (want REFUSED_STREAM=7)",
+        )
+        _assert(
+            rec_refused.get("status") is None
+            and len(rec_refused.get("body") or b"") == 0,
+            f"post-GOAWAY stream received response data {rec_refused!r}",
         )
 
         # 5) Open the stream window generously so the stalled response

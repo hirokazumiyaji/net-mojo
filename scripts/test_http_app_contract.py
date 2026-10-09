@@ -636,6 +636,7 @@ def case_hop_by_hop_headers(h1: H1Client, h2: H2Client) -> None:
         f"H1 handler-set Connection header expected: {r1.header_values('connection')!r}",
     )
     r2 = h2.request("GET", "/strip")
+    _assert(r2.reset_code is None, f"H2 strip unexpected reset {r2.reset_code!r}")
     _assert(r2.body == b"stripped?", f"H2 strip body {r2.body!r}")
     for hop in ("connection", "keep-alive", "transfer-encoding"):
         _assert(
