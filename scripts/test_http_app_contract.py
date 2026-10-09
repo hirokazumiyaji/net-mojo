@@ -165,16 +165,29 @@ class H1Client:
             # a forbidden payload after a 204/304 is visible to the
             # caller rather than being silently discarded. The caller
             # issues these with Connection: close so the server must
-            # close after the header line.
+            # close after the header line — a read timeout here means
+            # the server kept the socket open and the drain check
+            # cannot run, so propagate the timeout instead of returning
+            # an unverified empty body.
             self._sock.settimeout(REQUEST_TIMEOUT_S)
+            saw_eof = False
             while True:
                 try:
                     chunk = self._sock.recv(4096)
-                except (socket.timeout, ssl.SSLError, OSError):
+                except socket.timeout as exc:
+                    raise RuntimeError(
+                        "H1: Connection: close socket never closed; no-body"
+                        " drain check cannot verify absent forbidden payload"
+                    ) from exc
+                except (ssl.SSLError, OSError):
+                    saw_eof = True
                     break
                 if not chunk:
+                    saw_eof = True
                     break
                 body.extend(chunk)
+            if not saw_eof:
+                raise RuntimeError("H1: no-body drain did not reach EOF")
             body_bytes = bytes(body)
         elif cl is not None:
             while len(body) < cl:
@@ -441,6 +454,7 @@ def case_head_no_body(port: int) -> None:
     try:
         r2 = h2.request("HEAD", "/head")
         _assert(r2.status == 200, f"H2 HEAD status {r2.status}")
+        _assert(r2.reset_code is None, f"H2 HEAD unexpected reset {r2.reset_code!r}")
         _assert(r2.header_values("content-length") == ["10"], f"H2 HEAD CL {r2.header_values('content-length')!r}")
         _assert(r2.body == b"", f"H2 HEAD body {r2.body!r}")
     finally:
@@ -456,6 +470,7 @@ def case_no_body_statuses(h1: H1Client, h2: H2Client) -> None:
 
         r2 = h2.request("GET", path)
         _assert(r2.status == status, f"H2 {path} status {r2.status}")
+        _assert(r2.reset_code is None, f"H2 {path} unexpected reset {r2.reset_code!r}")
         _assert(r2.body == b"", f"H2 {path} body {r2.body!r}")
         _assert(r2.header_values("content-length") == [], f"H2 {path} CL {r2.header_values('content-length')!r}")
 
@@ -609,6 +624,12 @@ def case_hop_by_hop_headers(h1: H1Client, h2: H2Client) -> None:
             f"H2 hop header leaked: {hop}={r2.header_values(hop)!r}",
         )
     _assert(not h2.terminated(), "H2 connection terminated after hop header strip")
+    # Verify the connection is still usable with another request so a
+    # server that closed the connection right after stripping cannot
+    # satisfy the terminated() check (which stops reading at END_STREAM).
+    r3 = h2.request("GET", "/head")
+    _assert(r3.status == 200, f"H2 liveness after strip failed: status {r3.status}")
+    _assert(r3.reset_code is None, f"H2 liveness after strip reset {r3.reset_code!r}")
 
 
 # --- Driver ---

@@ -427,6 +427,11 @@ def case_stalled_stream_sibling_progresses(port: int) -> None:
         peer._flush()
         rec = peer.wait_stream(stalled, time.perf_counter() + TIMEOUT_S)
         _assert(rec["status"] == 200, f"stalled stream status after release {rec['status']}")
+        _assert(rec["reset"] is None, f"stalled stream reset after release {rec['reset']!r}")
+        _assert(
+            len(rec["body"]) == 128 * 1024,
+            f"stalled stream body length after release {len(rec['body'])}",
+        )
     finally:
         peer.close()
 
@@ -663,9 +668,11 @@ def case_shutdown_goaway_drains_in_flight(port: int) -> None:
 
 def case_client_sent_goaway(port: int) -> None:
     """A client-initiated GOAWAY must let the in-flight stream complete
-    and then the server closes. Driven entirely with raw framing so
-    hyper-h2's ClientConnection cannot transition to CLOSED on the
-    server's reciprocating GOAWAY and reject legitimate in-flight DATA."""
+    and then the server closes. Open /large (128 KiB) so the server's
+    first drain stalls at the initial stream window (65535) and the
+    stream is guaranteed to still be in flight when GOAWAY lands. Drive
+    with raw framing so hyper-h2 cannot transition the client to CLOSED
+    on the server's reciprocating GOAWAY and reject in-flight DATA."""
     from hpack import Decoder, Encoder  # type: ignore[import-not-found]
 
     raw = socket.create_connection(("127.0.0.1", port), timeout=TIMEOUT_S)
@@ -693,38 +700,49 @@ def case_client_sent_goaway(port: int) -> None:
                 + payload
             )
 
-        # Open /sibling with HEADERS+END_STREAM so the server queues an
-        # in-flight response. Flow-control credit stays untouched so the
-        # whole body + END_STREAM is sent in one scheduler drain.
+        # Raise the connection receive window up front so the response
+        # is only ever flow-blocked on its stream window, not the
+        # connection one.
+        sock.sendall(frame(0x08, 0x00, 0, ((1 << 20) - 1).to_bytes(4, "big")))
+
         stream_id = 1
         block = encoder.encode(
             [
                 (b":method", b"GET"),
                 (b":scheme", b"https"),
                 (b":authority", b"localhost"),
-                (b":path", b"/sibling"),
+                (b":path", b"/large"),
             ]
         )
         sock.sendall(frame(0x01, 0x05, stream_id, block))
 
-        # Immediately follow with a GOAWAY so the server must drain the
-        # in-flight stream before closing.
-        goaway = (
-            (0).to_bytes(4, "big")
-            + (int(ErrorCodes.NO_ERROR)).to_bytes(4, "big")
-        )
-        sock.sendall(frame(0x07, 0x00, 0, goaway))
-
         deadline = time.perf_counter() + TIMEOUT_S
         buf = bytearray()
+        total_body = bytearray()
+        status: Optional[int] = None
+        headers_decoded = False
         stream_ended = False
+        reset_code: Optional[int] = None
         server_closed = False
+        goaway_sent = False
+        credit_sent = False
         while time.perf_counter() < deadline and not (stream_ended and server_closed):
             remaining = max(0.0, deadline - time.perf_counter())
             sock.settimeout(min(POLL_INTERVAL_S, remaining) if remaining else 0.0)
             try:
                 chunk = sock.recv(65536)
             except (socket.timeout, ssl.SSLWantReadError):
+                if not goaway_sent and headers_decoded and len(total_body) > 0:
+                    # Response is in flight (stalled on stream window
+                    # at some point under the initial 65535). Send
+                    # GOAWAY now so draining engages while the server
+                    # still has to finish /large.
+                    goaway = (
+                        (0).to_bytes(4, "big")
+                        + (int(ErrorCodes.NO_ERROR)).to_bytes(4, "big")
+                    )
+                    sock.sendall(frame(0x07, 0x00, 0, goaway))
+                    goaway_sent = True
                 continue
             except (OSError, ssl.SSLError):
                 server_closed = True
@@ -740,10 +758,41 @@ def case_client_sent_goaway(port: int) -> None:
                 frame_type = buf[3]
                 flags = buf[4]
                 frame_stream = int.from_bytes(buf[5:9], "big") & 0x7FFFFFFF
+                payload = bytes(buf[9 : 9 + length])
                 del buf[: 9 + length]
-                if frame_stream == stream_id and (flags & 0x01):
+                if frame_type == 0x01 and frame_stream == stream_id:
+                    for name, value in decoder.decode(payload):
+                        name_bytes = name if isinstance(name, bytes) else name.encode()
+                        if name_bytes == b":status":
+                            value_bytes = value if isinstance(value, bytes) else value.encode()
+                            status = int(value_bytes.decode())
+                    headers_decoded = True
+                elif frame_type == 0x00 and frame_stream == stream_id:
+                    total_body.extend(payload)
+                    if flags & 0x01:
+                        stream_ended = True
+                elif frame_type == 0x03 and frame_stream == stream_id:
+                    reset_code = int.from_bytes(payload[:4], "big")
                     stream_ended = True
+            if goaway_sent and not credit_sent and headers_decoded:
+                sock.sendall(
+                    frame(
+                        0x08,
+                        0x00,
+                        stream_id,
+                        ((1 << 20) - 1).to_bytes(4, "big"),
+                    )
+                )
+                credit_sent = True
+        _assert(headers_decoded, "server never emitted response HEADERS")
+        _assert(goaway_sent, "test never had a chance to send GOAWAY")
         _assert(stream_ended, "in-flight stream never finished with END_STREAM")
+        _assert(reset_code is None, f"in-flight stream reset: {reset_code!r}")
+        _assert(status == 200, f"GOAWAY-drained response status {status!r}")
+        _assert(
+            len(total_body) == 128 * 1024,
+            f"GOAWAY-drained response body length {len(total_body)}",
+        )
         _assert(server_closed, "server did not close after client GOAWAY drain")
     finally:
         try:
