@@ -1488,5 +1488,21 @@ def test_http2_scheduler_lazy_encode_keeps_single_inflater_in_sync() raises:
     assert_equal(decoded_streams[1], UInt32(3))
 
 
+def test_hpack_deflate_bound_matches_encoded_output() raises:
+    # Regression: the scheduler's drain gate must use nghttp2's actual
+    # deflate bound. Hand-rolled estimates can push valid responses
+    # above the drain batch and trigger a bogus 500 fallback.
+    var deflater = _make_deflater()
+    var fields = List[Byte]()
+    _append_hpack_field(fields, ":status", "200")
+    _append_hpack_field(fields, "x-pad", "a" * 1000)
+    var bound = deflater.deflate_bound(Span(fields))
+    assert_true(bound > 0)
+    var output = Array[Byte, 2048](fill=0)
+    var encoded = deflater.encode(Span(fields), 65536, 32, Span(output))
+    assert_true(encoded.is_success())
+    assert_true(encoded.output_length <= bound)
+
+
 def main() raises:
     TestSuite.discover_tests[__functions_in_module()]().run()

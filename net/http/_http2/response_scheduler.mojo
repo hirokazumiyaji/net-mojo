@@ -189,20 +189,22 @@ struct Http2ResponseScheduler(Movable):
                 # nghttp2_hd_deflate_bound = sum(name+value+32) + 128.
                 # The queued buffer carries 8 bytes of (name_len,
                 # value_len) overhead per field, so add 24 bytes per
-                # field plus 128 bytes head room for a dynamic-table-
-                # size-update prefix (RFC 7541 §4.2) and nghttp2 slack.
-                # Cap by `compressed_capacity` so the gate never asks
-                # for more than the deflater can actually emit. The
-                # bound tracks nghttp2_hd_deflate_bound (sum(name_len +
-                # value_len + 32)); the queued buffer carries 8 bytes
-                # of overhead per field already, so adding 24 bytes per
-                # field reaches the native upper bound without the old
-                # 128-byte slack that could push a valid response above
-                # the drain batch.
-                var raw_len = len(self._responses[index].header_fields)
-                var hpack_bound = (
-                    raw_len + 24 * self._responses[index].header_field_count
+                # Call nghttp2 directly for the exact compressed-wire
+                # upper bound: hand estimates can push valid responses
+                # above the drain batch and trigger a 500 fallback where
+                # the native encoder would succeed. Cap by
+                # `compressed_capacity` so the gate never asks for more
+                # than the deflater can actually emit.
+                var hpack_bound = deflater.deflate_bound(
+                    Span(self._responses[index].header_fields)
                 )
+                if hpack_bound < 0:
+                    return Http2ScheduledOutput(
+                        wire=output^,
+                        completed_streams=completed^,
+                        released_bytes=released,
+                        deflater_failed=True,
+                    )
                 if hpack_bound > self._responses[index].compressed_capacity:
                     hpack_bound = self._responses[index].compressed_capacity
                 var worst_frames = (
