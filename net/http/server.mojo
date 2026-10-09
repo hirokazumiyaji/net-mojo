@@ -1733,6 +1733,24 @@ struct Server(Movable):
             return
         if not self._conns[idx].http2_deflater:
             return
+        # Re-apply the peer's current SETTINGS_HEADER_TABLE_SIZE before
+        # the scheduler encodes any deferred HEADERS (RFC 7541 §4.2).
+        # If the peer shrunk the table while a response was flow-blocked,
+        # the next encoded block must prefix the dynamic-table-size
+        # update or a compliant inflater rejects it.
+        var current_table_size = Int(
+            self._conns[idx]
+            .http2_session.value()
+            .peer_settings()
+            .header_table_size
+        )
+        if (
+            not self._conns[idx]
+            .http2_deflater.value()
+            .set_max_table_size(current_table_size)
+        ):
+            self._close_conn(idx)
+            return
         var batch = self._conns[idx].http2_responses.drain(
             self._conns[idx].http2_session.value(),
             self._conns[idx].http2_deflater.value(),
