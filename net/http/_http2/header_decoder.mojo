@@ -71,6 +71,17 @@ struct Http2HeaderDecodeResult(Copyable):
             end_stream=False,
         )
 
+    @staticmethod
+    def flooded() -> Self:
+        return Self(
+            status=5,
+            output_length=0,
+            field_count=0,
+            decoded_size=0,
+            stream_id=UInt32(0),
+            end_stream=False,
+        )
+
     def is_pending(self) -> Bool:
         return self.status == 0
 
@@ -86,6 +97,9 @@ struct Http2HeaderDecodeResult(Copyable):
     def is_compression_error(self) -> Bool:
         return self.status == 4
 
+    def is_flooded(self) -> Bool:
+        return self.status == 5
+
 
 struct Http2HeaderDecoder(Movable):
     var _block: Http2HeaderBlock
@@ -97,8 +111,11 @@ struct Http2HeaderDecoder(Movable):
         var library_path: String,
         max_table_size: Int,
         max_compressed_size: Int,
+        max_continuation_frames: Int = 32,
     ) raises:
-        self._block = Http2HeaderBlock(max_compressed_size)
+        self._block = Http2HeaderBlock(
+            max_compressed_size, max_continuation_frames=max_continuation_frames
+        )
         self._inflater = Http2HpackInflater(library_path^, max_table_size)
         self._failed = False
 
@@ -124,6 +141,9 @@ struct Http2HeaderDecoder(Movable):
             assembled = self._block.continue_with(frame, payload)
         else:
             assembled = self._block.begin(frame, payload)
+        if assembled.is_flooded():
+            self._failed = True
+            return Http2HeaderDecodeResult.flooded()
         if assembled.is_error():
             self._failed = True
             return Http2HeaderDecodeResult.protocol_error()

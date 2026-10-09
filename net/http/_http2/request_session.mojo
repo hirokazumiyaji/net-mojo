@@ -137,13 +137,14 @@ struct Http2RequestSession(Movable):
         body_deadline: Timeout = Timeout.nanoseconds(30_000_000_000),
         max_control_frames_per_second: Int = 1000,
         max_resets_per_second: Int = 100,
-        max_new_streams_per_second: Int = 1000000,
+        max_new_streams_per_second: Int = 10000,
     ):
         self._input = Http2ServerConnectionInput(
             max_concurrent_streams=max_active_streams,
             max_control_frames_per_second=max_control_frames_per_second,
             max_resets_per_second=max_resets_per_second,
             max_new_streams_per_second=max_new_streams_per_second,
+            max_header_list_size=max_headers_bytes,
         )
         self._decoder = None
         self._library_path = library_path^
@@ -359,6 +360,21 @@ struct Http2RequestSession(Movable):
                             )
                         self._remove_stream(stream_id)
                         continue
+                    elif decoded.is_flooded():
+                        self._pending_headers_at = NO_DEADLINE
+                        self._draining = True
+                        self._failed = True
+                        var goaway = encode_goaway_frame(
+                            self._last_stream_id, UInt32(11)
+                        )
+                        if not goaway.is_complete():
+                            return Http2RequestSessionResult.error(
+                                consumed, output^
+                            )
+                        output.extend(Span(goaway.wire))
+                        return Http2RequestSessionResult.pending(
+                            consumed, output^
+                        )
                     else:
                         self._failed = True
                         return Http2RequestSessionResult.error(

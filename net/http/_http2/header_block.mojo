@@ -19,6 +19,10 @@ struct HeaderBlockResult(Movable):
     def error() -> Self:
         return Self(kind=2)
 
+    @staticmethod
+    def flooded() -> Self:
+        return Self(kind=3)
+
     def is_pending(self) -> Bool:
         return self.kind == 0
 
@@ -28,21 +32,32 @@ struct HeaderBlockResult(Movable):
     def is_error(self) -> Bool:
         return self.kind == 2
 
+    def is_flooded(self) -> Bool:
+        return self.kind == 3
+
 
 struct Http2HeaderBlock(Movable):
     var max_compressed_size: Int
+    var max_continuation_frames: Int
     var stream_id: UInt32
     var end_stream: Bool
     var pending: Bool
     var failed: Bool
+    var continuation_count: Int
     var bytes: List[Byte]
 
-    def __init__(out self, max_compressed_size: Int):
+    def __init__(
+        out self,
+        max_compressed_size: Int,
+        max_continuation_frames: Int = 32,
+    ):
         self.max_compressed_size = max_compressed_size
+        self.max_continuation_frames = max_continuation_frames
         self.stream_id = UInt32(0)
         self.end_stream = False
         self.pending = False
-        self.failed = max_compressed_size < 0
+        self.failed = max_compressed_size < 0 or max_continuation_frames < 0
+        self.continuation_count = 0
         self.bytes = List[Byte]()
 
     def begin[
@@ -65,6 +80,7 @@ struct Http2HeaderBlock(Movable):
             return HeaderBlockResult.error()
 
         self.bytes.clear()
+        self.continuation_count = 0
         self.stream_id = frame.stream_id
         self.end_stream = (frame.flags & Byte(1)) != Byte(0)
         var fragment = Self._headers_fragment(frame.flags, payload)
@@ -99,6 +115,12 @@ struct Http2HeaderBlock(Movable):
             self.failed = True
             self.pending = False
             return HeaderBlockResult.error()
+
+        self.continuation_count += 1
+        if self.continuation_count > self.max_continuation_frames:
+            self.failed = True
+            self.pending = False
+            return HeaderBlockResult.flooded()
 
         if not self._append(payload, 0, len(payload)):
             self.failed = True

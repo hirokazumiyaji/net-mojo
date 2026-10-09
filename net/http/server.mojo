@@ -119,6 +119,14 @@ comptime _TICK_POLL_CAP_MS: Int = 100
 comptime _SHUTDOWN_QUIET_MS: Int = 10
 comptime _QUIC_GOAWAY_DELAY_NS: Int = 1_000_000_000
 comptime _QUIC_CLOSE_DRAIN_NS: Int = 3_000_000_000
+comptime _HPACK_DEFLATER_TABLE_CAP: Int = 4096
+
+
+def _bounded_hpack_table_size(peer_value: UInt32) -> Int:
+    var value = Int(peer_value)
+    if value > _HPACK_DEFLATER_TABLE_CAP:
+        return _HPACK_DEFLATER_TABLE_CAP
+    return value
 
 
 @fieldwise_init
@@ -1564,7 +1572,7 @@ struct Server(Movable):
 
         if not self._conns[idx].http2_deflater:
             try:
-                var table_size = Int(
+                var table_size = _bounded_hpack_table_size(
                     self._conns[idx]
                     .http2_session.value()
                     .peer_settings()
@@ -1580,7 +1588,7 @@ struct Server(Movable):
                 self._close_conn(idx)
                 return
         else:
-            var table_size = Int(
+            var table_size = _bounded_hpack_table_size(
                 self._conns[idx]
                 .http2_session.value()
                 .peer_settings()

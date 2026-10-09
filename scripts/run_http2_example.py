@@ -65,8 +65,8 @@ def _run_request(port):
                 b"\x00\x00\x00\x04\x00\x00\x00\x00\x00"
             )
             bootstrap = bytearray()
-            while len(bootstrap) < 24:
-                chunk = client.recv(24 - len(bootstrap))
+            while len(bootstrap) < 30:
+                chunk = client.recv(30 - len(bootstrap))
                 if not chunk:
                     raise RuntimeError("incomplete HTTP/2 bootstrap")
                 bootstrap.extend(chunk)

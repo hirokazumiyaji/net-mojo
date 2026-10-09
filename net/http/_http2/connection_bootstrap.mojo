@@ -47,9 +47,12 @@ struct Http2ConnectionBootstrap(Movable):
         out self,
         max_frame_size: Int = 16384,
         max_concurrent_streams: Int = 100,
+        max_header_list_size: Int = 32768,
     ):
         self._max_frame_size = max_frame_size
-        self._protocol = Http2ServerBootstrap(max_concurrent_streams)
+        self._protocol = Http2ServerBootstrap(
+            max_concurrent_streams, max_header_list_size
+        )
         self._preface = List[Byte]()
         self._frame = List[Byte]()
         self._preface_complete = False
