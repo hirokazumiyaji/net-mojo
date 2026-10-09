@@ -747,6 +747,38 @@ fn normalize_http3_response_header_name(name: &[u8]) -> Option<Vec<u8>> {
     }
 }
 
+fn normalize_http3_response_trailer_name(name: &[u8]) -> Option<Vec<u8>> {
+    let lower = normalize_http3_response_header_name(name)?;
+    // RFC 9110 §6.5.1: fields that change framing, routing,
+    // authentication, or payload processing are forbidden in trailers.
+    match lower.as_slice() {
+        b"content-length"
+        | b"trailer"
+        | b"host"
+        | b"expect"
+        | b"authorization"
+        | b"www-authenticate"
+        | b"proxy-authenticate"
+        | b"proxy-authorization"
+        | b"content-encoding"
+        | b"content-type"
+        | b"content-range"
+        | b"cache-control"
+        | b"vary"
+        | b"set-cookie"
+        | b"age"
+        | b"expires"
+        | b"pragma"
+        | b"location"
+        | b"retry-after"
+        | b"allow"
+        | b"etag"
+        | b"last-modified"
+        | b"content-disposition" => None,
+        _ => Some(lower),
+    }
+}
+
 fn is_http_tchar(byte: u8) -> bool {
     matches!(
         byte,
@@ -2201,7 +2233,7 @@ impl QuicServer {
         }
         let mut response_trailers = Vec::with_capacity(trailers.len());
         for (name, value) in trailers {
-            let Some(normalized) = normalize_http3_response_header_name(&name) else {
+            let Some(normalized) = normalize_http3_response_trailer_name(&name) else {
                 self.buffered_response_bytes -= buffered_bytes;
                 let connection = self.connections.get_mut(&connection_key).unwrap();
                 cancel_http3_request(connection, stream_id, H3_GENERAL_PROTOCOL_ERROR);
