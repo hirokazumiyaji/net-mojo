@@ -1,10 +1,27 @@
-# HTTP/1.1 results — current comparison and retained history
+# HTTP/1.1 results — current probe and retained history
 
-The current numerical comparison and its recorded source/tool/binary provenance are available in [H1_RESULTS.tables.json](H1_RESULTS.tables.json).
+The original matched numerical comparison and its recorded source/tool/binary provenance are available in [H1_RESULTS.tables.json](H1_RESULTS.tables.json). A shorter current-source probe follows below.
 
-The current matched comparison uses benchmark policy 93 (Go TCP SO_KEEPALIVE OFF, with HTTP connection reuse unchanged) and the unchanged frozen Mojo runtime 87. All 120 original-schedule trials are valid. Fixed 64 B throughput passes the original ≥0.90 criterion at 64 and 1,024 connections, with paired ratios 1.0203 and 1.0869. The separate five-pair planned-arrival LATENCY cell at 250 requests/s passes the original ≤1.2 p99 criterion with ratio 0.9074. JSON and echo observations receive no added numerical targets; the large-body throughput gap remains visible.
+The original matched comparison uses benchmark policy 93 (Go TCP SO_KEEPALIVE OFF, with HTTP connection reuse unchanged) and the unchanged frozen Mojo runtime 87. All 120 original-schedule trials are valid. Fixed 64 B throughput passes the original ≥0.90 criterion at 64 and 1,024 connections, with paired ratios 1.0203 and 1.0869. The separate five-pair planned-arrival LATENCY cell at 250 requests/s passes the original ≤1.2 p99 criterion with ratio 0.9074. JSON and echo observations receive no added numerical targets; the large-body throughput gap belongs to that frozen binary.
 
-The first section below retains the qualified current comparison, including its rates, latencies, errors, classified cutoffs, resource coverage and source limits. The historical section preserves the complete earlier v5 report. Its asymmetric TCP maintenance policy, old R500 latency, invalid rows, failed original soaks, traced controls and historical Darwin observations remain separate evidence. No old row is replaced, spliced into a current aggregate or relabeled as policy 93. Whole-allocator/RSS bounds and an exact kernel cause are not established.
+The qualified original comparison below retains its rates, latencies, errors, classified cutoffs, resource coverage and source limits. The historical section preserves the complete earlier v5 report. Its asymmetric TCP maintenance policy, old R500 latency, invalid rows, failed original soaks, traced controls and historical Darwin observations remain separate evidence. No old row is replaced or spliced into the current probe. Whole-allocator/RSS bounds and an exact kernel cause are not established.
+
+## Current-source 64 KiB echo probe — 2026-10-12
+
+The original policy 93 series measured 1,193.0 Mojo versus 23,414.2 Go requests/s for 64 KiB Content-Length echo (paired ratio 0.0508). The source from 2026-10-06 (`847b3c0`) reproduces that order of magnitude in a separate Linux container. The first following HTTP/1 change, `6770d3a` (`Simplify HTTP server internals`), replaces byte-by-byte appends with bulk `List.extend` in the receive buffer, request body, response writer and wire encoder. A build of that commit measured 19,861.8 requests/s in one 64 KiB Content-Length trial. This isolates the large improvement to the commit; it does not assign a percentage to any one changed copy site.
+
+The same Go 1.26.4 server and loader binaries drove alternating three-pair runs of the old and current Mojo builds. Each run used 64 persistent connections, 2 s warmup, 5 s measurement, one server on CPU 0, and the loader on CPUs 1–2. All 24 trials were valid with zero errors. Per-role rates are medians of three runs; ratios are medians of the three within-pair Mojo/Go ratios.
+
+| Mojo source | Workload | Go req/s | Mojo req/s | Paired Mojo/Go |
+| --- | --- | ---: | ---: | ---: |
+| `847b3c0` | 64 KiB echo, Content-Length | 18,273.4 | 1,158.0 | 0.0626 |
+| `c70832e` | 64 KiB echo, Content-Length | 18,782.0 | 19,239.4 | 1.0191 |
+| `c70832e` | 64 KiB echo, chunked | 19,218.8 | 19,818.4 | 1.0312 |
+| `c70832e` | fixed 64 B response | 110,887.2 | 138,611.4 | 1.2276 |
+
+This probe ran on Linux aarch64 in Docker Desktop (`7.0.14-linuxkit`), image `net-mojo-http-netem:issue42-current` (`fcb839473c5e`), with a three-CPU quota. Mojo was 1.1.0 (`8189361e`); Go was 1.26.4. The optimized builds used `mojo build -O3 -Xlinker -ldl` and `go build -p 1 -buildvcs=false`. SHA256: old Mojo `7acea9bd1da54a3b152ee10857d243e6285f66e67ba0ebdaaab66bfda3b2b536`, bulk-append commit `fce3f9ecdd4edaa38bbce2011888d5397af339c70b31d6d762851d5e73ac1316`, current Mojo `b13dfe497c50d1cc37e07dcb7f2231e11b72772fc8abf1a7db0785eea815283a`, Go server `0dcb3d7ab2d82f24c6b14dcc3364f75cdaf4a2baad2ec9e26cb36f767cc5e3b6`, and Go loader `f9b9afd00337bdbfd6f2c05934a35fbf373a24a3f68a31a495685976537a95d2`.
+
+Reproduce with the HTTP/1 build commands below, then run `http-load -url http://127.0.0.1:18081/echo -body-size 65536 -connections 64 -warmup 2s -duration 5s` against Mojo and the same command on port 18080 against Go. Add `-chunked` for the second echo row or use `/fixed` for the control. The original source can be checked out at `847b3c0`; build `6770d3a` separately to test the bulk-append boundary. These short runs demonstrate the change on this host, but do not replace the original 10 s warmup, 30 s measurement, five-pair policy 93 results or establish performance on the original rig.
 
 ## macOS M3 Max 30-minute H1 stability soak — 2026-10-12
 
