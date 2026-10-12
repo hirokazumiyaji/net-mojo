@@ -254,6 +254,17 @@ separately, together with timestamped server/client CPU, RSS and FD samples.
 Short functional probes do not satisfy the exact 10,000-connection or 30-minute
 soak evidence requirements.
 
+For a long soak, run the resource sampler with a bounded ceiling and stop it
+when the loader exits:
+
+```bash
+python3 benchmarks/http/sample_resources.py --server-pid "$server_pid" --loader-pid "$loader_pid" --interval 5 --samples 500 --until-loader-exits
+```
+
+The sampler records the loader's exit as its final event and requires the
+server to remain alive through that event. Check the loader's exit status and
+JSON result separately; the sampler does not validate workload success.
+
 For a mixed slow-header/slow-body probe, add explicit cohorts to ordinary
 `/fixed` clients. Both counts default to zero; this mode requires keepalive and
 cannot combine with the idle mode:

@@ -193,9 +193,11 @@ def _collector_cpu():
                (resource.getrusage(resource.RUSAGE_SELF), resource.getrusage(resource.RUSAGE_CHILDREN)))
 
 
-def collect(pids, interval, samples):
+def collect(pids, interval, samples, stop_when_exited=None):
+    if stop_when_exited is not None and stop_when_exited not in pids:
+        raise ValueError("stop role must be one of the sampled processes")
     start, cpu_start = time.monotonic_ns(), _collector_cpu()
-    rows = []
+    rows, stop_reason = [], "sample_limit"
     with ExitStack() as stack:
         processes = {role: stack.enter_context(Process(pid, role)) for role, pid in pids.items()}
         for index in range(samples):
@@ -207,11 +209,27 @@ def collect(pids, interval, samples):
                    "processes": {role: process.sample() for role, process in processes.items()}}
             row["collection_wall_seconds"] = (time.monotonic_ns() - began) / 1e9
             rows.append(row)
+            if stop_when_exited is not None and row["processes"][stop_when_exited]["state"] == "exited":
+                stop_reason = f"{stop_when_exited}_exited"
+                break
     elapsed = (time.monotonic_ns() - start) / 1e9
     cpu = _collector_cpu() - cpu_start
+    valid = bool(rows)
+    for index, row in enumerate(rows):
+        for role, process in row["processes"].items():
+            expected_exit = (
+                role == stop_when_exited
+                and index == len(rows) - 1
+                and stop_reason == f"{stop_when_exited}_exited"
+                and process["state"] == "exited"
+            )
+            if process["state"] != "running" and not expected_exit:
+                valid = False
+    if stop_when_exited is not None and (stop_reason != f"{stop_when_exited}_exited" or len(rows) < 2):
+        valid = False
     return {"os": platform.system(), "release": platform.release(), "machine": platform.machine(),
             "host_logical_cpus": os.cpu_count(), "interval_seconds": interval, "samples_requested": samples,
-            "valid": all(p["state"] == "running" for row in rows for p in row["processes"].values()),
+            "samples_collected": len(rows), "stop_reason": stop_reason, "valid": valid,
             "collector": {"cpu_seconds": cpu, "elapsed_seconds": elapsed, "cpu_percent": 100 * cpu / elapsed,
                           "collection_wall_seconds": sum(row["collection_wall_seconds"] for row in rows)},
             "samples": rows}
@@ -223,10 +241,16 @@ def main():
     parser.add_argument("--loader-pid", type=int, required=True)
     parser.add_argument("--interval", type=float, default=1)
     parser.add_argument("--samples", type=int, default=30)
+    parser.add_argument("--until-loader-exits", action="store_true")
     args = parser.parse_args()
     if min(args.server_pid, args.loader_pid, args.samples) <= 0 or not math.isfinite(args.interval) or args.interval <= 0:
         parser.error("PIDs, samples and finite interval must be positive")
-    result = collect({"server": args.server_pid, "loader": args.loader_pid}, args.interval, args.samples)
+    result = collect(
+        {"server": args.server_pid, "loader": args.loader_pid},
+        args.interval,
+        args.samples,
+        stop_when_exited="loader" if args.until_loader_exits else None,
+    )
     print(json.dumps(result, allow_nan=False))
     return 0 if result["valid"] else 1
 
