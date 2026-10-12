@@ -4,9 +4,9 @@
 # Varies connections × streams independently for GET /fixed on HTTPS+H2 and
 # QUIC H3. Also runs slow-stream, cancel, and one loss scenario per protocol.
 #
-# Procedure is intentionally shortened vs full Phase 0 and labeled as such
-# (defaults: warmup 3 s, measure 8 s, 3 runs). Never invent numbers — only
-# record what this harness prints.
+# Defaults are a shortened diagnostic procedure (warmup 3 s, measure 8 s,
+# 3 runs). Set 10 s / 30 s / 5 runs for the Phase 0 procedure. Never invent
+# numbers — only record what this harness prints.
 #
 # Usage (from repository root, after tls/hpack/quic builds):
 #   bash benchmarks/http/run_multiplex_matrix.sh
@@ -15,6 +15,7 @@
 #   WARMUP_S MEASURE_S RUNS CONNS STREAMS
 #   SKIP_H2=1 SKIP_H3=1 SKIP_SPECIAL=1
 #   SKIP_GO=1 SKIP_MOJO=1 SKIP_BASELINE=1
+#   SERVER_CPUSET CLIENT_CPUSET SPECIAL_RUNS SPECIAL_LOSS_DURATION
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
@@ -39,7 +40,17 @@ PIXI_ENV_H3="${PIXI_ENV_H3:-tls-http3}"
 # (SKIP_H2=1 / SKIP_H3=1) never requires the other pixi env at startup.
 PIXI_PYTHON_H2="${PIXI_PYTHON_H2:-}"
 PIXI_PYTHON_H3="${PIXI_PYTHON_H3:-}"
+SERVER_CPUSET="${SERVER_CPUSET:-}"
+CLIENT_CPUSET="${CLIENT_CPUSET:-}"
+SPECIAL_RUNS="${SPECIAL_RUNS:-1}"
+SPECIAL_LOSS_DURATION="${SPECIAL_LOSS_DURATION:-}"
+BASE_PID=""
+MOJO_H3_PID=""
 MATRIX_FAILURES=0
+PROCEDURE_LABEL="SHORTENED"
+if [ "$WARMUP_S" = "10" ] && [ "$MEASURE_S" = "30" ] && [ "$RUNS" = "5" ]; then
+    PROCEDURE_LABEL="FORMAL"
+fi
 
 h3_python() {
     if [ -n "${PIXI_PYTHON_H3:-}" ]; then
@@ -67,7 +78,7 @@ echo "== multiplex matrix host =="
 uname -a
 sw_vers 2>/dev/null || true
 sysctl -n machdep.cpu.brand_string 2>/dev/null || true
-echo "procedure: SHORTENED warmup=${WARMUP_S}s measure=${MEASURE_S}s runs=${RUNS}"
+echo "procedure: ${PROCEDURE_LABEL} warmup=${WARMUP_S}s measure=${MEASURE_S}s runs=${RUNS}"
 echo "matrix: conns=[${CONNS}] streams=[${STREAMS}] GET /fixed"
 echo
 
@@ -152,6 +163,26 @@ PY
     done
     echo "timeout waiting for $hostport" >&2
     return 1
+}
+
+run_with_affinity() {
+    local cpuset="$1"
+    shift
+    if [ -n "$cpuset" ]; then
+        taskset -c "$cpuset" "$@"
+    else
+        "$@"
+    fi
+}
+
+start_with_affinity() {
+    local cpuset="$1"
+    shift
+    if [ -n "$cpuset" ]; then
+        exec taskset -c "$cpuset" "$@"
+    else
+        exec "$@"
+    fi
 }
 
 verify_fixed_h2() {
@@ -510,7 +541,7 @@ run_h3_cell() {
     local sampler_pid=$!
 
     set +e
-    "$PIXI_PYTHON_H3" benchmarks/http3_load.py \
+    run_with_affinity "$CLIENT_CPUSET" "$PIXI_PYTHON_H3" benchmarks/http3_load.py \
         --url "$url" \
         --clients "$clients" \
         --streams "$streams" \
@@ -761,12 +792,12 @@ run_h3_special() {
         set +e
         case "$scenario" in
             slow)
-                line="$($(h3_python) benchmarks/http/http3_scenarios.py \
+                line="$(run_with_affinity "$CLIENT_CPUSET" "$(h3_python)" benchmarks/http/http3_scenarios.py \
                     --url "$url" --scenario slow --slow-s 0.25 --siblings 8 \
                     2>>"$special_log")"
                 ;;
             cancel)
-                line="$($(h3_python) benchmarks/http/http3_scenarios.py \
+                line="$(run_with_affinity "$CLIENT_CPUSET" "$(h3_python)" benchmarks/http/http3_scenarios.py \
                     --url "$url" --scenario cancel --siblings 8 \
                     2>>"$special_log")"
                 ;;
@@ -876,9 +907,9 @@ run_h3_special() {
     fi
 
     set +e
-    line="$($(h3_python) benchmarks/http/http3_scenarios.py \
+    line="$(run_with_affinity "$CLIENT_CPUSET" "$(h3_python)" benchmarks/http/http3_scenarios.py \
         --url "$url" --scenario loss --drop-rate 0.05 \
-        --clients 4 --streams 4 --duration 5 \
+        --clients 4 --streams 4 --duration "$SPECIAL_LOSS_DURATION" \
         2>>"$special_log")"
     scenario_rc=$?
     set -e
@@ -1001,7 +1032,8 @@ if [ "${SKIP_H3:-0}" != "1" ]; then
 
     if [ "${SKIP_BASELINE:-0}" != "1" ]; then
         echo "== start aioquic H3 baseline =="
-        $(h3_python) benchmarks/http3_aioquic_baseline.py \
+        start_with_affinity "$SERVER_CPUSET" "$(h3_python)" \
+            benchmarks/http3_aioquic_baseline.py \
             --host 127.0.0.1 --port 18452 \
             --certificate build/tls/test-cert.pem \
             --private-key build/tls/test-key.pem \
@@ -1010,46 +1042,74 @@ if [ "${SKIP_H3:-0}" != "1" ]; then
         trap 'kill_pid "${GO_PID:-}"; kill_pid "${MOJO_H2_PID:-}"; kill_pid "${BASE_PID:-}"; kill_pid "${MOJO_H3_PID:-}"' EXIT
         wait_udp "$BASE_PID"
         sleep 0.5
-        for clients in $CONNS; do
-            for streams in $STREAMS; do
-                for run in $(seq 1 "$RUNS"); do
-                    echo "== aioquic H3 GET /fixed c=${clients} m=${streams} run=${run} =="
-                    run_h3_cell "aioquic" "https://${BASELINE_H3_ADDR}/fixed" \
-                        "$clients" "$streams" "$run" "$BASE_PID"
-                done
-            done
-        done
-        if [ "${SKIP_SPECIAL:-0}" != "1" ]; then
-            run_h3_special "aioquic" "$BASELINE_H3_ADDR"
-        fi
-        kill_pid "$BASE_PID"
-        BASE_PID=
     fi
 
     if [ "${SKIP_MOJO:-0}" != "1" ]; then
         echo "== build Mojo H3 =="
-        pixi run -e "$PIXI_ENV_H3" mojo build --Werror -I . \
-            benchmarks/http3_server.mojo -o "$MOJO_H3_BIN"
-        "$MOJO_H3_BIN" >"$OUT_DIR/h3/mojo_server.log" 2>&1 &
+        pixi run -e "$PIXI_ENV_H3" bash -lc 'PATH=/usr/bin:/bin:$PATH mojo build --Werror -Xlinker -ldl -I . benchmarks/http3_server.mojo -o "$1"' _ "$MOJO_H3_BIN"
+        start_with_affinity "$SERVER_CPUSET" "$MOJO_H3_BIN" \
+            >"$OUT_DIR/h3/mojo_server.log" 2>&1 &
         MOJO_H3_PID=$!
         trap 'kill_pid "${GO_PID:-}"; kill_pid "${MOJO_H2_PID:-}"; kill_pid "${BASE_PID:-}"; kill_pid "${MOJO_H3_PID:-}"' EXIT
         wait_udp "$MOJO_H3_PID"
         sleep 0.5
-        for clients in $CONNS; do
-            for streams in $STREAMS; do
-                for run in $(seq 1 "$RUNS"); do
-                    echo "== Mojo H3 GET /fixed c=${clients} m=${streams} run=${run} =="
-                    run_h3_cell "mojo" "https://${MOJO_H3_ADDR}/fixed" \
-                        "$clients" "$streams" "$run" "$MOJO_H3_PID"
+    fi
+
+    if [ "${SKIP_SPECIAL:-0}" != "1" ] && [ -z "$SPECIAL_LOSS_DURATION" ]; then
+        if [ "$PROCEDURE_LABEL" = "FORMAL" ]; then
+            SPECIAL_LOSS_DURATION=30
+        else
+            SPECIAL_LOSS_DURATION=5
+        fi
+    fi
+    for clients in $CONNS; do
+        for streams in $STREAMS; do
+            for run in $(seq 1 "$RUNS"); do
+                if [ "$((run % 2))" -eq 1 ]; then
+                    first="aioquic"
+                    second="mojo"
+                else
+                    first="mojo"
+                    second="aioquic"
+                fi
+                for label in "$first" "$second"; do
+                    if [ "$label" = "aioquic" ] && [ -n "$BASE_PID" ]; then
+                        echo "== aioquic H3 GET /fixed c=${clients} m=${streams} run=${run} =="
+                        run_h3_cell "aioquic" "https://${BASELINE_H3_ADDR}/fixed" \
+                            "$clients" "$streams" "$run" "$BASE_PID"
+                    elif [ "$label" = "mojo" ] && [ -n "$MOJO_H3_PID" ]; then
+                        echo "== Mojo H3 GET /fixed c=${clients} m=${streams} run=${run} =="
+                        run_h3_cell "mojo" "https://${MOJO_H3_ADDR}/fixed" \
+                            "$clients" "$streams" "$run" "$MOJO_H3_PID"
+                    fi
                 done
             done
         done
-        if [ "${SKIP_SPECIAL:-0}" != "1" ]; then
-            run_h3_special "mojo" "$MOJO_H3_ADDR"
-        fi
-        kill_pid "$MOJO_H3_PID"
-        MOJO_H3_PID=
+    done
+
+    if [ "${SKIP_SPECIAL:-0}" != "1" ]; then
+        for run in $(seq 1 "$SPECIAL_RUNS"); do
+            if [ "$((run % 2))" -eq 1 ]; then
+                first="aioquic"
+                second="mojo"
+            else
+                first="mojo"
+                second="aioquic"
+            fi
+            for label in "$first" "$second"; do
+                if [ "$label" = "aioquic" ] && [ -n "$BASE_PID" ]; then
+                    run_h3_special "aioquic_r${run}" "$BASELINE_H3_ADDR"
+                elif [ "$label" = "mojo" ] && [ -n "$MOJO_H3_PID" ]; then
+                    run_h3_special "mojo_r${run}" "$MOJO_H3_ADDR"
+                fi
+            done
+        done
     fi
+
+    kill_pid "${BASE_PID:-}"
+    BASE_PID=
+    kill_pid "${MOJO_H3_PID:-}"
+    MOJO_H3_PID=
 fi
 
 echo

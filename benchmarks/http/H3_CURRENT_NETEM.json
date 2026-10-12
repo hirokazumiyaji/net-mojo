@@ -1,0 +1,108 @@
+{
+  "host": {
+    "system": "Linux",
+    "node": "067fe58ac148",
+    "release": "7.0.14-linuxkit",
+    "version": "#1 SMP PREEMPT Sun Sep 20 16:14:09 UTC 2026",
+    "machine": "aarch64",
+    "processor": "aarch64"
+  },
+  "command": [
+    "bash",
+    "-lc",
+    "cd /work && OUT_DIR=build/bench/h3_netem_current WARMUP_S=10 MEASURE_S=30 RUNS=5 CONNS=\"16\" STREAMS=\"10\" SERVER_CPUSET=0 CLIENT_CPUSET=1,2 SKIP_H2=1 SKIP_SPECIAL=1 bash benchmarks/http/run_multiplex_matrix.sh"
+  ],
+  "delay_ms_per_direction": 10.0,
+  "loss_percent_per_direction": 1.0,
+  "before": [
+    {
+      "kind": "noqueue",
+      "handle": "0:",
+      "root": true,
+      "refcnt": 2,
+      "options": {},
+      "bytes": 0,
+      "packets": 0,
+      "drops": 0,
+      "overlimits": 0,
+      "requeues": 0,
+      "backlog": 0,
+      "qlen": 0
+    }
+  ],
+  "configured": [
+    {
+      "kind": "netem",
+      "handle": "42:",
+      "root": true,
+      "refcnt": 2,
+      "options": {
+        "limit": 100000,
+        "delay": {
+          "delay": 0.01,
+          "jitter": 0,
+          "correlation": 0
+        },
+        "loss-random": {
+          "loss": 0.01,
+          "correlation": 0
+        },
+        "ecn": false,
+        "gap": 0
+      },
+      "bytes": 0,
+      "packets": 0,
+      "drops": 0,
+      "overlimits": 0,
+      "requeues": 0,
+      "backlog": 0,
+      "qlen": 0
+    }
+  ],
+  "exit_code": 0,
+  "after_workload": [
+    {
+      "kind": "netem",
+      "handle": "42:",
+      "root": true,
+      "refcnt": 2,
+      "options": {
+        "limit": 100000,
+        "delay": {
+          "delay": 0.01,
+          "jitter": 0,
+          "correlation": 0
+        },
+        "loss-random": {
+          "loss": 0.01,
+          "correlation": 0
+        },
+        "ecn": false,
+        "gap": 0
+      },
+      "bytes": 1166312664,
+      "packets": 11227351,
+      "drops": 113367,
+      "overlimits": 0,
+      "requeues": 0,
+      "backlog": 0,
+      "qlen": 0
+    }
+  ],
+  "after_cleanup": [
+    {
+      "kind": "noqueue",
+      "handle": "0:",
+      "root": true,
+      "refcnt": 2,
+      "options": {},
+      "bytes": 0,
+      "packets": 0,
+      "drops": 0,
+      "overlimits": 0,
+      "requeues": 0,
+      "backlog": 0,
+      "qlen": 0
+    }
+  ]
+}

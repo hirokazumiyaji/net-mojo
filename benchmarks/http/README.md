@@ -8,6 +8,7 @@ stay comparable.
 
 - [HTTP/1 results](H1_RESULTS.md): current matched TCP keepalive OFF comparison, separately retained historical results and maintained-cohort status.
 - [Current HTTP/2 results](H2_RESULTS.md): matched-policy numerical and wire comparisons, resource/counter limits and provenance.
+- [Current HTTP/3 multiplexing results](H3_CURRENT_RESULTS.md): full-duration current-source aioquic comparison, six connection/stream cells, slow/cancel/client-drop scenarios and an isolated 10 ms / 1% netem row.
 - [HTTP/2 and HTTP/3 epochs](MULTIPLEX_RESULTS.md): current H2 and retained original H3/historical H2 evidence without pooling epochs.
 - [Issue #42 unit 111 — shortened Linux re-measurement + allocation / syscall counts](LINUX_REMEASURE_RESULTS.md): shortened H1 F64/F1024/LATENCY, one matched H2 cell and per-request allocation/syscall counts for the Mojo H1 server and Go H1 baseline at the current main SHA.
 - [Handshake-included (churn) H2/H3 cells](HANDSHAKE_RESULTS.md): shortened macOS loopback measurement of a new TLS/QUIC handshake per request, at c=1 and c=16; labelled shortened, descriptive only.
