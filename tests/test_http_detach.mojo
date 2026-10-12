@@ -437,6 +437,7 @@ struct _DeferredHandler(Handler):
             req.path == "/deferred"
             or req.path == "/stream"
             or req.path == "/stream-204"
+            or req.path == "/stream-205"
         ):
             var s = writer.detach()
             self.sender_box[] = s._take()
@@ -2144,7 +2145,8 @@ def test_cross_thread_worker_respond_and_wakeup() raises:
     external_call["free", NoneType](box)
 
 
-def test_detached_client_disconnect_cancels_early() raises:
+def test_detached_write_half_close_delivers_delayed_response() raises:
+    # Issue #214: SHUT_WR must not cancel an accepted detached response.
     var server = Server(ServerConfig.default())
     server.add_listener(listen_tcp("127.0.0.1:0"))
     var port = server.local_address().port
@@ -2160,7 +2162,10 @@ def test_detached_client_disconnect_cancels_early() raises:
         String("127.0.0.1:") + String(port), Timeout.seconds(2)
     )
     client.write_all(
-        "GET /deferred HTTP/1.1\r\nHost: localhost\r\n\r\n".as_bytes(),
+        (
+            "GET /deferred HTTP/1.1\r\nHost: localhost\r\n"
+            "Connection: close\r\n\r\n"
+        ).as_bytes(),
         Timeout.seconds(2),
     )
 
@@ -2171,20 +2176,30 @@ def test_detached_client_disconnect_cancels_early() raises:
     var sender = ResponseSender(sender_addr)
     assert_false(sender.is_cancelled())
 
-    # Client closes socket while response is detached
-    client.close()
-
-    # Server tick: _pump_read detects EOF on STATE_DETACHED and calls _close_conn
-    for _ in range(20):
+    # Write half-close only: client still reads the delayed response.
+    client.shutdown(False, True)
+    for _ in range(10):
         _ = server.tick(handler, Timeout.nanoseconds(0))
-        if sender.is_cancelled():
-            break
         sleep(0.002)
-
-    assert_true(
+    assert_false(
         sender.is_cancelled(),
-        "early peer disconnect must mark sender cancelled",
+        "write half-close must not cancel detached sender",
     )
+
+    var headers = Headers()
+    headers.add(String("Content-Type"), String("text/plain"))
+    var body = List[Byte]()
+    var msg = "delayed".as_bytes()
+    for i in range(len(msg)):
+        body.append(msg[i])
+    sender.respond(200, headers^, body^)
+
+    var resp = _tick_and_read(server, handler, client)
+    assert_equal(_status_of(resp), 200)
+    assert_equal(_body_of(resp), "delayed")
+    assert_false(sender.is_cancelled())
+
+    client.close()
     external_call["free", NoneType](box)
 
 
@@ -2492,7 +2507,160 @@ def test_detached_streaming_no_body_status() raises:
     external_call["free", NoneType](box)
 
 
-def test_detached_streaming_client_disconnect_cancels() raises:
+def test_detached_streaming_205_frames_zero_length() raises:
+    var server = Server(ServerConfig.default())
+    server.add_listener(listen_tcp("127.0.0.1:0"))
+    var port = server.local_address().port
+
+    var box = external_call["malloc", Pointer[Int, MutUntrackedOrigin]](
+        c_size_t(size_of[Int]())
+    )
+    assert_true(Int(box) != 0)
+    box.unsafe_write(0)
+
+    var handler = _DeferredHandler(box)
+    var client = dial_tcp(
+        String("127.0.0.1:") + String(port), Timeout.seconds(2)
+    )
+    client.write_all(
+        "GET /stream-205 HTTP/1.1\r\nHost: localhost\r\n\r\n".as_bytes(),
+        Timeout.seconds(2),
+    )
+
+    _tick_until_detached(server, handler, box)
+    var sender_addr = box[]
+    assert_true(sender_addr != 0)
+    box.unsafe_write(0)
+
+    var sender = ResponseSender(sender_addr)
+    sender.start(205)
+    _ = sender.send(String("dropped-payload").as_bytes())
+    sender.finish()
+
+    var resp = _tick_and_read(server, handler, client)
+    assert_equal(_status_of(resp), 205)
+    var raw = String(from_utf8_lossy=Span(resp))
+    assert_true(raw.find("Transfer-Encoding") < 0)
+    assert_true(raw.find("Content-Length: 0\r\n") >= 0)
+    assert_equal(_body_of(resp), "")
+
+    client.write_all(
+        "GET /second HTTP/1.1\r\nHost: localhost\r\n\r\n".as_bytes(),
+        Timeout.seconds(2),
+    )
+    var resp2 = _tick_and_read(server, handler, client)
+    assert_equal(_status_of(resp2), 200)
+    assert_equal(_body_of(resp2), "second-response")
+
+    client.close()
+    external_call["free", NoneType](box)
+
+
+def test_detached_respond_205_frames_zero_length() raises:
+    var server = Server(ServerConfig.default())
+    server.add_listener(listen_tcp("127.0.0.1:0"))
+    var port = server.local_address().port
+    var client = dial_tcp(
+        String("127.0.0.1:") + String(port), Timeout.seconds(2)
+    )
+
+    var box = external_call["malloc", Pointer[Int, MutUntrackedOrigin]](
+        c_size_t(size_of[Int]())
+    )
+    assert_true(Int(box) != 0)
+    box.unsafe_write(0)
+    var handler = _DeferredHandler(box)
+
+    client.write_all(
+        "GET /deferred HTTP/1.1\r\nHost: localhost\r\n\r\n".as_bytes(),
+        Timeout.seconds(2),
+    )
+
+    _tick_until_detached(server, handler, box)
+    var sender_addr = box[]
+    assert_true(sender_addr != 0)
+
+    var sender = ResponseSender(sender_addr)
+    var headers = Headers()
+    headers.add(String("Content-Type"), String("text/plain"))
+    var body = List[Byte]()
+    var msg = "dropped".as_bytes()
+    for i in range(len(msg)):
+        body.append(msg[i])
+    sender.respond(205, headers^, body^)
+
+    var resp1 = _tick_and_read(server, handler, client)
+    assert_equal(_status_of(resp1), 205)
+    var raw = String(from_utf8_lossy=Span(resp1))
+    assert_true(raw.find("Content-Length: 0\r\n") >= 0)
+    assert_equal(_body_of(resp1), "")
+
+    client.write_all(
+        "GET /second HTTP/1.1\r\nHost: localhost\r\n\r\n".as_bytes(),
+        Timeout.seconds(2),
+    )
+    var resp2 = _tick_and_read(server, handler, client)
+    assert_equal(_status_of(resp2), 200)
+    assert_equal(_body_of(resp2), "second-response")
+
+    client.close()
+    external_call["free", NoneType](box)
+
+
+def test_detached_streaming_write_half_close_delivers_chunks() raises:
+    # Issue #214: after start(), SHUT_WR must still deliver chunks + end.
+    var server = Server(ServerConfig.default())
+    server.add_listener(listen_tcp("127.0.0.1:0"))
+    var port = server.local_address().port
+
+    var box = external_call["malloc", Pointer[Int, MutUntrackedOrigin]](
+        c_size_t(size_of[Int]())
+    )
+    assert_true(Int(box) != 0)
+    box.unsafe_write(0)
+
+    var handler = _DeferredHandler(box)
+    var client = dial_tcp(
+        String("127.0.0.1:") + String(port), Timeout.seconds(2)
+    )
+    client.write_all(
+        (
+            "GET /stream HTTP/1.1\r\nHost: localhost\r\n"
+            "Connection: close\r\n\r\n"
+        ).as_bytes(),
+        Timeout.seconds(2),
+    )
+
+    _tick_until_detached(server, handler, box)
+    var sender_addr = box[]
+    assert_true(sender_addr != 0)
+    var sender = ResponseSender(sender_addr)
+
+    sender.start(200)
+    _ = server.tick(handler, Timeout.nanoseconds(0))
+
+    client.shutdown(False, True)
+    for _ in range(10):
+        _ = server.tick(handler, Timeout.nanoseconds(0))
+        sleep(0.002)
+    assert_false(sender.is_cancelled())
+
+    assert_true(sender.send(String("chunk-a").as_bytes()))
+    assert_true(sender.send(String("chunk-b").as_bytes()))
+    sender.finish()
+
+    var resp = _tick_and_read_chunked(server, handler, client)
+    assert_equal(_status_of(resp), 200)
+    var text = String(from_utf8_lossy=Span(resp))
+    assert_true(text.find("chunk-a") >= 0)
+    assert_true(text.find("chunk-b") >= 0)
+    assert_true(text.find("0\r\n\r\n") >= 0)
+
+    client.close()
+    external_call["free", NoneType](box)
+
+
+def test_detached_streaming_client_disconnect_cancels_on_write() raises:
     var server = Server(ServerConfig.default())
     server.add_listener(listen_tcp("127.0.0.1:0"))
     var port = server.local_address().port
@@ -2518,21 +2686,42 @@ def test_detached_streaming_client_disconnect_cancels() raises:
     var sender = ResponseSender(sender_addr)
 
     sender.start(200)
-    # Server flushes start headers
-    _ = server.tick(handler, Timeout.nanoseconds(0))
+    # Drain started headers so no pending write remains before peer close.
+    var headers_out = List[Byte]()
+    var tmp = Array[Byte, 4096](fill=0)
+    for _ in range(100):
+        _ = server.tick(handler, Timeout.nanoseconds(0))
+        try:
+            var n = client.try_read(Span(tmp))
+            if n > 0:
+                for i in range(n):
+                    headers_out.append(tmp[i])
+                if _header_end(headers_out) >= 0:
+                    break
+        except e:
+            if e.kind != NetErrorKind.timeout():
+                raise e
+        sleep(0.002)
+    assert_true(_header_end(headers_out) >= 0)
+    assert_false(sender.is_cancelled())
 
-    # Client disconnects early
+    # Full close: read EOF alone must not cancel once the write side is idle.
     client.close()
+    for _ in range(20):
+        _ = server.tick(handler, Timeout.nanoseconds(0))
+        sleep(0.002)
+    assert_false(sender.is_cancelled())
 
-    # Server tick observes EOF and cancels detached state
-    for _ in range(10):
+    # A later chunk write against the closed peer cancels the stream.
+    _ = sender.send(String("chunk").as_bytes())
+    for _ in range(40):
         _ = server.tick(handler, Timeout.nanoseconds(0))
         if sender.is_cancelled():
             break
         sleep(0.002)
 
     assert_true(sender.is_cancelled())
-    assert_false(sender.send(String("chunk").as_bytes()))
+    assert_false(sender.send(String("more").as_bytes()))
 
     external_call["free", NoneType](box)
 
@@ -2580,7 +2769,9 @@ def test_detached_server_shutdown_cancels_live_connections() raises:
 
 
 def test_detached_late_respond_after_cancellation_ignored_safely() raises:
-    var server = Server(ServerConfig.default())
+    var config = ServerConfig.default()
+    config.detached_response_timeout = Timeout.milliseconds(50)
+    var server = Server(config^)
     server.add_listener(listen_tcp("127.0.0.1:0"))
     var port = server.local_address().port
 
@@ -2605,10 +2796,9 @@ def test_detached_late_respond_after_cancellation_ignored_safely() raises:
 
     var sender = ResponseSender(sender_addr)
 
-    # Client disconnects early, cancelling the detached state
-    client.close()
-    for _ in range(10):
-        _ = server.tick(handler, Timeout.nanoseconds(0))
+    # Detach timeout cancels without relying on read-EOF-as-disconnect.
+    for _ in range(100):
+        _ = server.tick(handler, Timeout.milliseconds(5))
         if sender.is_cancelled():
             break
         sleep(0.002)

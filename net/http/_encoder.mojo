@@ -1,8 +1,10 @@
 """Wire encoder for HTTP/1.1 responses (Phase 1, socket-independent).
 
 `ResponseWriter` stays buffered and socket-free; this module renders it
-to bytes. Framing rules live here so HEAD / 204 / 304 handling cannot
-drift between call sites.
+to bytes. Framing rules live here so HEAD / 204 / 205 / 304 handling
+cannot drift between call sites. 205 suppresses content like 204/304 but
+still frames an empty body with Content-Length: 0 on keep-alive
+connections (RFC 9112 §6.3).
 """
 
 from std.ffi import c_long, external_call
@@ -273,12 +275,14 @@ def _render_response[
     mut out: List[Byte],
     mut byte_count: Int,
 ) raises NetError:
-    if writer.status < 100 or writer.status > 999:
+    # Final responses are 2xx–5xx (and uncommon 6xx–9xx). 1xx is
+    # intermediate only; Expect: 100-continue uses encode_100_continue().
+    if writer.status < 200 or writer.status > 999:
         raise NetError(
             NetErrorKind.invalid_argument(),
             "encode response",
             None,
-            "response status is not a three-digit code",
+            "final response status must be in 200..999",
         )
     if len(writer.headers) > max_headers:
         raise NetError(
@@ -302,7 +306,7 @@ def _render_response[
     var send_body = has_body_for_status(writer.status, is_head)
     # Trailers only reach the wire for responses that frame a body on
     # this request (RFC 9112 §7.1.2); HEAD / 1xx / 204 / 205 / 304
-    # silently drop trailers so framing stays Content-Length.
+    # silently drop trailers. 205 still uses Content-Length: 0.
     var use_trailers = send_body and len(writer.trailers) > 0
     if use_trailers:
         if len(writer.headers) + len(writer.trailers) > max_headers:
@@ -337,14 +341,18 @@ def _render_response[
                 "response trailers too large",
             )
     # HEAD omits body bytes but keeps the GET-equivalent length.
-    # 1xx / 204 / 205 / 304 omit both length and bytes.
+    # 1xx / 204 / 304 omit both length and bytes.
+    # 205 omits content bytes but frames Content-Length: 0 so keep-alive
+    # clients can delimit the empty message body (RFC 9112 §6.3).
     var wire_length = -1
     if has_body_for_status(writer.status, False):
         wire_length = len(writer.body)
+    elif writer.status == 205:
+        wire_length = 0
     # Validate a caller-supplied Content-Length against the framed length.
     # For HEAD the framed length is the GET-equivalent body length.
-    # For 1xx/204/205/304 there is no framed length; a caller value is
-    # dropped.
+    # For 1xx/204/304 there is no framed length; a caller value is
+    # dropped. For 205 the framed length is 0.
     # A caller-supplied Transfer-Encoding is always rejected: this server
     # sends buffered responses with a known length, so emitting both
     # would create a request/response smuggling vector (RFC 9112 6.1).
@@ -370,7 +378,9 @@ def _render_response[
             None,
             "Content-Length is not permitted when response trailers are set",
         )
-    if declared >= 0 and wire_length >= 0:
+    # 205 always frames length 0 and drops any caller Content-Length;
+    # do not validate caller digits against that forced length.
+    if declared >= 0 and wire_length >= 0 and writer.status != 205:
         var parsed = 0
         var digits = writer.headers._value_bytes_span(declared)
         if len(digits) == 0:
@@ -691,12 +701,12 @@ def _render_chunked_start[
     mut out: List[Byte],
     mut byte_count: Int,
 ) raises NetError:
-    if writer.status < 100 or writer.status > 999:
+    if writer.status < 200 or writer.status > 999:
         raise NetError(
             NetErrorKind.invalid_argument(),
             "encode chunked start",
             None,
-            "response status is not a three-digit code",
+            "final response status must be in 200..999",
         )
     if len(writer.headers) > max_headers:
         raise NetError(
@@ -732,14 +742,19 @@ def _render_chunked_start[
             "Transfer-Encoding header is managed by chunked encoder",
         )
 
+    # 1xx / 204 / 304 omit Transfer-Encoding. 205 also omits chunked
+    # framing but emits Content-Length: 0 so the empty body is delimited.
     var emit_transfer_encoding = True
+    var emit_zero_content_length = False
     if (
         (writer.status >= 100 and writer.status <= 199)
         or writer.status == 204
-        or writer.status == 205
         or writer.status == 304
     ):
         emit_transfer_encoding = False
+    elif writer.status == 205:
+        emit_transfer_encoding = False
+        emit_zero_content_length = True
 
     _append_response_string[measure](
         out,
@@ -788,6 +803,10 @@ def _render_chunked_start[
         _append_response_string[measure](
             out, "Transfer-Encoding: chunked\r\n", byte_count
         )
+    elif emit_zero_content_length:
+        _append_response_string[measure](
+            out, "Content-Length: 0\r\n", byte_count
+        )
 
     if writer.should_close:
         var connection = writer.headers._first_lower_index("connection")
@@ -832,7 +851,8 @@ def encode_chunked_start(
     - Status must be a 3-digit code (100-999).
     - Content-Length is prohibited with chunked transfer coding (RFC 9112 §6.1).
     - Transfer-Encoding header is managed by this encoder; caller-supplied is rejected.
-    - Status 1xx, 204, 205, 304 omit Transfer-Encoding: chunked.
+    - Status 1xx, 204, 304 omit Transfer-Encoding: chunked.
+    - Status 205 omits chunked coding and emits Content-Length: 0 instead.
     - HEAD advertises Transfer-Encoding: chunked (if status allows body) but omits chunk bodies.
     """
     var capacity = _measure_chunked_start(

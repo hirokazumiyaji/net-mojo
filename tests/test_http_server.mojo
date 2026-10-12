@@ -1063,6 +1063,22 @@ struct _HelloHandler(Handler):
             writer.write_string("missing")
 
 
+struct _Status205ThenOkHandler(Handler):
+    def __init__(out self):
+        pass
+
+    def handle(mut self, req: Request, mut writer: ResponseWriter) raises:
+        if req.path == "/reset":
+            writer.set_status(205)
+            writer.write_string("dropped")
+        elif req.path == "/next":
+            writer.set_status(200)
+            writer.write_string("next")
+        else:
+            writer.set_status(404)
+            writer.write_string("missing")
+
+
 struct _EchoHandler(Handler):
     def __init__(out self):
         pass
@@ -1178,6 +1194,18 @@ struct _BoomHandler(Handler):
 
     def handle(mut self, req: Request, mut writer: ResponseWriter) raises:
         raise Error("boom")
+
+
+struct _Final1xxHandler(Handler):
+    var status: Int
+
+    def __init__(out self, status: Int):
+        self.status = status
+
+    def handle(mut self, req: Request, mut writer: ResponseWriter) raises:
+        _ = req
+        writer.set_status(self.status)
+        writer.write_string("should-not-reach-client")
 
 
 struct _WorkspaceHandler(Handler):
@@ -1841,6 +1869,64 @@ def test_hello_keep_alive_two_requests() raises:
     assert_equal(server.active_connections(), 0)
 
 
+def test_http1_205_frames_zero_length_on_keep_alive_and_pipeline() raises:
+    var server = Server(ServerConfig.default())
+    server.add_listener(listen_tcp("127.0.0.1:0"))
+    var port = server.local_address().port
+    var handler = _Status205ThenOkHandler()
+    var client = dial_tcp(
+        String("127.0.0.1:") + String(port), Timeout.seconds(2)
+    )
+    var first = _exchange(
+        server,
+        handler,
+        client,
+        "GET /reset HTTP/1.1\r\nHost: x\r\n\r\n",
+    )
+    assert_equal(_status_of(first), 205)
+    assert_equal(_content_length_of(first), 0)
+    _assert_body(first, "")
+    var second = _exchange(
+        server,
+        handler,
+        client,
+        "GET /next HTTP/1.1\r\nHost: x\r\n\r\n",
+    )
+    assert_equal(_status_of(second), 200)
+    _assert_body(second, "next")
+    client.write_all(
+        String(
+            "GET /reset HTTP/1.1\r\nHost: x\r\n\r\nGET /next HTTP/1.1\r\nHost:"
+            " x\r\nConnection: close\r\n\r\n"
+        ).as_bytes(),
+        Timeout.seconds(2),
+    )
+    var out = List[Byte]()
+    var tmp = Array[Byte, 65536](fill=0)
+    for _ in range(300):
+        _ = server.tick(handler, Timeout.nanoseconds(0))
+        try:
+            var n = client.try_read(Span(tmp))
+            if n == 0:
+                break
+            for i in range(n):
+                out.append(tmp[i])
+        except e:
+            if e.kind == NetErrorKind.timeout():
+                pass
+            elif e.kind == NetErrorKind.closed():
+                break
+            else:
+                raise e
+        sleep(0.001)
+    var wire = String(from_utf8_lossy=Span(out))
+    assert_true(wire.find("HTTP/1.1 205") >= 0)
+    assert_true(wire.find("Content-Length: 0\r\n") >= 0)
+    assert_true(wire.find("HTTP/1.1 200") >= 0)
+    assert_true(wire.find("\r\n\r\nnext") >= 0)
+    client.close()
+
+
 def test_pipeline_order_preserved() raises:
     var server = Server(ServerConfig.default())
     server.add_listener(listen_tcp("127.0.0.1:0"))
@@ -2014,6 +2100,26 @@ def test_capped_pipeline_does_not_wait_between_batches() raises:
     # Without the skip-wait the capped remainder would stall one full
     # poll cap (~100ms); the margin below is wide in both directions.
     assert_true(elapsed_ms < 60)
+
+
+def test_final_1xx_handler_status_becomes_500() raises:
+    for status in [100, 101, 103]:
+        var server = Server(ServerConfig.default())
+        server.add_listener(listen_tcp("127.0.0.1:0"))
+        var port = server.local_address().port
+        var handler = _Final1xxHandler(status)
+        var client = dial_tcp(
+            String("127.0.0.1:") + String(port), Timeout.seconds(2)
+        )
+        var out = _exchange(
+            server,
+            handler,
+            client,
+            "GET / HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n",
+        )
+        assert_equal(_status_of(out), 500)
+        assert_true(String(from_utf8_lossy=Span(out)).find("100 Continue") < 0)
+        client.close()
 
 
 def test_100_continue_flow() raises:

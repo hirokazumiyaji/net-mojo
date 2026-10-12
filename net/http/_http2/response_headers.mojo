@@ -69,10 +69,11 @@ def encode_http2_response_headers(
     max_header_list_size: Int,
     max_fields: Int,
 ) -> Http2ResponseHeadersResult:
+    # Reject 1xx as a completed response: informational sections must not
+    # close the stream with END_STREAM. 101 is also unsupported (no Upgrade).
     if (
-        writer.status < 100
+        writer.status < 200
         or writer.status > 599
-        or writer.status == 101
         or max_header_list_size < 0
         or max_fields < 1
     ):

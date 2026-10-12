@@ -545,13 +545,19 @@ API の検証は `tests/test_http_api.mojo`で、handler trait、所有 Request�
 
 HTTP/1 の parser が組み立てる `Request.headers`、`trailers`、field の `String` と検証用の一時 storage は、この budget に計上していない。
 既定の入力上限は request line 8 KiB、header 32 KiB／100 fields、trailer 8 KiB／32 fields である。
-これらの materialized values は同期処理中の loop 内で所有し、不完全な body を待つ間は接続に保存しない。
-handler は一つずつ実行し、Request は handler 終了時、detach の採用前に破棄する。
+`parse_head` が完了すると所有 `HeadOutcome` を接続の `request_head` に保存する。
+不完全な body を待つ間もこの cached head は接続に残り、body 完了時の `take`、error 応答、または close まで解放しない。
+同時に複数の接続が body 待ちのまま各自の materialized head を保持できる。
+handler は一つずつ実行し、handler に渡す `Request` は完了した body から組み立てた所有値である。
+Request は handler 終了時、detach の採用前に破棄する。
 アプリケーションが handler の borrow から明示的にコピーして保持する値は、呼び出し側が所有する。
 
 64-bit の Mojo 1.1.0 と既定上限では、三つの List 配列、raw value capacity、元の名前と cached lowercase 名前の参照容量を保守的に合計した値は、header 一組で 80,952 bytes、trailer 一組で 20,672 bytes 以下となる。
-同じ head の再構築を含めて二組と trailer を数えると 182,576 bytes であり、この見積りを idle 接続数で乗算しない。
-これは parser の全 peak allocation や RSS の上限を示さず、comma-token の一時配列、UTF-8 lossy conversion の拡張、allocation 置換中の旧容量、allocator cache／overhead は別に残る。
+同じ head の再構築を含めて二組と trailer を数えると 182,576 bytes である。
+これは同期 handler が一つだけ保持する前提の見積りではなく、同時に body を待つ接続ごとにこの規模の対象外 allocation が残り得る。
+idle keep-alive 接続（head 未保持）では乗算しないが、body 待ち接続数では無視せず見積もる。
+80,952／182,576 bytes は保守的な header 容量見積りであり、実測 RSS や攻撃コストの正確値ではない。
+parser の全 peak allocation やプロセス RSS の hard cap も示さず、comma-token の一時配列、UTF-8 lossy conversion の拡張、allocation 置換中の旧容量、allocator cache／overhead は別に残る。
 入力上限を変更した場合はこの見積りも変わり、RSS の安定範囲は実際の測定で確認する。
 
 quiche の opt-in `Config::set_send_budget()` は、各送信 view の `AsRef` backing bytes と、owner および実際に確保された deque cell の数を、受信 pool と独立して計上する。
@@ -644,7 +650,7 @@ parser と encoder の単体 fixture は wire bytes を入力または出力し�
 | C7 | chunk extension を検証し、trailer を通常 header と別に保持する。metadata と trailer に別上限を適用する | 9112 §7.1.1、§7.1.2。9110 §6.5、§6.5.1、§6.5.2 | P `test_chunked_with_extension_and_trailer` は `X-Trailer` の値と別 storage を確認。`test_chunk_extension_grammar` は token／quoted extension と不正例。`test_chunk_metadata_and_trailer_limits` は trailer 件数超過を 431、指定した framing、認証、content 等の field を 400 |
 | C8 | header 検証と宣言 body 上限判定後に 100 Continue を送り、未対応 Expect は 417 と close にする | 9110 §10.1.1、§15.2.1、§15.5.18 | S `test_100_continue_flow` は body 送信前に 100 を受信し、3-byte body 送信後に 200 と `abc` を確認。P `test_multiple_expect_fields_all_must_agree` は両 field 順序で 417。S `test_unknown_expectation_is_417` は 417 の status のみ確認 |
 | C9 | HTTP/1.1 の接続を再利用し、`Connection: close` を処理する。pipeline の応答順序を保つ | 9112 §9.2、§9.3、§9.3.2。9110 §7.6.1 | S `test_hello_keep_alive_two_requests` は同一接続で 200、404。`test_connection_close_roundtrip` は close header と接続消滅。`test_pipeline_order_preserved` は ONE が TWO より前。D `test_detached_pipeline_order_preserved` は detach 中の後続 request の順序を確認 |
-| C10 | buffered response は確定 CL と Date を出力する。HEAD は body を省略し、1xx／204／205／304 は body と CL を省略する。detached streaming は chunked を使う | 9112 §6.3、§7.1。9110 §6.6.1、§8.6、§9.3.2、§15.3.5、§15.3.6、§15.4.5 | R `test_normal_response_has_length_and_date`、`test_head_keeps_length_but_omits_body`、`test_no_body_statuses_drop_body_and_length` は出力 header と body 終端を確認。D `test_detached_response_streaming_chunks` は 3 chunks、zero 終端、接続再利用。304 で CL を省略するのは現在の方針で、条件付き GET の処理を証明しない |
+| C10 | buffered response は確定 CL と Date を出力する。HEAD は body を省略し、1xx／204／304 は body と CL を省略する。205 は内容を抑止しつつ `Content-Length: 0` で空 body を区切る。detached streaming は通常 chunked を使い、205 の start も `Content-Length: 0` を出す | 9112 §6.3、§7.1。9110 §6.6.1、§8.6、§9.3.2、§15.3.5、§15.3.6、§15.4.5 | R `test_normal_response_has_length_and_date`、`test_head_keeps_length_but_omits_body`、`test_no_body_statuses_drop_body_and_length` は出力 header と body 終端を確認。D `test_detached_response_streaming_chunks` は 3 chunks、zero 終端、接続再利用。D `test_detached_streaming_205_frames_zero_length` と S の 205 pipeline は持続接続上の区切りを確認。304 で CL を省略するのは現在の方針で、条件付き GET の処理を証明しない |
 | C11 | 完全 request 後の EOF は応答後に close、未完 body の EOF は成功応答にしない | 9112 §6.3、§8、§9.6 | S `test_eof_after_complete_responds_then_closes` は 200、body、EOF、接続消滅。`test_eof_after_pipelined_batch_serves_all` は 3 応答。`test_eof_mid_request_closes_without_success` は CL 100 に 3 bytes だけ送り、接続消滅と応答 bytes なしを確認 |
 
 未検証の範囲は、全 request の全分割点、全 trailer field 定義、全 method／status の意味規則である。

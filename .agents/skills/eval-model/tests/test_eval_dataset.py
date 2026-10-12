@@ -15,6 +15,7 @@
 from __future__ import annotations
 
 import json
+import subprocess
 import sys
 import tempfile
 import threading
@@ -22,6 +23,7 @@ import time
 import unittest
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from unittest.mock import Mock, patch
 
 SKILL_DIR = Path(__file__).resolve().parents[1]
 SCRIPTS_DIR = SKILL_DIR / "scripts"
@@ -267,6 +269,41 @@ class EvalDatasetTest(unittest.TestCase):
         self.assertEqual(exit_code, eval_dataset.EXIT_OK)
         self.assertEqual(summary["status"], "completed")
         self.assertIsNone(summary["target"])
+
+    def test_lm_eval_reaps_child_on_heartbeat_failure(self) -> None:
+        proc = Mock()
+        proc.poll.return_value = None
+        proc.wait.side_effect = [subprocess.TimeoutExpired(cmd="lm_eval", timeout=5), 0]
+        emitter = Mock()
+        emitter.emit.side_effect = [None, BrokenPipeError("heartbeat closed")]
+        with patch.object(eval_dataset.subprocess, "Popen", return_value=proc), patch.object(
+            eval_dataset, "HeartbeatEmitter", return_value=emitter
+        ):
+            with self.assertRaises(BrokenPipeError):
+                eval_dataset.run_lm_eval_full(
+                    "http://unused",
+                    "fake-model",
+                    "fake-tokenizer",
+                    ["gsm8k"],
+                    {},
+                    0.0,
+                    1.0,
+                    1,
+                    30,
+                    None,
+                    False,
+                )
+        proc.terminate.assert_called_once()
+        proc.kill.assert_called_once()
+        self.assertEqual(proc.wait.call_count, 2)
+
+    def test_reap_owned_child_skips_already_exited(self) -> None:
+        proc = Mock()
+        proc.poll.return_value = 0
+        eval_dataset._reap_owned_child(proc)
+        proc.terminate.assert_not_called()
+        proc.kill.assert_not_called()
+        proc.wait.assert_not_called()
 
 
 class _TestLoglikelihoodEvaluator(LoglikelihoodEvaluator):

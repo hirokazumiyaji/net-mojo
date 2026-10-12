@@ -49,6 +49,7 @@ def parse_window_update_frame[
         | (UInt32(payload[2]) << 8)
         | UInt32(payload[3])
     ) & UInt32(0x7FFFFFFF)
-    if increment == UInt32(0):
-        return WindowUpdateFrameResult.error()
+    # Zero increment is semantically invalid but not a frame-shape error.
+    # Connection (stream 0) vs stream handling is decided by the session:
+    # stream 0 → connection PROTOCOL_ERROR; nonzero → RST_STREAM.
     return WindowUpdateFrameResult.valid(frame.stream_id, increment)

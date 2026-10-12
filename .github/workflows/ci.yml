@@ -154,6 +154,15 @@ jobs:
         run: pixi run package
       - name: Verify packaged artifact
         run: pixi run test-package
+      - name: Set up Go
+        uses: actions/setup-go@d35c59abb061a4a6fb18e82ac0862c26744d6ab5 # v5.5.0
+        with:
+          go-version: "1.26.x"
+          cache-dependency-path: benchmarks/http_go/go.sum
+      - name: Test HTTP benchmark harness regression
+        run: pixi run benchmark-harness-test
+      - name: Test Go HTTP loader
+        run: pixi run benchmark-go-test
 
   sanitize:
     name: Sanitize (${{ matrix.os }})

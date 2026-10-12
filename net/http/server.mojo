@@ -158,6 +158,11 @@ struct Server(Movable):
     # expire via _deadline_heap. Ready events drive only touched conns.
     var _tick_id: Int
     var _tick_seen: List[Int]
+    # Per-connection stamp/position for O(E+U) ready/urgent dedup in tick.
+    # Stamps equal _tick_id only for connections touched this tick; idle
+    # slots keep stale stamps so idle ticks never scan or re-init arrays.
+    var _touch_stamp: List[Int]
+    var _touch_pos: List[Int]
     var _urgent: List[Int]
     var _urgent_flag: List[Bool]
     var _deadline_heap: List[_HeapEntry]
@@ -189,6 +194,8 @@ struct Server(Movable):
         self._tick_date = String("")
         self._tick_id = 0
         self._tick_seen = List[Int]()
+        self._touch_stamp = List[Int]()
+        self._touch_pos = List[Int]()
         self._urgent = List[Int]()
         self._urgent_flag = List[Bool]()
         self._deadline_heap = List[_HeapEntry]()
@@ -360,6 +367,7 @@ struct Server(Movable):
         # Token equality pins the generation, so a reused reactor slot can
         # never steer an event at the wrong connection. Only touched conns
         # plus urgent pipelines are driven; idle conns cost nothing.
+        # Dedup is O(E+U) via per-conn tick stamp/position (not O(E²) scan).
         var touched = List[Int]()
         var masks = List[UInt8]()
         for k in range(len(events)):
@@ -373,33 +381,27 @@ struct Server(Movable):
                 continue
             if not (self._conns[idx].token == events[k].token):
                 continue
-            var found = -1
-            for t in range(len(touched)):
-                if touched[t] == idx:
-                    found = t
-                    break
             var mask: UInt8 = 0
-            if found >= 0:
-                mask = masks[found]
             if events[k].readable:
                 mask |= 1
             if events[k].writable:
                 mask |= 2
-            if found >= 0:
-                masks[found] = mask
+            if self._touch_stamp[idx] == self._tick_id:
+                var found = self._touch_pos[idx]
+                masks[found] |= mask
             else:
+                self._touch_stamp[idx] = self._tick_id
+                self._touch_pos[idx] = len(touched)
                 touched.append(idx)
                 masks.append(mask)
         for u in range(len(urgent)):
             var idx = urgent[u]
-            var seen = False
-            for t in range(len(touched)):
-                if touched[t] == idx:
-                    seen = True
-                    break
-            if not seen:
-                touched.append(idx)
-                masks.append(0)
+            if self._touch_stamp[idx] == self._tick_id:
+                continue
+            self._touch_stamp[idx] = self._tick_id
+            self._touch_pos[idx] = len(touched)
+            touched.append(idx)
+            masks.append(0)
         for t in range(len(touched)):
             var idx = touched[t]
             if not self._conns[idx].active:
@@ -509,6 +511,8 @@ struct Server(Movable):
     def _ensure_conn_arrays(mut self, idx: Int):
         while len(self._tick_seen) <= idx:
             self._tick_seen.append(-1)
+            self._touch_stamp.append(-1)
+            self._touch_pos.append(-1)
             self._urgent_flag.append(False)
             self._deadline_pos.append(-1)
 
@@ -876,7 +880,9 @@ struct Server(Movable):
                 response.status = 500
                 response.body.clear()
                 response.trailers.clear()
-            if response.status < 100 or response.status > 599:
+            # 1xx is intermediate only; a completed handler has no follow-up
+            # final response API, so reject informational as a final status.
+            if response.status < 200 or response.status > 599:
                 response.status = 500
                 response.body.clear()
                 response.trailers.clear()
@@ -1420,12 +1426,10 @@ struct Server(Movable):
                 self._pump_read(idx, read_event, now)
                 if not self._conns[idx].active:
                     return
-                if self._conns[idx].read_eof:
-                    # Peer disconnected: cancel detached state and close socket immediately.
-                    self._close_conn(idx)
-                    return
-                # Re-sync interests: the read above can fill the buffer, which flips
-                # wants_read() to False and must drop reactor read interest.
+                # Write half-close (read EOF) is not a full disconnect: stop
+                # reading and finish any accepted detached/streaming response.
+                # Write failure, reset, and deadlines still cancel via their
+                # existing paths. wants_read() is already False on read_eof.
                 self._sync_interests(idx)
             return
         if self._conns[idx].state == STATE_READING:

@@ -434,9 +434,15 @@ struct Http2RequestSession(Movable):
                     if goaway.is_complete():
                         output.extend(Span(goaway.wire))
             elif input.is_window_update():
+                # RFC 9113 §6.9: stream increment=0 → RST PROTOCOL_ERROR;
+                # stream window overflow → RST FLOW_CONTROL_ERROR; stream 0
+                # violations remain connection errors. Malformed frames are
+                # rejected earlier as connection errors by the dispatcher.
+                var increment = Int(input.value)
                 if input.stream_id == UInt32(0):
-                    if not self._send_window.apply_window_update(
-                        Int(input.value)
+                    if (
+                        increment == 0
+                        or not self._send_window.apply_window_update(increment)
                     ):
                         self._failed = True
                         return Http2RequestSessionResult.error(
@@ -444,12 +450,40 @@ struct Http2RequestSession(Movable):
                         )
                 else:
                     var send_index = self._find_send_stream(input.stream_id)
-                    if send_index >= 0 and not self._send_streams[
+                    if send_index < 0:
+                        # Idle / unknown stream: zero increment is still a
+                        # connection PROTOCOL_ERROR; nonzero on a closed
+                        # stream is ignored.
+                        if increment == 0:
+                            self._failed = True
+                            return Http2RequestSessionResult.error(
+                                consumed, output^
+                            )
+                    elif increment == 0:
+                        # PROTOCOL_ERROR on the stream only.
+                        if not self._append_reset(
+                            output, input.stream_id, UInt32(1)
+                        ):
+                            return Http2RequestSessionResult.error(
+                                consumed, output^
+                            )
+                        self._remove_stream(input.stream_id)
+                        return Http2RequestSessionResult.pending(
+                            consumed, output^, input.stream_id
+                        )
+                    elif not self._send_streams[
                         send_index
-                    ].window.apply_window_update(Int(input.value)):
-                        self._failed = True
-                        return Http2RequestSessionResult.error(
-                            consumed, output^
+                    ].window.apply_window_update(increment):
+                        # FLOW_CONTROL_ERROR on the stream only.
+                        if not self._append_reset(
+                            output, input.stream_id, UInt32(3)
+                        ):
+                            return Http2RequestSessionResult.error(
+                                consumed, output^
+                            )
+                        self._remove_stream(input.stream_id)
+                        return Http2RequestSessionResult.pending(
+                            consumed, output^, input.stream_id
                         )
 
             if input.consumed == 0:

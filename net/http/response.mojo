@@ -213,11 +213,12 @@ struct ResponseWriter(Movable, Sized):
 
 
 def has_body_for_status(status: Int, is_head: Bool) -> Bool:
-    """Reports whether the encoder must frame a response body.
+    """Reports whether the encoder may emit response content bytes.
 
-    HEAD never frames a body, and 1xx / 204 / 205 / 304 never do either,
+    HEAD never emits content, and 1xx / 204 / 205 / 304 never do either,
     regardless of any buffered bytes (RFC 9110: none of them allow
-    content).
+    content). HTTP/1 still frames 205 with Content-Length: 0 so clients
+    can delimit the empty message body on keep-alive connections.
     """
     if is_head:
         return False

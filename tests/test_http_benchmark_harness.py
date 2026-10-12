@@ -23,7 +23,8 @@ def measurement_functions(protocol, multiplex=False):
         "benchmarks/http/run_multiplex_matrix.sh"
         if multiplex else f"benchmarks/http/run_http{protocol}_bench.sh"
     )
-    names = ("run_h3_cell",) if multiplex else (
+    # Multiplex run_h3_cell depends on run_with_affinity and CLIENT_CPUSET.
+    names = ("run_with_affinity", "run_h3_cell") if multiplex else (
         ("to_us", "run_h2load") if protocol == 2 else ("run_load",)
     )
     source = script.read_text()
@@ -71,6 +72,8 @@ class BenchmarkHarnessTests(unittest.TestCase):
                 f"OUT_DIR={shlex.quote(directory)}\n"
                 "BENCH_FAILURES=0\nMATRIX_FAILURES=0\n"
                 "WARMUP_S=0\nMEASURE_S=0\nLOSS_PCT=0\n"
+                # Match production defaults so set -u does not trip on affinity.
+                'CLIENT_CPUSET="${CLIENT_CPUSET:-}"\n'
                 f"PIXI_PYTHON={shlex.quote(str(loader))}\n"
                 f"PIXI_PYTHON_H3={shlex.quote(str(loader))}\n"
                 f"h2load() {{ {shlex.quote(str(loader))} \"$@\"; }}\n"

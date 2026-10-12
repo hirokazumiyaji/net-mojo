@@ -2023,5 +2023,125 @@ def test_hpack_deflate_bound_matches_encoded_output() raises:
     assert_true(encoded.output_length <= bound)
 
 
+def _bootstrap_two_open_streams(
+    mut session: Http2RequestSession,
+) raises:
+    """Client preface + empty SETTINGS, then HEADERS on streams 1 and 3
+    without END_STREAM so both remain open for WINDOW_UPDATE tests."""
+    var wire = List[Byte]()
+    var preface = "PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n".as_bytes()
+    for i in range(len(preface)):
+        wire.append(preface[i])
+    var empty = List[Byte]()
+    _append_frame(wire, Byte(4), Byte(0), UInt32(0), Span(empty))
+    # GET https / authority=x (issue #216 fixture)
+    var compressed: List[Byte] = [
+        Byte(0x82),
+        Byte(0x87),
+        Byte(0x84),
+        Byte(0x01),
+        Byte(0x01),
+        Byte(0x78),
+    ]
+    _append_frame(wire, Byte(1), Byte(4), UInt32(1), Span(compressed))
+    _append_frame(wire, Byte(1), Byte(4), UInt32(3), Span(compressed))
+    var boot = session.consume(Span(wire))
+    assert_true(boot.is_pending())
+    assert_false(session.is_failed())
+
+
+def test_http2_stream_window_update_zero_resets_stream_keeps_sibling() raises:
+    var session = Http2RequestSession("build/http2/libnet_hpack", 4, 1024)
+    _bootstrap_two_open_streams(session)
+
+    var zero: List[Byte] = [Byte(0), Byte(0), Byte(0), Byte(0)]
+    var bad = List[Byte]()
+    _append_frame(bad, Byte(8), Byte(0), UInt32(1), Span(zero))
+    var reset_result = session.consume(Span(bad))
+    assert_true(reset_result.is_pending())
+    assert_false(session.is_failed())
+    assert_equal(reset_result.reset_stream_id, UInt32(1))
+    var saw_protocol_error = False
+    var offset = 0
+    while offset < len(reset_result.output):
+        var frame = parse_frame(Span(reset_result.output)[offset:])
+        assert_true(frame.is_complete())
+        if frame.frame_type == Byte(3) and frame.stream_id == UInt32(1):
+            var rst = parse_rst_stream_frame(
+                frame,
+                Span(reset_result.output)[offset + 9 : offset + 13],
+            )
+            assert_true(rst.is_valid())
+            assert_equal(rst.error_code, UInt32(1))  # PROTOCOL_ERROR
+            saw_protocol_error = True
+        offset += frame.consumed
+    assert_true(saw_protocol_error)
+
+    var empty = List[Byte]()
+    var sibling = List[Byte]()
+    _append_frame(sibling, Byte(0), Byte(1), UInt32(3), Span(empty))
+    var request = session.consume(Span(sibling))
+    assert_true(request.is_request())
+    assert_equal(request.stream_id, UInt32(3))
+    assert_false(session.is_failed())
+
+
+def test_http2_stream_window_overflow_resets_stream_keeps_sibling() raises:
+    var session = Http2RequestSession("build/http2/libnet_hpack", 4, 1024)
+    _bootstrap_two_open_streams(session)
+
+    # Initial send window 65535 + 0x7fffffff overflows.
+    var huge: List[Byte] = [
+        Byte(0x7F),
+        Byte(0xFF),
+        Byte(0xFF),
+        Byte(0xFF),
+    ]
+    var bad = List[Byte]()
+    _append_frame(bad, Byte(8), Byte(0), UInt32(1), Span(huge))
+    var reset_result = session.consume(Span(bad))
+    assert_true(reset_result.is_pending())
+    assert_false(session.is_failed())
+    assert_equal(reset_result.reset_stream_id, UInt32(1))
+    var saw_flow_control_error = False
+    var offset = 0
+    while offset < len(reset_result.output):
+        var frame = parse_frame(Span(reset_result.output)[offset:])
+        assert_true(frame.is_complete())
+        if frame.frame_type == Byte(3) and frame.stream_id == UInt32(1):
+            var rst = parse_rst_stream_frame(
+                frame,
+                Span(reset_result.output)[offset + 9 : offset + 13],
+            )
+            assert_true(rst.is_valid())
+            assert_equal(rst.error_code, UInt32(3))  # FLOW_CONTROL_ERROR
+            saw_flow_control_error = True
+        offset += frame.consumed
+    assert_true(saw_flow_control_error)
+
+    var empty = List[Byte]()
+    var sibling = List[Byte]()
+    _append_frame(sibling, Byte(0), Byte(1), UInt32(3), Span(empty))
+    var request = session.consume(Span(sibling))
+    assert_true(request.is_request())
+    assert_equal(request.stream_id, UInt32(3))
+    assert_false(session.is_failed())
+
+
+def test_http2_connection_window_update_zero_is_connection_error() raises:
+    var session = Http2RequestSession("build/http2/libnet_hpack", 4, 1024)
+    var wire = List[Byte]()
+    var preface = "PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n".as_bytes()
+    for i in range(len(preface)):
+        wire.append(preface[i])
+    var empty = List[Byte]()
+    _append_frame(wire, Byte(4), Byte(0), UInt32(0), Span(empty))
+    var zero: List[Byte] = [Byte(0), Byte(0), Byte(0), Byte(0)]
+    _append_frame(wire, Byte(8), Byte(0), UInt32(0), Span(zero))
+    var result = session.consume(Span(wire))
+    assert_true(result.is_error())
+    assert_true(session.is_failed())
+
+
 def main() raises:
     TestSuite.discover_tests[__functions_in_module()]().run()

@@ -341,13 +341,14 @@ def test_http2_response_headers_reject_forbidden_and_mismatched_fields() raises:
         ).is_error()
     )
 
-    var invalid_status = ResponseWriter(16)
-    invalid_status.set_status(101)
-    assert_true(
-        encode_http2_response_headers(
-            invalid_status, False, "date", 1024, 8
-        ).is_error()
-    )
+    for status in [100, 101, 103]:
+        var invalid_status = ResponseWriter(16)
+        invalid_status.set_status(status)
+        assert_true(
+            encode_http2_response_headers(
+                invalid_status, False, "date", 1024, 8
+            ).is_error()
+        )
 
 
 def test_http2_response_trailers_reject_forbidden_fields() raises:
@@ -401,10 +402,19 @@ def test_http2_window_update_parses_connection_and_stream_credit() raises:
     assert_equal(parsed.stream_id, UInt32(7))
 
 
-def test_http2_window_update_rejects_zero_increment() raises:
+def test_http2_window_update_parses_zero_increment_for_session_policy() raises:
+    # Frame shape is valid; stream vs connection PROTOCOL_ERROR is decided
+    # by the request session (issue #216).
     var payload: List[Byte] = [Byte(0), Byte(0), Byte(0), Byte(0)]
-    var frame = FrameParseResult.complete(Byte(8), Byte(0), UInt32(0), 4)
-    assert_true(parse_window_update_frame(frame, Span(payload)).is_error())
+    var connection = FrameParseResult.complete(Byte(8), Byte(0), UInt32(0), 4)
+    var parsed = parse_window_update_frame(connection, Span(payload))
+    assert_true(parsed.is_valid())
+    assert_equal(parsed.increment, UInt32(0))
+    var stream = FrameParseResult.complete(Byte(8), Byte(0), UInt32(1), 4)
+    parsed = parse_window_update_frame(stream, Span(payload))
+    assert_true(parsed.is_valid())
+    assert_equal(parsed.stream_id, UInt32(1))
+    assert_equal(parsed.increment, UInt32(0))
 
 
 def test_http2_window_update_rejects_invalid_frame_shape() raises:
