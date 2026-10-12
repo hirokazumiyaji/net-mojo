@@ -573,11 +573,13 @@ run_h3_cell() {
         | tee -a "$OUT_DIR/h3/summary.tsv"
     local cell_failed=0
     if [ "$rc" -ne 0 ]; then cell_failed=1; fi
-    if [ -n "${failed:-}" ] && [ "${failed}" != "0" ]; then cell_failed=1; fi
-    if [ -z "${req_s:-}" ]; then cell_failed=1; fi
+    if [ -z "${failed:-}" ] || [ "${failed}" != "0" ]; then cell_failed=1; fi
+    if [ -z "${ok:-}" ] || [ "$ok" = "0" ]; then cell_failed=1; fi
+    if [ -z "${req_s:-}" ] || ! awk -v rate="$req_s" 'BEGIN { exit !(rate > 0) }'; then cell_failed=1; fi
+    if [ -z "${p50:-}" ] || [ -z "${p95:-}" ] || [ -z "${p99:-}" ]; then cell_failed=1; fi
     if [ "$cell_failed" -ne 0 ]; then
         MATRIX_FAILURES=$((MATRIX_FAILURES + 1))
-        echo "matrix cell failed: h3 $label c=$clients m=$streams run=$run_idx rc=$rc failed=${failed:-?}" >&2
+        echo "matrix cell failed: h3 $label c=$clients m=$streams run=$run_idx rc=$rc req_s=${req_s:-?} ok=${ok:-?} failed=${failed:-?} p99_us=${p99:-?}" >&2
     fi
 }
 
@@ -811,13 +813,10 @@ run_h3_special() {
         printf 'proto=h3 label=%s %s rc=%s\n' \
             "$label" "$line" "$scenario_rc" \
             | tee -a "$OUT_DIR/special/summary.tsv"
-        case "$line" in
-            *"verdict=pass"*) ;;
-            *)
-                MATRIX_FAILURES=$((MATRIX_FAILURES + 1))
-                echo "H3 special scenario failed: $label $scenario" >&2
-                ;;
-        esac
+        if [ "$scenario_rc" -ne 0 ] || [[ "$line" != *"verdict=pass"* ]]; then
+            MATRIX_FAILURES=$((MATRIX_FAILURES + 1))
+            echo "H3 special scenario failed: $label $scenario rc=$scenario_rc" >&2
+        fi
     done
 
     # Loss: try pf first; always also run client-side drop (measurable without root).
@@ -920,13 +919,10 @@ run_h3_special() {
     printf 'proto=h3 label=%s %s method=client_datagram_drop rc=%s\n' \
         "$label" "$line" "$scenario_rc" \
         | tee -a "$OUT_DIR/special/summary.tsv"
-    case "$line" in
-        *"verdict=pass"*) ;;
-        *)
-            MATRIX_FAILURES=$((MATRIX_FAILURES + 1))
-            echo "H3 special scenario failed: $label loss" >&2
-            ;;
-    esac
+    if [ "$scenario_rc" -ne 0 ] || [[ "$line" != *"verdict=pass"* ]]; then
+        MATRIX_FAILURES=$((MATRIX_FAILURES + 1))
+        echo "H3 special scenario failed: $label loss rc=$scenario_rc" >&2
+    fi
 }
 
 # ========== HTTP/2 matrix ==========
@@ -1017,6 +1013,10 @@ echo -e "label\tc\tm\trun\treq_s\tp50_us\tp95_us\tp99_us\tok\tfailed\trc\tsample
     >>"$OUT_DIR/h3/summary.tsv"
 
 if [ "${SKIP_H3:-0}" != "1" ]; then
+    if [ "${SKIP_BASELINE:-0}" = "1" ] && [ "${SKIP_MOJO:-0}" = "1" ]; then
+        echo "H3 benchmark requires at least one selected server" >&2
+        exit 1
+    fi
     for artifact in build/tls/test-cert.pem build/tls/test-key.pem; do
         [ -f "$artifact" ] || {
             echo "missing $artifact; run tls-build" >&2
