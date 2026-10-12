@@ -5,6 +5,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest.mock import patch
 
 import sample_resources as sampler
 
@@ -45,6 +46,33 @@ for command in sys.stdin:
 
 
 class ResourceTests(unittest.TestCase):
+    def test_collect_stops_on_expected_loader_exit(self):
+        class FakeProcess:
+            def __init__(self, pid, role):
+                self.pid, self.role, self.calls = pid, role, 0
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                pass
+
+            def sample(self):
+                self.calls += 1
+                state = "exited" if self.role == "loader" and self.calls == 4 else "running"
+                return {"pid": self.pid, "role": self.role, "state": state}
+
+        with patch.object(sampler, "Process", FakeProcess), patch.object(sampler.time, "sleep"):
+            artifact = sampler.collect(
+                {"server": 1, "loader": 2}, 0.1, 100, stop_when_exited="loader"
+            )
+
+        self.assertEqual(artifact["stop_reason"], "loader_exited")
+        self.assertEqual(artifact["samples_collected"], 4)
+        self.assertTrue(artifact["valid"])
+        self.assertEqual(artifact["samples"][-1]["processes"]["loader"]["state"], "exited")
+        self.assertEqual(artifact["samples"][-1]["processes"]["server"]["state"], "running")
+
     def test_linux_fd_limit_formats_and_required_metadata(self):
         for soft, hard, expected in [("64", "128", (64, 128)), ("64", "unlimited", (64, "unlimited")),
                                      ("unlimited", "unlimited", ("unlimited", "unlimited"))]:

@@ -6,6 +6,31 @@ The current matched comparison uses benchmark policy 93 (Go TCP SO_KEEPALIVE OFF
 
 The first section below retains the qualified current comparison, including its rates, latencies, errors, classified cutoffs, resource coverage and source limits. The historical section preserves the complete earlier v5 report. Its asymmetric TCP maintenance policy, old R500 latency, invalid rows, failed original soaks, traced controls and historical Darwin observations remain separate evidence. No old row is replaced, spliced into a current aggregate or relabeled as policy 93. Whole-allocator/RSS bounds and an exact kernel cause are not established.
 
+## macOS M3 Max 30-minute H1 stability soak — 2026-10-12
+
+A standalone Mojo HTTP/1.1 server soak completed 1,800 seconds with 9,900
+confirmed idle sockets and 100 active sockets. This is a single-platform
+stability run, not a Go performance comparison: the Go 1.27.2 loader ran on the
+same host without CPU pinning, while the maintained comparison below uses Go
+1.26.4 on Linux arm64.
+
+| Measurement | Result |
+| --- | --- |
+| Host | MacBook Pro Mac15,9, Apple M3 Max, 48 GB; macOS Darwin 27.0.0 arm64 |
+| Source and toolchain | `8d6fed02ad3fc0f832eb7cd684d7c9342f8d3afc`; Mojo 1.1.0 (8189361e); Go loader 1.27.2 |
+| Binary SHA256 | Mojo server `bcd627112c6c58de5911ce521bd93033624e3419057f87319f58fe2a131283ed`; Go loader `ca5aac9836de99ff106268297d46f60c2cd52b75f285f340be0b455517779662` |
+| Server configuration | 10,000 connection limit; 268,435,456 B configured buffer budget; one-hour idle timeout; process FD limit 30,000 / unlimited |
+| Workload | `GET /fixed`, 64 B response; 10 s warmup; 1,800 s at 500 requests/s |
+| Requests | 900,000 / 900,000 successful; 57,600,000 response bytes; zero errors, cutoffs, dropped or unstarted arrivals |
+| Idle/active cohort | 9,900 / 9,900 idle initially and finally; 100 / 100 active sockets used; zero replacements or early closes |
+| Server resources | 360 in-window samples at 5 s cadence; FD count 10,000 in every sample; RSS 6.4375–51.671875 MiB (first 51.671875, last 6.4375 MiB); CPU median 1.20%, range 0.80–2.60% |
+
+The resource sampler completed validly when the loader exited, and the server
+remained alive. Sampled RSS decreased over the window and stayed below the
+configured buffer budget; that budget is not a whole-allocator or RSS cap.
+The run is descriptive stability evidence for this host and workload and does
+not replace the separate Linux maintained-cohort comparison.
+
 ## Current maintained-cohort — passed (one Go → Mojo pair)
 
 The separately identified policy 93 pair completed 1,800 s per role at 250
