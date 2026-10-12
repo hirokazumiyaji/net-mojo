@@ -451,10 +451,15 @@ struct Http2RequestSession(Movable):
                 else:
                     var send_index = self._find_send_stream(input.stream_id)
                     if send_index < 0:
-                        # Idle / unknown stream: zero increment is still a
-                        # connection PROTOCOL_ERROR; nonzero on a closed
-                        # stream is ignored.
-                        if increment == 0:
+                        # Idle (never opened / even id): WINDOW_UPDATE is a
+                        # connection PROTOCOL_ERROR (RFC 9113 §5.1).
+                        # Closed streams: ignore stream errors, including
+                        # increment=0, so a late update cannot tear down
+                        # the connection (RFC 9113 §5.1 closed).
+                        if (
+                            input.stream_id > self._last_stream_id
+                            or (input.stream_id & UInt32(1)) == UInt32(0)
+                        ):
                             self._failed = True
                             return Http2RequestSessionResult.error(
                                 consumed, output^

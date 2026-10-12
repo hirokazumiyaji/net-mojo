@@ -2143,5 +2143,49 @@ def test_http2_connection_window_update_zero_is_connection_error() raises:
     assert_true(session.is_failed())
 
 
+def test_http2_window_update_zero_on_closed_stream_is_ignored() raises:
+    var session = Http2RequestSession("build/http2/libnet_hpack", 4, 1024)
+    _bootstrap_two_open_streams(session)
+
+    var zero: List[Byte] = [Byte(0), Byte(0), Byte(0), Byte(0)]
+    var bad = List[Byte]()
+    _append_frame(bad, Byte(8), Byte(0), UInt32(1), Span(zero))
+    var reset_result = session.consume(Span(bad))
+    assert_true(reset_result.is_pending())
+    assert_false(session.is_failed())
+    assert_equal(reset_result.reset_stream_id, UInt32(1))
+
+    # Stream 1 is now closed; a second zero WINDOW_UPDATE must not fail
+    # the session so stream 3 can still complete.
+    var late = List[Byte]()
+    _append_frame(late, Byte(8), Byte(0), UInt32(1), Span(zero))
+    var ignored = session.consume(Span(late))
+    assert_true(ignored.is_pending())
+    assert_false(session.is_failed())
+
+    var empty = List[Byte]()
+    var sibling = List[Byte]()
+    _append_frame(sibling, Byte(0), Byte(1), UInt32(3), Span(empty))
+    var request = session.consume(Span(sibling))
+    assert_true(request.is_request())
+    assert_equal(request.stream_id, UInt32(3))
+    assert_false(session.is_failed())
+
+
+def test_http2_window_update_on_idle_stream_is_connection_error() raises:
+    var session = Http2RequestSession("build/http2/libnet_hpack", 4, 1024)
+    var wire = List[Byte]()
+    var preface = "PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n".as_bytes()
+    for i in range(len(preface)):
+        wire.append(preface[i])
+    var empty = List[Byte]()
+    _append_frame(wire, Byte(4), Byte(0), UInt32(0), Span(empty))
+    var zero: List[Byte] = [Byte(0), Byte(0), Byte(0), Byte(0)]
+    _append_frame(wire, Byte(8), Byte(0), UInt32(1), Span(zero))
+    var result = session.consume(Span(wire))
+    assert_true(result.is_error())
+    assert_true(session.is_failed())
+
+
 def main() raises:
     TestSuite.discover_tests[__functions_in_module()]().run()
