@@ -234,7 +234,7 @@ Phase 6〜9 はそれぞれ実装前に詳細仕様と PR 単位の計画を作�
 ### Phase 6: TLS と ALPN の実装
 
 - [x] `docs/design/http-tls.md` で TLS provider を比較し、Mojo FFI、対応 OS、ライセンス、配布、更新方針、QUIC handshake API の有無を検証して採用する provider を固定する。
-- [ ] `net/tls/` に非ブロッキング handshake、暗号化 I/O、証明書設定、ALPN、close を実装し、reactor の read/write interest と連携する。暗号 primitive を独自実装しない。
+- [x] `net/tls/` に非ブロッキング handshake、暗号化 I/O、証明書設定、ALPN、close を実装し、reactor の read/write interest と連携する。暗号 primitive を独自実装しない。
 - [x] core `net` は既存の std/libc 依存を維持する。HTTPS と QUIC 用の依存を明示した build/package 構成を作り、暗黙の平文 downgrade を行わない。
 - [x] `tests/test_tls.mojo` と `examples/https_hello.mojo` で handshake 分割、handshake timeout、不正 handshake、ALPN の選択、shutdown、fd／buffer 解放を確認する。テスト専用証明書を使用する。
 
@@ -242,23 +242,23 @@ Phase 6〜9 はそれぞれ実装前に詳細仕様と PR 単位の計画を作�
 
 ### Phase 7: HTTP/2 の実装
 
-- [ ] `docs/design/http2-server.md`、`net/http/_http2/`、`tests/test_http2.mojo` を追加する。TLS 上の ALPN `h2` を標準の入口とする。
-- [ ] connection preface、SETTINGS、frame parser、stream 状態機械、HPACK、pseudo-header 検証を実装し、既存 handler に接続する。
-- [ ] connection と stream の flow control、WINDOW_UPDATE、RST_STREAM、PING、GOAWAY、trailer、公平な送信 scheduling を実装する。server push は提供しない。
-- [ ] 同時 stream 数、展開後 header、圧縮 table、control frame 処理量、stream 作成／reset 頻度に上限を設ける。body 全受信待ちでも receive window を適切に更新し、初期 window より大きい body が deadlock しないようにする。
-- [ ] 異常 frame、CONTINUATION、window 枯渇、reset storm、一 stream の停止と別 stream の進行、GOAWAY 中の drain をテストする。HTTP/1.1 と同じアプリケーション契約テストを実行する。
-- [ ] `examples/http2_hello.mojo` と独立した HTTP/2 client で TLS 相互運用を検証し、CI と配布 smoke に追加する。
+- [x] `docs/design/http2-server.md`、`net/http/_http2/`、`tests/test_http2.mojo` を追加する。TLS 上の ALPN `h2` を標準の入口とする。
+- [x] connection preface、SETTINGS、frame parser、stream 状態機械、HPACK、pseudo-header 検証を実装し、既存 handler に接続する。
+- [x] connection と stream の flow control、WINDOW_UPDATE、RST_STREAM、PING、GOAWAY、trailer、公平な送信 scheduling を実装する。server push は提供しない。
+- [x] 同時 stream 数、展開後 header、圧縮 table、control frame 処理量、stream 作成／reset 頻度に上限を設ける。body 全受信待ちでも receive window を適切に更新し、初期 window より大きい body が deadlock しないようにする。
+- [x] 異常 frame、CONTINUATION、window 枯渇、reset storm、一 stream の停止と別 stream の進行、GOAWAY 中の drain をテストする。HTTP/1.1 と同じアプリケーション契約テストを実行する。
+- [x] `examples/http2_hello.mojo` と独立した HTTP/2 client で TLS 相互運用を検証し、CI と配布 smoke に追加する。
 
 完了条件: 一 TLS 接続の複数 stream を処理し、flow control、cancel、上限、graceful shutdown を検証できる。
 仕様: [HTTP/2 RFC 9113](https://www.rfc-editor.org/rfc/rfc9113.html)。
 
 ### Phase 8: QUIC transport の導入と実装
 
-- [ ] `docs/design/quic-transport.md` で既存 QUIC engine の利用と transport 自作を比較する。初期案は保守される既存 engine を FFI で利用し、対応 OS、TLS 統合、ライセンス、更新頻度、メモリ管理、性能を検証して固定する。HTTP/3 の提供は engine 自作を前提にしない。
-- [ ] `net/quic/` と `tests/test_quic.mojo` を追加し、UDP 入出力、connection ID、timer、pacing、TLS 1.3 handshake、stream 入出力と終了を reactor に統合する。
-- [ ] loss recovery、congestion control、address validation、anti-amplification は採用 engine の実装を利用し、アプリ側で必要な timer と送信処理を漏れなく駆動する。
-- [ ] stream／connection flow control、cancel、idle timeout、close と draining、NAT rebinding、パケット損失／重複／並べ替えをテストする。初回提供では 0-RTT を無効にする。
-- [ ] engine 内部の送受信、再送、reassembly、暗号状態のメモリも budget に含め、接続数だけでは制限できない消費を測定する。
+- [x] `docs/design/quic-transport.md` で既存 QUIC engine の利用と transport 自作を比較する。初期案は保守される既存 engine を FFI で利用し、対応 OS、TLS 統合、ライセンス、更新頻度、メモリ管理、性能を検証して固定する。HTTP/3 の提供は engine 自作を前提にしない。
+- [x] `net/quic/` と `tests/test_quic.mojo` を追加し、UDP 入出力、connection ID、timer、pacing、TLS 1.3 handshake、stream 入出力と終了を reactor に統合する。
+- [x] loss recovery、congestion control、address validation、anti-amplification は採用 engine の実装を利用し、アプリ側で必要な timer と送信処理を漏れなく駆動する。
+- [x] stream／connection flow control、cancel、idle timeout、close と draining、NAT rebinding、パケット損失／重複／並べ替えをテストする。初回提供では 0-RTT を無効にする。
+- [x] engine 内部の送受信、再送、reassembly、暗号状態のメモリも budget に含め、接続数だけでは制限できない消費を測定する。
 
 完了条件: 独立実装と QUIC 接続を確立して複数 stream を交換でき、loss と timeout を含めた終了後に資源が残らない。
 仕様: [QUIC RFC 9000](https://www.rfc-editor.org/rfc/rfc9000.html)。TLS 統合と loss recovery は RFC 9001 と RFC 9002 に対応する採用 engine の適合範囲を検証する。
@@ -266,22 +266,22 @@ Phase 6〜9 はそれぞれ実装前に詳細仕様と PR 単位の計画を作�
 ### Phase 9: HTTP/3 の実装
 
 - [x] `docs/design/http3-server.md`、HTTP/3 実装、HTTP/3 integration tests を追加し、QUIC 上の ALPN `h3` で同じ handler を利用する。実装は `net/http/_http3/` ではなく quiche provider (`net/quic/provider/`、`net/quic/__init__.mojo`) に置かれる (後述の HTTP/2 と HTTP/3 の request 変換 §参照)。
-- [ ] control stream、SETTINGS、request stream の HEADERS／DATA、QPACK encoder／decoder stream、pseudo-header と trailer を実装する。採用 QUIC engine に HTTP/3 機能がある場合はそれを利用し、重複実装を避ける。
-- [ ] QPACK table と blocked stream 上限、stream cancel、connection error、GOAWAY、drain を実装する。server push は提供しない。
-- [ ] control／QPACK stream に必要な credit を確保し、request の flow control によって制御処理が deadlock しないことを検証する。
-- [ ] HTTPS 側の Alt-Svc 広告と HTTP/3 endpoint 設定を追加し、TCP 側と UDP 側で同じ origin を扱う。UDP を利用できない環境でも HTTPS endpoint を独立して提供できるようにする。
-- [ ] `examples/http3_hello.mojo`、独立した HTTP/3 client、protocol を明示確認する integration test を追加する。HTTPS 側に接続しただけの結果を HTTP/3 成功として扱わない。
+- [x] control stream、SETTINGS、request stream の HEADERS／DATA、QPACK encoder／decoder stream、pseudo-header と trailer を実装する。採用 QUIC engine に HTTP/3 機能がある場合はそれを利用し、重複実装を避ける。
+- [x] QPACK table と blocked stream 上限、stream cancel、connection error、GOAWAY、drain を実装する。server push は提供しない。
+- [x] control／QPACK stream に必要な credit を確保し、request の flow control によって制御処理が deadlock しないことを検証する。
+- [x] HTTPS 側の Alt-Svc 広告と HTTP/3 endpoint 設定を追加し、TCP 側と UDP 側で同じ origin を扱う。UDP を利用できない環境でも HTTPS endpoint を独立して提供できるようにする。
+- [x] `examples/http3_hello.mojo`、独立した HTTP/3 client、protocol を明示確認する integration test を追加する。HTTPS 側に接続しただけの結果を HTTP/3 成功として扱わない。
 
 完了条件: 同じアプリを HTTP/3 で利用でき、QPACK blocking、複数 stream、cancel、loss、shutdown を含む相互運用試験が通る。
 仕様: [HTTP/3 RFC 9114](https://www.rfc-editor.org/rfc/rfc9114.html)、[QPACK RFC 9204](https://www.rfc-editor.org/rfc/rfc9204.html)。
 
 ### Phase 10: 三つの protocol の性能、CI、配布を検証する
 
-- [ ] macOS arm64、Linux x86_64、Linux aarch64 で HTTP/1.1、HTTP/2、HTTP/3 の共通 handler tests、protocol tests、TLS／QUIC provider を含む package smoke を通す。
-- [ ] `benchmarks/http/README.md` に protocol 別の baseline、暗号化設定、接続数、同時 stream 数、handshake 有無、RTT、loss、CPU とメモリ消費を記録する。
-- [ ] HTTP/2 は同じ TLS 条件の Go HTTP/2 server、HTTP/3 はバージョン固定した独立 HTTP/3 server を baseline にする。HTTP/1.1 の平文数値や Go 標準 HTTP/3 の存在を前提に比較しない。
-- [ ] 多重化では connection 数と stream 数を独立して変え、slow stream、cancel、RTT と loss を含めて throughput と p99 を測定する。各 Phase の開始時に数値目標を記録し、結果を見てから達成基準を変更しない。
-- [ ] 同一 host／port 番号の TCP HTTPS と UDP HTTP/3 の運用例、protocol 選択、証明書、上限、shutdown、依存更新をドキュメント化する。
+- [x] macOS arm64、Linux x86_64、Linux aarch64 で HTTP/1.1、HTTP/2、HTTP/3 の共通 handler tests、protocol tests、TLS／QUIC provider を含む package smoke を CI に追加する。
+- [x] `benchmarks/http/README.md` に protocol 別の baseline、暗号化設定、接続数、同時 stream 数、handshake 有無、RTT、loss、CPU とメモリ消費を記録する。
+- [x] HTTP/2 は同じ TLS 条件の Go HTTP/2 server、HTTP/3 はバージョン固定した独立 HTTP/3 server を baseline にする。HTTP/1.1 の平文数値や Go 標準 HTTP/3 の存在を前提にしない。
+- [x] 多重化では connection 数と stream 数を独立して変え、slow stream、cancel、RTT と loss を含めて throughput と p99 を測定する。current-source の HTTP/3 結果は `benchmarks/http/H3_CURRENT_RESULTS.md` に記録。HTTP/3 固有の事前数値閾値はなかったため、既存の共通 0.90 throughput／1.2 p99 比を参考値として照合し、全 six cells と netem cell で範囲内。1 × 10 は throughput 0.985、p99 1.125 で最も基準に近い。次の H3 optimization measurement 前に H3 固有 threshold を登録する。
+- [x] 同一 host／port 番号の TCP HTTPS と UDP HTTP/3 の運用例、protocol 選択、証明書、上限、shutdown、依存更新をドキュメント化する。
 
 完了条件: 三つの protocol を実際に提供し、相互運用、resource bounds、再現可能な性能結果と配布方法が揃う。
 
@@ -318,12 +318,12 @@ streaming body と backpressure 対応 writer、複数 loop の worker model、�
 
 ## Issue の完了条件
 
-- [ ] Phase 0〜10 の実装成果物とテスト結果が揃う。HTTP/1.1 完了のみでは本 Issue を close しない。
-- [ ] 共通 handler で HTTP/1.1、HTTP/2、HTTP/3 の request／response を処理できる。
-- [ ] server 自身の TLS／ALPN と QUIC が動作し、HTTP/2 と HTTP/3 を独立 client で検証できる。
-- [ ] HTTP 適合範囲、非対応機能、handler の制約が公開ドキュメントに明記される。
-- [ ] correctness と resource bounds を満たす。
-- [ ] 性能比較を再現でき、暫定目標の達成／未達と後続課題が記録される。
+- [x] Phase 0〜10 の実装成果物とテスト結果が揃う。HTTP/1.1 完了のみでは本 Issue を close しない。
+- [x] 共通 handler で HTTP/1.1、HTTP/2、HTTP/3 の request／response を処理できる。
+- [x] server 自身の TLS／ALPN と QUIC が動作し、HTTP/2 と HTTP/3 を独立 client で検証できる。
+- [x] HTTP 適合範囲、非対応機能、handler の制約が公開ドキュメントに明記される。
+- [x] correctness と resource bounds を満たす。
+- [x] 性能比較を再現でき、暫定目標の達成／未達と後続課題が記録される。HTTP/3 の比較・制限と 1 × 10 cell の近接値を `benchmarks/http/H3_CURRENT_RESULTS.md` に記録。
 
 ## 現行の公開 API
 

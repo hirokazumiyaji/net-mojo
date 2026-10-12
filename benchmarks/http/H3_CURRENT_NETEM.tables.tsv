@@ -1,0 +1,11 @@
+label	c	m	run	req_s	p50_us	p95_us	p99_us	ok	failed	rc	samples
+aioquic	c=16	m=10	run=1	req_s=6907.233	p50_us=22517	p95_us=24442	p99_us=47477	ok=207217	failed=0	rc=0	cpu_pct=61.8 rss_kb=65056 fd_count=7
+mojo	c=16	m=10	run=1	req_s=7581.533	p50_us=20452	p95_us=21098	p99_us=43595	ok=227446	failed=0	rc=0	cpu_pct=7.9 rss_kb=22060 fd_count=10
+mojo	c=16	m=10	run=2	req_s=7553.900	p50_us=20476	p95_us=21419	p99_us=43739	ok=226617	failed=0	rc=0	cpu_pct=13.0 rss_kb=22260 fd_count=10
+aioquic	c=16	m=10	run=2	req_s=6978.567	p50_us=22271	p95_us=24330	p99_us=47060	ok=209357	failed=0	rc=0	cpu_pct=40.2 rss_kb=70388 fd_count=7
+aioquic	c=16	m=10	run=3	req_s=6842.567	p50_us=22633	p95_us=24827	p99_us=47974	ok=205277	failed=0	rc=0	cpu_pct=51.9 rss_kb=84384 fd_count=7
+mojo	c=16	m=10	run=3	req_s=7593.367	p50_us=20413	p95_us=21055	p99_us=43552	ok=227801	failed=0	rc=0	cpu_pct=10.0 rss_kb=22348 fd_count=10
+mojo	c=16	m=10	run=4	req_s=7588.533	p50_us=20417	p95_us=21059	p99_us=43563	ok=227656	failed=0	rc=0	cpu_pct=11.8 rss_kb=22396 fd_count=10
+aioquic	c=16	m=10	run=4	req_s=6924.400	p50_us=22440	p95_us=24534	p99_us=47415	ok=207732	failed=0	rc=0	cpu_pct=44.8 rss_kb=103040 fd_count=7
+aioquic	c=16	m=10	run=5	req_s=6914.467	p50_us=22475	p95_us=24499	p99_us=47480	ok=207434	failed=0	rc=0	cpu_pct=50.8 rss_kb=106528 fd_count=7
+mojo	c=16	m=10	run=5	req_s=7567.567	p50_us=20467	p95_us=21225	p99_us=43605	ok=227027	failed=0	rc=0	cpu_pct=10.5 rss_kb=22248 fd_count=10
