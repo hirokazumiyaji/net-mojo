@@ -57,6 +57,7 @@ comptime EPOLL_CLOEXEC: Int32 = 0x80000
 comptime EPOLL_CTL_ADD: Int32 = 1
 comptime EPOLL_CTL_DEL: Int32 = 2
 comptime EPOLL_CTL_MOD: Int32 = 3
+comptime EPOLLEXCLUSIVE: UInt32 = 0x10000000
 comptime EPOLLIN: UInt32 = 0x1
 comptime EPOLLOUT: UInt32 = 0x4
 comptime EPOLLERR: UInt32 = 0x8

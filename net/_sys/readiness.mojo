@@ -126,7 +126,12 @@ struct _EventQueue(Movable):
         return self._fd.raw()
 
     def register(
-        mut self, fd: Int32, readable: Bool, writable: Bool, token: UInt64
+        mut self,
+        fd: Int32,
+        readable: Bool,
+        writable: Bool,
+        token: UInt64,
+        exclusive: Bool = False,
     ) raises NetError:
         comptime if _IS_DARWIN:
             if _kqueue_wants_read(readable, writable):
@@ -134,7 +139,10 @@ struct _EventQueue(Movable):
             if writable:
                 self._kevent_add(fd, darwin.EVFILT_WRITE, token)
         else:
-            var words = _epoll_ctl_words(_epoll_mask(readable, writable), token)
+            var mask = _epoll_mask(readable, writable)
+            if exclusive:
+                mask |= linux.EPOLLEXCLUSIVE
+            var words = _epoll_ctl_words(mask, token)
             var rc = external_call["epoll_ctl", c_int](
                 c_int(self._fd.raw()),
                 c_int(linux.EPOLL_CTL_ADD),

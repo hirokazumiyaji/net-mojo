@@ -14,6 +14,7 @@ from net._sys.common import (
     _connect_candidate,
     _create_bound_socket,
     _default_listen_backlog,
+    _duplicate_fd,
     _listen,
     _final_error,
     _set_linger,
@@ -273,6 +274,9 @@ struct TCPListener(Movable):
 
     def __init__(out self, var fd: _OwnedFD):
         self._fd = fd^
+
+    def _duplicate(self) raises NetError -> Self:
+        return Self(_duplicate_fd(self._fd.raw()))
 
     def accept(
         self, timeout: Optional[Timeout] = None

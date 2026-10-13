@@ -588,6 +588,36 @@ def _no_sigpipe_status(fd: Int32) -> _SyscallStatus:
     return _SyscallStatus(value=0, error_number=0)
 
 
+def _duplicate_fd(fd: Int32) raises NetError -> _OwnedFD:
+    comptime command: Int32 = 67 if _DARWIN else 1030
+    var raw = _fcntl(fd, command, 0)
+    if raw == -1:
+        raise _system_error("fcntl(F_DUPFD_CLOEXEC)", _last_errno())
+    return _OwnedFD(raw)
+
+
+def _online_cpu_count() -> Int:
+    comptime if _DARWIN:
+        var name = String("hw.activecpu")
+        var c_name = name.as_c_string_span()
+        var value: Int32 = 0
+        var length = c_size_t(size_of[Int32]())
+        var result = external_call["sysctlbyname", c_int](
+            c_name.ptr(),
+            Pointer(to=value),
+            Pointer(to=length),
+            Optional[Pointer[Byte, MutUntrackedOrigin]](None),
+            c_size_t(0),
+        )
+        if result == 0 and length == c_size_t(size_of[Int32]()) and value > 0:
+            return Int(value)
+    else:
+        var value = external_call["sysconf", c_ssize_t](c_int(84))
+        if value > 0:
+            return Int(value)
+    return 1
+
+
 def _set_nonblocking_cloexec(fd: Int32) raises NetError:
     var status = _nonblocking_cloexec_status(fd)
     if status.error_number != 0:

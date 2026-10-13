@@ -1,4 +1,10 @@
-from std.testing import assert_equal, assert_false, assert_true, TestSuite
+from std.testing import (
+    assert_equal,
+    assert_false,
+    assert_true,
+    assert_raises,
+    TestSuite,
+)
 from std.time import perf_counter_ns
 
 from net import Timeout, dial_tcp, listen_tcp
@@ -358,6 +364,35 @@ def test_eof_with_unread_data_still_surfaces() raises:
 
     assert_true(reactor.remove(token))
     server.close()
+    listener.close()
+
+
+def test_exclusive_listener_registration_accepts_and_reregisters() raises:
+    var listener = listen_tcp("127.0.0.1:0")
+    var reactor = Reactor()
+    var token = reactor._register_listener(listener.raw_fd())
+    assert_true(reactor.modify(token, True, False))
+    with assert_raises():
+        _ = reactor.modify(token, False, True)
+    var client = dial_tcp(String(listener.local_address()), Timeout.seconds(1))
+    var ready = reactor.wait(Timeout.seconds(1))
+    assert_equal(len(ready), 1)
+    assert_equal(ready[0].token, token)
+    var server = listener.try_accept()
+    assert_true(reactor.remove(token))
+    var next_token = reactor._register_listener(listener.raw_fd())
+    var next_client = dial_tcp(
+        String(listener.local_address()), Timeout.seconds(1)
+    )
+    var next_ready = reactor.wait(Timeout.seconds(1))
+    assert_equal(len(next_ready), 1)
+    assert_equal(next_ready[0].token, next_token)
+    var next_server = listener.try_accept()
+    assert_true(reactor.remove(next_token))
+    client.close()
+    server.close()
+    next_client.close()
+    next_server.close()
     listener.close()
 
 

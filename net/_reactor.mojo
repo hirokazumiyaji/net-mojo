@@ -17,7 +17,7 @@ from net._sys.readiness import (
     _encode_token,
     _EventQueue,
 )
-from net.error import NetError
+from net.error import NetError, NetErrorKind
 from net.timeout import Timeout, _Deadline
 
 
@@ -50,6 +50,7 @@ struct _ReactorSlot(Copyable, Movable):
     var writable: Bool
     var generation: UInt64
     var active: Bool
+    var exclusive: Bool
 
     def __init__(out self):
         self.fd = -1
@@ -57,6 +58,7 @@ struct _ReactorSlot(Copyable, Movable):
         self.writable = False
         self.generation = 0
         self.active = False
+        self.exclusive = False
 
 
 struct Reactor(Movable, Sized):
@@ -91,6 +93,14 @@ struct Reactor(Movable, Sized):
     def register(
         mut self, fd: Int32, readable: Bool = True, writable: Bool = False
     ) raises NetError -> ReactorToken:
+        return self._register(fd, readable, writable, False)
+
+    def _register_listener(mut self, fd: Int32) raises NetError -> ReactorToken:
+        return self._register(fd, True, False, True)
+
+    def _register(
+        mut self, fd: Int32, readable: Bool, writable: Bool, exclusive: Bool
+    ) raises NetError -> ReactorToken:
         var slot: Int
         if len(self._free) > 0:
             slot = self._free.pop()
@@ -108,6 +118,7 @@ struct Reactor(Movable, Sized):
             entry.generation = self._next_generation
             entry.active = True
             self._slots.append(entry^)
+        self._slots[slot].exclusive = exclusive
         var token = ReactorToken(slot=slot, generation=self._next_generation)
         self._next_generation += 1
         # Generation must never wrap to 0 (reserved).
@@ -116,7 +127,7 @@ struct Reactor(Movable, Sized):
         self._active_count += 1
         var wire = _encode_token(slot, token.generation)
         try:
-            self._queue.register(fd, readable, writable, wire)
+            self._queue.register(fd, readable, writable, wire, exclusive)
         except e:
             # Roll back the slot so a failed registration never validates.
             self._slots[slot].active = False
@@ -137,6 +148,15 @@ struct Reactor(Movable, Sized):
     ) raises NetError -> Bool:
         if not self.contains(token):
             return False
+        if self._slots[token.slot].exclusive:
+            if readable and not writable:
+                return True
+            raise NetError(
+                NetErrorKind.invalid_state(),
+                "reactor modify",
+                None,
+                "listener registrations have fixed readable interest",
+            )
         self._slots[token.slot].readable = readable
         self._slots[token.slot].writable = writable
         var wire = _encode_token(token.slot, token.generation)

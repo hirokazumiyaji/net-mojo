@@ -19,6 +19,7 @@ from net._sys.readiness import (
     _verify_readiness_abi,
 )
 from net._sys.common import (
+    _online_cpu_count,
     AF_INET,
     EAGAIN,
     EINPROGRESS,
@@ -309,6 +310,10 @@ def test_event_queue_fd_leak() raises:
         _ = queue.raw_fd()
     var after = _count_open_fds()
     assert_equal(before, after)
+
+
+def test_online_cpu_count_is_positive() raises:
+    assert_true(_online_cpu_count() >= 1)
 
 
 def main() raises:
