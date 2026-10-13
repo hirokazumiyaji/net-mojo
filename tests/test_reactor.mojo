@@ -7,8 +7,11 @@ from std.testing import (
 )
 from std.time import perf_counter_ns
 
+from net.error import NetErrorKind
 from net import Timeout, dial_tcp, listen_tcp
 from net._reactor import Reactor
+from net._sys.readiness import _epoll_mask
+from net._sys import linux
 from tests.support import (
     _arm_eintr_probe,
     _count_open_fds,
@@ -374,6 +377,8 @@ def test_exclusive_listener_registration_accepts_and_reregisters() raises:
     assert_true(reactor.modify(token, True, False))
     with assert_raises():
         _ = reactor.modify(token, False, True)
+    with assert_raises():
+        _ = reactor.modify(token, True, False, watch_hangup=True)
     var client = dial_tcp(String(listener.local_address()), Timeout.seconds(1))
     var ready = reactor.wait(Timeout.seconds(1))
     assert_equal(len(ready), 1)
@@ -393,6 +398,138 @@ def test_exclusive_listener_registration_accepts_and_reregisters() raises:
     server.close()
     next_client.close()
     next_server.close()
+    listener.close()
+
+
+def test_linux_half_close_is_watched_for_every_interest_combination() raises:
+    for readable in [False, True]:
+        for writable in [False, True]:
+            assert_true(
+                (
+                    _epoll_mask(readable, writable, watch_hangup=True)
+                    & linux.EPOLLRDHUP
+                )
+                != 0
+            )
+
+
+def test_write_only_terminal_event_preserves_hangup_metadata() raises:
+    var listener = listen_tcp("127.0.0.1:0")
+    var client = dial_tcp(String(listener.local_address()), Timeout.seconds(1))
+    var server = listener.accept(Timeout.seconds(1))
+    var reactor = Reactor()
+    var token = reactor.register(
+        server.raw_fd(), readable=False, writable=True, watch_hangup=True
+    )
+    client.close()
+    var seen = False
+    var expires = Int(perf_counter_ns()) + 1_000_000_000
+    while not seen and Int(perf_counter_ns()) < expires:
+        var events = reactor.wait(Timeout.milliseconds(100))
+        for index in range(len(events)):
+            if events[index].token == token and events[index].has_hangup:
+                assert_true(events[index].readable)
+                seen = True
+    assert_true(seen)
+    assert_true(reactor.remove(token))
+    server.close()
+    listener.close()
+
+
+def test_paused_read_watch_restores_normal_data_threshold() raises:
+    var listener = listen_tcp("127.0.0.1:0")
+    var client = dial_tcp(String(listener.local_address()), Timeout.seconds(1))
+    var server = listener.accept(Timeout.seconds(1))
+    var reactor = Reactor()
+    var token = reactor.register(
+        server.raw_fd(), readable=False, writable=True, watch_hangup=True
+    )
+    client.write_all("x".as_bytes(), Timeout.seconds(1))
+    var paused = reactor.wait(Timeout.milliseconds(100))
+    assert_equal(len(paused), 1)
+    assert_false(paused[0].readable)
+    assert_false(paused[0].has_hangup)
+    assert_true(reactor.modify(token, True, False))
+    var enabled = reactor.wait(Timeout.seconds(1))
+    assert_equal(len(enabled), 1)
+    assert_true(enabled[0].readable)
+    assert_false(enabled[0].has_hangup)
+    assert_true(reactor.modify(token, False, True, watch_hangup=True))
+    var paused_again = reactor.wait(Timeout.milliseconds(100))
+    assert_equal(len(paused_again), 1)
+    assert_false(paused_again[0].readable)
+    client.close()
+    var terminal = False
+    var expires = Int(perf_counter_ns()) + 1_000_000_000
+    while not terminal and Int(perf_counter_ns()) < expires:
+        var events = reactor.wait(Timeout.milliseconds(100))
+        for index in range(len(events)):
+            if events[index].token == token and events[index].has_hangup:
+                terminal = True
+    assert_true(terminal)
+    var bytes = Array[Byte, 1](fill=0)
+    assert_equal(server.try_read(Span(bytes)), 1)
+    assert_equal(bytes[0], Byte(ord("x")))
+    assert_equal(server.try_read(Span(bytes)), 0)
+    assert_true(reactor.remove(token))
+    server.close()
+    listener.close()
+
+
+def test_acknowledged_half_close_can_disarm_terminal_watch_with_blocked_output() raises:
+    var listener = listen_tcp("127.0.0.1:0")
+    var client = dial_tcp(String(listener.local_address()), Timeout.seconds(1))
+    var server = listener.accept(Timeout.seconds(1))
+    client.set_read_buffer(4096)
+    server.set_write_buffer(4096)
+    var bytes = List[Byte](length=65536, fill=7)
+    var blocked = False
+    var sent = 0
+    while sent < 32 * 1024 * 1024:
+        try:
+            sent += server.try_write(Span(bytes))
+        except e:
+            assert_equal(e.kind, NetErrorKind.timeout())
+            blocked = True
+            break
+    assert_true(blocked)
+    var reactor = Reactor()
+    var token = reactor.register(
+        server.raw_fd(), readable=False, writable=True, watch_hangup=True
+    )
+    client.shutdown(False, True)
+    var observed = False
+    var expires = Int(perf_counter_ns()) + 1_000_000_000
+    while not observed and Int(perf_counter_ns()) < expires:
+        var events = reactor.wait(Timeout.milliseconds(100))
+        for index in range(len(events)):
+            if events[index].token == token and events[index].has_hangup:
+                observed = True
+    assert_true(observed)
+    var scratch = Array[Byte, 1](fill=0)
+    assert_equal(server.try_read(Span(scratch)), 0)
+    assert_true(reactor.modify(token, False, True, watch_hangup=False))
+    var quiet = False
+    expires = Int(perf_counter_ns()) + 2_000_000_000
+    while not quiet and Int(perf_counter_ns()) < expires:
+        var events = reactor.wait(Timeout.milliseconds(50))
+        if len(events) == 0:
+            quiet = True
+            break
+        for index in range(len(events)):
+            assert_false(events[index].readable)
+            assert_false(events[index].has_hangup)
+            assert_true(events[index].writable)
+        for _ in range(64):
+            try:
+                _ = server.try_write(Span(bytes))
+            except e:
+                assert_equal(e.kind, NetErrorKind.timeout())
+                break
+    assert_true(quiet)
+    assert_true(reactor.remove(token))
+    server.close()
+    client.close()
     listener.close()
 
 

@@ -56,6 +56,7 @@ comptime EV_DELETE: UInt16 = 0x2
 comptime EV_ENABLE: UInt16 = 0x4
 comptime EV_DISABLE: UInt16 = 0x8
 comptime EV_CLEAR: UInt16 = 0x20
+comptime NOTE_LOWAT: UInt32 = 0x1
 comptime EV_EOF: UInt16 = 0x8000
 comptime EV_ERROR: UInt16 = 0x4000
 
