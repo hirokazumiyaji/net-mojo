@@ -2,6 +2,11 @@ from net import Timeout, dial_tcp, listen_tcp
 from net.http import (
     DefaultHandlerFactory,
     Handler,
+    Client,
+    ClientConfig,
+    ClientRequest,
+    ClientTLSConfig,
+    RedirectPolicy,
     Headers,
     HttpVersion,
     MiddlewareFn,
@@ -141,6 +146,26 @@ def _check_websocket_values() raises:
         raise Error("packaged WebSocket Close metadata mismatch")
 
 
+def _check_http_client() raises:
+    var config = ClientConfig.default()
+    if config.max_conns_per_host != 32 or config.max_response_body != 1048576:
+        raise Error("packaged HTTP client defaults mismatch")
+    if (
+        not RedirectPolicy.follow_default().follow
+        or RedirectPolicy.never().follow
+    ):
+        raise Error("packaged HTTP redirect policy mismatch")
+    if ClientTLSConfig.default().insecure_skip_verify:
+        raise Error("packaged HTTP client TLS verification is disabled")
+    var client = Client(config^)
+    var request = ClientRequest.post_bytes(
+        "http://127.0.0.1:8080/", _to_bytes("body")
+    )
+    if request.method != "POST" or len(request.body.bytes) != 4:
+        raise Error("packaged HTTP client request mismatch")
+    client.close()
+
+
 def main() raises:
     var listener = listen_tcp("127.0.0.1:0")
     var client = dial_tcp(String(listener.local_address()), Timeout.seconds(1))
@@ -175,3 +200,6 @@ def main() raises:
 
     _check_websocket_values()
     print("packaged WebSocket values succeeded")
+
+    _check_http_client()
+    print("packaged net.http client API succeeded")

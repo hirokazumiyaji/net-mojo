@@ -340,6 +340,11 @@ jobs:
         run: pixi run test-http-offload
       - name: Test actor primitives
         run: pixi run test-actor
+      - name: Run HTTP client example
+        run: pixi run example-http-client
+      - name: Measure bounded HTTP client loopback workload
+        timeout-minutes: 5
+        run: pixi run benchmark-http-client
       - name: Package precompiled artifact
         run: pixi run package
       - name: Verify packaged artifact

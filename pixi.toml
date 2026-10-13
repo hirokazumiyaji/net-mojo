@@ -169,6 +169,7 @@ test = { depends-on = [
 example-tcp = "mojo run --Werror -I . examples/tcp_echo.mojo"
 example-udp = "mojo run --Werror -I . examples/udp_echo.mojo"
 example-unix = "mojo run --Werror -I . examples/unix_echo.mojo"
+example-http-client = "mojo run --Werror -I . examples/http_client.mojo"
 example-http-hello = "mojo run --Werror -I . examples/http_hello.mojo"
 example-http-router = "mojo run --Werror -I . examples/http_router.mojo"
 example-http-json = "mojo run --Werror -I . examples/http_json.mojo"
@@ -183,6 +184,7 @@ example-http-offload-body = "mojo run --Werror -I . examples/http_offload_body.m
 package = "mkdir -p build && mojo precompile net -o build/net.mojoc"
 websocket-package-smoke = { cmd = "mojo run --Werror -I build examples/websocket_echo.mojo", depends-on = ["package"] }
 test-package = "mojo run --Werror -I build tests/package_smoke.mojo"
+benchmark-http-client = "mojo run --Werror -I . benchmarks/http_client.mojo"
 benchmark-ip = "mojo run --Werror -I . benchmarks/ip_parse.mojo"
 benchmark-loopback = "mojo run --Werror -I . benchmarks/loopback_io.mojo"
 benchmark-http-parse = "mojo run --Werror -I . benchmarks/http_parse.mojo"
@@ -367,6 +369,7 @@ https-alt-svc-invalid-test = { cmd = "python3 scripts/test_https_alt_svc_invalid
 https-example-build = { cmd = "bash scripts/check_https_example.sh", depends-on = [
   "tls-build",
 ] }
+https-client-example-run = { cmd = "mojo run --Werror -I . examples/https_client.mojo", depends-on = ["tls-build"] }
 https-example-run = { cmd = "python3 scripts/run_https_example.py", depends-on = [
   "tls-build",
 ] }
@@ -382,6 +385,7 @@ tls-suite = { depends-on = [
   "https-alt-svc-invalid-test",
   "https-example-build",
   "https-example-run",
+  "https-client-example-run",
 ] }
 example-https-hello = { cmd = "mojo run --Werror -I . examples/https_hello.mojo", depends-on = [
   "tls-build",
