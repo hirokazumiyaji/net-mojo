@@ -34,6 +34,10 @@ struct NetErrorKind(Copyable, Equatable, Hashable, Writable):
     def unsupported() -> Self:
         return Self(value=7)
 
+    @staticmethod
+    def cancelled() -> Self:
+        return Self(value=8)
+
     def write_to[W: Writer](self, mut writer: W):
         if self == Self.invalid_address():
             writer.write("invalid_address")
@@ -51,6 +55,8 @@ struct NetErrorKind(Copyable, Equatable, Hashable, Writable):
             writer.write("invalid_state")
         elif self == Self.unsupported():
             writer.write("unsupported")
+        elif self == Self.cancelled():
+            writer.write("cancelled")
         else:
             writer.write("unknown")
 

@@ -214,6 +214,8 @@ jobs:
         run: pixi run test-http-control
       - name: Test HTTP worker pool
         run: pixi run test-http-pool
+      - name: Test request body pipe
+        run: pixi run test-http-body-pipe
       - name: Test HTTP parser
         run: pixi run test-http-parser
       - name: Test HTTP response
@@ -311,6 +313,8 @@ jobs:
         run: pixi run sanitize-http-pool
       - name: Sanitize HTTP parser
         run: pixi run sanitize-http-parser
+      - name: Sanitize request body pipe
+        run: pixi run sanitize-http-body-pipe
       - name: Sanitize HTTP response
         run: pixi run sanitize-http-response
       - name: Sanitize HTTP router

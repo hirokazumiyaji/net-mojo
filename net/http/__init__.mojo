@@ -4,7 +4,7 @@ Import from here, not from `net`:
 
 ```mojo
 from net.http import (
-    Handler, Headers, HttpError, HttpVersion, MiddlewareFn, Request, ResponseWriter,
+    Handler, Headers, HttpError, HttpVersion, MiddlewareFn, Request, RequestBody, ResponseWriter,
     RouteHandler, ServeMux, Server, ServerConfig, ServerControl, has_body_for_status,
     apply_middleware, maybe_inject_alt_svc, split_path_query,
 )
@@ -24,7 +24,7 @@ from .middleware import (
     TimeoutHandler,
     apply_middleware,
 )
-from .request import HttpVersion, Request, split_path_query
+from .request import HttpVersion, Request, RequestBody, split_path_query
 from .response import (
     ResponseSender,
     ResponseWriter,

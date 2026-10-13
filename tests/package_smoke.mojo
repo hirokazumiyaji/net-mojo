@@ -41,6 +41,9 @@ def _check_http_codec() raises:
         raise Error("packaged net.http parser failed")
     if result.request.method != "GET" or result.request.path != "/hello":
         raise Error("packaged net.http request mismatch")
+    var body = result.request.body_reader()
+    if body.is_streaming() or not body.is_eof() or len(body.buffered()) != 0:
+        raise Error("packaged RequestBody view mismatch")
     var headers = Headers()
     headers.add(String("Content-Type"), String("text/plain"))
     var found = headers.get_first("content-type")

@@ -19,6 +19,8 @@ shape before calling the handler:
 
 from .headers import Headers
 from std.memory import ArcPointer
+from ._body_pipe import _BodyPipe, _copy_body_trailers
+from net.error import NetError
 
 
 @fieldwise_init
@@ -58,6 +60,51 @@ struct HttpVersion(Copyable, Equatable, Writable):
             writer.write("HTTP/unknown")
 
 
+@fieldwise_init
+struct RequestBody[origin: ImmOrigin](Movable):
+    """Borrowed body view; streaming reads never block the event loop.
+
+    Buffered requests retain their existing List and expose it through buffered().
+    Their read() returns EOF. Streaming views consume the shared decoded queue;
+    temporary emptiness raises timeout, cancellation raises cancelled.
+    """
+
+    var _request: Pointer[Request, Self.origin]
+    var _pipe: Optional[_BodyPipe]
+
+    def is_streaming(self) -> Bool:
+        return Bool(self._pipe)
+
+    def is_eof(self) -> Bool:
+        return not self._pipe or self._pipe.value().is_eof()
+
+    def total_decoded(self) -> Int:
+        if self._pipe:
+            return self._pipe.value().total_decoded()
+        return len(self._request[].body)
+
+    def buffered(self) -> Span[Byte, origin_of(self._request[].body)]:
+        return Span(self._request[].body)
+
+    def read[
+        buffer_origin: MutOrigin
+    ](
+        mut self, buffer: Span[mut=True, Byte, buffer_origin]
+    ) raises NetError -> Int:
+        if self._pipe:
+            return self._pipe.value().pop(buffer)
+        return 0
+
+    def trailers(self) raises NetError -> Headers:
+        if self._pipe:
+            return self._pipe.value().trailers()
+        return _copy_body_trailers(self._request[].trailers)
+
+    def discard(mut self) raises NetError:
+        if self._pipe:
+            self._pipe.value().discard()
+
+
 struct Request(Movable):
     """Owned decoded request fields, borrowed by the handler.
 
@@ -79,6 +126,7 @@ struct Request(Movable):
     var trailers: Headers
     var body: List[Byte]
     var _route_params: ArcPointer[List[Tuple[String, String]]]
+    var _body_pipe: Optional[_BodyPipe]
 
     def __init__(
         out self,
@@ -99,6 +147,12 @@ struct Request(Movable):
         self.trailers = Headers()
         self.body = List[Byte]()
         self._route_params = ArcPointer(List[Tuple[String, String]]())
+        self._body_pipe = None
+
+    def body_reader(self) raises NetError -> RequestBody[origin_of(self)]:
+        if self._body_pipe:
+            self._body_pipe.value().claim_reader()
+        return RequestBody(Pointer(to=self), self._body_pipe.copy())
 
 
 def split_path_query(
