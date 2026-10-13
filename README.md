@@ -129,16 +129,35 @@ def main() raises:
     server.serve(listen_tcp("127.0.0.1:8080"), handler)
 ```
 
+### HTTP/1 request body streaming
+
+Set `config.enable_request_body_streaming = True` before constructing `Server`.
+A streaming request has an empty `req.body`; its `body_reader().read(buffer)`
+returns decoded bytes, zero at EOF, or `NetErrorKind.timeout()` when more input
+is needed. The loop thread's read never blocks.
+
+For a worker, use `var endpoints = writer.detach_with_body(req)` and transfer
+`endpoints^` into its owned context. `endpoints.receiver.receive(buffer, timeout)`
+waits for input; `endpoints.sender` completes or streams the response.
+`receiver.trailers()` becomes available after consumed EOF. Disconnects,
+input deadlines and expired shutdown grace wake the receiver with
+`NetErrorKind.cancelled()`.
+
+Call `body_reader().discard()` to drain an unwanted body before reusing the
+connection. A synchronous response with an incomplete, undiscarded body closes
+the connection. Streaming input progress renews `body_deadline`; response
+and shutdown deadlines still apply.
+
 Constraints (see `docs/design/http-server.md` for the full contract):
 
 - The handler runs synchronously on the loop thread. HTTP/1, HTTP/2 and HTTP/3 handlers can
   move a `ResponseSender` returned by `writer.detach()` to a background
   thread for deferred or streaming responses.
-- Bounded buffered request body: the full request body (up to
-  `max_body_bytes`, default 1 MiB) is received before `handle` runs.
-  Response streaming and deferred responses use
-  `ResponseWriter.detach()` and `ResponseSender`; request body streaming
-  is not included.
+- Request bodies are buffered by default, up to `max_body_bytes` (1 MiB).
+  With `enable_request_body_streaming = True`, HTTP/1 handlers run after the
+  headers arrive and use `req.body_reader()` to read decoded bytes. The limit
+  then bounds queued body bytes; socket reads pause until the consumer drains
+  them. HTTP/2 and HTTP/3 retain buffered request bodies in this slice.
 - Response trailers: `writer.add_trailer(name, value)` queues a trailer
   on a buffered HTTP/1.1 response. The encoder switches to
   `Transfer-Encoding: chunked`, advertises the names in `Trailer:`, and

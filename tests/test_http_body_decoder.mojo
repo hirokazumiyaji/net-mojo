@@ -105,6 +105,8 @@ def test_invalid_chunk_and_trailer_framing() raises:
         "1\nA",
         "g\r\n",
         "1;=bad\r\na\r\n",
+        "1;a=b \r\na\r\n0\r\n\r\n",
+        '1;a="b"\t\r\na\r\n0\r\n\r\n',
         "1\r\naX",
         "1\r\na\rX",
         "0\r\nContent-Length: 1\r\n\r\n",
@@ -200,11 +202,13 @@ def test_budget_blocked_eof_preserves_trailers_for_retry() raises:
     var blocked = decoder.feed(String("\r\nNEXT").as_bytes(), config)
     assert_true(blocked.blocked)
     assert_false(blocked.complete)
-    assert_equal(blocked.consumed, 0)
+    assert_equal(blocked.consumed, 2)
+    assert_false(decoder.wants_input())
+    assert_equal(decoder.read_allowance(64), 0)
     budget.release(held)
-    var retry = decoder.feed(String("\r\nNEXT").as_bytes(), config)
+    var retry = decoder.feed(String("NEXT").as_bytes(), config)
     assert_true(retry.complete)
-    assert_equal(retry.consumed, 2)
+    assert_equal(retry.consumed, 0)
     var trailers = pipe.trailers()
     assert_equal(trailers.get_first("x-end").value(), "done")
 

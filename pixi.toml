@@ -30,6 +30,7 @@ test-reactor = "mojo run --Werror -I . tests/test_reactor.mojo"
 test-http-pool = "mojo run --Werror -I . tests/test_http_pool.mojo"
 test-http-control = "mojo run --Werror -I . tests/test_http_control.mojo"
 test-http-api = "mojo run --Werror -I . tests/test_http_api.mojo"
+test-http-request-stream = "mojo run --Werror -I . tests/test_http_request_stream.mojo"
 test-http-body-decoder = "mojo run --Werror -I . tests/test_http_body_decoder.mojo"
 test-http-body-pipe = "mojo run --Werror -I . tests/test_http_body_pipe.mojo"
 test-http-parser = "mojo run --Werror -I . tests/test_http_parser.mojo"
@@ -49,6 +50,7 @@ sanitize-actor = { cmd = "bash scripts/run_sanitized.sh tests/test_actor.mojo", 
 sanitize-http-api = { cmd = "bash scripts/run_sanitized.sh tests/test_http_api.mojo", default-environment = "sanitize" }
 sanitize-http-pool = { cmd = "bash scripts/run_sanitized.sh tests/test_http_pool.mojo", default-environment = "sanitize" }
 sanitize-http-control = { cmd = "bash scripts/run_sanitized.sh tests/test_http_control.mojo", default-environment = "sanitize" }
+sanitize-http-request-stream = { cmd = "bash scripts/run_sanitized.sh tests/test_http_request_stream.mojo", default-environment = "sanitize" }
 sanitize-http-body-decoder = { cmd = "bash scripts/run_sanitized.sh tests/test_http_body_decoder.mojo", default-environment = "sanitize" }
 sanitize-http-body-pipe = { cmd = "bash scripts/run_sanitized.sh tests/test_http_body_pipe.mojo", default-environment = "sanitize" }
 sanitize-http-parser = { cmd = "bash scripts/run_sanitized.sh tests/test_http_parser.mojo", default-environment = "sanitize" }
@@ -72,6 +74,7 @@ sanitize = { depends-on = [
   { task = "sanitize-http-control", environment = "sanitize" },
   { task = "sanitize-http-pool", environment = "sanitize" },
   { task = "sanitize-http-parser", environment = "sanitize" },
+  { task = "sanitize-http-request-stream", environment = "sanitize" },
   { task = "sanitize-http-body-decoder", environment = "sanitize" },
   { task = "sanitize-http-body-pipe", environment = "sanitize" },
   { task = "sanitize-http-response", environment = "sanitize" },
@@ -95,6 +98,7 @@ test = { depends-on = [
   "test-http-control",
   "test-http-pool",
   "test-http-parser",
+  "test-http-request-stream",
   "test-http-body-decoder",
   "test-http-body-pipe",
   "test-http-response",
@@ -259,6 +263,9 @@ https-state-test = { cmd = "mojo run --Werror -I . tests/test_https_server.mojo"
 https-client-test = { cmd = "python3 scripts/test_https_server.py", depends-on = [
   "tls-build",
 ] }
+https-body-stream-test = { cmd = "python3 scripts/test_https_body_stream.py", depends-on = [
+  "tls-build",
+] }
 https-alt-svc-invalid-test = { cmd = "python3 scripts/test_https_alt_svc_invalid.py", depends-on = [
   "tls-build",
 ] }
@@ -272,6 +279,7 @@ tls-suite = { depends-on = [
   "tls-test",
   "https-state-test",
   "https-client-test",
+  "https-body-stream-test",
   "https-alt-svc-invalid-test",
   "https-example-build",
   "https-example-run",

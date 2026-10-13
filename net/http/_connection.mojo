@@ -15,6 +15,8 @@ from net.http._http2.hpack import Http2HpackDeflater
 from net.http._http2.request_session import Http2RequestSession
 from net.http._http2.response_scheduler import Http2ResponseScheduler
 from net.http._parser import HeadOutcome, _RequestScan
+from net.http._body_decoder import _BodyDecoder
+from net.http._body_pipe import _BodyPipe
 from net.http._buffer import (
     _CapacityBudget,
     _CapacityTicket,
@@ -72,6 +74,9 @@ struct HttpConnection(Movable):
     var http1_body_reserved: Int
     var request_head: Optional[HeadOutcome]
     var request_scan: _RequestScan
+    var body_pipe: Optional[_BodyPipe]
+    var body_decoder: Optional[_BodyDecoder]
+    var body_blocked_budget: Int
     var more_work: Bool
     var active: Bool
     var _no_deadline: Int
@@ -136,6 +141,9 @@ struct HttpConnection(Movable):
         self.http1_body_reserved = 0
         self.request_head = None
         self.request_scan = _RequestScan.start()
+        self.body_pipe = None
+        self.body_decoder = None
+        self.body_blocked_budget = -1
         self.more_work = False
         self.active = True
         self.tls_handshake_at = handshake_at
@@ -190,9 +198,18 @@ struct HttpConnection(Movable):
         if self.tls_write_would_block or self.tls_read_would_block:
             return (
                 self.tls_write_would_block and self.tls_write_wants_read
-            ) or (self.tls_read_would_block and not self.tls_read_wants_write)
+            ) or (
+                self.tls_read_would_block
+                and not self.tls_read_wants_write
+                and self.body_blocked_budget < 0
+            )
         if self.state == STATE_SENDING_HTTP2_CONTROL:
             return True
+        if self.body_decoder:
+            return (
+                self.body_blocked_budget < 0
+                and self.body_decoder.value().wants_input()
+            )
         if self.state == STATE_READING:
             return True
         if self.state == STATE_DETACHED or self.state == STATE_STREAMING:
@@ -211,7 +228,11 @@ struct HttpConnection(Movable):
             return self.tls_handshake_wants_write
         if self.state == STATE_TLS_SHUTDOWN:
             return self.tls_shutdown_wants_write
-        if self.tls_read_would_block and self.tls_read_wants_write:
+        if (
+            self.tls_read_would_block
+            and self.tls_read_wants_write
+            and self.body_blocked_budget < 0
+        ):
             return True
         if self.tls_write_would_block:
             return not self.tls_write_wants_read
@@ -447,6 +468,11 @@ struct HttpConnection(Movable):
         shared state reference prior to calling `close()`.
         """
         self.active = False
+        if self.body_pipe:
+            self.body_pipe.value().cancel()
+        self.body_pipe = None
+        self.body_decoder = None
+        self.body_blocked_budget = -1
         # Drop the allocations instead of clearing: clear() would retain
         # capacity on a free-listed slot, hoarding memory the budget no
         # longer accounts for. Both lists are replaced, not cleared.

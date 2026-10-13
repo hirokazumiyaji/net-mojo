@@ -5,9 +5,7 @@ from ._body_pipe import _BodyPipe
 from ._parser import (
     _find_crlf,
     _has_lone_lf_before,
-    _split_chunk_size,
-    _chunk_ext_valid,
-    _parse_hex_size,
+    _ChunkLine,
     _is_token,
 )
 from .config import ServerConfig
@@ -28,6 +26,8 @@ struct _BodyDecoder(Movable):
     var _phase: UInt8
     var _remaining: Int
     var _chunked: Bool
+    var _chunk_line: _ChunkLine
+    var _chunk_cr: Bool
     var _metadata: Int
     var _trailer_bytes: Int
     var _trailers: Headers
@@ -37,6 +37,8 @@ struct _BodyDecoder(Movable):
         self._phase = 0 if chunked else 1
         self._remaining = max(0, length)
         self._chunked = chunked
+        self._chunk_line = _ChunkLine()
+        self._chunk_cr = False
         self._metadata = 0
         self._trailer_bytes = 0
         self._trailers = Headers()
@@ -44,9 +46,39 @@ struct _BodyDecoder(Movable):
     def _result(self, consumed: Int, blocked: Bool = False) -> _BodyFeed:
         return _BodyFeed(consumed, self._phase == 4, blocked, None)
 
+    def wants_input(self) -> Bool:
+        return self._phase != 5 and (
+            self._phase != 1
+            or self._remaining == 0
+            or self._pipe.writable_bytes() > 0
+        )
+
+    def read_allowance(self, limit: Int) -> Int:
+        if self._phase == 5:
+            return 0
+        if self._phase == 1 and self._remaining > 0:
+            return self._pipe._prepare_input(min(limit, self._remaining))
+        if self._chunked and (self._phase == 0 or self._phase == 2):
+            return self._pipe._prepare_input(limit)
+        return limit
+
     def _failure(mut self, consumed: Int, var error: HttpError) -> _BodyFeed:
         self._pipe.cancel()
         return _BodyFeed(consumed, False, False, Optional(error^))
+
+    def _publish_trailers(mut self, consumed: Int) raises NetError -> _BodyFeed:
+        try:
+            if not self._pipe._try_push_eof(self._trailers):
+                return self._result(consumed, True)
+        except error:
+            if error.kind == NetErrorKind.invalid_argument():
+                return self._failure(
+                    consumed,
+                    HttpError.unavailable("trailers exceed buffer budget"),
+                )
+            raise error^
+        self._phase = 4
+        return self._result(consumed)
 
     def feed[
         origin: ImmOrigin
@@ -55,6 +87,8 @@ struct _BodyDecoder(Movable):
     ) raises NetError -> _BodyFeed:
         var pos = 0
         while self._phase != 4:
+            if self._phase == 5:
+                return self._publish_trailers(pos)
             if self._phase == 1:
                 if self._remaining == 0:
                     if self._chunked:
@@ -86,6 +120,40 @@ struct _BodyDecoder(Movable):
                 pos += 2
                 self._phase = 0
                 continue
+            if self._phase == 0:
+                while pos < len(wire) and self._phase == 0:
+                    if self._metadata >= config.max_chunk_metadata:
+                        return self._failure(
+                            pos,
+                            HttpError.payload_too_large(
+                                "chunk metadata too large"
+                            ),
+                        )
+                    var byte = wire[pos]
+                    if self._chunk_cr:
+                        if byte != 10:
+                            return self._failure(
+                                pos, HttpError.bad_request("bad chunk size")
+                            )
+                        self._remaining = self._chunk_line.size
+                        self._phase = 3 if self._remaining == 0 else 1
+                        self._chunk_line = _ChunkLine()
+                        self._chunk_cr = False
+                    elif byte == 13:
+                        if not self._chunk_line.is_complete():
+                            return self._failure(
+                                pos, HttpError.bad_request("bad chunk size")
+                            )
+                        self._chunk_cr = True
+                    elif not self._chunk_line.push(byte):
+                        return self._failure(
+                            pos, HttpError.bad_request("bad chunk size")
+                        )
+                    self._metadata += 1
+                    pos += 1
+                if self._phase == 0:
+                    return self._result(pos)
+                continue
             var end = _find_crlf(wire, pos)
             var available_end = end if end >= 0 else len(wire)
             if _has_lone_lf_before(wire, pos, available_end):
@@ -93,44 +161,9 @@ struct _BodyDecoder(Movable):
                     pos, HttpError.bad_request("bad body framing")
                 )
             var line_bytes = available_end - pos + (2 if end >= 0 else 0)
-            if self._phase == 0:
-                if line_bytes > config.max_chunk_metadata - self._metadata:
-                    return self._failure(
-                        pos,
-                        HttpError.payload_too_large("chunk metadata too large"),
-                    )
-                if end < 0:
-                    return self._result(pos)
-                var line = String(from_utf8_lossy=wire[pos:end])
-                var size, extension, has_extension = _split_chunk_size(line)
-                var count = _parse_hex_size(size)
-                if count < 0 or (
-                    has_extension and not _chunk_ext_valid(extension)
-                ):
-                    return self._failure(
-                        pos, HttpError.bad_request("bad chunk size")
-                    )
-                self._metadata += line_bytes
-                self._remaining = count
-                self._phase = 3 if count == 0 else 1
-                pos = end + 2
-                continue
             if end == pos:
-                try:
-                    if not self._pipe._try_push_eof(self._trailers):
-                        return self._result(pos, True)
-                except error:
-                    if error.kind == NetErrorKind.invalid_argument():
-                        return self._failure(
-                            pos,
-                            HttpError.unavailable(
-                                "trailers exceed buffer budget"
-                            ),
-                        )
-                    raise error^
-                self._phase = 4
-                pos += 2
-                break
+                self._phase = 5
+                return self._publish_trailers(pos + 2)
             if len(wire) - pos == 1 and wire[pos] == 13:
                 return self._result(pos)
             if line_bytes > config.max_trailer_bytes - self._trailer_bytes:

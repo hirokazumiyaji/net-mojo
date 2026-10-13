@@ -175,8 +175,8 @@ struct Request(Movable):
     Copy fields that must outlive the handler call so retained data
     does not depend on the server's request lifetime. StringSlice and
     Span views borrow their source field storage.
-    The full bounded body is received before the handler runs; there
-    is no request streaming in this phase.
+    Buffered requests contain the complete bounded body before the handler runs.
+    Opt-in streaming requests expose decoded input through body_reader().
     """
 
     var method: String

@@ -1060,3 +1060,43 @@ TCP listener がない pool は、設定した worker 数によらず worker 0 �
 QUIC の Connection ID による複数 loop への振り分けは行わない。
 `http-pool-quic-test` は endpoint の唯一所有と失敗時の解放を確認する。
 `http-pool-quic-integration-test` は TCP の分散と HTTP/3 の worker 0 固定、一括停止を確認する。
+
+## HTTP/1 のストリーミング本文受信
+
+`ServerConfig.enable_request_body_streaming` の既定値は `False` である。
+既定の HTTP/1 と、この段階の HTTP/2・HTTP/3 は、本文全体を `max_body_bytes` まで受信してから handler を呼ぶ。
+HTTP/1 でフラグを有効にすると、検証済みヘッダーを受信した時点で handler を一度だけ呼ぶ。
+`Expect: 100-continue` の中間応答も、本文を待つ前に送信する。
+
+ストリーミング時の `Request.body` は空の `List[Byte]` である。
+`req.body_reader()` は唯一の reader を取得し、`read(buffer)` は到着済みのデコード済みバイトを消化する。
+EOF は `0`、未到着は `NetErrorKind.timeout()`、キャンセルは `NetErrorKind.cancelled()` で区別する。
+同期 handler を同じリクエストについて再呼び出すことはない。
+本文を待つ処理は、receiver を worker へ移して実行する。
+
+`writer.detach_with_body(req)` は、`receiver` と `sender` を所有する `RequestBodyEndpoints` を返す。
+この値を worker の context へ移すと、借用された `Request` の寿命を超えて受信と応答を進められる。
+`receiver.receive(buffer, timeout)` は condition variable で待ち、消化したバイトの通知はイベントループを起こす。
+receiver を破棄すると、残りの本文は discard として扱う。
+トレーラーはデコード済み本文をすべて消化した EOF の後に `receiver.trailers()` で取得する。
+
+`max_body_bytes` は、ストリーミング中の pipe が保持する未消化のデコード済みバイト数を制限する。
+受信キューの上限または共有 budget に達すると、ソケットの read interest を止める。
+固定長本文も、大きな一つの chunk も、消化によって空いた容量まで順次デコードする。
+消費済みの wire prefix は接続バッファーから取り除き、次のリクエストのバイトは残す。
+チャンクサイズ行、CRLF、拡張とトレーラーには、既存の構文規則と metadata 上限を適用する。
+一時的なトレーラー容量不足では EOF 通知を再試行し、総 budget を超える容量は 503 の失敗として扱う。
+
+本文受信と応答送信の完了は別々に管理する。
+未完の本文を同期 handler が discard せずに返した場合は、応答に `Connection: close` を付けて接続を閉じる。
+明示的な discard は残りのフレーミングを検証しながら排出し、応答と入力が両方完了した後に接続を再利用する。
+本文完了前に detached response を終えた場合も、discard 済みでなければ接続を閉じる。
+`sender.start()` 時点で本文が未完かつ未 discard の場合は、応答ヘッダーに `Connection: close` を付ける。
+
+ストリーミングの `body_deadline` は、本文またはフレーミングを消費した最後の進捗から更新する。
+応答側の期限と本文側の期限のうち、早い方を接続に適用する。
+未完本文の EOF、ソケットの失敗、本文期限と shutdown grace の満了は、pipe と sender をキャンセルする。
+本文の wire EOF 後には pipe の wakeup descriptor 参照を外し、完了済み receiver が接続再利用後に残っても、新しい入力を起こさない。
+
+`tests/test_http_request_stream.mojo` は、ヘッダーだけでの dispatch、固定長と chunked、トレーラー、discard と pipeline、未読本文の切断を検証する。
+期限更新、100-continue、受信途中の EOF・shutdown と、32 バイトのキューを使う 16 KiB の pthread 受信も同じテストで確認する。

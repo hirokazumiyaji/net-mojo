@@ -810,7 +810,15 @@ def test_chunk_extension_grammar() raises:
     var ok_result = parse_one(Span(ext_ok), config)
     assert_true(ok_result.is_complete())
     assert_equal(len(ok_result.request.body), 10)
-    for bad in ["1;", "1;=", "1;=v", "1;a b", '1;a="oops']:
+    for bad in [
+        "1;",
+        "1;=",
+        "1;=v",
+        "1;a b",
+        '1;a="oops',
+        "1;a=b ",
+        '1;a="b"	',
+    ]:
         var raw = _to_bytes(
             String(
                 "POST /a HTTP/1.1\r\nHost:"

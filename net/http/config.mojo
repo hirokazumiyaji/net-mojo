@@ -2,9 +2,8 @@
 
 ServerPool applies an independent copy to each worker.
 
-Every value is enforced and recorded in benchmark reports. Deadlines
-are absolute monotonic times derived once per phase; receiving one
-more byte never extends them.
+Buffered body deadlines are absolute monotonic times derived once per phase.
+Opt-in streaming body deadlines renew on framing or body progress.
 """
 
 from net import Timeout
@@ -36,6 +35,7 @@ struct ServerConfig(Copyable, Movable):
     var max_headers_bytes: Int
     var max_headers_count: Int
     var max_body_bytes: Int
+    var enable_request_body_streaming: Bool
     var max_chunk_metadata: Int
     var max_trailer_bytes: Int
     var max_trailer_count: Int
@@ -88,6 +88,7 @@ struct ServerConfig(Copyable, Movable):
             max_headers_bytes=32768,
             max_headers_count=100,
             max_body_bytes=1048576,
+            enable_request_body_streaming=False,
             max_chunk_metadata=65536,
             max_trailer_bytes=8192,
             max_trailer_count=32,

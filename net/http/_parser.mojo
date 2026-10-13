@@ -185,83 +185,117 @@ def _split_comma_tokens(data: StringSlice) -> List[String]:
     return out^
 
 
-def _skip_bws[origin: Origin](bytes: Span[Byte, origin], mut i: Int):
-    while i < len(bytes) and (
-        bytes[i] == Byte(ord(" ")) or bytes[i] == Byte(ord("\t"))
-    ):
-        i += 1
+struct _ChunkLine(Movable):
+    var size: Int
+    var _phase: UInt8
+    var _padded: Bool
+
+    def __init__(out self, extension: Bool = False):
+        self.size = 0
+        self._phase = 3 if extension else 0
+        self._padded = False
+
+    def push(mut self, byte: Byte) -> Bool:
+        var whitespace = byte == 32 or byte == 9
+        if self._phase <= 2:
+            if whitespace:
+                self._padded = True
+                if self._phase == 1:
+                    self._phase = 2
+                return True
+            if byte == 59 and self._phase != 0:
+                self._phase = 3
+                return True
+            if self._phase == 2:
+                return False
+            var digit = -1
+            if byte >= 48 and byte <= 57:
+                digit = Int(byte - 48)
+            elif byte >= 65 and byte <= 70:
+                digit = Int(byte - 65) + 10
+            elif byte >= 97 and byte <= 102:
+                digit = Int(byte - 97) + 10
+            if digit < 0:
+                return False
+            self.size = self.size * 16 + digit
+            self._phase = 1
+            return self.size <= 16 * 1024 * 1024 * 1024
+        if self._phase == 3:
+            if whitespace:
+                return True
+            if _is_tchar(byte):
+                self._phase = 4
+                return True
+            return False
+        if self._phase == 4 or self._phase == 5:
+            if self._phase == 4 and _is_tchar(byte):
+                return True
+            if whitespace:
+                self._phase = 5
+                return True
+            if byte == 61:
+                self._phase = 6
+                return True
+            if byte == 59:
+                self._phase = 3
+                return True
+            return False
+        if self._phase == 6:
+            if whitespace:
+                return True
+            if byte == 34:
+                self._phase = 8
+                return True
+            if _is_tchar(byte):
+                self._phase = 7
+                return True
+            return False
+        if self._phase == 7:
+            if _is_tchar(byte):
+                return True
+            if whitespace:
+                self._phase = 11
+                return True
+            if byte == 59:
+                self._phase = 3
+                return True
+            return False
+        if self._phase == 8 or self._phase == 9:
+            if self._phase == 8:
+                if byte == 34:
+                    self._phase = 10
+                    return True
+                if byte == 92:
+                    self._phase = 9
+                    return True
+            if (byte < 32 and byte != 9) or byte == 127:
+                return False
+            self._phase = 8
+            return True
+        if whitespace:
+            self._phase = 11
+            return True
+        if byte == 59:
+            self._phase = 3
+            return True
+        return False
+
+    def is_complete(self) -> Bool:
+        return (
+            (self._phase == 1 and not self._padded)
+            or self._phase == 4
+            or self._phase == 5
+            or self._phase == 7
+            or self._phase == 10
+        )
 
 
 def _chunk_ext_valid(ext: StringSlice) -> Bool:
-    # Validates `chunk-ext` after the leading size (RFC 9112 7.1.1):
-    # `*( BWS ";" BWS name [ BWS "=" BWS value ] )` with token names
-    # and token or quoted-string values.
-    var bytes = ext.as_bytes()
-    if len(bytes) == 0:
-        return False
-    var i = 0
-    var expect_item = True
-    while i < len(bytes):
-        if expect_item:
-            _skip_bws(bytes, i)
-            var name_start = i
-            while i < len(bytes) and _is_tchar(bytes[i]):
-                i += 1
-            if i == name_start:
-                return False
-            _skip_bws(bytes, i)
-            if i < len(bytes) and bytes[i] == Byte(ord("=")):
-                i += 1
-                _skip_bws(bytes, i)
-                if i < len(bytes) and bytes[i] == Byte(ord('"')):
-                    i += 1
-                    var closed = False
-                    while i < len(bytes):
-                        if bytes[i] == Byte(ord("\\")):
-                            # quoted-pair carries exactly one quoted
-                            # byte: it must itself be quotable (HTAB /
-                            # SP / VCHAR / obs-text), never a bare CR,
-                            # NUL, or DEL a strict peer would reject.
-                            if i + 1 >= len(bytes):
-                                return False
-                            var quoted = bytes[i + 1]
-                            if quoted == Byte(0) or (
-                                Int(quoted) < 32
-                                and quoted != Byte(ord("\t"))
-                                and quoted != Byte(ord(" "))
-                            ):
-                                return False
-                            if Int(quoted) == 127:
-                                return False
-                            i += 2
-                            continue
-                        if bytes[i] == Byte(ord('"')):
-                            closed = True
-                            i += 1
-                            break
-                        if bytes[i] == Byte(0) or (
-                            Int(bytes[i]) < 32 and bytes[i] != Byte(ord("\t"))
-                        ):
-                            return False
-                        if Int(bytes[i]) == 127:
-                            return False
-                        i += 1
-                    if not closed:
-                        return False
-                else:
-                    var value_start = i
-                    while i < len(bytes) and _is_tchar(bytes[i]):
-                        i += 1
-                    if i == value_start:
-                        return False
-            expect_item = False
-        else:
-            _skip_bws(bytes, i)
-            if i >= len(bytes) or bytes[i] != Byte(ord(";")):
-                return False
-            i += 1
-            expect_item = True
-    return not expect_item
+    var line = _ChunkLine(extension=True)
+    for byte in ext.as_bytes():
+        if not line.push(byte):
+            return False
+    return line.is_complete()
 
 
 def _split_chunk_size(line: StringSlice) -> Tuple[String, String, Bool]:
@@ -1121,7 +1155,10 @@ def parse_head[
             var split_path, split_query = split_path_query(target)
             path = String(split_path)
             query = String(split_query)
-    if content_length_value > config.max_body_bytes:
+    if (
+        not config.enable_request_body_streaming
+        and content_length_value > config.max_body_bytes
+    ):
         return HeadOutcome.failure(
             HttpError.payload_too_large(String("body too large"))
         )
@@ -1162,6 +1199,10 @@ def parse_body[
 ) -> ParseResult:
     """Completes a request whose head `parse_head` already accepted."""
     var length = len(buf)
+    if outcome.head.content_length > config.max_body_bytes:
+        return ParseResult.failure(
+            HttpError.payload_too_large("body too large"), 0, True
+        )
 
     var body = List[Byte]()
     var trailers = Headers()

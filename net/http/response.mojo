@@ -23,6 +23,16 @@ from ._detach import (
 )
 from ._buffer import SharedBufferBudget, _reserve_capacity
 from .headers import Headers, _trailer_forbidden
+from .request import Request, RequestBodyReceiver
+from ._body_pipe import _BodyPipe
+
+
+@fieldwise_init
+struct RequestBodyEndpoints(Movable):
+    """Owned input and output endpoints for one detached request."""
+
+    var receiver: RequestBodyReceiver
+    var sender: ResponseSender
 
 
 struct ResponseWriter(Movable, Sized):
@@ -42,6 +52,7 @@ struct ResponseWriter(Movable, Sized):
     var _body_budget: Optional[SharedBufferBudget]
     var _mailbox_budget: Optional[SharedBufferBudget]
     var _body_capacity_reserved: Int
+    var _request_body_pipe: Optional[_BodyPipe]
 
     def __init__(
         out self,
@@ -68,6 +79,7 @@ struct ResponseWriter(Movable, Sized):
         self._body_budget = None
         self._mailbox_budget = None
         self._body_capacity_reserved = 0
+        self._request_body_pipe = None
 
     def __init__(out self, *, deinit move: Self):
         self.status = move.status
@@ -84,6 +96,7 @@ struct ResponseWriter(Movable, Sized):
         self._body_budget = move._body_budget^
         self._mailbox_budget = move._mailbox_budget^
         self._body_capacity_reserved = move._body_capacity_reserved
+        self._request_body_pipe = move._request_body_pipe^
 
     def __deinit__(deinit self):
         self._drop_body()
@@ -96,6 +109,9 @@ struct ResponseWriter(Movable, Sized):
 
     def _set_mailbox_budget(mut self, var budget: SharedBufferBudget):
         self._mailbox_budget = budget^
+
+    def _set_request_body_pipe(mut self, var pipe: Optional[_BodyPipe]):
+        self._request_body_pipe = pipe^
 
     def _drop_headers(mut self):
         self.headers = Headers()
@@ -131,6 +147,15 @@ struct ResponseWriter(Movable, Sized):
 
     def set_detach_state(mut self, addr: Int):
         self._detach_state_addr = addr
+
+    def detach_with_body(
+        mut self, request: Request
+    ) raises NetError -> RequestBodyEndpoints:
+        """Transfers both streaming endpoints to an owned worker context."""
+        var body = request.body_reader()
+        var receiver = body.detach()
+        var sender = self.detach()
+        return RequestBodyEndpoints(receiver^, sender^)
 
     def detach(mut self) raises NetError -> ResponseSender:
         """Detaches the response from the synchronous handler flow.

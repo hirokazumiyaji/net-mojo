@@ -47,6 +47,8 @@ from net.error import NetError, NetErrorKind
 from net.quic import QuicUDPEndpoint
 
 from ._buffer import SharedBufferBudget, _CapacityTicket, _reserve_capacity
+from ._body_decoder import _BodyDecoder
+from ._body_pipe import _BodyPipe
 from ._control import ServerControl
 from ._connection import (
     HttpConnection,
@@ -274,6 +276,7 @@ struct Server(Movable):
     var _http2_detached_ticket: _CapacityTicket
     var _http3_detached: List[_Http3DetachedStream]
     var _http3_detached_ticket: _CapacityTicket
+    var _request_body_conns: List[Int]
 
     def __init__(out self, var config: ServerConfig) raises:
         var budget_total = config.total_buffer_budget
@@ -312,6 +315,7 @@ struct Server(Movable):
         self._http2_detached_ticket = _CapacityTicket(self._budget.copy())
         self._http3_detached = List[_Http3DetachedStream]()
         self._http3_detached_ticket = _CapacityTicket(self._budget.copy())
+        self._request_body_conns = List[Int]()
         while len(self._slot_map) <= wtoken.slot:
             self._slot_map.append(-1)
 
@@ -321,6 +325,8 @@ struct Server(Movable):
         self._finish_control()
         for idx in range(len(self._conns)):
             self._discard_http2_detached(idx)
+            if self._conns[idx].body_pipe:
+                self._conns[idx].body_pipe.value().cancel()
             var addr = self._conns[idx].detach_state_addr
             if addr != 0:
                 self._conns[idx].detach_state_addr = 0
@@ -438,6 +444,7 @@ struct Server(Movable):
             self._finish_control()
             return False
         self._tick_id += 1
+        self._retry_request_body_budget()
         var wait_timeout = self._compute_timeout(now, timeout)
         self._process_detached_messages(now)
         # Capped pipelines from the previous tick re-drive without a kernel
@@ -474,6 +481,14 @@ struct Server(Movable):
             if events[i].token == self._wakeup_token:
                 self._wakeup_channel.drain()
                 self._process_detached_messages(now)
+                var body_conns = self._request_body_conns.copy()
+                for idx in body_conns:
+                    if (
+                        self._conns[idx].body_pipe.value().take_consumed() > 0
+                        or self._conns[idx].body_pipe.value().is_discarded()
+                    ):
+                        self._conns[idx].body_blocked_budget = -1
+                    self._push_urgent(idx)
                 break
         # Fold the ready batch into per-connection masks via the slot map.
         # Token equality pins the generation, so a reused reactor slot can
@@ -533,6 +548,7 @@ struct Server(Movable):
                 self._arm_deadline(idx)
         self._expire_deadlines(now_ns())
         self._process_detached_messages(now_ns())
+        self._retry_request_body_budget()
         if (
             not self._listener
             and not self._quic_endpoint
@@ -640,6 +656,16 @@ struct Server(Movable):
         self._urgent.append(idx)
 
     def _next_deadline(self, idx: Int) -> Int:
+        var deadline = self._next_response_deadline(idx)
+        if self._conns[idx].active and self._conns[idx].body_decoder:
+            var body_deadline = self._conns[idx].body_at
+            if body_deadline != NO_DEADLINE and (
+                deadline == NO_DEADLINE or body_deadline < deadline
+            ):
+                deadline = body_deadline
+        return deadline
+
+    def _next_response_deadline(self, idx: Int) -> Int:
         if not self._conns[idx].active:
             return NO_DEADLINE
         if self._conns[idx].state == STATE_HANDSHAKING:
@@ -794,7 +820,14 @@ struct Server(Movable):
             if mark == NO_DEADLINE or mark > now:
                 self._arm_deadline(idx)
                 continue
-            if self._conns[idx].state == STATE_TLS_SHUTDOWN:
+            if (
+                self._conns[idx].state == STATE_TLS_SHUTDOWN
+                or (
+                    self._conns[idx].body_decoder
+                    and self._conns[idx].body_at != NO_DEADLINE
+                    and now >= self._conns[idx].body_at
+                )
+            ):
                 self._close_conn(idx)
                 continue
             if self._conns[idx].state == STATE_DETACHED:
@@ -886,6 +919,7 @@ struct Server(Movable):
                         continue
                     if (
                         self._conns[i].state == STATE_READING
+                        and not self._conns[i].body_decoder
                         and self._conns[i].buffered_len() == 0
                         and self._conns[i].pending_remaining() == 0
                         and self._conns[i].idle_at > quiet
@@ -1632,6 +1666,7 @@ struct Server(Movable):
             return
         self._discard_detached(idx)
         self._discard_http2_detached(idx)
+        self._cancel_request_body(idx)
         var token = self._conns[idx].token.copy()
         _ = self._reactor.remove(token)
         if token.slot >= 0 and token.slot < len(self._slot_map):
@@ -1680,6 +1715,7 @@ struct Server(Movable):
     def _send_error(
         mut self, idx: Int, status: Int, is_head: Bool = False
     ) raises NetError:
+        self._cancel_request_body(idx)
         self._release_http1_body(idx)
         self._discard_detached(idx)
         # TLS error responses also advertise Alt-Svc when configured,
@@ -1716,6 +1752,12 @@ struct Server(Movable):
 
     def _sync_interests(mut self, idx: Int) raises NetError:
         var want_read = self._conns[idx].wants_read()
+        if (
+            self._conns[idx].body_decoder
+            and self._conns[idx].body_blocked_budget < 0
+            and not self._conns[idx].body_decoder.value().wants_input()
+        ):
+            self._conns[idx].body_blocked_budget = self._budget.remaining()
         if (
             self._conns[idx].protocol == PROTOCOL_HTTP2
             and self._conns[idx].http2_failed()
@@ -1798,6 +1840,7 @@ struct Server(Movable):
             self._close_conn(idx)
 
     def _finish_connection(mut self, idx: Int) raises NetError:
+        self._cancel_request_body(idx)
         if not self._conns[idx].is_tls():
             self._close_conn(idx)
             return
@@ -1933,6 +1976,10 @@ struct Server(Movable):
                 )
             self._sync_interests(idx)
             return
+        if self._conns[idx].body_decoder:
+            self._drive_request_body(idx, readable, writable, now)
+            if not self._conns[idx].active:
+                return
         if (
             self._conns[idx].state == STATE_SENDING
             or self._conns[idx].state == STATE_SENDING_100
@@ -1948,7 +1995,7 @@ struct Server(Movable):
             or self._conns[idx].state == STATE_STREAMING
         ):
             var read_event = self._conns[idx].read_ready(readable, writable)
-            if read_event:
+            if read_event and not self._conns[idx].body_decoder:
                 self._pump_read(idx, read_event, now)
                 if not self._conns[idx].active:
                     return
@@ -1956,9 +2003,12 @@ struct Server(Movable):
                 # reading and finish any accepted detached/streaming response.
                 # Write failure, reset, and deadlines still cancel via their
                 # existing paths. wants_read() is already False on read_eof.
-                self._sync_interests(idx)
+            self._sync_interests(idx)
             return
         if self._conns[idx].state == STATE_READING:
+            if self._conns[idx].body_decoder:
+                self._sync_interests(idx)
+                return
             if (
                 self._conns[idx].read_eof
                 and self._conns[idx].buffered_len() == 0
@@ -2863,8 +2913,38 @@ struct Server(Movable):
             if room <= 0:
                 break
             var limit = room if room < READ_BUFFER_SIZE else READ_BUFFER_SIZE
+            if self._conns[idx].body_decoder:
+                limit = (
+                    self._conns[idx].body_decoder.value().read_allowance(limit)
+                )
+                var wire_free = (
+                    self._conns[idx].buf.capacity()
+                    - self._conns[idx].buffered_len()
+                )
+                if limit > wire_free:
+                    limit = min(
+                        limit,
+                        max(
+                            0,
+                            self._budget.remaining()
+                            - self._conns[idx].buffered_len(),
+                        ),
+                    )
+                if limit == 0:
+                    self._conns[
+                        idx
+                    ].body_blocked_budget = self._budget.remaining()
+                    break
             if self._conns[idx].tls_read_retry_length > limit:
-                self._conns[idx].more_work = True
+                if self._conns[idx].body_decoder and (
+                    self._conns[idx].tls_read_retry_length
+                    <= min(room, READ_BUFFER_SIZE)
+                ):
+                    self._conns[
+                        idx
+                    ].body_blocked_budget = self._budget.remaining()
+                else:
+                    self._conns[idx].more_work = True
                 break
             try:
                 var count = self._conns[idx].try_read_into(
@@ -2887,11 +2967,11 @@ struct Server(Movable):
                 var first = self._conns[idx].buffered_len() == 0
                 self._conns[idx].append_bytes(Span(scratch)[0:count])
                 self._conns[idx].bytes_this_tick += count
-                if first:
+                if first and not self._conns[idx].body_decoder:
                     self._conns[idx].header_at = deadline_from_now(
                         self.config.header_deadline
                     )
-                if count < limit:
+                if count < limit or self.config.enable_request_body_streaming:
                     break
             except e:
                 if e.kind == NetErrorKind.timeout():
@@ -2911,6 +2991,128 @@ struct Server(Movable):
         var old_capacity = self._conns[idx].buf.capacity()
         self._conns[idx].drain_prefix(count)
         self._budget.release(old_capacity - self._conns[idx].buf.capacity())
+
+    def _retry_request_body_budget(mut self) raises NetError:
+        var available = self._budget.remaining()
+        for idx in self._request_body_conns:
+            var blocked_at = self._conns[idx].body_blocked_budget
+            if blocked_at >= 0 and available > blocked_at:
+                self._conns[idx].body_blocked_budget = -1
+                self._push_urgent(idx)
+                self._sync_interests(idx)
+
+    def _remove_request_body(mut self, idx: Int):
+        for i in range(len(self._request_body_conns)):
+            if self._request_body_conns[i] == idx:
+                _ = self._request_body_conns.pop(i)
+                return
+
+    def _cancel_request_body(mut self, idx: Int):
+        if self._conns[idx].body_pipe:
+            self._conns[idx].body_pipe.value().cancel()
+        self._conns[idx].body_pipe = None
+        self._conns[idx].body_decoder = None
+        self._conns[idx].body_blocked_budget = -1
+        self._conns[idx].body_at = NO_DEADLINE
+        self._remove_request_body(idx)
+
+    def _feed_request_body(
+        mut self, idx: Int, initial: Bool = False
+    ) raises NetError:
+        var result = (
+            self._conns[idx]
+            .body_decoder.value()
+            .feed(Span(self._conns[idx].buf), self.config)
+        )
+        var blocked_budget = self._budget.remaining()
+        self._consume_receive(idx, result.consumed)
+        if result.blocked:
+            self._conns[idx].body_blocked_budget = blocked_budget
+        elif result.consumed > 0 or result.complete:
+            self._conns[idx].body_blocked_budget = -1
+        if result.error:
+            var status = result.error.value().status
+            self._cancel_request_body(idx)
+            if initial:
+                self._send_error(idx, status)
+            else:
+                self._close_conn(idx)
+            return
+        if result.consumed > 0:
+            self._conns[idx].body_at = deadline_from_now(
+                self.config.body_deadline
+            )
+        if result.complete:
+            self._conns[idx].body_decoder = None
+            self._conns[idx].body_pipe.value()._stop_loop_wakeup()
+            self._conns[idx].body_at = NO_DEADLINE
+            self._remove_request_body(idx)
+            if self._conns[idx].state == STATE_READING:
+                self._resume_http1_reading(idx)
+        elif self._conns[idx].read_eof:
+            self._close_conn(idx)
+
+    def _drive_request_body(
+        mut self, idx: Int, readable: Bool, writable: Bool, now: Int
+    ) raises NetError:
+        self._feed_request_body(idx)
+        if not self._conns[idx].active or not self._conns[idx].body_decoder:
+            return
+        var event = (
+            self._conns[idx].read_ready(readable, writable)
+            or self._conns[idx].tls_pending() > 0
+        )
+        self._pump_read(idx, event, now)
+        if self._conns[idx].active:
+            self._feed_request_body(idx)
+
+    def _dispatch_streaming_request[
+        H: Handler
+    ](mut self, idx: Int, mut handler: H) raises:
+        if (
+            self._conns[idx].request_head.value().head.expect_100
+            and not self._conns[idx].sent_100
+        ):
+            if not self._send_100(idx):
+                return
+        var head = self._conns[idx].request_head.take()
+        var close = head.head.should_close
+        var pipe = _BodyPipe(
+            self.config.max_body_bytes,
+            self._budget.copy(),
+            self._wakeup_channel.write_fd(),
+        )
+        self._conns[idx].body_pipe = pipe.copy()
+        self._conns[idx].body_decoder = _BodyDecoder(
+            pipe.copy(), head.head.chunked, head.head.content_length
+        )
+        self._request_body_conns.append(idx)
+        self._conns[idx].header_at = NO_DEADLINE
+        self._conns[idx].idle_at = NO_DEADLINE
+        self._conns[idx].body_at = deadline_from_now(self.config.body_deadline)
+        self._consume_receive(idx, head.head.header_end)
+        self._conns[idx].request_scan = _RequestScan.start()
+        var req = Request(
+            String(head.head.method),
+            String(head.head.target),
+            String(head.head.path),
+            String(head.head.query),
+            head.head.version.copy(),
+        )
+        req.scheme = String(head.head.scheme)
+        req.authority = String(head.head.authority)
+        req.headers = head.take_headers()
+        req._body_pipe = pipe^
+        self._feed_request_body(idx, initial=True)
+        if (
+            not self._conns[idx].active
+            or self._conns[idx].state != STATE_READING
+        ):
+            return
+        self._conns[idx].requests_this_tick += 1
+        self._respond(
+            idx, ParseResult.complete(req^, 0, False, close), close, handler
+        )
 
     def _advance_head(mut self, idx: Int) -> Int:
         """Resumes the head scan and caches the parsed head once complete.
@@ -2954,6 +3156,11 @@ struct Server(Movable):
         ):
             if self._conns[idx].state != STATE_READING:
                 break
+            if self._conns[idx].body_decoder:
+                self._feed_request_body(idx)
+                if not self._conns[idx].active or self._conns[idx].body_decoder:
+                    return
+            self._conns[idx].body_pipe = None
             if self._conns[idx].buffered_len() == 0:
                 break
             if not self._conns[idx].request_head:
@@ -2966,6 +3173,9 @@ struct Server(Movable):
                         self._close_conn(idx)
                         return
                     break
+            if self.config.enable_request_body_streaming:
+                self._dispatch_streaming_request(idx, handler)
+                return
             var header_end = (
                 self._conns[idx].request_head.value().head.header_end
             )
@@ -3142,6 +3352,7 @@ struct Server(Movable):
             queue_limit=self.config.stream_queue_limit,
         )
         writer._set_body_budget(self._budget.copy())
+        writer._set_request_body_pipe(self._conns[idx].body_pipe.copy())
         # The wire must advertise close whenever the connection will not
         # persist, even when the handler leaves the writer untouched.
         if req_close or self._shutdown_at != NO_DEADLINE:
@@ -3159,6 +3370,12 @@ struct Server(Movable):
             self._send_error(idx, 500, is_head=is_head)
             return
 
+        if (
+            self._conns[idx].body_decoder
+            and not writer.is_detached()
+            and not self._conns[idx].body_pipe.value().is_discarded()
+        ):
+            writer.set_should_close(True)
         _ = req^
         self._release_http1_body(idx)
         if writer.is_detached():
@@ -3180,7 +3397,8 @@ struct Server(Movable):
                 self.config.detached_response_timeout
             )
             self._conns[idx].header_at = NO_DEADLINE
-            self._conns[idx].body_at = NO_DEADLINE
+            if not self._conns[idx].body_decoder:
+                self._conns[idx].body_at = NO_DEADLINE
             self._conns[idx].idle_at = NO_DEADLINE
             self._conns[idx].write_at = NO_DEADLINE
             self._detached_conns.append(idx)
@@ -3254,27 +3472,15 @@ struct Server(Movable):
         self._conns[idx].stream_has_body = False
         self._conns[idx].detach_at = NO_DEADLINE
         self._conns[idx].requests_served += 1
+        if (
+            self._conns[idx].body_decoder
+            and not self._conns[idx].body_pipe.value().is_discarded()
+        ):
+            self._conns[idx].should_close = True
         if self._conns[idx].should_close or self._shutdown_at != NO_DEADLINE:
             self._finish_connection(idx)
             return
-        self._conns[idx].state = STATE_READING
-        self._conns[idx].is_head = False
-        self._conns[idx].sent_100 = False
-        self._conns[idx].body_at = NO_DEADLINE
-        self._conns[idx].write_at = NO_DEADLINE
-        if self._conns[idx].buffered_len() > 0:
-            self._conns[idx].header_at = deadline_from_now(
-                self.config.header_deadline
-            )
-            self._conns[idx].idle_at = deadline_from_now(
-                self.config.idle_timeout
-            )
-            self._push_urgent(idx)
-        else:
-            self._conns[idx].header_at = NO_DEADLINE
-            self._conns[idx].idle_at = deadline_from_now(
-                self.config.idle_timeout
-            )
+        self._resume_http1_reading(idx)
 
     def _pump_send(mut self, idx: Int, event: Bool) raises NetError:
         if not self._conns[idx].active:
@@ -3353,31 +3559,38 @@ struct Server(Movable):
             self._complete_stream(idx)
             return
         self._conns[idx].requests_served += 1
+        if (
+            self._conns[idx].body_decoder
+            and not self._conns[idx].body_pipe.value().is_discarded()
+        ):
+            self._conns[idx].should_close = True
         if self._conns[idx].should_close or self._shutdown_at != NO_DEADLINE:
             self._finish_connection(idx)
             return
+        self._resume_http1_reading(idx)
+
+    def _resume_http1_reading(mut self, idx: Int):
         self._conns[idx].state = STATE_READING
         self._conns[idx].is_head = False
         self._conns[idx].sent_100 = False
-        self._conns[idx].body_at = NO_DEADLINE
         self._conns[idx].write_at = NO_DEADLINE
-        if self._conns[idx].buffered_len() > 0:
-            # A pipelined next head is already waiting: arm its header
-            # deadline now. Without this, clearing below would leave a
-            # partial head with no deadline at all (idle only applies to
-            # empty buffers), retaining the connection indefinitely.
-            self._conns[idx].header_at = deadline_from_now(
-                self.config.header_deadline
-            )
-            self._conns[idx].idle_at = deadline_from_now(
-                self.config.idle_timeout
-            )
-            self._push_urgent(idx)
-        else:
+        if self._conns[idx].body_decoder:
             self._conns[idx].header_at = NO_DEADLINE
+            self._conns[idx].idle_at = NO_DEADLINE
+        else:
+            self._conns[idx].body_pipe = None
+            self._conns[idx].body_at = NO_DEADLINE
+            self._conns[idx].header_at = (
+                deadline_from_now(self.config.header_deadline) if self._conns[
+                    idx
+                ].buffered_len()
+                > 0 else NO_DEADLINE
+            )
             self._conns[idx].idle_at = deadline_from_now(
                 self.config.idle_timeout
             )
+        if self._conns[idx].buffered_len() > 0:
+            self._push_urgent(idx)
 
     def _mark_detached_cancelled(mut self, idx: Int):
         if idx < 0 or idx >= len(self._conns):
@@ -3545,7 +3758,14 @@ struct Server(Movable):
         mut self, idx: Int, mut msg: DetachMessage
     ) raises NetError:
         var is_head = self._conns[idx].is_head
-        var req_close = self._conns[idx].req_close or msg.should_close
+        var req_close = (
+            self._conns[idx].req_close
+            or msg.should_close
+            or (
+                self._conns[idx].body_decoder
+                and not self._conns[idx].body_pipe.value().is_discarded()
+            )
+        )
         var rw = ResponseWriter(self.config.max_response_body)
         rw.status = msg.status
         var h = msg.headers^
@@ -3611,7 +3831,14 @@ struct Server(Movable):
         mut self, idx: Int, mut msg: DetachMessage
     ) raises NetError:
         var is_head = self._conns[idx].is_head
-        var req_close = self._conns[idx].req_close or msg.should_close
+        var req_close = (
+            self._conns[idx].req_close
+            or msg.should_close
+            or (
+                self._conns[idx].body_decoder
+                and not self._conns[idx].body_pipe.value().is_discarded()
+            )
+        )
         var rw = ResponseWriter(self.config.max_response_body)
         rw.status = msg.status
         var h = msg.headers^

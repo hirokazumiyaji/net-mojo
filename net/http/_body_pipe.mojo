@@ -148,6 +148,8 @@ struct _BodyPipe(Copyable):
                 NetErrorKind.invalid_argument(),
                 "body trailers exceed total buffer budget",
             )
+        if state.head == len(state.bytes):
+            _drop_body_bytes(Pointer(to=state))
         if not trailers._adopt_capacity_budget(Optional(state.budget.copy())):
             state.mutex.unlock()
             return False
@@ -249,6 +251,19 @@ struct _BodyPipe(Copyable):
         state.mutex.unlock()
         return cancelled
 
+    def is_discarded(self) -> Bool:
+        ref state = self._state[]
+        state.mutex.lock()
+        var discarded = state.discarded
+        state.mutex.unlock()
+        return discarded
+
+    def _stop_loop_wakeup(self):
+        ref state = self._state[]
+        state.mutex.lock()
+        state.loop_wakeup_fd = -1
+        state.mutex.unlock()
+
     def total_decoded(self) -> Int:
         ref state = self._state[]
         state.mutex.lock()
@@ -268,6 +283,34 @@ struct _BodyPipe(Copyable):
         state.mutex.lock()
         var count = state.consumed
         state.consumed = 0
+        state.mutex.unlock()
+        return count
+
+    def _prepare_input(self, limit: Int) -> Int:
+        ref state = self._state[]
+        state.mutex.lock()
+        if state.discarded:
+            state.mutex.unlock()
+            return limit
+        var pending = len(state.bytes) - state.head
+        var count = min(limit, state.limit - pending)
+        if state.head > 0 and len(state.bytes) + count > state.bytes.capacity():
+            for i in range(pending):
+                state.bytes[i] = state.bytes[state.head + i]
+            state.bytes.resize(pending, fill=0)
+            state.head = 0
+        var existing = state.bytes.capacity() - len(state.bytes)
+        if count > existing:
+            var available = state.budget.remaining()
+            count = max(
+                existing,
+                min(count, max(0, (available - len(state.bytes)) // 2)),
+            )
+            var reservation = 0
+            if not _reserve_capacity(
+                state.bytes, state.budget, len(state.bytes) + count, reservation
+            ):
+                count = 0
         state.mutex.unlock()
         return count
 
