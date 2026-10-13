@@ -1,11 +1,11 @@
-"""`net.http` origin-server API (Phase 0 signatures).
+"""`net.http` origin-server and routing API.
 
 Import from here, not from `net`:
 
 ```mojo
 from net.http import (
     Handler, Headers, HttpError, HttpVersion, Request, ResponseWriter,
-    Server, ServerConfig, ServerControl, has_body_for_status,
+    RouteHandler, ServeMux, Server, ServerConfig, ServerControl, has_body_for_status,
     maybe_inject_alt_svc, split_path_query,
 )
 ```

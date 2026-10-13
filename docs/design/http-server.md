@@ -48,6 +48,7 @@ blocking I/O や長時間 CPU 処理を handler に入れると同じ loop の�
 | `Headers` | 大文字小文字を区別しない検索と重複値の列挙。すべてを一律にカンマ結合しない |
 | `ResponseWriter` | status と headers を設定し、上限付きの response buffer に body を書く。socket を直接待たず、handler 終了後に server が送信する |
 | `Handler` | request を借用し、response writer を変更する。コンパイル時に handler 型を選べる構成を優先する |
+| `ServeMux` | method/path の登録表から handler を選び、パス変数、404、405 を共通層で処理する |
 | `ServerConfig` | 接続数、byte 上限、各 deadline、公平性の処理量上限を保持する |
 | `Server.serve` | listener の所有権を受け取り、handler を使用して loop を実行する |
 | `listen_and_serve` | bind と serve の便利関数 |
@@ -57,8 +58,8 @@ request の views と response writer は handler 呼び出し中だけ有効と
 受信 buffer は呼び出し中に移動、拡張、再利用しない。保持したい値は明示的にコピーする。
 response は送信完了まで接続が所有する。短命な handler の値を送信待ち queue に借用しない。
 初版では request body 全体を上限付きで受信してから handler を呼ぶ。
-request streaming、response streaming、`Flush`、汎用 router、middleware framework は初版に含めない。
-handler は method/path で分岐できる。未処理 path の例は 404 を返す。
+request streaming、response streaming、`Flush`、middleware framework は初版に含めない。
+`ServeMux` は method/path パターンを登録し、未登録 path に 404 を返す。
 
 ## 最終形から逆算する共通境界
 
@@ -427,6 +428,30 @@ struct ResponseSender(Movable):
 trait Handler(Movable):
     def handle(mut self, req: Request, mut writer: ResponseWriter) raises: ...
 
+# net/http/router.mojo
+struct RouteHandler(Handler, Movable):
+    def __init__[F: def(Request, mut ResponseWriter) raises -> None](
+        out self, var callback: F
+    )
+    @staticmethod
+    def from_handler[H: Handler & Deinitable](var handler: H) -> Self
+    def handle(mut self, req: Request, mut writer: ResponseWriter) raises
+
+struct ServeMux(Handler, Movable):
+    def __init__(out self, max_routes: Int = 1024) raises NetError
+    def handle[F: def(Request, mut ResponseWriter) raises -> None](
+        mut self, pattern: StringSlice, var callback: F
+    ) raises NetError
+    def handle_handler[H: Handler & Deinitable](
+        mut self, pattern: StringSlice, var handler: H
+    ) raises NetError
+    def register(
+        mut self, pattern: StringSlice, var handler: RouteHandler
+    ) raises NetError
+    def handle(mut self, req: Request, mut writer: ResponseWriter) raises
+    @staticmethod
+    def param(req: Request, name: StringSlice) -> Optional[String]
+
 # net/http/error.mojo
 struct HttpError(Copyable, Movable, Writable):
     var status: Int
@@ -605,10 +630,28 @@ HTTP/3 の record buffer と handler の `Request.body` は同じ借用 storage 
 request の view や mutable writer の借用を handler 終了後まで保持する用途には使わない。
 HTTP/2 と HTTP/3 の共通 handler は bounded buffered response を返す。
 両 protocol での detach は未対応で、現在の HTTP/2 adapter は接続を閉じ、HTTP/3 adapter は sender を取り消して 500 応答にする。
-request streaming、`Flush`、router、middleware は含めない。
+request streaming、`Flush`、middleware は含めない。
 
 所有値へのコピーは `tests/test_http_api.mojo` の `test_response_writer_owns_copies_of_handler_locals` と `test_header_value_span_borrows_storage_and_owned_copy_survives_clear` で検証する。
 HTTP/2 の request 組立ては `tests/test_http2.mojo` の `test_http2_request_stream_combines_headers_body_and_trailers`、HTTP/3 の native record と Mojo decode は `tests/test_quic_provider.mojo` で検証する。
+
+### method/path のルーティング
+
+`ServeMux` は protocol adapter が組み立てた `Request` を共通のパターン表で処理する。
+登録パターンは `GET /items/{id}`、`/static/{path...}`、末尾スラッシュの subtree、`/x/{$}` の完全一致を表せる。
+GET は HEAD にも一致し、一致する要求集合が狭いパターンを優先する。
+同じ要求に一致しても一方を優先できないパターンと重複パターンは登録時に `invalid_argument` となる。
+パスだけが一致する場合は 405 と登録 method を整列した `Allow`、パスも一致しない場合は 404 を返す。
+
+ルート数の既定上限は 1024、パターンは 1024 byte、32 segment、16 個の名前付き変数までとする。
+登録は serve の開始前に終え、一つの mux とその handler を一つの event loop が所有する。
+`RouteHandler` は登録 callback の所有権を受け取り、異なる型の callback と concrete handler を同じ表に保持する。
+callback はコピー捕捉か移動捕捉で値を所有し、捕捉した view の参照元は mux より長く生存させる。
+
+`Request` の内部共有領域に選択したルートの変数を保持し、`ServeMux.param` は所有する `Optional[String]` を返す。
+percent decoding は行わず、`a%2Fb` をそのまま返す。
+パラメータは選択した handler の呼び出し中だけ参照でき、入れ子の mux から戻ると外側の変数を復元する。
+handler が例外を返した場合も同じ復元を行う。
 
 ### エラー契約
 

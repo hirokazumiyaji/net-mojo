@@ -3,11 +3,13 @@ from net.http import (
     DefaultHandlerFactory,
     Handler,
     Headers,
+    HttpVersion,
     Request,
     ServerPool,
     ResponseSender,
     ResponseWriter,
     ServerConfig,
+    ServeMux,
     has_body_for_status,
 )
 from net.http._parser import parse_one
@@ -68,6 +70,25 @@ def _check_http_pool() raises:
         raise Error("packaged ServerPool shutdown failed")
 
 
+def _packaged_route(req: Request, mut writer: ResponseWriter) raises:
+    writer.write_string(ServeMux.param(req, "name").value())
+
+
+def _check_http_router() raises:
+    var mux = ServeMux()
+    mux.handle("GET /hello/{name}", _packaged_route)
+    var req = Request(
+        "GET", "/hello/package", "/hello/package", "", HttpVersion.http11()
+    )
+    var writer = ResponseWriter(1024)
+    mux.handle(req, writer)
+    if (
+        writer.status != 200
+        or String(from_utf8_lossy=Span(writer.body)) != "package"
+    ):
+        raise Error("packaged net.http router mismatch")
+
+
 def main() raises:
     var listener = listen_tcp("127.0.0.1:0")
     var client = dial_tcp(String(listener.local_address()), Timeout.seconds(1))
@@ -86,3 +107,6 @@ def main() raises:
     print("packaged net.http codec succeeded")
     _check_http_pool()
     print("packaged net.http pool succeeded")
+
+    _check_http_router()
+    print("packaged net.http router succeeded")

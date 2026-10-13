@@ -139,7 +139,7 @@ Constraints (see `docs/design/http-server.md` for the full contract):
   `max_body_bytes`, default 1 MiB) is received before `handle` runs.
   HTTP/1 response streaming and deferred responses use
   `ResponseWriter.detach()` and `ResponseSender`; request body streaming,
-  routers, and middleware frameworks are not included.
+  and middleware frameworks are not included.
 - Response trailers: `writer.add_trailer(name, value)` queues a trailer
   on a buffered HTTP/1.1 response. The encoder switches to
   `Transfer-Encoding: chunked`, advertises the names in `Trailer:`, and
@@ -178,6 +178,39 @@ Constraints (see `docs/design/http-server.md` for the full contract):
   macOS end-to-end Mojo HTTP/3 validation runs in CI (`http3` on macos-14).
 - No client, no HTTP/1.0, no WebSocket/CONNECT/Upgrade switching, no
   multipart helpers, no body compression, no static file serving.
+
+### Method and path routing
+
+`ServeMux` implements `Handler` and routes every HTTP protocol through the
+same method/path table:
+
+```mojo
+from net.http import Request, ResponseWriter, ServeMux, ServerConfig, listen_and_serve
+
+def greeting(req: Request, mut writer: ResponseWriter) raises:
+    writer.write_string(ServeMux.param(req, "name").value())
+
+def main() raises:
+    var mux = ServeMux()
+    mux.handle("GET /hello/{name}", greeting)
+    listen_and_serve("127.0.0.1:8080", ServerConfig.default(), mux)
+```
+
+Run the finite loopback example with `pixi run example-http-router`.
+Patterns support literal segments, `{name}`, a final `{path...}`, subtree
+paths such as `/static/`, and an exact final slash with `/static/{$}`.
+GET patterns also match HEAD; more specific patterns win. Duplicate and
+ambiguous routes fail at registration. A matching path with no matching
+method returns 405 with a sorted `Allow` header; an unknown path returns 404.
+Paths and captures retain their raw percent spelling.
+
+Register routes before serving. `ServeMux()` permits at most 1024 routes;
+each pattern is bounded to 1024 bytes, 32 segments and 16 named captures.
+`ServeMux.param` returns an owned `Optional[String]` during the selected
+handler call. Register concrete stateful handlers with `handle_handler`;
+callbacks passed to `handle` must own their captures, using `{var value}`
+or `{var value^}`. Captured views require their backing storage to outlive
+the mux. Each mux and its handlers belong to one event loop.
 
 Optional provider pins live in `pixi.toml` (`openssl`, `libnghttp2`) and
 `net/quic/provider/Cargo.toml` (quiche). After bumping a pin, refresh

@@ -21,6 +21,7 @@ from net.http import (
     Server,
     ServerConfig,
     ServerControl,
+    ServeMux,
 )
 from tests.support import (
     _content_length_of,
@@ -1870,6 +1871,78 @@ def test_hello_keep_alive_two_requests() raises:
     client.close()
     _tick_n(server, handler, 50)
     assert_equal(server.active_connections(), 0)
+
+
+def _router_greeting(req: Request, mut writer: ResponseWriter) raises:
+    writer.write_string(String("hello, ") + ServeMux.param(req, "name").value())
+
+
+def _router_rest(req: Request, mut writer: ResponseWriter) raises:
+    writer.write_string(ServeMux.param(req, "path").value())
+
+
+def test_serve_mux_keep_alive_wildcards_404_and_405() raises:
+    var server = Server(ServerConfig.default())
+    server.add_listener(listen_tcp("127.0.0.1:0"))
+    var mux = ServeMux()
+    mux.handle("GET /hello/{name}", _router_greeting)
+    mux.handle("GET /static/{path...}", _router_rest)
+    var client = dial_tcp(
+        String("127.0.0.1:") + String(server.local_address().port),
+        Timeout.seconds(2),
+    )
+    var first = _exchange(
+        server, mux, client, "GET /hello/a%2Fb?x=1 HTTP/1.1\r\nHost: x\r\n\r\n"
+    )
+    assert_equal(_status_of(first), 200)
+    _assert_body(first, "hello, a%2Fb")
+    var forbidden = _exchange(
+        server, mux, client, "POST /hello/world HTTP/1.1\r\nHost: x\r\n\r\n"
+    )
+    assert_equal(_status_of(forbidden), 405)
+    assert_true(
+        String(from_utf8_lossy=Span(forbidden)).find("\r\nAllow: GET, HEAD\r\n")
+        >= 0
+    )
+    _assert_body(forbidden, "method not allowed")
+    var missing = _exchange(
+        server, mux, client, "GET /missing HTTP/1.1\r\nHost: x\r\n\r\n"
+    )
+    assert_equal(_status_of(missing), 404)
+    _assert_body(missing, "not found")
+    var rest = _exchange(
+        server, mux, client, "GET /static/a/b%2Fc HTTP/1.1\r\nHost: x\r\n\r\n"
+    )
+    assert_equal(_status_of(rest), 200)
+    _assert_body(rest, "a/b%2Fc")
+    assert_equal(server.active_connections(), 1)
+    client.close()
+    _tick_n(server, mux, 50)
+    assert_equal(server.active_connections(), 0)
+    assert_equal(server._budget.used(), 0)
+
+
+def test_serve_mux_head_falls_back_and_omits_wire_body() raises:
+    var server = Server(ServerConfig.default())
+    server.add_listener(listen_tcp("127.0.0.1:0"))
+    var mux = ServeMux()
+    mux.handle("GET /hello/{name}", _router_greeting)
+    var client = dial_tcp(
+        String("127.0.0.1:") + String(server.local_address().port),
+        Timeout.seconds(2),
+    )
+    var wire = _exchange(
+        server,
+        mux,
+        client,
+        "HEAD /hello/world HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n",
+    )
+    assert_equal(_status_of(wire), 200)
+    assert_equal(_content_length_of(wire), 12)
+    assert_equal(len(wire), _header_end(wire))
+    assert_equal(server.active_connections(), 0)
+    assert_equal(server._budget.used(), 0)
+    client.close()
 
 
 def test_http1_205_frames_zero_length_on_keep_alive_and_pipeline() raises:

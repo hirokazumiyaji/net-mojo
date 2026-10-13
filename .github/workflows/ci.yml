@@ -216,6 +216,8 @@ jobs:
         run: pixi run test-http-router
       - name: Test HTTP server
         run: pixi run test-http-server
+      - name: Run HTTP router example
+        run: pixi run example-http-router
       - name: Build HPACK shim for HTTP/2 session tests
         run: pixi run -e http2 hpack-test
       - name: Test HTTP/2 frame parser
