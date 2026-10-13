@@ -68,6 +68,7 @@ def encode_http2_response_headers(
     date: StringSlice,
     max_header_list_size: Int,
     max_fields: Int,
+    streaming: Bool = False,
 ) -> Http2ResponseHeadersResult:
     # Reject 1xx as a completed response: informational sections must not
     # close the stream with END_STREAM. 101 is also unsupported (no Upgrade).
@@ -85,10 +86,12 @@ def encode_http2_response_headers(
     var field_count = 1
     var send_body = has_body_for_status(writer.status, is_head)
     var wire_length = -1
-    if has_body_for_status(writer.status, False):
+    if not streaming and has_body_for_status(writer.status, False):
         wire_length = len(writer.body)
 
     var declared_lengths = writer.headers.get_all("content-length")
+    if streaming and len(declared_lengths) > 0:
+        return Http2ResponseHeadersResult.error()
     if wire_length >= 0:
         for i in range(len(declared_lengths)):
             if not _content_length_matches(declared_lengths[i], wire_length):

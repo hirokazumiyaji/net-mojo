@@ -1495,6 +1495,21 @@ def test_http2_failed_session_ignores_header_and_body_deadlines() raises:
         assert_equal(session.next_deadline(), NO_DEADLINE)
 
 
+def test_http2_streaming_headers_omit_unknown_content_length() raises:
+    var writer = ResponseWriter(64)
+    var fields = encode_http2_response_headers(
+        writer, False, "Thu, 01 Jan 1970 00:00:00 GMT", 4096, 32, streaming=True
+    )
+    assert_true(fields.is_valid())
+    var raw = String(from_utf8_lossy=Span(fields.fields))
+    assert_equal(raw.find("content-length"), -1)
+    writer.headers.add("Content-Length", "0")
+    var declared = encode_http2_response_headers(
+        writer, False, "Thu, 01 Jan 1970 00:00:00 GMT", 4096, 32, streaming=True
+    )
+    assert_true(declared.is_error())
+
+
 def _enqueue_streaming(
     mut scheduler: Http2ResponseScheduler,
     stream_id: UInt32,

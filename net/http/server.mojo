@@ -69,6 +69,7 @@ from ._detach import (
     MSG_KIND_RESPOND,
     MSG_KIND_START,
     _cancel_detach_state,
+    _mark_detach_cancelled,
     _detach_state,
     _DetachTarget,
     _release_detach_state,
@@ -2448,16 +2449,7 @@ struct Server(Movable):
             return
         var addr = self._conns[idx].detach_state_addr
         if addr != 0:
-            var s_ptr = _detach_state(addr)
-            s_ptr[].mutex.lock()
-            s_ptr[].cancelled = True
-            s_ptr[].finished = True
-            s_ptr[].messages = List[DetachMessage]()
-            s_ptr[].array_ticket.release()
-            s_ptr[].queued_bytes = 0
-            s_ptr[].terminal_kind = MSG_KIND_NONE
-            s_ptr[].terminal_trailers = Headers()
-            s_ptr[].mutex.unlock()
+            _mark_detach_cancelled(addr)
 
     def _cleanup_detached_state(mut self, idx: Int):
         if idx < 0 or idx >= len(self._conns):

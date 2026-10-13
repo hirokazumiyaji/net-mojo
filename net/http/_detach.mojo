@@ -266,7 +266,8 @@ def _take_batch(
     var trailers = trailers_ptr.unsafe_take_pointee()
     trailers_ptr.unsafe_write(Headers())
     var target = state[].target.copy()
-    state[].queued_bytes = 0
+    if state[].target.protocol == _DETACH_HTTP1:
+        state[].queued_bytes = 0
     state[].terminal_kind = MSG_KIND_NONE
     state[].mutex.unlock()
     return _DetachedBatch(
@@ -341,12 +342,29 @@ def _unlock_and_wake(state: Pointer[_SharedDetachState, MutUntrackedOrigin]):
     signal_wakeup_fd(wakeup_fd)
 
 
-def _cancel_detach_state(addr: Int):
+def _consume_detach_bytes(addr: Int, amount: Int):
+    var state = _detach_state(addr)
+    state[].mutex.lock()
+    if not state[].cancelled and state[].started:
+        state[].queued_bytes -= amount
+    state[].mutex.unlock()
+
+
+def _mark_detach_cancelled(addr: Int):
     var state = _detach_state(addr)
     state[].mutex.lock()
     state[].cancelled = True
+    state[].finished = True
+    state[].messages = List[DetachMessage]()
+    state[].array_ticket.release()
+    state[].queued_bytes = 0
+    state[].terminal_kind = MSG_KIND_NONE
     state[].terminal_trailers = Headers()
     state[].mutex.unlock()
+
+
+def _cancel_detach_state(addr: Int):
+    _mark_detach_cancelled(addr)
     _release_detach_state(addr, from_sender=False)
 
 
@@ -575,6 +593,9 @@ struct ResponseSender(Movable):
                 "streaming response not started or already finished",
             )
         if s_ptr[].queued_bytes + len(data) > s_ptr[].queue_limit:
+            if s_ptr[].target.protocol != _DETACH_HTTP1:
+                s_ptr[].mutex.unlock()
+                return False
             s_ptr[].cancelled = True
             s_ptr[].finished = True
             s_ptr[].terminal_kind = MSG_KIND_ABORT

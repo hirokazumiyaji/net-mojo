@@ -31,6 +31,7 @@ from net.http._detach import (
     _detach_state,
     _DetachedBatch,
     _take_batch,
+    _consume_detach_bytes,
     _release_detach_state,
     _SharedDetachState,
 )
@@ -270,6 +271,71 @@ def test_writer_detach_preserves_multiplexed_target_in_batch() raises:
     assert_equal(batch.target, target)
     assert_equal(len(batch.messages), 1)
     _release_detach_state(writer._detach_state_addr, from_sender=False)
+
+
+def test_multiplexed_batch_retains_queue_credit_until_consumption() raises:
+    for protocol in [UInt8(2), UInt8(3)]:
+        var addr = _create_detach_state(
+            slot=0, generation=1, protocol=protocol, stream_id=1, queue_limit=4
+        )
+        var sender = ResponseSender(addr)
+        sender.start()
+        assert_true(sender.send("abcd".as_bytes()))
+        var batch = _take_batch(_detach_state(addr))
+        assert_equal(_detach_state(addr)[].queued_bytes, 4)
+        assert_false(sender.send("e".as_bytes()))
+        assert_false(sender.is_cancelled())
+        _consume_detach_bytes(addr, 2)
+        assert_true(sender.send("ef".as_bytes()))
+        assert_equal(_detach_state(addr)[].queued_bytes, 4)
+        _consume_detach_bytes(addr, 4)
+        assert_equal(_detach_state(addr)[].queued_bytes, 0)
+        _ = batch^
+        sender.finish()
+        _release_detach_state(addr, from_sender=False)
+
+
+def test_deferred_response_consumption_does_not_refund_streaming_credit() raises:
+    var addr = _create_detach_state(
+        slot=0, generation=1, protocol=2, stream_id=1
+    )
+    var sender = ResponseSender(addr)
+    var body: List[Byte] = [1, 2, 3]
+    sender.respond(body=body^)
+    var batch = _take_batch(_detach_state(addr))
+    _consume_detach_bytes(addr, 3)
+    assert_equal(_detach_state(addr)[].queued_bytes, 0)
+    _ = batch^
+    _release_detach_state(addr, from_sender=False)
+
+
+def test_writer_mailbox_budget_does_not_charge_buffered_body_budget() raises:
+    var budget = SharedBufferBudget(65536)
+    var writer = ResponseWriter(64)
+    writer._set_mailbox_budget(budget.copy())
+    writer._set_detach_target(_DetachTarget.http2(0, 1, 1))
+    assert_false(Bool(writer._body_budget))
+    var sender = writer.detach()
+    assert_true(budget.used() >= size_of[_SharedDetachState]())
+    sender.start()
+    _cancel_detach_state(writer._detach_state_addr)
+    _ = sender^
+    assert_equal(budget.used(), 0)
+
+
+def test_cancel_refunds_queued_messages_while_sender_remains_alive() raises:
+    var budget = SharedBufferBudget(65536)
+    var addr = _create_detach_state(slot=0, generation=1, budget=budget.copy())
+    var sender = ResponseSender(addr)
+    sender.start()
+    assert_true(sender.send("body".as_bytes()))
+    assert_true(budget.used() > size_of[_SharedDetachState]())
+    _cancel_detach_state(addr)
+    assert_true(sender.is_cancelled())
+    assert_equal(_detach_state(addr)[].queued_bytes, 0)
+    assert_equal(budget.used(), size_of[_SharedDetachState]())
+    _ = sender^
+    assert_equal(budget.used(), 0)
 
 
 def test_detach_state_lifecycle_and_cleanup() raises:

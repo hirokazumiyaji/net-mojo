@@ -40,6 +40,7 @@ struct ResponseWriter(Movable, Sized):
     var _wakeup_fd: Int32
     var _queue_limit: Int
     var _body_budget: Optional[SharedBufferBudget]
+    var _mailbox_budget: Optional[SharedBufferBudget]
     var _body_capacity_reserved: Int
 
     def __init__(
@@ -65,6 +66,7 @@ struct ResponseWriter(Movable, Sized):
         self._wakeup_fd = wakeup_fd
         self._queue_limit = queue_limit
         self._body_budget = None
+        self._mailbox_budget = None
         self._body_capacity_reserved = 0
 
     def __init__(out self, *, deinit move: Self):
@@ -80,6 +82,7 @@ struct ResponseWriter(Movable, Sized):
         self._wakeup_fd = move._wakeup_fd
         self._queue_limit = move._queue_limit
         self._body_budget = move._body_budget^
+        self._mailbox_budget = move._mailbox_budget^
         self._body_capacity_reserved = move._body_capacity_reserved
 
     def __deinit__(deinit self):
@@ -88,7 +91,11 @@ struct ResponseWriter(Movable, Sized):
     def _set_body_budget(mut self, var budget: SharedBufferBudget):
         _ = self.headers._adopt_capacity_budget(Optional(budget.copy()))
         _ = self.trailers._adopt_capacity_budget(Optional(budget.copy()))
+        self._mailbox_budget = budget.copy()
         self._body_budget = budget^
+
+    def _set_mailbox_budget(mut self, var budget: SharedBufferBudget):
+        self._mailbox_budget = budget^
 
     def _drop_headers(mut self):
         self.headers = Headers()
@@ -149,7 +156,7 @@ struct ResponseWriter(Movable, Sized):
             stream_id=self._target.stream_id,
             wakeup_fd=self._wakeup_fd,
             queue_limit=self._queue_limit,
-            budget=self._body_budget.copy(),
+            budget=self._mailbox_budget.copy(),
         )
         self._detach_state_addr = addr
         self._detached = True
