@@ -22,6 +22,7 @@ from .response import (
     has_body_for_status,
     maybe_inject_alt_svc,
 )
+from .router import Pattern, RouteHandler, ServeMux
 from .server import (
     Server,
     ServerControl,

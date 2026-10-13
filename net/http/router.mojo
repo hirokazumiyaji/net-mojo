@@ -6,8 +6,12 @@ each pattern, including GET's implicit HEAD match.
 """
 
 from net.error import NetError, NetErrorKind
+from std.memory import OwnedPointer
 
 from .headers import _is_tchar
+from .handler import Handler
+from .request import Request
+from .response import ResponseWriter
 
 
 comptime _EQUAL = 0
@@ -276,3 +280,184 @@ struct Pattern(Copyable, Movable):
     def conflicts_with(self, other: Self) -> Bool:
         var relationship = self._relationship(other)
         return relationship == _EQUAL or relationship == _OVERLAP
+
+
+comptime _Callback = def(Request, mut ResponseWriter) raises -> None
+comptime _RouteInvoke = def(
+    Int, Request, mut ResponseWriter
+) raises thin -> None
+comptime _RouteDrop = def(Int) thin -> None
+
+
+@fieldwise_init
+struct _CallbackHandler[F: Movable & Deinitable](Handler):
+    var callback: Self.F
+
+    def handle(mut self, req: Request, mut writer: ResponseWriter) raises:
+        comptime assert conforms_to(Self.F, _Callback)
+        self.callback(req, writer)
+
+
+def _route_invoke[
+    H: Handler
+](address: Int, req: Request, mut writer: ResponseWriter) raises:
+    var pointer = Pointer[H, MutUntrackedOrigin](unsafe_from_address=address)
+    pointer[].handle(req, writer)
+
+
+def _route_drop[H: Movable & Deinitable](address: Int):
+    _ = OwnedPointer[H](
+        unsafe_from_raw_pointer=Pointer[H, MutUntrackedOrigin](
+            unsafe_from_address=address
+        )
+    )
+
+
+struct RouteHandler(Handler, Movable):
+    """Owned callback with runtime dispatch.
+
+    Callbacks must own their captures; use copy or move captures rather than
+    borrowing stack values that can disappear before the mux. Captured views
+    must refer to storage that remains alive for the handler's lifetime.
+    """
+
+    var _address: Int
+    var _invoke: _RouteInvoke
+    var _drop: _RouteDrop
+
+    def __init__[F: _Callback](out self, var callback: F):
+        var owner = OwnedPointer(_CallbackHandler[F](callback^))
+        self._address = Int(owner^.unsafe_take_allocation().unsafe_leak())
+        self._invoke = _route_invoke[_CallbackHandler[F]]
+        self._drop = _route_drop[_CallbackHandler[F]]
+
+    def __init__(
+        out self, address: Int, invoke: _RouteInvoke, drop: _RouteDrop
+    ):
+        self._address = address
+        self._invoke = invoke
+        self._drop = drop
+
+    @staticmethod
+    def from_handler[H: Handler & Deinitable](var handler: H) -> Self:
+        var owner = OwnedPointer(handler^)
+        return Self(
+            Int(owner^.unsafe_take_allocation().unsafe_leak()),
+            _route_invoke[H],
+            _route_drop[H],
+        )
+
+    def __deinit__(deinit self):
+        self._drop(self._address)
+
+    def handle(mut self, req: Request, mut writer: ResponseWriter) raises:
+        self._invoke(self._address, req, writer)
+
+
+@fieldwise_init
+struct _Route(Movable):
+    var pattern: Pattern
+    var handler: RouteHandler
+
+
+struct ServeMux(Handler, Movable):
+    """Bounded route table shared by HTTP/1.1, HTTP/2 and HTTP/3.
+
+    Register routes before serving. A mux belongs to one event loop and its
+    owned handlers are invoked sequentially. Parameters retain raw bytes and
+    are available only while a selected route runs.
+    """
+
+    var _routes: List[_Route]
+    var _max_routes: Int
+
+    def __init__(out self, max_routes: Int = 1024) raises NetError:
+        if max_routes < 1:
+            raise _pattern_error("route capacity must be positive")
+        self._routes = List[_Route]()
+        self._max_routes = max_routes
+
+    def handle[
+        F: _Callback
+    ](mut self, pattern: StringSlice, var callback: F) raises NetError:
+        self.register(pattern, RouteHandler(callback^))
+
+    def handle_handler[
+        H: Handler & Deinitable
+    ](mut self, pattern: StringSlice, var handler: H) raises NetError:
+        self.register(pattern, RouteHandler.from_handler(handler^))
+
+    def register(
+        mut self, pattern: StringSlice, var handler: RouteHandler
+    ) raises NetError:
+        if len(self._routes) == self._max_routes:
+            raise _pattern_error("route capacity exceeded")
+        var compiled = Pattern(pattern)
+        for index in range(len(self._routes)):
+            ref route = self._routes[index]
+            if compiled.conflicts_with(route.pattern):
+                raise _pattern_error("ambiguous or duplicate route")
+        self._routes.append(_Route(compiled^, handler^))
+
+    @staticmethod
+    def param(req: Request, name: StringSlice) -> Optional[String]:
+        for entry in req._route_params[]:
+            if entry[0] == name:
+                return Optional(entry[1].copy())
+        return None
+
+    def handle(mut self, req: Request, mut writer: ResponseWriter) raises:
+        var best = -1
+        var path_matched = False
+        for index in range(len(self._routes)):
+            ref pattern = self._routes[index].pattern
+            if not pattern.matches_path(req.path):
+                continue
+            path_matched = True
+            if pattern.matches_method(req.method) and (
+                best == -1
+                or pattern.more_specific_than(self._routes[best].pattern)
+            ):
+                best = index
+        if best == -1:
+            if path_matched:
+                writer.set_status(405)
+                writer.headers.add("Allow", self._allowed_methods(req.path))
+                writer.write_string("method not allowed")
+            else:
+                writer.set_status(404)
+                writer.write_string("not found")
+            return
+        var matched = self._routes[best].pattern.matches(req.method, req.path)
+        var previous = req._route_params[].copy()
+        req._route_params[] = matched.params^
+        matched.params = List[Tuple[String, String]]()
+        try:
+            self._routes[best].handler.handle(req, writer)
+        except e:
+            req._route_params[] = previous^
+            raise e^
+        req._route_params[] = previous^
+
+    def _allowed_methods(self, path: StringSlice) -> String:
+        var methods = List[String]()
+        for index in range(len(self._routes)):
+            ref route = self._routes[index]
+            if route.pattern.matches_path(path):
+                self._insert_method(methods, route.pattern.method)
+                if route.pattern.method == "GET":
+                    self._insert_method(methods, "HEAD")
+        var result = String("")
+        for method in methods:
+            if result != "":
+                result += ", "
+            result += method
+        return result^
+
+    @staticmethod
+    def _insert_method(mut methods: List[String], method: String):
+        var index = 0
+        while index < len(methods) and methods[index] < method:
+            index += 1
+        if index == len(methods) or methods[index] != method:
+            methods.insert(index, method.copy())

@@ -1,7 +1,10 @@
 from std.testing import assert_equal, assert_false, assert_true, TestSuite
+from std.memory import ArcPointer
 
 from net.error import NetErrorKind
-from net.http.router import Pattern
+from net.http import HttpVersion, Request, ResponseWriter
+from net.http.handler import Handler
+from net.http.router import Pattern, RouteHandler, ServeMux
 
 
 def test_literals_and_subtrees() raises:
@@ -158,6 +161,206 @@ def test_conflict_symmetry_and_disjoint_paths() raises:
     var left = Pattern("/a/{tail...}")
     var right = Pattern("/b/")
     assert_false(left.conflicts_with(right))
+
+
+def _request(method: StringSlice, path: StringSlice) -> Request:
+    return Request(
+        String(method), String(path), String(path), "", HttpVersion.http11()
+    )
+
+
+def _echo_param(req: Request, mut writer: ResponseWriter) raises:
+    writer.write_string(ServeMux.param(req, "id").value())
+
+
+def _literal(req: Request, mut writer: ResponseWriter) raises:
+    writer.write_string("literal")
+
+
+def test_mux_specificity_head_and_params() raises:
+    var mux = ServeMux()
+    mux.handle("/items/{id}", _echo_param)
+    mux.handle("GET /items/new", _literal)
+    var dynamic = _request("POST", "/items/a%2Fb")
+    var dynamic_writer = ResponseWriter(1024)
+    mux.handle(dynamic, dynamic_writer)
+    assert_equal(String(from_utf8_lossy=Span(dynamic_writer.body)), "a%2Fb")
+    assert_false(ServeMux.param(dynamic, "id"))
+    var head = _request("HEAD", "/items/new")
+    var head_writer = ResponseWriter(1024)
+    mux.handle(head, head_writer)
+    assert_equal(String(from_utf8_lossy=Span(head_writer.body)), "literal")
+
+
+def test_mux_not_found_and_allow() raises:
+    var mux = ServeMux()
+    mux.handle("POST /item", _literal)
+    mux.handle("GET /item", _literal)
+    mux.handle("DELETE /item", _literal)
+    var missing = _request("GET", "/missing")
+    var missing_writer = ResponseWriter(1024)
+    mux.handle(missing, missing_writer)
+    assert_equal(missing_writer.status, 404)
+    assert_equal(String(from_utf8_lossy=Span(missing_writer.body)), "not found")
+    var wrong_method = _request("PATCH", "/item")
+    var method_writer = ResponseWriter(1024)
+    mux.handle(wrong_method, method_writer)
+    assert_equal(method_writer.status, 405)
+    assert_equal(
+        method_writer.headers.get_first("allow").value(),
+        "DELETE, GET, HEAD, POST",
+    )
+
+
+@fieldwise_init
+struct _CounterHandler(Handler):
+    var count: Int
+
+    def handle(mut self, req: Request, mut writer: ResponseWriter) raises:
+        self.count += 1
+        writer.write_string(String(self.count))
+
+
+def test_mux_heterogeneous_owned_handlers() raises:
+    var mux = ServeMux()
+    mux.handle_handler("/counter", _CounterHandler(0))
+    var prefix = String("owned")
+
+    def callback(req: Request, mut writer: ResponseWriter) raises {var prefix}:
+        writer.write_string(prefix)
+
+    mux.handle("/closure", callback^)
+    prefix = "changed"
+    assert_equal(prefix, "changed")
+    for expected in range(1, 4):
+        var req = _request("GET", "/counter")
+        var writer = ResponseWriter(1024)
+        mux.handle(req, writer)
+        assert_equal(
+            String(from_utf8_lossy=Span(writer.body)), String(expected)
+        )
+    var closure_req = _request("GET", "/closure")
+    var closure_writer = ResponseWriter(1024)
+    mux.handle(closure_req, closure_writer)
+    assert_equal(String(from_utf8_lossy=Span(closure_writer.body)), "owned")
+
+
+def _owned_callback() -> RouteHandler:
+    var payload = String("retained after factory")
+
+    def callback(
+        req: Request, mut writer: ResponseWriter
+    ) raises {var payload^}:
+        writer.write_string(payload)
+
+    return RouteHandler(callback^)
+
+
+def test_callback_survives_factory_and_route_list_growth() raises:
+    var mux = ServeMux()
+    mux.register("/retained", _owned_callback())
+    for index in range(64):
+        mux.handle(String("/route/") + String(index), _literal)
+    var req = _request("GET", "/retained")
+    var writer = ResponseWriter(1024)
+    mux.handle(req, writer)
+    assert_equal(
+        String(from_utf8_lossy=Span(writer.body)), "retained after factory"
+    )
+
+
+@fieldwise_init
+struct _DropHandler(Handler, Movable):
+    var drops: ArcPointer[Int]
+
+    def __deinit__(deinit self):
+        self.drops[] += 1
+
+    def handle(mut self, req: Request, mut writer: ResponseWriter) raises:
+        writer.write_string("drop")
+
+
+def _make_and_drop_mux(drops: ArcPointer[Int]) raises:
+    var mux = ServeMux()
+    mux.handle_handler("/drop", _DropHandler(drops))
+
+
+def test_handlers_are_destroyed_once() raises:
+    var drops = ArcPointer(0)
+    _make_and_drop_mux(drops)
+    assert_equal(drops[], 1)
+
+
+def test_mux_registration_failure_is_atomic() raises:
+    var mux = ServeMux(2)
+    mux.handle("/items/{id}", _echo_param)
+    var rejected = False
+    try:
+        mux.handle("/items/{name}", _literal)
+    except:
+        rejected = True
+    assert_true(rejected)
+    mux.handle("/other", _literal)
+    rejected = False
+    try:
+        mux.handle("/third", _literal)
+    except:
+        rejected = True
+    assert_true(rejected)
+    var req = _request("GET", "/items/42")
+    var writer = ResponseWriter(1024)
+    mux.handle(req, writer)
+    assert_equal(String(from_utf8_lossy=Span(writer.body)), "42")
+
+
+def _raise_after_param(req: Request, mut writer: ResponseWriter) raises:
+    assert_equal(ServeMux.param(req, "id").value(), "42")
+    raise Error("handler failed")
+
+
+def test_mux_clears_params_when_handler_raises() raises:
+    var mux = ServeMux()
+    mux.handle("/items/{id}", _raise_after_param)
+    var req = _request("GET", "/items/42")
+    var writer = ResponseWriter(1024)
+    var raised = False
+    try:
+        mux.handle(req, writer)
+    except:
+        raised = True
+    assert_true(raised)
+    assert_false(ServeMux.param(req, "id"))
+
+
+@fieldwise_init
+struct _NestedMuxHandler(Handler):
+    var inner: ServeMux
+
+    def handle(mut self, req: Request, mut writer: ResponseWriter) raises:
+        assert_equal(ServeMux.param(req, "outer").value(), "42")
+        try:
+            self.inner.handle(req, writer)
+        except:
+            pass
+        assert_true(ServeMux.param(req, "outer"))
+        assert_equal(ServeMux.param(req, "outer").value(), "42")
+        assert_false(ServeMux.param(req, "id"))
+
+
+def test_nested_mux_restores_outer_params_on_return_and_error() raises:
+    for should_raise in range(2):
+        var inner = ServeMux()
+        if should_raise:
+            inner.handle("/items/{id}", _raise_after_param)
+        else:
+            inner.handle("/items/{id}", _echo_param)
+        var outer = ServeMux()
+        outer.handle_handler("/items/{outer}", _NestedMuxHandler(inner^))
+        var req = _request("GET", "/items/42")
+        var writer = ResponseWriter(1024)
+        outer.handle(req, writer)
+        assert_false(ServeMux.param(req, "outer"))
+        assert_false(ServeMux.param(req, "id"))
 
 
 def main() raises:

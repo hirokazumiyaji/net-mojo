@@ -18,6 +18,7 @@ shape before calling the handler:
 """
 
 from .headers import Headers
+from std.memory import ArcPointer
 
 
 @fieldwise_init
@@ -77,6 +78,7 @@ struct Request(Movable):
     var headers: Headers
     var trailers: Headers
     var body: List[Byte]
+    var _route_params: ArcPointer[List[Tuple[String, String]]]
 
     def __init__(
         out self,
@@ -96,6 +98,7 @@ struct Request(Movable):
         self.headers = Headers()
         self.trailers = Headers()
         self.body = List[Byte]()
+        self._route_params = ArcPointer(List[Tuple[String, String]]())
 
 
 def split_path_query(
