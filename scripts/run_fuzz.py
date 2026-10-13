@@ -35,6 +35,32 @@ SEEDS = {
         struct.pack(">II", 0xffffffff, 0xffffffff),
     ],
 }
+REPLAY_TARGETS = ("http1", "authority", "http2-frames", "ip", "address", "hpack-mojo")
+SEEDS["http2-frames"] = [
+    b"", bytes.fromhex("000000040000000000"),
+    bytes.fromhex("000003000100000001") + b"abc",
+    bytes.fromhex("000008060000000000") + b"12345678",
+    bytes.fromhex("00000408000000000100000001"),
+    bytes.fromhex("00000101050000000182"),
+    bytes.fromhex("ffffff000100000001"),
+    bytes.fromhex("000000040000000000000003000100000001") + b"abc",
+]
+SEEDS["ip"] = [
+    b"", b"127.0.0.1", b"0.0.0.0", b"255.255.255.255", b"256.0.0.1",
+    b"01.2.3.4", b"::", b"::1", b"2001:db8::1", b"::ffff:192.0.2.1",
+    b"2001:db8:1:2:3:4:5:6", b"1::2::3", b"127.0.0.1\x00", b"\xff",
+]
+SEEDS["address"] = [
+    b"", b"127.0.0.1:0", b"255.255.255.255:65535", b"[::1]:443",
+    b"[fe80::1%3]:443", b"[fe80::1%4294967295]:65535", b"[::1]:65536",
+    b"[::1", b"::1:80", b"user@host:80", b"127.0.0.1:-1",
+    b"127.0.0.1:80\x00", b"\xff",
+]
+SEEDS["hpack-mojo"] = list(SEEDS["hpack"]) + [
+    bytes.fromhex("828684418cf1e3c2e5f23a6ba0ab90f4ff"),
+    struct.pack(">II", 7, 3) + b":status200",
+]
+
 
 
 def mutate(data: bytes, rng: random.Random) -> bytes:
@@ -86,20 +112,20 @@ def positive(value: str) -> int:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("target", choices=["http1", "authority", "hpack", "smoke"])
+    parser.add_argument("target", choices=[*REPLAY_TARGETS, "hpack", "smoke"])
     parser.add_argument("--seed", type=int, default=227)
     parser.add_argument("--iterations", type=positive, default=10000)
     parser.add_argument("--seconds", type=positive, default=60)
     parser.add_argument("--replay", type=Path)
     args = parser.parse_args()
     if args.replay:
-        if args.target not in ("http1", "authority"):
-            parser.error("--replay requires http1 or authority")
+        if args.target not in REPLAY_TARGETS:
+            parser.error("--replay requires a Mojo replay target")
         replay(args.target, args.replay)
         return
     root = Path("build/fuzz")
     root.mkdir(parents=True, exist_ok=True)
-    targets = ["http1", "authority", "hpack"] if args.target == "smoke" else [args.target]
+    targets = [*REPLAY_TARGETS, "hpack"] if args.target == "smoke" else [args.target]
     for target in targets:
         if target == "hpack":
             corpus = root / "hpack-corpus"

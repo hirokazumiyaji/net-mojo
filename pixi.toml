@@ -248,6 +248,10 @@ fuzz-native-build = "bash scripts/build_fuzz.sh"
 fuzz-build = { depends-on = ["fuzz-native-build", { task = "fuzz-parser-build", environment = "sanitize" }] }
 fuzz-http1 = { cmd = "python3 scripts/run_fuzz.py http1", depends-on = ["fuzz-build"] }
 fuzz-authority = { cmd = "python3 scripts/run_fuzz.py authority", depends-on = ["fuzz-build"] }
+fuzz-http2-frames = { cmd = "python3 scripts/run_fuzz.py http2-frames", depends-on = ["fuzz-build"] }
+fuzz-ip = { cmd = "python3 scripts/run_fuzz.py ip", depends-on = ["fuzz-build"] }
+fuzz-address = { cmd = "python3 scripts/run_fuzz.py address", depends-on = ["fuzz-build"] }
+fuzz-hpack-mojo = { cmd = "python3 scripts/run_fuzz.py hpack-mojo", depends-on = ["fuzz-build"] }
 fuzz-hpack = { cmd = "python3 scripts/run_fuzz.py hpack", depends-on = ["fuzz-build"] }
 fuzz-smoke = { cmd = "python3 scripts/run_fuzz.py smoke", depends-on = ["fuzz-build"] }
 fuzz-driver-test = { cmd = "python3 tests/fuzz/test_driver.py", depends-on = ["fuzz-build"] }

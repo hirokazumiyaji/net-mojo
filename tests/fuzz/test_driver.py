@@ -13,7 +13,7 @@ spec.loader.exec_module(driver)
 
 class MutationDriverTests(unittest.TestCase):
     def test_seed_reproduces_exact_inputs(self):
-        for target in ("http1", "authority"):
+        for target in ("http1", "authority", "http2-frames", "ip", "address", "hpack-mojo"):
             first = driver.make_inputs(target, 227, 100)
             self.assertEqual(first, driver.make_inputs(target, 227, 100))
             self.assertNotEqual(first, driver.make_inputs(target, 228, 100))
