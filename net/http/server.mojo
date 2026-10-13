@@ -482,7 +482,7 @@ struct Server(Movable):
         try:
             if self.control._addr != control._addr:
                 self._finish_control()
-                self.control = control.copy()
+                self.control = control._fork()
                 self._control_token = self._reactor.register(
                     self.control._read_fd()
                 )

@@ -18,3 +18,27 @@ from .response import ResponseWriter
 trait Handler(Movable):
     def handle(mut self, req: Request, mut writer: ResponseWriter) raises:
         ...
+
+
+trait HandlerFactory(Movable):
+    """Builds an independent handler for each worker before threads start."""
+
+    comptime HandlerType: Handler & Deinitable
+
+    def build(mut self, worker_id: Int) raises -> Self.HandlerType:
+        ...
+
+
+struct DefaultHandlerFactory[H: Handler & Copyable & Deinitable](
+    HandlerFactory
+):
+    """Copies the supplied handler for each worker."""
+
+    comptime HandlerType = Self.H
+    var _handler: Self.H
+
+    def __init__(out self, var handler: Self.H):
+        self._handler = handler^
+
+    def build(mut self, worker_id: Int) raises -> Self.H:
+        return self._handler.copy()
