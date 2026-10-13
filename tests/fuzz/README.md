@@ -4,8 +4,9 @@ Issue #227 is delivered in stages. Current targets cover HTTP/1 `parse_one`,
 Host/authority validation, HTTP/2 complete and incremental frame parsing,
 IP/socket address parsing and formatting, and the native and Mojo HPACK
 encode/decode boundaries. Nightly runs retain evolving native corpora and
-reproducible Mojo batches. QUIC targets, minimization and h2spec conformance
-follow in separate PRs.
+reproducible Mojo batches. The QUIC provider has a separate real cargo-fuzz
+target described in `net/quic/provider/fuzz/README.md`. Minimization and h2spec
+conformance follow in separate PRs.
 
 Run `pixi run -e fuzz fuzz-smoke`. It compiles the Mojo replay target with ASan
 in the existing `sanitize` environment and the native HPACK target with

@@ -168,6 +168,8 @@ rust = ">=1.88,<2"
 aioquic = "==1.3.0"
 
 [feature.http3.tasks]
+fuzz-quic-build = { cmd = "bash scripts/build_fuzz_quic.sh", depends-on = ["tls-build"] }
+fuzz-quic-recv = { cmd = "python3 scripts/run_fuzz_quic.py", depends-on = ["fuzz-quic-build"] }
 quic-build = "bash scripts/build_quic_provider.sh"
 quic-test = { cmd = "build/quic/test_quic_provider build/tls/test-cert.pem build/tls/test-key.pem", depends-on = [
   "tls-build",

@@ -1,0 +1,66 @@
+name: QUIC receive fuzzing
+
+on:
+  pull_request:
+  schedule:
+    - cron: '41 17 * * *'
+  workflow_dispatch:
+    inputs:
+      seconds:
+        description: 'Seconds per target (1–1800)'
+        default: '1800'
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  receive:
+    name: QUIC receive (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, ubuntu-24.04-arm, macos-14]
+        exclude:
+          - os: ${{ github.event_name == 'schedule' && 'macos-14' || 'unused' }}
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      - name: Install pixi
+        uses: prefix-dev/setup-pixi@f00437f565399d418b0acc85936d12c1fb668347
+        with:
+          frozen: true
+      - name: Restore receive corpus
+        uses: actions/cache@0400d5f644dc74513175e3cd8d07132dd4860809
+        with:
+          path: build/fuzz/quic-recv-corpus
+          key: fuzz-quic-${{ matrix.os }}-${{ github.run_id }}
+          restore-keys: fuzz-quic-${{ matrix.os }}-
+      - name: Build and fuzz local QUIC provider
+        env:
+          REPLAY_SECONDS: ${{ github.event_name == 'pull_request' && '60' || inputs.seconds || '1800' }}
+        run: |
+          [[ "$REPLAY_SECONDS" =~ ^[1-9][0-9]{0,3}$ ]] || exit 1
+          (( REPLAY_SECONDS >= 1 && REPLAY_SECONDS <= 1800 )) || exit 1
+          pixi run -e tls-http3 fuzz-quic-recv --seconds "$REPLAY_SECONDS"
+      - name: Retain reproduction inputs
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: quic-receive-${{ matrix.os }}
+          path: |
+            build/fuzz/quic-recv-nightly.json
+            build/fuzz/quic-recv.log
+            build/fuzz/quic-recv-crash-*
+            build/fuzz/quic-recv-timeout-*
+            build/fuzz/quic-recv-oom-*
+            build/fuzz/quic-recv-leak-*
+          if-no-files-found: ignore
+          retention-days: 14
