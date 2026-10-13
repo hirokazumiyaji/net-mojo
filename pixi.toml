@@ -136,6 +136,7 @@ benchmark-http-parse = "mojo run --Werror -I . benchmarks/http_parse.mojo"
 benchmark-http-server = "mojo run --Werror -I . benchmarks/http_server.mojo"
 benchmark-http-stream = "mojo run --Werror -I . benchmarks/http_stream.mojo"
 benchmark-http-stream-sse = { cmd = "python3 benchmarks/http_stream_sse.py", default-environment = "http-stream-sse", depends-on = [{ task = "tls-build", environment = "http-stream-sse" }, { task = "hpack-test", environment = "http-stream-sse" }, { task = "quic-build", environment = "http-stream-sse" }] }
+benchmark-http-body-stream = { cmd = "python3 benchmarks/http_body_stream.py", default-environment = "http-stream-sse", depends-on = [{ task = "tls-build", environment = "http-stream-sse" }, { task = "hpack-test", environment = "http-stream-sse" }, { task = "quic-build", environment = "http-stream-sse" }] }
 benchmark-http-offload = "mojo run --Werror -I . benchmarks/http_offload.mojo"
 # Harness/loader regression only — no long performance runs or thresholds.
 benchmark-harness-test = "python3 tests/test_http_benchmark_harness.py"

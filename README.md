@@ -131,6 +131,11 @@ def main() raises:
 
 ### Request body streaming
 
+Run `pixi run benchmark-http-body-stream` to compare throughput and fresh-server
+peak RSS for 1 MiB, 16 MiB, and 256 MiB uploads over HTTP/1 chunked and HTTP/2/HTTP/3
+DATA. Streaming uses a 64 KiB queue; buffered baselines use size-specific limits.
+See [measurement details and the HTTP/3 buffered limit](benchmarks/http_body_stream.md).
+
 Set `config.enable_request_body_streaming = True` before constructing `Server`.
 A streaming request has an empty `req.body`; its `body_reader().read(buffer)`
 returns decoded bytes, zero at EOF, or `NetErrorKind.timeout()` when more input
