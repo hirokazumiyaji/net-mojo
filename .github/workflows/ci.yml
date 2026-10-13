@@ -33,8 +33,8 @@ jobs:
         with:
           frozen: true
           environments: proptest
-      - name: Test IP round trips
-        run: pixi run -e proptest test-prop-ip
+      - name: Test semantic properties
+        run: pixi run -e proptest test-prop
 
   fuzz:
     name: Fuzz smoke (${{ matrix.os }})
