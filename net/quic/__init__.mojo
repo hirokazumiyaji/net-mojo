@@ -469,6 +469,16 @@ struct QuicServer(Movable):
             == 1
         )
 
+    def send_continue(mut self, request_id: UInt64) -> Bool:
+        """Queues one 100 response; final response headers follow it on the wire.
+        """
+        return (
+            self._library.call["net_quic_send_continue", c_int](
+                self._server, request_id
+            )
+            == 1
+        )
+
     def respond[
         headers_origin: Origin, body_origin: Origin, trailers_origin: Origin
     ](
@@ -971,6 +981,9 @@ struct QuicUDPEndpoint(Movable):
         mut self, request_id: UInt64, cancel: Bool = False
     ) -> Bool:
         return self._server.release_body(request_id, cancel)
+
+    def send_continue(mut self, request_id: UInt64) -> Bool:
+        return self._server.send_continue(request_id)
 
     def respond[
         headers_origin: Origin, body_origin: Origin, trailers_origin: Origin

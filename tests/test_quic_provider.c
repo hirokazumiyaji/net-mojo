@@ -78,6 +78,9 @@ static int test_streaming_response_ffi(struct NetQuicServer *server) {
 static int test_request_input_ffi(struct NetQuicServer *server) {
     uint8_t body[16];
     if (net_quic_next_request_head(server, body, sizeof(body)) != -1 ||
+        net_quic_send_continue(server, 1) != -1 ||
+        net_quic_send_continue(NULL, 1) != -1 ||
+        net_quic_server_send_continue(NULL, 1) != -1 ||
         net_quic_set_request_streaming(server, 1) != 1 ||
         net_quic_next_request_head(server, body, sizeof(body)) != 0 ||
         net_quic_read_body(server, 1, body, sizeof(body)) != -2 ||

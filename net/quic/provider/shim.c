@@ -120,6 +120,10 @@ int32_t net_quic_next_request(
     return net_quic_server_next_request(server, output, output_capacity);
 }
 
+int32_t net_quic_send_continue(struct NetQuicServer *server, uint64_t id) {
+    return net_quic_server_send_continue(server, id);
+}
+
 int32_t net_quic_respond(
     struct NetQuicServer *server, uint64_t request_id, uint32_t status,
     const uint8_t *headers, size_t headers_length,
