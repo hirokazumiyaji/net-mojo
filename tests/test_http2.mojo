@@ -1,3 +1,4 @@
+from net.http import Handler, Request, ResponseWriter
 from std.testing import assert_equal, assert_false, assert_true, TestSuite
 from net.http.request import HttpVersion
 
@@ -2440,6 +2441,42 @@ def test_http2_priority_allows_other_dependencies_and_idle_streams() raises:
     assert_true(headers.is_ignored())
 
 
+struct _Http2ControlHandler(Handler):
+    def __init__(out self):
+        pass
+
+    def handle(mut self, req: Request, mut writer: ResponseWriter) raises:
+        _ = req
+        writer.set_status(204)
+
+
+def test_http2_server_control_output_arms_and_preserves_write_deadline() raises:
+    from net import dial_tcp, listen_tcp, Timeout
+    from net.http import Handler, Request, ResponseWriter, Server, ServerConfig
+    from net.http._deadline import NO_DEADLINE
+
+    var server = Server(ServerConfig.default())
+    server.add_listener(listen_tcp("127.0.0.1:0"))
+    var client = dial_tcp(
+        String("127.0.0.1:") + String(server.local_address().port),
+        Timeout.seconds(2),
+    )
+    var handler = _Http2ControlHandler()
+    _ = server.tick(handler, Timeout.milliseconds(10))
+    assert_equal(server.active_connections(), 1)
+    assert_equal(server._conns[0].write_at, NO_DEADLINE)
+    assert_true(server._flush_http2_control_output(0, List[Byte]()))
+    assert_equal(server._conns[0].write_at, NO_DEADLINE)
+    var output: List[Byte] = [Byte(0)]
+    assert_true(server._flush_http2_control_output(0, output^))
+    var deadline = server._conns[0].write_at
+    assert_true(deadline != NO_DEADLINE)
+    output = [Byte(1)]
+    assert_true(server._flush_http2_control_output(0, output^))
+    assert_equal(server._conns[0].write_at, deadline)
+    client.close()
+
+
 def main() raises:
     TestSuite.discover_tests[__functions_in_module()]().run()
 
@@ -2652,7 +2689,7 @@ def test_http2_streaming_completed_retained_input_rejects_late_data() raises:
     _ = reader.detach()
 
 
-def test_http2_streaming_overrun_is_stream_error_and_shutdown_cancels_eof() raises:
+def test_http2_streaming_overrun_is_stream_error_and_shutdown_preserves_eof() raises:
     from net.http._buffer import SharedBufferBudget
 
     var budget = SharedBufferBudget(8)
@@ -2696,7 +2733,14 @@ def test_http2_streaming_overrun_is_stream_error_and_shutdown_cancels_eof() rais
     assert_true(session.consume(Span(wire)).is_pending())
     assert_true(session.is_draining())
     var shutdown = session.begin_shutdown()
-    assert_equal(_wire_credit(shutdown, UInt32(0)), 4)
+    assert_equal(_wire_credit(shutdown, UInt32(0)), 0)
+    assert_equal(budget.used(), 4)
+    assert_false(request._body_pipe.value().is_cancelled())
+    var buffer = List[Byte](length=4, fill=0)
+    assert_equal(other.read(Span(buffer)), 4)
+    assert_true(other.is_eof())
+    var credit = session.flush_body_credit()
+    assert_equal(_wire_credit(credit, UInt32(0)), 4)
     assert_equal(budget.used(), 0)
     _ = reader.detach()
     _ = other.detach()
@@ -2920,3 +2964,32 @@ def test_http2_buffered_shutdown_preserves_admitted_input() raises:
     var completed = session.consume(Span(wire))
     assert_true(completed.is_request())
     assert_false(session.is_failed())
+
+
+def test_http2_streaming_expiry_reports_only_matching_stream_ids() raises:
+    from net.http._buffer import SharedBufferBudget
+
+    var budget = SharedBufferBudget(8)
+    var session = Http2RequestSession(
+        "build/http2/libnet_hpack",
+        4,
+        4,
+        request_body_budget=Optional(budget.copy()),
+    )
+    _stream_rate_bootstrap(session)
+    var wire = _streaming_head_wire(1)
+    assert_true(session.consume(Span(wire)).is_head())
+    wire = _streaming_head_wire(3)
+    assert_true(session.consume(Span(wire)).is_head())
+    assert_true(session.has_request_inputs())
+    session._streams[0].body_at = 100
+    session._streams[1].body_at = 200
+    var reset_ids = List[UInt32]()
+    var output = session.expire(150, reset_ids)
+    assert_equal(len(reset_ids), 1)
+    assert_equal(reset_ids[0], UInt32(1))
+    assert_equal(output[12], Byte(8))
+    assert_true(session.has_request_inputs())
+    assert_equal(budget.used(), 4)
+    assert_equal(session.next_deadline(), 200)
+    _ = session.begin_shutdown()

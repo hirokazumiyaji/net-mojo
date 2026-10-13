@@ -180,6 +180,10 @@ http2-integration-test = { cmd = "python3 scripts/test_http2_integration.py", de
   "tls-build",
   "hpack-test",
 ] }
+http2-request-stream-integration-test = { cmd = "python3 scripts/test_http2_request_stream.py", depends-on = [
+  "tls-build",
+  "hpack-test",
+] }
 http2-example-run = { cmd = "python3 scripts/run_http2_example.py", depends-on = [
   "tls-build",
   "hpack-test",

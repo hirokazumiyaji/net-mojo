@@ -229,12 +229,6 @@ struct Http2RequestSession(Movable):
             self._draining = True
             var goaway = encode_goaway_frame(self._last_stream_id, error_code)
             output.extend(Span(goaway.wire))
-        var index = 0
-        while index < len(self._streams):
-            if self._streams[index].stream.is_streaming():
-                self._cancel_stream_at(index, output)
-            else:
-                index += 1
         return output^
 
     def next_deadline(self) -> Int:
@@ -852,6 +846,9 @@ struct Http2RequestSession(Movable):
 
     def is_draining(self) -> Bool:
         return self._draining
+
+    def has_request_inputs(self) -> Bool:
+        return len(self._streams) > 0
 
     def has_active_streams(self) -> Bool:
         return len(self._streams) > 0 or len(self._send_streams) > 0

@@ -97,6 +97,7 @@ from ._parser import (
     _scan_head,
     parse_body,
     parse_head,
+    _split_comma_tokens,
 )
 from .config import ServerConfig
 from .handler import Handler
@@ -116,10 +117,12 @@ from net.http._http2.request_session import (
 from net.http._http2.response_headers import (
     _content_length_matches,
     encode_http2_response_headers,
+    _append_field,
     encode_http2_minimal_500_fields,
     encode_http2_response_trailers,
 )
 from net.http._http2.control_frames import encode_rst_stream_frame
+from net.http._http2.frame_encoder import encode_frame
 
 
 comptime _TICK_POLL_CAP_MS: Int = 100
@@ -483,6 +486,10 @@ struct Server(Movable):
                 self._process_detached_messages(now)
                 var body_conns = self._request_body_conns.copy()
                 for idx in body_conns:
+                    if self._conns[idx].protocol == PROTOCOL_HTTP2:
+                        self._flush_http2_body_credit(idx)
+                        self._push_urgent(idx)
+                        continue
                     if (
                         self._conns[idx].body_pipe.value().take_consumed() > 0
                         or self._conns[idx].body_pipe.value().is_discarded()
@@ -694,6 +701,11 @@ struct Server(Movable):
                 and self._conns[idx].pending_remaining() == 0
                 and self._conns[idx].http2_responses.queued_count() == 0
                 and not self._has_http2_detached(idx)
+                and not (
+                    self.config.enable_request_body_streaming
+                    and self._conns[idx].http2_session.value().next_deadline()
+                    != NO_DEADLINE
+                )
             ):
                 if best == NO_DEADLINE or self._conns[idx].idle_at < best:
                     best = self._conns[idx].idle_at
@@ -1792,6 +1804,9 @@ struct Server(Movable):
                 if protocol == "h2":
                     self._conns[idx]._drop_error_wire()
                     self._conns[idx].protocol = PROTOCOL_HTTP2
+                    var body_budget: Optional[SharedBufferBudget] = None
+                    if self.config.enable_request_body_streaming:
+                        body_budget = self._budget.copy()
                     self._conns[idx].http2_session = Optional(
                         Http2RequestSession(
                             String(self.config.hpack_library_path),
@@ -1806,6 +1821,8 @@ struct Server(Movable):
                             self.config.http2_max_control_frames_per_second,
                             self.config.http2_max_resets_per_second,
                             self.config.http2_max_new_streams_per_second,
+                            request_body_budget=body_budget^,
+                            body_wakeup_fd=self._wakeup_channel.write_fd(),
                         )
                     )
                 elif protocol != "http/1.1":
@@ -2128,7 +2145,20 @@ struct Server(Movable):
                     - target_body_reservation
                 )
             self._conns[idx].http2_body_reserved = target_body_reservation
-            if result.is_request():
+            if self.config.enable_request_body_streaming:
+                if self._conns[idx].http2_session.value().has_request_inputs():
+                    self._register_http2_body_input(idx)
+                var credit = (
+                    self._conns[idx].http2_session.value().flush_body_credit()
+                )
+                result.output.extend(Span(credit))
+                if (
+                    not self._conns[idx]
+                    .http2_session.value()
+                    .has_request_inputs()
+                ):
+                    self._remove_request_body(idx)
+            if result.is_request() or result.is_head():
                 self._respond_http2(idx, result^, request_body_bytes, handler)
                 return
             if len(result.output) > 0:
@@ -2161,6 +2191,93 @@ struct Server(Movable):
         result.output = List[Byte]()
         var request = result^.take_request()
         var is_head = request.method == "HEAD"
+        if not self._conns[idx].http2_deflater:
+            try:
+                var table_size = _bounded_hpack_table_size(
+                    self._conns[idx]
+                    .http2_session.value()
+                    .peer_settings()
+                    .header_table_size
+                )
+                self._conns[idx].http2_deflater = Optional(
+                    Http2HpackDeflater(
+                        String(self.config.hpack_library_path), table_size
+                    )
+                )
+            except e:
+                _ = e
+                self._close_conn(idx)
+                return
+        else:
+            var table_size = _bounded_hpack_table_size(
+                self._conns[idx]
+                .http2_session.value()
+                .peer_settings()
+                .header_table_size
+            )
+            if (
+                not self._conns[idx]
+                .http2_deflater.value()
+                .set_max_table_size(table_size)
+            ):
+                self._close_conn(idx)
+                return
+
+        var reject_expectation = False
+        if self.config.enable_request_body_streaming:
+            var expectations = request.headers.get_all("expect")
+            for expectation in expectations:
+                var tokens = _split_comma_tokens(expectation)
+                if len(tokens) == 0:
+                    reject_expectation = True
+                for token in tokens:
+                    if token.lower() != "100-continue":
+                        reject_expectation = True
+            if reject_expectation:
+                request._body_pipe.value().discard()
+            elif (
+                len(expectations) > 0
+                and not request._body_pipe.value().is_eof()
+            ):
+                var fields = List[Byte]()
+                _ = _append_field(fields, ":status", "100".as_bytes())
+                var bound = (
+                    self._conns[idx]
+                    .http2_deflater.value()
+                    .deflate_bound(Span(fields))
+                )
+                if bound < 0:
+                    self._close_conn(idx)
+                    return
+                var block = List[Byte](length=bound, fill=0)
+                var encoded = (
+                    self._conns[idx]
+                    .http2_deflater.value()
+                    .encode(
+                        Span(fields),
+                        min(
+                            self.config.max_response_headers_bytes,
+                            Int(
+                                self._conns[idx]
+                                .http2_session.value()
+                                .peer_settings()
+                                .max_header_list_size
+                            ),
+                        ),
+                        self.config.max_response_headers_count,
+                        Span(block),
+                    )
+                )
+                if not encoded.is_success():
+                    self._close_conn(idx)
+                    return
+                var informational = encode_frame(
+                    UInt8(1),
+                    UInt8(4),
+                    stream_id,
+                    Span(block)[: encoded.output_length],
+                )
+                control_output.extend(Span(informational.wire))
         var cap = self.config.max_response_body
         var room = (
             self._budget.remaining()
@@ -2186,10 +2303,15 @@ struct Server(Movable):
             )
         )
         writer._set_mailbox_budget(self._budget.copy())
+        var request_pipe = request._body_pipe.copy()
+        writer._set_request_body_pipe(request_pipe.copy())
         self._conns[idx].requests_this_tick += 1
         self._conns[idx].requests_served += 1
         try:
-            handler.handle(request^, writer)
+            if reject_expectation:
+                writer.set_status(417)
+            else:
+                handler.handle(request^, writer)
         except e:
             _ = e
             writer._cancel_detach()
@@ -2197,6 +2319,12 @@ struct Server(Movable):
             writer.headers.clear()
             writer.trailers.clear()
             writer.body.clear()
+
+        if (
+            self.config.enable_request_body_streaming
+            and not request_pipe.value().has_detached_reader()
+        ):
+            request_pipe.value().discard()
 
         self._budget.release(request_body_bytes)
         self._conns[idx].http2_body_reserved -= request_body_bytes
@@ -2206,40 +2334,6 @@ struct Server(Movable):
             writer.headers.clear()
             writer.trailers.clear()
             writer.body.clear()
-
-        if not self._conns[idx].http2_deflater:
-            try:
-                var table_size = _bounded_hpack_table_size(
-                    self._conns[idx]
-                    .http2_session.value()
-                    .peer_settings()
-                    .header_table_size
-                )
-                self._conns[idx].http2_deflater = Optional(
-                    Http2HpackDeflater(
-                        String(self.config.hpack_library_path), table_size
-                    )
-                )
-            except e:
-                _ = e
-                writer._cancel_detach()
-                self._close_conn(idx)
-                return
-        else:
-            var table_size = _bounded_hpack_table_size(
-                self._conns[idx]
-                .http2_session.value()
-                .peer_settings()
-                .header_table_size
-            )
-            if (
-                not self._conns[idx]
-                .http2_deflater.value()
-                .set_max_table_size(table_size)
-            ):
-                writer._cancel_detach()
-                self._close_conn(idx)
-                return
 
         if writer.is_detached() and writer._detach_state_addr != 0:
             var addr = writer._detach_state_addr
@@ -2769,6 +2863,10 @@ struct Server(Movable):
             self._close_conn(idx)
             return False
         self._conns[idx].state = STATE_SENDING_HTTP2_CONTROL
+        if self._conns[idx].write_at == NO_DEADLINE:
+            self._conns[idx].write_at = deadline_from_now(
+                self.config.write_deadline
+            )
         return True
 
     def _http2_drained(self, idx: Int) -> Bool:
@@ -3002,9 +3100,26 @@ struct Server(Movable):
         self._conns[idx].drain_prefix(count)
         self._budget.release(old_capacity - self._conns[idx].buf.capacity())
 
+    def _register_http2_body_input(mut self, idx: Int):
+        for existing in self._request_body_conns:
+            if existing == idx:
+                return
+        self._request_body_conns.append(idx)
+
+    def _flush_http2_body_credit(mut self, idx: Int) raises NetError:
+        var output = self._conns[idx].http2_session.value().flush_body_credit()
+        if not self._conns[idx].http2_session.value().has_request_inputs():
+            self._remove_request_body(idx)
+        _ = self._flush_http2_control_output(idx, output^)
+        if self._conns[idx].active:
+            self._arm_deadline(idx)
+            self._sync_interests(idx)
+
     def _retry_request_body_budget(mut self) raises NetError:
         var available = self._budget.remaining()
         for idx in self._request_body_conns:
+            if self._conns[idx].protocol == PROTOCOL_HTTP2:
+                continue
             var blocked_at = self._conns[idx].body_blocked_budget
             if blocked_at >= 0 and available > blocked_at:
                 self._conns[idx].body_blocked_budget = -1

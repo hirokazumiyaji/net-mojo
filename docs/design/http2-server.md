@@ -114,12 +114,23 @@ independently. Terminal input refunds any remaining connection credit and
 removes the pipe's loop wakeup capability while preserving EOF and trailers.
 Admission counts the union of retained input and response streams.
 
-RST_STREAM, body expiry, connection failure and local shutdown cancel streaming
+RST_STREAM, body expiry, connection failure and shutdown grace expiry cancel streaming
 input and wake detached readers. Cancellation refunds outstanding connection
 credit without issuing stream credit for a closed stream. Local stream resets
 also set `reset_stream_id` so the owner can cancel response work. Local shutdown
-cancels streaming input even when an earlier peer GOAWAY already marked the
-session draining; buffered input retains its existing shutdown grace behavior.
+preserves admitted streaming input during the configured grace period, including
+when an earlier peer GOAWAY already marked the session draining.
+
+With `ServerConfig.enable_request_body_streaming`, the Server dispatches the
+handler at completed request headers and supplies the pipe to paired detach.
+Consumer wakeups flush flow credit; per-stream body expiry cancels the matching
+response work. Unsupported Expect values produce 417, while `100-continue`
+produces informational HEADERS only when the request body remains open.
+Synchronous responses discard input unless a detached receiver owns it. A
+standalone `RequestBody.detach()` receiver survives synchronous response FIN.
+Consumer-generated control output starts the configured write deadline without
+extending an existing pending write deadline.
+The default configuration retains buffered request dispatch.
 
 ## Outbound frame encoding
 
@@ -310,10 +321,9 @@ closed stream.
 
 When shutdown begins, the server sends GOAWAY with the highest admitted peer
 stream ID and refuses later streams with `REFUSED_STREAM`. GOAWAY is queued
-behind existing connection output, and admitted buffered requests keep the
-configured shutdown grace period to finish. Streaming input is cancelled as
-described in the request-session contract above. At the grace deadline, remaining TCP
-connections are closed.
+behind existing connection output, and admitted requests keep the configured
+shutdown grace period to finish their upload and response. At the grace deadline,
+remaining TCP connections close and cancel both request and response endpoints.
 
 ## Verification sequence
 
@@ -323,3 +333,11 @@ frame types, and multiple concatenated frames. The client preface parser tests
 every incomplete prefix, mismatch rejection, and the consumed byte count.
 Independent TLS client tests verify response completion and the GOAWAY boundary
 during graceful HTTP/2 shutdown.
+
+The Server request-streaming fixture runs with
+`pixi run -e tls-http2 http2-request-stream-integration-test`. Its independent
+hyper-h2 client covers first-flight DATA before SETTINGS acknowledgement, a
+1 MiB bounded upload, withheld consumer credit and sibling progress, padding,
+trailers, Expect, EOF wakeups, resets, progress deadlines, early response FIN,
+and accepted uploads completing during shutdown grace. `--fixture PATH` runs
+the same client against a precompiled sanitizer fixture.

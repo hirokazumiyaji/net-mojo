@@ -116,6 +116,8 @@ jobs:
         run: pixi run -e tls-http2 http2-integration-test
       - name: Test shared-listener HTTP worker pool
         run: pixi run -e tls-http2 http-pool-integration-test
+      - name: Test HTTP/2 streaming request uploads
+        run: pixi run -e tls-http2 http2-request-stream-integration-test
       - name: Run HTTP/2 example with independent client
         run: pixi run -e tls-http2 http2-example-run
 
