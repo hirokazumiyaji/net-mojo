@@ -15,6 +15,10 @@ from ._offload import HandlerJob, OffloadError, WorkerPool, WorkerPoolConfig
 
 from .switch import HijackedConn
 from ._hijack import HijackSender
+from .client import Client
+from .client_config import ClientConfig, ClientTLSConfig, RedirectPolicy
+from .client_request import ClientRequest, ClientRequestBody
+from .client_response import Response, ResponseBody
 from .client_error import ClientError
 from .config import ServerConfig
 from .error import HttpError, _status_reason

@@ -1554,6 +1554,11 @@ struct ResponseHeadOutcome(Movable):
     def is_error(self) -> Bool:
         return self.kind == 2
 
+    def take_headers(mut self) -> Headers:
+        var headers = self.headers^
+        self.headers = Headers()
+        return headers^
+
 
 def parse_response_head[
     origin: ImmOrigin
