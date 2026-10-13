@@ -235,6 +235,21 @@ example-https-hello = { cmd = "mojo run --Werror -I . examples/https_hello.mojo"
   "tls-build",
 ] }
 
+[feature.fuzz.dependencies]
+clang = "==23.1.2"
+compiler-rt = "==23.1.2"
+libnghttp2 = ">=1.64,<2"
+pkg-config = "*"
+python = ">=3.11,<3.15"
+
+[feature.fuzz.tasks]
+fuzz-build = "bash scripts/build_fuzz.sh"
+fuzz-http1 = { cmd = "python3 scripts/run_fuzz.py http1", depends-on = ["fuzz-build"] }
+fuzz-authority = { cmd = "python3 scripts/run_fuzz.py authority", depends-on = ["fuzz-build"] }
+fuzz-hpack = { cmd = "python3 scripts/run_fuzz.py hpack", depends-on = ["fuzz-build"] }
+fuzz-smoke = { cmd = "python3 scripts/run_fuzz.py smoke", depends-on = ["fuzz-build"] }
+fuzz-driver-test = { cmd = "python3 tests/fuzz/test_driver.py", depends-on = ["fuzz-build"] }
+
 [feature.mojo-1-1.dependencies]
 mojo = ">=1.1.0,<1.2"
 
@@ -245,6 +260,7 @@ compiler-rt = "==23.1.2"
 [environments]
 default = ["mojo-1-1"]
 sanitize = ["sanitize", "mojo-1-1"]
+fuzz = ["fuzz", "sanitize", "mojo-1-1"]
 tls = ["tls", "mojo-1-1"]
 http2 = ["http2", "mojo-1-1"]
 http3 = ["http3", "mojo-1-1"]
