@@ -1027,5 +1027,155 @@ def test_incomplete_needs_more_not_success() raises:
     assert_true(partial.is_need_more())
 
 
+def test_response_heads_and_framing() raises:
+    from net.http._parser import parse_response_head
+
+    var config = ServerConfig.default()
+    var raw = _to_bytes(
+        "HTTP/1.1 200 OK\r\nContent-Length: 3\r\nX-Test: a\r\nX-Test:"
+        " b\r\n\r\nabcNEXT"
+    )
+    var result = parse_response_head(Span(raw), config)
+    assert_true(result.is_complete())
+    assert_equal(result.status, 200)
+    assert_equal(result.reason, "OK")
+    assert_equal(result.content_length, 3)
+    assert_equal(result.framing, UInt8(0))
+    assert_equal(len(result.headers.get_all("x-test")), 2)
+    for split in range(result.consumed):
+        assert_true(
+            parse_response_head(Span(raw)[:split], config).is_need_more()
+        )
+    var head = parse_response_head(Span(raw), config, "HEAD")
+    assert_equal(head.framing, UInt8(3))
+    var chunked = _to_bytes(
+        "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n"
+    )
+    assert_equal(parse_response_head(Span(chunked), config).framing, UInt8(1))
+    var eof = _to_bytes("HTTP/1.0 200 Fine\r\n\r\n")
+    var closing = parse_response_head(Span(eof), config)
+    assert_equal(closing.framing, UInt8(2))
+    assert_true(closing.should_close)
+    var nobody = _to_bytes(
+        "HTTP/1.1 304 Not Modified\r\nContent-Length: 100\r\n\r\n"
+    )
+    assert_equal(parse_response_head(Span(nobody), config).framing, UInt8(3))
+
+
+def test_response_head_rejects_invalid_framing() raises:
+    from net.http._parser import parse_response_head
+    from net.http import ClientError
+
+    var config = ServerConfig.default()
+    var invalid: List[String] = [
+        "HTTP/1.1 200 OK\r\nContent-Length: 1\r\nContent-Length: 1\r\n\r\n",
+        (
+            "HTTP/1.1 200 OK\r\nContent-Length: 1\r\nTransfer-Encoding:"
+            " chunked\r\n\r\n"
+        ),
+        "HTTP/1.1 200 OK\r\nTransfer-Encoding: gzip, chunked\r\n\r\n",
+        "HTTP/1.1 200 OK\n\n",
+        "HTTP/1.1 20 OK\r\n\r\n",
+        "HTTP/2 200 OK\r\n\r\n",
+        "HTTP/1.1 200 OK\r\n X: y\r\n\r\n",
+        "HTTP/1.1 200 OK\r\nX : y\r\n\r\n",
+        "HTTP/1.0 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n",
+        "HTTP/1.1 204 No Content\r\nContent-Length: 0\r\n\r\n",
+        "HTTP/1.1 100 Continue\r\nTransfer-Encoding: chunked\r\n\r\n",
+    ]
+    for raw in invalid:
+        var bytes = _to_bytes(raw)
+        var result = parse_response_head(Span(bytes), config)
+        assert_true(result.is_error())
+        assert_equal(result.error.kind, ClientError.PARSE)
+    config.max_response_headers_bytes = 12
+    var partial_status = _to_bytes("HTTP/1.1 200 OK")
+    assert_true(parse_response_head(Span(partial_status), config).is_error())
+    var excessive = _to_bytes("HTTP/1.1 200 OK\r\nX: long value\r\n\r\n")
+    assert_true(parse_response_head(Span(excessive), config).is_error())
+
+
+def test_response_bodies() raises:
+    from net.http._parser import parse_response_head, parse_response_body
+
+    var config = ServerConfig.default()
+    var fixed = _to_bytes("HTTP/1.1 200 OK\r\nContent-Length: 3\r\n\r\nabcNEXT")
+    var fixed_head = parse_response_head(Span(fixed), config)
+    var body = parse_response_body(
+        fixed_head, Span(fixed)[fixed_head.consumed :], config
+    )
+    assert_true(body.is_complete())
+    assert_equal(body.consumed, 3)
+    assert_equal(String(from_utf8_lossy=body.body), "abc")
+    var chunked = _to_bytes(
+        "HTTP/1.1 200 OK\r\nTransfer-Encoding:"
+        " chunked\r\n\r\n3\r\nabc\r\n0\r\nX-End: yes\r\n\r\nNEXT"
+    )
+    var chunk_head = parse_response_head(Span(chunked), config)
+    var chunks = parse_response_body(
+        chunk_head, Span(chunked)[chunk_head.consumed :], config
+    )
+    assert_true(chunks.is_complete())
+    assert_equal(String(from_utf8_lossy=chunks.body), "abc")
+    assert_equal(chunks.trailers.get_first("x-end").value(), "yes")
+    for split in range(chunks.consumed):
+        assert_true(
+            parse_response_body(
+                chunk_head,
+                Span(chunked)[
+                    chunk_head.consumed : chunk_head.consumed + split
+                ],
+                config,
+            ).is_need_more()
+        )
+    var eof = _to_bytes("HTTP/1.1 200 OK\r\n\r\nbye")
+    var eof_head = parse_response_head(Span(eof), config)
+    assert_true(
+        parse_response_body(
+            eof_head, Span(eof)[eof_head.consumed :], config
+        ).is_need_more()
+    )
+    assert_true(
+        parse_response_body(
+            eof_head, Span(eof)[eof_head.consumed :], config, True
+        ).is_complete()
+    )
+    config.max_body_bytes = 2
+    assert_true(
+        parse_response_body(
+            fixed_head, Span(fixed)[fixed_head.consumed :], config
+        ).is_error()
+    )
+
+
+def test_response_chunk_scan_retains_frontier() raises:
+    from net.http._parser import (
+        parse_response_head,
+        parse_response_body,
+        _ResponseBodyScan,
+    )
+
+    var config = ServerConfig.default()
+    var head_bytes = _to_bytes(
+        "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n"
+    )
+    var head = parse_response_head(Span(head_bytes), config)
+    var bytes = _to_bytes("1\r\na\r\n1\r\nb\r\n0\r\n\r\n")
+    var scan = _ResponseBodyScan()
+    assert_true(
+        parse_response_body(head, Span(bytes)[:6], config, scan).is_need_more()
+    )
+    assert_equal(scan.wire, 6)
+    assert_equal(scan.decoded, 1)
+    assert_true(
+        parse_response_body(head, Span(bytes)[:12], config, scan).is_need_more()
+    )
+    assert_equal(scan.wire, 12)
+    assert_equal(scan.decoded, 2)
+    var complete = parse_response_body(head, Span(bytes), config, scan)
+    assert_true(complete.is_complete())
+    assert_equal(String(from_utf8_lossy=complete.body), "ab")
+
+
 def main() raises:
     TestSuite.discover_tests[__functions_in_module()]().run()

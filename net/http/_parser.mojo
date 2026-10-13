@@ -10,6 +10,7 @@ from net.http import Headers, HttpError, HttpVersion, Request, ServerConfig
 from net.http import split_path_query
 from net.http.headers import _is_tchar, _parse_decimal, _trailer_forbidden
 from ._authority import _host_is_valid
+from .client_error import ClientError
 
 
 @fieldwise_init
@@ -1511,3 +1512,329 @@ def parse_body[
     request.trailers = trailers^
     request.body = body^
     return ParseResult.complete(request^, consumed, expect_100, should_close)
+
+
+struct ResponseHeadOutcome(Movable):
+    var kind: UInt8
+    var consumed: Int
+    var status: Int
+    var reason: String
+    var version: HttpVersion
+    var headers: Headers
+    var framing: UInt8
+    var content_length: Int
+    var should_close: Bool
+    var error: ClientError
+
+    def __init__(out self):
+        self.kind = 0
+        self.consumed = 0
+        self.status = 0
+        self.reason = ""
+        self.version = HttpVersion.http11()
+        self.headers = Headers()
+        self.framing = 3
+        self.content_length = 0
+        self.should_close = False
+        self.error = ClientError.parse("")
+
+    @staticmethod
+    def failure(var message: String) -> Self:
+        var result = Self()
+        result.kind = 2
+        result.error = ClientError.parse(message^)
+        return result^
+
+    def is_need_more(self) -> Bool:
+        return self.kind == 0
+
+    def is_complete(self) -> Bool:
+        return self.kind == 1
+
+    def is_error(self) -> Bool:
+        return self.kind == 2
+
+
+def parse_response_head[
+    origin: ImmOrigin
+](
+    buf: Span[Byte, origin],
+    config: ServerConfig,
+    method: StringSlice = "GET",
+) -> ResponseHeadOutcome:
+    var line_end = _find_crlf(buf, 0)
+    if line_end < 0:
+        if len(buf) > config.max_response_headers_bytes:
+            return ResponseHeadOutcome.failure("response headers too large")
+        if _has_lone_lf_before(buf, 0, len(buf)):
+            return ResponseHeadOutcome.failure("bare LF in response status")
+        if len(buf) > config.max_request_line:
+            return ResponseHeadOutcome.failure("response status line too large")
+        return ResponseHeadOutcome()
+    if line_end + 2 > config.max_request_line:
+        return ResponseHeadOutcome.failure("response status line too large")
+    if line_end < 13:
+        return ResponseHeadOutcome.failure("invalid response status line")
+    var version = String(from_utf8_lossy=buf[:8])
+    if version != "HTTP/1.0" and version != "HTTP/1.1":
+        return ResponseHeadOutcome.failure("unsupported response version")
+    if buf[8] != Byte(ord(" ")) or buf[12] != Byte(ord(" ")):
+        return ResponseHeadOutcome.failure("invalid response status line")
+    var code = _parse_decimal(String(from_utf8_lossy=buf[9:12]), 599)
+    if code < 100:
+        return ResponseHeadOutcome.failure("invalid response status")
+    if code == 101:
+        return ResponseHeadOutcome.failure("protocol upgrades are unsupported")
+    for i in range(13, line_end):
+        if (buf[i] < 32 and buf[i] != Byte(ord("\t"))) or buf[i] == 127:
+            return ResponseHeadOutcome.failure("invalid response reason")
+    var result = ResponseHeadOutcome()
+    result.status = code
+    result.reason = String(from_utf8_lossy=buf[13:line_end])
+    if version == "HTTP/1.0":
+        result.version = HttpVersion.http10()
+        result.should_close = True
+    var pos = line_end + 2
+    var content_lengths = 0
+    var transfer = String("")
+    var transfer_seen = False
+    var length = -1
+    while True:
+        var end = _find_crlf(buf, pos)
+        if end < 0:
+            if _has_lone_lf_before(buf, pos, len(buf)):
+                return ResponseHeadOutcome.failure(
+                    "bare LF in response headers"
+                )
+            if len(buf) > config.max_response_headers_bytes:
+                return ResponseHeadOutcome.failure("response headers too large")
+            return ResponseHeadOutcome()
+        if end + 2 > config.max_response_headers_bytes:
+            return ResponseHeadOutcome.failure("response headers too large")
+        if end == pos:
+            pos += 2
+            break
+        if len(result.headers) >= config.max_response_headers_count:
+            return ResponseHeadOutcome.failure("too many response headers")
+        var colon = -1
+        for i in range(pos, end):
+            if buf[i] == Byte(ord(":")):
+                colon = i
+                break
+        if colon <= pos:
+            return ResponseHeadOutcome.failure("invalid response header")
+        var name = String(from_utf8_lossy=buf[pos:colon])
+        if not _is_token(name):
+            return ResponseHeadOutcome.failure("invalid response header name")
+        var start = colon + 1
+        var value_end = end
+        while start < value_end and (
+            buf[start] == Byte(ord(" ")) or buf[start] == Byte(ord("\t"))
+        ):
+            start += 1
+        while value_end > start and (
+            buf[value_end - 1] == Byte(ord(" "))
+            or buf[value_end - 1] == Byte(ord("\t"))
+        ):
+            value_end -= 1
+        try:
+            result.headers.add_bytes(name, buf[start:value_end])
+        except:
+            return ResponseHeadOutcome.failure("invalid response header value")
+        var lowered = name.lower()
+        var value = String(from_utf8_lossy=buf[start:value_end])
+        if lowered == "content-length":
+            content_lengths += 1
+            length = _parse_decimal(value, Int.MAX)
+            if length < 0 or content_lengths > 1:
+                return ResponseHeadOutcome.failure(
+                    "invalid or duplicate Content-Length"
+                )
+        elif lowered == "transfer-encoding":
+            if transfer_seen:
+                transfer += ","
+            transfer_seen = True
+            transfer += value
+        elif lowered == "connection":
+            var tokens = _split_comma_tokens(value)
+            for token in tokens:
+                if token.lower() == "close":
+                    result.should_close = True
+        pos = end + 2
+    if content_lengths > 0 and (code < 200 or code == 204):
+        return ResponseHeadOutcome.failure(
+            "Content-Length is forbidden for this response status"
+        )
+    if transfer_seen:
+        if version == "HTTP/1.0" or code < 200 or code == 204:
+            return ResponseHeadOutcome.failure(
+                "Transfer-Encoding is forbidden for this response"
+            )
+        if content_lengths > 0:
+            return ResponseHeadOutcome.failure(
+                "Content-Length with Transfer-Encoding"
+            )
+        var tokens = _split_comma_tokens(transfer)
+        if len(tokens) != 1 or tokens[0].lower() != "chunked":
+            return ResponseHeadOutcome.failure("unsupported Transfer-Encoding")
+    result.kind = 1
+    result.consumed = pos
+    result.content_length = length
+    if method == "HEAD" or code < 200 or code == 204 or code == 304:
+        result.framing = 3
+    elif transfer_seen:
+        result.framing = 1
+    elif length >= 0:
+        result.framing = 0
+    else:
+        result.framing = 2
+        result.should_close = True
+    return result^
+
+
+struct ResponseBodyOutcome(Movable):
+    var kind: UInt8
+    var consumed: Int
+    var body: List[Byte]
+    var trailers: Headers
+    var error: ClientError
+
+    def __init__(out self):
+        self.kind = 0
+        self.consumed = 0
+        self.body = List[Byte]()
+        self.trailers = Headers()
+        self.error = ClientError.parse("")
+
+    @staticmethod
+    def failure(kind: UInt8, var message: String) -> Self:
+        var result = Self()
+        result.kind = 2
+        result.error = ClientError(kind, message^)
+        return result^
+
+    def is_need_more(self) -> Bool:
+        return self.kind == 0
+
+    def is_complete(self) -> Bool:
+        return self.kind == 1
+
+    def is_error(self) -> Bool:
+        return self.kind == 2
+
+
+struct _ResponseBodyScan(Copyable, Movable):
+    var wire: Int
+    var metadata: Int
+    var decoded: Int
+
+    def __init__(out self):
+        self.wire = 0
+        self.metadata = 0
+        self.decoded = 0
+
+
+def parse_response_body[
+    origin: ImmOrigin
+](
+    head: ResponseHeadOutcome,
+    buf: Span[Byte, origin],
+    config: ServerConfig,
+    eof: Bool = False,
+) -> ResponseBodyOutcome:
+    """Decodes complete input; incremental callers retain a scan state."""
+    var scan = _ResponseBodyScan()
+    return parse_response_body(head, buf, config, scan, eof)
+
+
+def parse_response_body[
+    origin: ImmOrigin
+](
+    head: ResponseHeadOutcome,
+    buf: Span[Byte, origin],
+    config: ServerConfig,
+    mut scan_state: _ResponseBodyScan,
+    eof: Bool = False,
+) -> ResponseBodyOutcome:
+    if not head.is_complete():
+        return ResponseBodyOutcome.failure(
+            ClientError.PARSE, "response head is incomplete"
+        )
+    var result = ResponseBodyOutcome()
+    if head.framing == 3:
+        result.kind = 1
+        return result^
+    if head.framing == 0 or head.framing == 2:
+        var length = head.content_length
+        if head.framing == 2:
+            length = len(buf)
+        if length > config.max_body_bytes:
+            return ResponseBodyOutcome.failure(
+                ClientError.BODY_TOO_LARGE, "response body too large"
+            )
+        if len(buf) < length:
+            if eof:
+                return ResponseBodyOutcome.failure(
+                    ClientError.READ, "truncated response body"
+                )
+            return result^
+        if head.framing == 2 and not eof:
+            return result^
+        result.body.extend(buf[:length])
+        result.consumed = length
+        result.kind = 1
+        return result^
+    var scan = _scan_chunked(
+        buf, config, scan_state.wire, scan_state.metadata, scan_state.decoded
+    )
+    if scan.is_need_more():
+        if eof:
+            return ResponseBodyOutcome.failure(
+                ClientError.READ, "truncated chunked response"
+            )
+        return result^
+    if scan.is_error():
+        var kind = ClientError.PARSE
+        if scan.error.status == 413 or scan.error.status == 431:
+            kind = ClientError.BODY_TOO_LARGE
+        return ResponseBodyOutcome.failure(kind, scan.error.message.copy())
+    result.body.reserve(scan.decoded)
+    var pos = 0
+    while True:
+        var end = _find_crlf(buf, pos)
+        var size, _, _ = _split_chunk_size(String(from_utf8_lossy=buf[pos:end]))
+        var length = _parse_hex_size(size)
+        pos = end + 2
+        if length == 0:
+            break
+        result.body.extend(buf[pos : pos + length])
+        pos += length + 2
+    while True:
+        var end = _find_crlf(buf, pos)
+        if end == pos:
+            break
+        var colon = pos
+        while buf[colon] != Byte(ord(":")):
+            colon += 1
+        var name = String(from_utf8_lossy=buf[pos:colon])
+        var start = colon + 1
+        var value_end = end
+        while start < value_end and (
+            buf[start] == Byte(ord(" ")) or buf[start] == Byte(ord("\t"))
+        ):
+            start += 1
+        while value_end > start and (
+            buf[value_end - 1] == Byte(ord(" "))
+            or buf[value_end - 1] == Byte(ord("\t"))
+        ):
+            value_end -= 1
+        try:
+            result.trailers.add_bytes(name, buf[start:value_end])
+        except:
+            return ResponseBodyOutcome.failure(
+                ClientError.PARSE, "invalid response trailer"
+            )
+        pos = end + 2
+    result.kind = 1
+    result.consumed = scan.consumed
+    return result^

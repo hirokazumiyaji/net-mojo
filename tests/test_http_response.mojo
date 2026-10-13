@@ -1126,5 +1126,80 @@ def test_switch_wire_rejects_content_and_invalid_status_without_reserving() rais
         assert_equal(budget.used, 7)
 
 
+def test_request_encoder_defaults_and_bytes() raises:
+    from net.http import Headers
+    from net.http._encoder import encode_request_head
+
+    var headers = Headers()
+    headers.add("X-Test", "yes")
+    var encoded = encode_request_head(
+        "POST", "/a?q=1", "example.com:8080", headers, 3, False, "net-mojo"
+    )
+    var text = String(from_utf8_lossy=encoded)
+    assert_true(text.startswith("POST /a?q=1 HTTP/1.1\r\n"))
+    assert_true(text.find("Host: example.com:8080\r\n") >= 0)
+    assert_true(text.find("Content-Length: 3\r\n") >= 0)
+    assert_true(text.find("User-Agent: net-mojo\r\n") >= 0)
+    assert_true(text.endswith("\r\n\r\n"))
+    var chunked = encode_request_head(
+        "POST", "/", "example.com", Headers(), -1, True
+    )
+    assert_true(
+        String(from_utf8_lossy=chunked).find("Transfer-Encoding: chunked\r\n")
+        >= 0
+    )
+
+
+def test_request_encoder_rejects_invalid_framing() raises:
+    from net.http import Headers, ClientError
+    from net.http._encoder import encode_request_head
+
+    var mismatch = Headers()
+    mismatch.add("Content-Length", "9")
+    var caught = False
+    try:
+        var _ = encode_request_head("POST", "/", "example.com", mismatch, 3)
+    except error:
+        assert_equal(error.kind, ClientError.PARSE)
+        caught = True
+    assert_true(caught)
+    caught = False
+    try:
+        var _ = encode_request_head(
+            "GET\r\nX:y", "/", "example.com", Headers(), 0
+        )
+    except error:
+        assert_equal(error.kind, ClientError.PARSE)
+        caught = True
+    assert_true(caught)
+
+
+def test_request_encoder_rejects_authority_injection() raises:
+    from net.http import Headers, ClientError
+    from net.http._encoder import encode_request_head
+
+    var caught = False
+    try:
+        var _ = encode_request_head(
+            "GET", "/", "example.com#\r\nX-Injected: yes", Headers(), 0
+        )
+    except error:
+        assert_equal(error.kind, ClientError.PARSE)
+        caught = True
+    assert_true(caught)
+
+
+def test_request_encoder_accepts_content_length_ows() raises:
+    from net.http import Headers
+    from net.http._encoder import encode_request_head
+
+    var headers = Headers()
+    headers.add("Content-Length", " 3 ")
+    var encoded = encode_request_head("POST", "/", "example.com", headers, 3)
+    assert_true(
+        String(from_utf8_lossy=encoded).find("Content-Length:  3 \r\n") >= 0
+    )
+
+
 def main() raises:
     TestSuite.discover_tests[__functions_in_module()]().run()

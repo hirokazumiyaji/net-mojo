@@ -13,7 +13,11 @@ from net.error import NetError, NetErrorKind
 
 from ._buffer import _CapacityBudget
 from .error import _status_reason
-from .headers import Headers, _trailer_forbidden
+from .headers import Headers, _parse_decimal, _trailer_forbidden
+from .client_error import ClientError
+from ._parser import _is_token, _trim_ows
+from ._authority import _host_is_valid
+from ._url import parse_url
 from .response import ResponseWriter, has_body_for_status
 
 
@@ -1020,3 +1024,158 @@ def _encode_chunk_end_budgeted[
         out.extend("\r\n".as_bytes())
     out.extend("\r\n".as_bytes())
     return out^
+
+
+def _render_request[
+    measure: Bool
+](
+    mut out: List[Byte],
+    method: StringSlice,
+    target: StringSlice,
+    authority: StringSlice,
+    headers: Headers,
+    body_length: Int,
+    chunked: Bool,
+    user_agent: StringSlice,
+    mut byte_count: Int,
+):
+    _append_response_string[measure](out, method, byte_count)
+    _append_response_string[measure](out, " ", byte_count)
+    _append_response_string[measure](out, target, byte_count)
+    _append_response_string[measure](out, " HTTP/1.1\r\n", byte_count)
+    for i in range(len(headers)):
+        _append_response_string[measure](out, headers.name_at(i), byte_count)
+        _append_response_string[measure](out, ": ", byte_count)
+        _append_response_bytes[measure](
+            out, headers._value_bytes_span(i), byte_count
+        )
+        _append_response_string[measure](out, "\r\n", byte_count)
+    if headers.count("host") == 0:
+        _append_response_string[measure](out, "Host: ", byte_count)
+        _append_response_string[measure](out, authority, byte_count)
+        _append_response_string[measure](out, "\r\n", byte_count)
+    if chunked and headers.count("transfer-encoding") == 0:
+        _append_response_string[measure](
+            out, "Transfer-Encoding: chunked\r\n", byte_count
+        )
+    elif not chunked and headers.count("content-length") == 0:
+        _append_response_string[measure](out, "Content-Length: ", byte_count)
+        _append_response_string[measure](out, String(body_length), byte_count)
+        _append_response_string[measure](out, "\r\n", byte_count)
+    if len(user_agent.as_bytes()) > 0 and headers.count("user-agent") == 0:
+        _append_response_string[measure](out, "User-Agent: ", byte_count)
+        _append_response_string[measure](out, user_agent, byte_count)
+        _append_response_string[measure](out, "\r\n", byte_count)
+    _append_response_string[measure](out, "\r\n", byte_count)
+
+
+def encode_request_head(
+    method: StringSlice,
+    target: StringSlice,
+    authority: StringSlice,
+    headers: Headers,
+    body_length: Int,
+    chunked: Bool = False,
+    user_agent: StringSlice = "",
+    max_header_bytes: Int = 32768,
+    max_header_count: Int = 100,
+) raises ClientError -> List[Byte]:
+    if not _is_token(method) or method == "CONNECT":
+        raise ClientError.parse("invalid or unsupported request method")
+    if not _host_is_valid(authority):
+        raise ClientError.parse("invalid request authority")
+    if not String(target).startswith("/"):
+        raise ClientError.parse("expected an origin-form request target")
+    var url = parse_url(String("http://") + String(authority) + String(target))
+    if url.target != target:
+        raise ClientError.parse("invalid request target")
+    if headers.count("host") > 1 or headers.count("upgrade") > 0:
+        raise ClientError.parse("invalid Host or unsupported Upgrade")
+    if headers.count("host") == 1:
+        if not _host_is_valid(headers.get_first("host").value()):
+            raise ClientError.parse("invalid Host")
+    if (
+        headers.count("content-length") > 1
+        or headers.count("transfer-encoding") > 1
+    ):
+        raise ClientError.parse("duplicate request framing header")
+    if chunked:
+        if headers.count("content-length") > 0:
+            raise ClientError.parse("Content-Length with chunked request")
+        if headers.count("transfer-encoding") == 1:
+            if (
+                _trim_ows(
+                    headers.get_first("transfer-encoding").value()
+                ).lower()
+                != "chunked"
+            ):
+                raise ClientError.parse("unsupported request Transfer-Encoding")
+    else:
+        if body_length < 0 or headers.count("transfer-encoding") > 0:
+            raise ClientError.parse("invalid request body framing")
+        if headers.count("content-length") == 1:
+            if (
+                _parse_decimal(
+                    _trim_ows(headers.get_first("content-length").value()),
+                    Int.MAX,
+                )
+                != body_length
+            ):
+                raise ClientError.parse(
+                    "request Content-Length differs from body length"
+                )
+    var header_count = len(headers)
+    if headers.count("host") == 0:
+        header_count += 1
+    if (
+        headers.count("content-length") == 0
+        and headers.count("transfer-encoding") == 0
+    ):
+        header_count += 1
+    if len(user_agent.as_bytes()) > 0 and headers.count("user-agent") == 0:
+        var checked = Headers()
+        try:
+            checked.add("User-Agent", String(user_agent))
+        except:
+            raise ClientError.parse("invalid User-Agent")
+        header_count += 1
+    if header_count > max_header_count:
+        raise ClientError.parse("request headers exceed count limit")
+    var out = List[Byte]()
+    var count = 0
+    _render_request[True](
+        out,
+        method,
+        target,
+        authority,
+        headers,
+        body_length,
+        chunked,
+        user_agent,
+        count,
+    )
+    if count > max_header_bytes:
+        raise ClientError.parse("request headers exceed byte limit")
+    out.reserve(count)
+    _render_request[False](
+        out,
+        method,
+        target,
+        authority,
+        headers,
+        body_length,
+        chunked,
+        user_agent,
+        count,
+    )
+    return out^
+
+
+def encode_request_chunk[
+    origin: ImmOrigin
+](data: Span[Byte, origin]) -> List[Byte]:
+    return encode_chunk(data)
+
+
+def encode_request_chunk_end() -> List[Byte]:
+    return encode_chunk_end()
