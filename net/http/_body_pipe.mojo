@@ -128,6 +128,13 @@ struct _BodyPipe(Copyable):
         return True
 
     def push_eof(self, var trailers: Headers = Headers()) raises NetError:
+        if not self._try_push_eof(trailers):
+            raise _body_error(
+                NetErrorKind.invalid_argument(),
+                "body trailers exceed buffer budget",
+            )
+
+    def _try_push_eof(self, mut trailers: Headers) raises NetError -> Bool:
         ref state = self._state[]
         state.mutex.lock()
         if state.finished or state.cancelled:
@@ -135,19 +142,24 @@ struct _BodyPipe(Copyable):
             raise _body_error(
                 NetErrorKind.invalid_state(), "body already terminated"
             )
-        if not trailers._adopt_capacity_budget(Optional(state.budget.copy())):
+        if trailers._known_capacity() > state.budget.total():
             state.mutex.unlock()
             raise _body_error(
                 NetErrorKind.invalid_argument(),
-                "body trailers exceed buffer budget",
+                "body trailers exceed total buffer budget",
             )
+        if not trailers._adopt_capacity_budget(Optional(state.budget.copy())):
+            state.mutex.unlock()
+            return False
         var trailers_ptr = Pointer(to=state.terminal_trailers)
         var previous = trailers_ptr.unsafe_take_pointee()
         trailers_ptr.unsafe_write(trailers^)
         _ = previous^
+        trailers = Headers()
         state.finished = True
         state.condition.broadcast()
         state.mutex.unlock()
+        return True
 
     def pop[
         origin: MutOrigin
@@ -256,6 +268,24 @@ struct _BodyPipe(Copyable):
         state.mutex.lock()
         var count = state.consumed
         state.consumed = 0
+        state.mutex.unlock()
+        return count
+
+    def writable_bytes(self) -> Int:
+        ref state = self._state[]
+        state.mutex.lock()
+        if state.discarded:
+            var count = state.limit
+            state.mutex.unlock()
+            return count
+        var pending = len(state.bytes) - state.head
+        var length = pending if state.head >= len(state.bytes) // 2 else len(
+            state.bytes
+        )
+        var room = (
+            max(state.bytes.capacity(), state.budget.remaining()) - length
+        )
+        var count = max(0, min(state.limit - pending, room))
         state.mutex.unlock()
         return count
 
