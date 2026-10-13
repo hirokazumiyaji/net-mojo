@@ -289,7 +289,9 @@ test-prop-timeout = "mojo run --Werror -I . tests/prop/test_prop_timeout.mojo"
 test-prop-mailbox = "mojo run --Werror -I . tests/prop/test_prop_mailbox.mojo"
 test-prop-http1-parser = "mojo run --Werror -I . tests/prop/test_prop_http1_parser.mojo"
 test-prop-http1-chunked = "mojo run --Werror -I . tests/prop/test_prop_http1_chunked.mojo"
-test-prop = { depends-on = ["test-prop-http1-parser", "test-prop-http1-chunked", "test-prop-ip", "test-prop-address", "test-prop-timeout", "test-prop-mailbox"] }
+test-prop-http2-flow = "mojo run --Werror -I . tests/prop/test_prop_http2_flow.mojo"
+test-prop-http2-stream = "mojo run --Werror -I . tests/prop/test_prop_http2_stream.mojo"
+test-prop = { depends-on = ["test-prop-http2-flow", "test-prop-http2-stream", "test-prop-http1-parser", "test-prop-http1-chunked", "test-prop-ip", "test-prop-address", "test-prop-timeout", "test-prop-mailbox"] }
 
 [feature.proptest-http2.tasks]
 test-prop-hpack = { cmd = "mojo run --Werror -I . tests/prop/test_prop_hpack.mojo", depends-on = ["hpack-test"] }
