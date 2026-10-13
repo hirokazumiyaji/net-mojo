@@ -234,7 +234,9 @@ struct _ClientPool(Movable):
         self.state = ArcPointer(_ClientPoolState(config))
         self.state[].mutex._initialize()
 
-    def acquire(mut self, url: ParsedUrl) raises ClientError -> _ClientLease:
+    def acquire(
+        mut self, url: ParsedUrl, fresh: Bool = False
+    ) raises ClientError -> _ClientLease:
         var key = url.scheme + "|" + url.host + "|" + String(url.port)
         self.state[].mutex.lock()
         if self.state[].closed:
@@ -250,7 +252,7 @@ struct _ClientPool(Movable):
             self.state[].origins.append(
                 _ClientOriginPool(key^, List[_IdleClientConnection](), 0)
             )
-        while len(self.state[].origins[origin].idle) > 0:
+        while not fresh and len(self.state[].origins[origin].idle) > 0:
             var idle = self.state[].origins[origin].idle.pop()
             if (
                 UInt64(perf_counter_ns() - idle.idle_since)

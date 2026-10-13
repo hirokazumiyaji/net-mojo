@@ -1,5 +1,6 @@
 from std.ffi import c_int, c_ulong, external_call
 from std.memory import ArcPointer
+from std.time import sleep
 from std.testing import assert_equal, assert_true, TestSuite
 from net import TCPConn, TCPListener, Timeout, listen_tcp
 from net.http import (
@@ -26,9 +27,14 @@ struct _FixtureState(Movable):
     var served: Int
     var failed: Bool
     var requests: List[String]
+    var wires: List[String]
+    var reply_delay: Float64
 
     def __init__(
-        out self, var listener: TCPListener, var replies: List[String]
+        out self,
+        var listener: TCPListener,
+        var replies: List[String],
+        reply_delay: Float64,
     ):
         self.listener = listener^
         self.replies = replies^
@@ -36,6 +42,8 @@ struct _FixtureState(Movable):
         self.served = 0
         self.failed = False
         self.requests = List[String]()
+        self.wires = List[String]()
+        self.reply_delay = reply_delay
 
 
 def _fixture_entry(
@@ -65,6 +73,7 @@ def _fixture_entry(
             if request.is_error():
                 state[].failed = True
                 return arg
+            state[].wires.append(String(from_utf8_lossy=wire))
             state[].requests.append(
                 request.request.method
                 + " "
@@ -73,11 +82,15 @@ def _fixture_entry(
                 + String(from_utf8_lossy=request.request.body)
             )
             var reply = state[].replies[state[].served].copy()
+            if state[].reply_delay:
+                sleep(state[].reply_delay)
             connection.value().write_all(reply.as_bytes(), Timeout.seconds(3))
             state[].served += 1
             wire.clear()
-            if reply.find("Connection: close") >= 0 or reply.startswith(
-                "HTTP/1.0"
+            if (
+                reply.byte_length() == 0
+                or reply.find("Connection: close") >= 0
+                or reply.startswith("HTTP/1.0")
             ):
                 connection = None
     except:
@@ -91,10 +104,12 @@ struct _Fixture(Movable):
     var joined: Bool
     var url: String
 
-    def __init__(out self, var replies: List[String]) raises:
+    def __init__(
+        out self, var replies: List[String], reply_delay: Float64 = 0
+    ) raises:
         var listener = listen_tcp("127.0.0.1:0")
         self.url = String("http://") + String(listener.local_address())
-        self.state = ArcPointer(_FixtureState(listener^, replies^))
+        self.state = ArcPointer(_FixtureState(listener^, replies^, reply_delay))
         self.handle = 0
         self.joined = True
         var rc = external_call["pthread_create", c_int](

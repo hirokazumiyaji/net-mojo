@@ -292,6 +292,10 @@ jobs:
         run: pixi run test-http-client
       - name: Test HTTP URL parser
         run: pixi run test-http-url
+      - name: Test HTTP client redirects
+        run: pixi run test-http-client-redirect
+      - name: Test HTTP client resiliency
+        run: pixi run test-http-client-resiliency
       - name: Test HTTP parser
         run: pixi run test-http-parser
       - name: Test HTTP response
@@ -407,6 +411,10 @@ jobs:
         run: pixi run sanitize-http-client
       - name: Sanitize HTTP URL parser
         run: pixi run sanitize-http-url
+      - name: Sanitize HTTP client redirects
+        run: pixi run sanitize-http-client-redirect
+      - name: Sanitize HTTP client resiliency
+        run: pixi run sanitize-http-client-resiliency
       - name: Sanitize HTTP parser
         run: pixi run sanitize-http-parser
       - name: Sanitize request body pipe

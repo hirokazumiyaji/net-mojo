@@ -9,18 +9,20 @@ from net.tls import TLSContext
 from net.timeout import _Deadline
 from .client_error import ClientError
 from .client_config import ClientConfig
-from .client_request import ClientRequest
+from .client_request import ClientRequest, ClientRequestBody
 from .client_response import Response, ResponseBody
 from .config import ServerConfig
 from ._client_pool import (
     _ClientPool,
+    _ClientLease,
     _ClientConnection,
     _client_transport,
     _phase_deadline,
 )
 from ._encoder import encode_request_head, _has_close_token
 from ._parser import parse_response_head
-from ._url import parse_url
+from ._url import parse_url, resolve_redirect
+from .headers import Headers
 
 
 struct Client(Movable):
@@ -52,10 +54,74 @@ struct Client(Movable):
         if request.deadline:
             timeout = request.deadline.value().copy()
         var deadline = _Deadline.from_timeout(timeout)
-        return self._request(request, deadline)
+        var hops = 0
+        while True:
+            var response = self._request(request, deadline)
+            if not self._config.redirect.follow or (
+                response.status != 301
+                and response.status != 302
+                and response.status != 303
+                and response.status != 307
+                and response.status != 308
+            ):
+                return response^
+            var location = response.headers.get_first("location")
+            if not location:
+                return response^
+            if hops >= self._config.redirect.max_hops:
+                raise ClientError(
+                    ClientError.REDIRECT, "HTTP redirect limit exceeded"
+                )
+            var previous = parse_url(request.url)
+            var next_url: String
+            try:
+                next_url = resolve_redirect(previous, location.value())
+            except error:
+                raise ClientError(ClientError.REDIRECT, error.message.copy())
+            var next_origin = parse_url(next_url)
+            var rewrite = (
+                response.status <= 303
+                and request.method != "GET"
+                and request.method != "HEAD"
+            )
+            var headers = Headers()
+            try:
+                for i in range(len(request.headers)):
+                    var name = request.headers.name_at(i)
+                    var lower = name.lower()
+                    if not previous.same_origin(next_origin) and (
+                        lower == "authorization"
+                        or lower == "cookie"
+                        or lower == "host"
+                    ):
+                        continue
+                    if rewrite and (
+                        lower == "content-length"
+                        or lower == "transfer-encoding"
+                        or lower == "content-type"
+                    ):
+                        continue
+                    headers.add_bytes(
+                        name^, request.headers._value_bytes_span(i)
+                    )
+            except error:
+                raise _client_transport(ClientError.PARSE, error^)
+            try:
+                response.close()
+            except:
+                pass
+            request.headers = headers^
+            request.url = next_url^
+            if rewrite:
+                request.method = "GET"
+                request.body = ClientRequestBody.empty()
+            hops += 1
 
     def _request(
-        mut self, request: ClientRequest, deadline: _Deadline
+        mut self,
+        request: ClientRequest,
+        deadline: _Deadline,
+        allow_retry: Bool = True,
     ) raises ClientError -> Response:
         var url = parse_url(request.url)
         if deadline.expired():
@@ -73,7 +139,7 @@ struct Client(Movable):
             False,
             self._config.user_agent,
         )
-        var lease = self._pool.acquire(url)
+        var lease = self._pool.acquire(url, fresh=not allow_retry)
         if not lease.connection:
             var connect_deadline = _phase_deadline(
                 deadline, self._config.connect_timeout
@@ -109,6 +175,39 @@ struct Client(Movable):
                 lease.connection.value().handshake(connect_deadline)
             else:
                 lease.connection = _ClientConnection(socket^)
+        var reused = lease.reused
+        var response_started = False
+        try:
+            return self._exchange(
+                request, head, lease^, deadline, response_started
+            )
+        except error:
+            var eligible = (
+                request.method == "GET"
+                or request.method == "HEAD"
+                or request.headers.count("idempotency-key") > 0
+            )
+            if (
+                allow_retry
+                and reused
+                and eligible
+                and not response_started
+                and (
+                    error.kind == ClientError.READ
+                    or error.kind == ClientError.WRITE
+                )
+            ):
+                return self._request(request, deadline, False)
+            raise error^
+
+    def _exchange(
+        mut self,
+        request: ClientRequest,
+        head: List[Byte],
+        var lease: _ClientLease,
+        deadline: _Deadline,
+        mut response_started: Bool,
+    ) raises ClientError -> Response:
         lease.connection.value().write_all(Span(head), deadline)
         lease.connection.value().write_all(Span(request.body.bytes), deadline)
         var header_deadline = _phase_deadline(
@@ -165,6 +264,7 @@ struct Client(Movable):
                     ClientError.READ,
                     "connection closed before response headers",
                 )
+            response_started = True
             wire.extend(Span(scratch)[:count])
 
     def close(mut self):
