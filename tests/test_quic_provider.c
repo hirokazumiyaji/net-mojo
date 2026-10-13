@@ -81,7 +81,8 @@ static int test_request_input_ffi(struct NetQuicServer *server) {
         net_quic_set_request_streaming(server, 1) != 1 ||
         net_quic_next_request_head(server, body, sizeof(body)) != 0 ||
         net_quic_read_body(server, 1, body, sizeof(body)) != -2 ||
-        net_quic_read_body(server, 1, body, 0) != -3 ||
+        net_quic_read_body(server, 1, body, 0) != -2 ||
+        net_quic_read_body(server, 1, NULL, 0) != -3 ||
         net_quic_consume_body(server, 1, 1) != -1 ||
         net_quic_body_trailers(server, 1, body, sizeof(body)) != -1 ||
         net_quic_release_body(server, 1, 0) != -1 ||

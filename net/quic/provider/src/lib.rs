@@ -576,7 +576,7 @@ pub unsafe extern "C" fn net_quic_server_read_body(
     output: *mut u8,
     capacity: usize,
 ) -> i64 {
-    if server.is_null() || output.is_null() || capacity == 0 || capacity > isize::MAX as usize {
+    if server.is_null() || output.is_null() || capacity > isize::MAX as usize {
         return -3;
     }
     let output = unsafe { std::slice::from_raw_parts_mut(output, capacity) };
@@ -2626,7 +2626,11 @@ impl QuicServer {
                 .saturating_sub(request.unconsumed),
         );
         if capacity == 0 {
-            return -1;
+            let _ = self.poll_requests(key.clone());
+            let Some((key, stream_id)) = self.input_routes.get(&request_id) else {
+                return -2;
+            };
+            return if self.connections[key].requests[stream_id].eof { 0 } else { -1 };
         }
         for attempt in 0..2 {
             let connection = self.connections.get_mut(&key).unwrap();

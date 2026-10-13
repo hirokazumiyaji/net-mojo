@@ -307,13 +307,9 @@ def test_request_input_ffi_unknown_and_typed_cancellation() raises:
     except error:
         rejected = error.kind == NetErrorKind.invalid_state()
     assert_true(rejected)
-    var empty = List[Byte]()
-    rejected = False
-    try:
-        _ = endpoint.read_body(UInt64(1), Span[mut=True](empty))
-    except error:
-        rejected = error.kind == NetErrorKind.invalid_argument()
-    assert_true(rejected)
+    result = endpoint.read_body(UInt64(1), Span[mut=True](output)[:0])
+    assert_true(result.state == QuicBodyReadState.cancelled())
+    assert_true(result.count == 0)
 
 
 def main() raises:

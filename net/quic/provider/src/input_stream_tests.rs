@@ -428,3 +428,29 @@ fn provider_input_stream_unread_payload_stays_in_bounded_receive_pool() {
     assert_eq!(server.receive_budget.usage().request.backing_bytes, 0);
     assert_eq!(server.buffered_request_bytes, 0);
 }
+
+#[test]
+fn provider_input_empty_probe_observes_eof_and_reset_without_consumption() {
+    let mut server = input_stream_server();
+    server.max_request_body_bytes = 4;
+    let mut peers = vec![ReceiveBudgetPeer::new(&mut server, 114)];
+    let stream = input_stream_post(&mut peers[0], Some(4));
+    input_stream_pump(&mut server, &mut peers);
+    let head = server.next_request().unwrap();
+    let mut output = [0; 4];
+    assert_eq!(unsafe { super::net_quic_server_read_body(std::ptr::null_mut(), head.id, output.as_mut_ptr(), 0) }, -3);
+    assert_eq!(input_stream_send(&mut peers[0], stream, b"data", false), Ok(4));
+    input_stream_send_trailers(&mut peers[0], stream);
+    input_stream_pump(&mut server, &mut peers);
+    assert_eq!(server.read_body(head.id, &mut output), 4);
+    let mut wrapped = super::NetQuicServer { _inner: server };
+    assert_eq!(unsafe { super::net_quic_server_read_body(&mut wrapped, head.id, output.as_mut_ptr(), 0) }, 0);
+    let mut server = wrapped._inner;
+    let (key, id) = server.input_routes[&head.id].clone();
+    assert_eq!(server.connections[&key].requests[&id].unconsumed, 4);
+    assert_eq!(server.connections[&key].requests[&id].trailers,
+        vec![(b"x-input-end".to_vec(), b"yes".to_vec())]);
+    assert!(server.consume_body(head.id, 4));
+    assert!(server.release_body(head.id, false));
+    assert_eq!(server.read_body(head.id, &mut output[..0]), -2);
+}
