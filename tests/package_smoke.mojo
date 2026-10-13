@@ -1,6 +1,10 @@
 from net import Timeout, dial_tcp, listen_tcp
 from net.http import (
+    DefaultHandlerFactory,
+    Handler,
     Headers,
+    Request,
+    ServerPool,
     ResponseSender,
     ResponseWriter,
     ServerConfig,
@@ -45,6 +49,25 @@ def _check_http_codec() raises:
         raise Error("packaged ResponseSender is_active mismatch")
 
 
+struct _PoolSmokeHandler(Copyable, Handler):
+    def __init__(out self):
+        pass
+
+    def handle(mut self, request: Request, mut writer: ResponseWriter) raises:
+        writer.write_string("ok")
+
+
+def _check_http_pool() raises:
+    var pool = ServerPool(ServerConfig.default(), workers=1)
+    pool.add_listener(listen_tcp("127.0.0.1:0"))
+    var control = pool.control()
+    control.request_shutdown()
+    var factory = DefaultHandlerFactory[_PoolSmokeHandler](_PoolSmokeHandler())
+    pool.serve(factory)
+    if not control.is_shutdown_requested():
+        raise Error("packaged ServerPool shutdown failed")
+
+
 def main() raises:
     var listener = listen_tcp("127.0.0.1:0")
     var client = dial_tcp(String(listener.local_address()), Timeout.seconds(1))
@@ -61,3 +84,5 @@ def main() raises:
     print("packaged artifact roundtrip succeeded")
     _check_http_codec()
     print("packaged net.http codec succeeded")
+    _check_http_pool()
+    print("packaged net.http pool succeeded")

@@ -246,6 +246,52 @@ are successful no-ops. Synchronous handlers must still return before shutdown
 can progress. See `tests/test_http_control.mojo` and
 `test_shutdown_drains_in_flight_and_exits` in `tests/test_http_server.mojo`.
 
+### Multiple HTTP workers
+
+`ServerPool` runs independent event loops on OS threads over one shared TCP
+listener. Each connection stays on the worker that accepted it. The factory
+builds a separate handler for each worker before any worker starts. Using `HelloHandler` above:
+
+```mojo
+from net.http import HandlerFactory, ServerConfig, listen_and_serve_pool
+
+struct HelloFactory(HandlerFactory):
+    comptime HandlerType = HelloHandler
+
+    def __init__(out self):
+        pass
+
+    def build(mut self, worker_id: Int) raises -> HelloHandler:
+        return HelloHandler()
+
+def main() raises:
+    var factory = HelloFactory()
+    listen_and_serve_pool("127.0.0.1:8080", ServerConfig.default(), factory, workers=4)
+```
+
+`workers=0` detects online CPUs; explicit counts are clamped to 1–1024.
+`DefaultHandlerFactory[H](handler)` copies a `Copyable` handler for each worker.
+Any state deliberately shared by handlers must support concurrent access.
+`Server` and `listen_and_serve` continue to run one event loop.
+
+Every `ServerConfig` bound is **per worker**: four workers with the default
+configuration allow up to 40,000 TCP connections and 1 GiB of aggregate buffer
+budget. A synchronous handler blocks its own worker, and must return before
+that worker can process a shutdown request.
+
+For a custom listener or TLS, construct `ServerPool(config, workers=N)`, call
+`add_listener(listener^)` or `add_tls_listener(listener^, tls_context^)`, then
+`serve(factory)`. Keep a copy from `pool.control()` to request shutdown from
+another thread. Each worker has its own wakeup channel; one request wakes all
+workers. `serve` joins every worker before returning and propagates startup or
+worker errors after shutdown cleanup. A pool serves once. Linux listener
+registrations use `EPOLLEXCLUSIVE`; macOS uses kqueue and handles competing
+accepts as would-block.
+
+Run `pixi run test-http-pool` and
+`pixi run -e tls-http2 http-pool-integration-test` for plain/TLS HTTP/1.1 and
+HTTP/2 coverage.
+
 Reproduce the performance comparison with
 `benchmarks/http/README.md` (Go baseline in `benchmarks/http_go`,
 parser benchmark `pixi run benchmark-http-parse`, server benchmark

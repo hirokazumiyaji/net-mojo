@@ -191,6 +191,11 @@ void *net_tls_context_server(const char *certificate, const char *private_key,
     return context;
 }
 
+void net_tls_context_retain(void *opaque) {
+    struct net_tls_context *context = opaque;
+    atomic_fetch_add_explicit(&context->references, 1, memory_order_relaxed);
+}
+
 void net_tls_context_free(void *opaque) {
     if (opaque != NULL) {
         net_tls_context_release(opaque);

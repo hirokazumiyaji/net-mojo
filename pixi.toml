@@ -27,6 +27,7 @@ test-udp = "mojo run --Werror -I . tests/test_udp.mojo"
 test-unix = "mojo run --Werror -I . tests/test_unix.mojo"
 test-poll = "mojo run --Werror -I . tests/test_poll.mojo"
 test-reactor = "mojo run --Werror -I . tests/test_reactor.mojo"
+test-http-pool = "mojo run --Werror -I . tests/test_http_pool.mojo"
 test-http-control = "mojo run --Werror -I . tests/test_http_control.mojo"
 test-http-api = "mojo run --Werror -I . tests/test_http_api.mojo"
 test-http-parser = "mojo run --Werror -I . tests/test_http_parser.mojo"
@@ -42,6 +43,7 @@ sanitize-unix = { cmd = "bash scripts/run_sanitized.sh tests/test_unix.mojo", de
 sanitize-reactor = { cmd = "bash scripts/run_sanitized.sh tests/test_reactor.mojo", default-environment = "sanitize" }
 sanitize-actor = { cmd = "bash scripts/run_sanitized.sh tests/test_actor.mojo", default-environment = "sanitize" }
 sanitize-http-api = { cmd = "bash scripts/run_sanitized.sh tests/test_http_api.mojo", default-environment = "sanitize" }
+sanitize-http-pool = { cmd = "bash scripts/run_sanitized.sh tests/test_http_pool.mojo", default-environment = "sanitize" }
 sanitize-http-control = { cmd = "bash scripts/run_sanitized.sh tests/test_http_control.mojo", default-environment = "sanitize" }
 sanitize-http-parser = { cmd = "bash scripts/run_sanitized.sh tests/test_http_parser.mojo", default-environment = "sanitize" }
 sanitize-http-response = { cmd = "bash scripts/run_sanitized.sh tests/test_http_response.mojo", default-environment = "sanitize" }
@@ -60,6 +62,7 @@ sanitize = { depends-on = [
   { task = "sanitize-actor", environment = "sanitize" },
   { task = "sanitize-http-api", environment = "sanitize" },
   { task = "sanitize-http-control", environment = "sanitize" },
+  { task = "sanitize-http-pool", environment = "sanitize" },
   { task = "sanitize-http-parser", environment = "sanitize" },
   { task = "sanitize-http-response", environment = "sanitize" },
   { task = "sanitize-http-server", environment = "sanitize" },
@@ -78,6 +81,7 @@ test = { depends-on = [
   "test-reactor",
   "test-http-api",
   "test-http-control",
+  "test-http-pool",
   "test-http-parser",
   "test-http-response",
   "test-http-server",
@@ -138,6 +142,10 @@ http2-example-build = { cmd = "bash scripts/check_http2_example.sh", depends-on 
   "hpack-test",
 ] }
 http-app-contract-test = { cmd = "python3 scripts/test_http_app_contract.py", depends-on = [
+  "tls-build",
+  "hpack-test",
+] }
+http-pool-integration-test = { cmd = "python3 scripts/test_http_pool_integration.py", depends-on = [
   "tls-build",
   "hpack-test",
 ] }

@@ -34,7 +34,8 @@ HTTP parser はソケットに依存させず、HTTP 固有の意味づけは `_
 初版は一つの event loop を持つサーバーとし、handler はその loop 上で同期実行する。
 Go の API の役割分担を参考にするが、goroutine と同じ実行特性は約束しない。
 blocking I/O や長時間 CPU 処理を handler に入れると同じ loop の接続を止めるため、用途と制約を API ドキュメントに明記する。
-マルチコア利用と重い handler の offload は後続段階とし、thread 間で接続所有者を共有する設計は持ち込まない。
+マルチコア利用は `ServerPool` が独立した `Server` を組み合わせて提供する。
+重い handler の offload は後続段階とし、thread 間で接続所有者を共有する設計は持ち込まない。
 参照: [Go net/http](https://pkg.go.dev/net/http)。
 
 ## 初版の公開 API と所有権
@@ -922,3 +923,35 @@ Latency p99: 2.0 - 48 ms
   - 受信タイムスタンプの毎クライアント計測およびミリ秒未満の微小クロックスキュー許容により、5,000 イベント全件の完全な追跡と低遅延（p50 約 0.11〜0.18 ms）を確認。
   - 100 スレッドの並行送信中もイベントループの CPU 使用率は約 12〜24% に収まり、十分なスケーラビリティ余力を実証。
   - ハンドラエラー処理仕様: `writer.detach()` 後に応答責務は `ResponseSender` へ移行する。スレッド生成失敗等の場合は `ResponseSender.abort()` を呼んでハンドラを正常終了（return）させることが推奨され、万一ハンドラが例外を送出した場合もサーバーが切り離し状態を安全にキャンセル・解放して 500 を返送する二重の安全機構を備える。
+
+
+## マルチワーカー構成（#229）
+
+`ServerPool` は一つの TCP listener を複製し、各 worker の `Server` に独立した descriptor の所有権を渡す。
+各 worker は OS thread 上で自分の reactor、接続テーブル、handler を動かす。
+受理した接続の所有 worker は終了まで変わらない。
+Linux は listener の epoll 登録に `EPOLLEXCLUSIVE` を付け、macOS は kqueue で競合した accept の would-block を正常系として扱う。
+
+`HandlerFactory.build(worker_id)` は worker ごとの handler を返す。
+factory の呼び出しと server の準備は、thread 起動前に呼び出し元で順に行う。
+`DefaultHandlerFactory[H]` は `Copyable` な handler をコピーする。
+handler 間で意図的に共有する可変状態には、利用側で同期を設ける。
+
+`workers=0` は online CPU 数を検出し、明示値を含めて 1〜1024 に制限する。
+CPU 数を検出できない場合は 1 worker とする。
+`ServerConfig` の接続数と buffer budget を含む全ての上限は worker ごとに適用する。
+既定の `max_connections=10000` と `total_buffer_budget=256 MiB` を 4 worker に渡すと、全体の上限は 40000 接続と 1 GiB になる。
+
+`pool.control()` のコピーから一度 `request_shutdown()` を呼ぶと、worker ごとの通知 channel を介して全 worker を起こす。
+各 worker の channel は、その worker の終了時に共有 mutex の下で閉じる。
+他の worker の通知は消費も破棄もしない。
+外部 handle は pool の終了後も保持でき、そのためだけに通知 descriptor を残すことはない。
+
+`serve(factory)` は全 thread を join してから戻る。
+準備中の失敗では thread を起動せず、作成済み server と listener の複製を破棄する。
+thread 起動途中または worker 実行中の失敗では停止を通知し、起動済み thread を join してから最初のエラーを返す。
+同期 handler が実行中の場合は、その handler が戻るまで停止処理は進まない。
+既存の `Server` と `listen_and_serve` は単一 loop の API として使える。
+
+`tests/test_http_pool.mojo` は共有 listener の受理件数、一括停止、起動前停止、factory と worker の失敗時の所有権を確認する。
+`http-pool-integration-test` は一つの TLS listener で HTTP/1.1 と HTTP/2 を並行に検証する。

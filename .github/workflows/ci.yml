@@ -112,6 +112,8 @@ jobs:
         run: pixi run -e tls-http2 http-app-contract-test
       - name: Test HTTP/2 integration gaps
         run: pixi run -e tls-http2 http2-integration-test
+      - name: Test shared-listener HTTP worker pool
+        run: pixi run -e tls-http2 http-pool-integration-test
       - name: Run HTTP/2 example with independent client
         run: pixi run -e tls-http2 http2-example-run
 
@@ -200,6 +202,8 @@ jobs:
         run: pixi run test-http-api
       - name: Test HTTP control
         run: pixi run test-http-control
+      - name: Test HTTP worker pool
+        run: pixi run test-http-pool
       - name: Test HTTP parser
         run: pixi run test-http-parser
       - name: Test HTTP response
@@ -275,6 +279,8 @@ jobs:
         run: pixi run sanitize-http-api
       - name: Sanitize HTTP control
         run: pixi run sanitize-http-control
+      - name: Sanitize HTTP worker pool
+        run: pixi run sanitize-http-pool
       - name: Sanitize HTTP parser
         run: pixi run sanitize-http-parser
       - name: Sanitize HTTP response

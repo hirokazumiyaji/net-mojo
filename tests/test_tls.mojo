@@ -99,5 +99,25 @@ def test_http2_tls_shutdown_deadline_closes_before_session_expiry() raises:
     client.close()
 
 
+def _duplicated_tls_context() raises -> TLSContext:
+    var context = TLSContext.server(
+        "build/tls/libnet_tls",
+        "build/tls/test-cert.pem",
+        "build/tls/test-key.pem",
+        "http/1.1",
+    )
+    return context._duplicate()
+
+
+def test_tls_context_duplicate_survives_original_owner_drop() raises:
+    var context = _duplicated_tls_context()
+    var pair = _socket_pair()
+    var client = TCPConn(_OwnedFD(pair.first._take()))
+    var server = TCPConn(_OwnedFD(pair.second._take()))
+    var tls = context.accept(server^)
+    assert_true(tls.handshake().is_wants_read())
+    client.close()
+
+
 def main() raises:
     TestSuite.discover_tests[__functions_in_module()]().run()

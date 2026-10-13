@@ -3,7 +3,8 @@
 The loop owns one listener and a table of connections. Handler code runs
 synchronously on the loop thread: blocking I/O or long CPU work inside a
 handler stalls every connection, so handlers must stay small and fast.
-Heavy-handler offload and multi-loop workers are later designs.
+ServerPool composes independent Server instances for multiple CPU cores.
+Heavy-handler offload is a later design.
 
 Ownership and resources:
 
@@ -247,7 +248,7 @@ struct Server(Movable):
                 None,
                 "server already has a listener",
             )
-        var token = self._reactor.register(listener.raw_fd())
+        var token = self._reactor._register_listener(listener.raw_fd())
         self._listener = listener^
         self._listener_token = token.copy()
         self._listener_paused = False
@@ -469,6 +470,14 @@ struct Server(Movable):
         _ = self._reactor.remove(self._control_token)
         self.control.mark_exited()
 
+    def _set_control(mut self, control: ServerControl) raises:
+        if self.control._addr != control._addr:
+            self._finish_control()
+            self.control = control._fork()
+            self._control_token = self._reactor.register(
+                self.control._read_fd()
+            )
+
     def serve_with_control[
         H: Handler
     ](
@@ -480,12 +489,7 @@ struct Server(Movable):
         """Serves with a shared handle; callers may keep a copy on another thread.
         """
         try:
-            if self.control._addr != control._addr:
-                self._finish_control()
-                self.control = control._fork()
-                self._control_token = self._reactor.register(
-                    self.control._read_fd()
-                )
+            self._set_control(control)
             self.add_listener(listener^)
             self._run(handler)
         except error:
@@ -1013,7 +1017,9 @@ struct Server(Movable):
 
     def _resume_listener(mut self) raises NetError:
         if self._listener and self._listener_paused:
-            var token = self._reactor.register(self._listener.value().raw_fd())
+            var token = self._reactor._register_listener(
+                self._listener.value().raw_fd()
+            )
             self._listener_token = token.copy()
             self._listener_paused = False
 

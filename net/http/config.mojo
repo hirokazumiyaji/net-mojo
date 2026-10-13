@@ -1,4 +1,6 @@
-"""Server-wide resource bounds and deadlines.
+"""Resource bounds and deadlines for one server event loop.
+
+ServerPool applies an independent copy to each worker.
 
 Every value is enforced and recorded in benchmark reports. Deadlines
 are absolute monotonic times derived once per phase; receiving one

@@ -1,6 +1,6 @@
 """Handler contract shared by HTTP/1.1, HTTP/2, and HTTP/3.
 
-The handler runs synchronously on the single event-loop thread. It
+The handler runs synchronously on its owning event-loop thread. It
 borrows the request and mutates the response writer, both valid only
 for the call. Blocking I/O or long CPU work stalls every connection
 on the loop; offload is future work.

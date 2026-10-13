@@ -115,6 +115,26 @@ struct TLSContext(Movable):
         self._library = library^
         self._context = context
 
+    def __init__(
+        out self,
+        *,
+        var library_path: String,
+        var library: OwnedDLHandle,
+        context: Pointer[Byte, MutUntrackedOrigin],
+    ):
+        self._library_path = library_path^
+        self._library = library^
+        self._context = context
+
+    def _duplicate(self) raises -> Self:
+        var library = OwnedDLHandle(self._library_path)
+        self._library.call["net_tls_context_retain"](self._context)
+        return Self(
+            library_path=self._library_path.copy(),
+            library=library^,
+            context=self._context,
+        )
+
     def __deinit__(deinit self):
         self._library.call["net_tls_context_free"](self._context)
 

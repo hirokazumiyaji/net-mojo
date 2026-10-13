@@ -400,18 +400,18 @@ def _copy_c_string[origin: MutOrigin](address: Pointer[Byte, origin]) -> String:
 
 
 def _strerror_text(error_number: Int32) -> String:
-    # NOTE: declared with a bare pointer return to match the stdlib's own
-    # strerror declaration (reached via std.tempfile); an
-    # Optional-wrapped return type conflicts at compile time. strerror
-    # never returns NULL on the supported targets (unknown codes yield
-    # "Unknown error N"). strerror may use a static buffer and is not
-    # guaranteed thread-safe; that is acceptable while net-mojo is
-    # single-threaded by design, and must be revisited (strerror_r) if
-    # threading support is ever added.
-    var message = external_call["strerror", Pointer[Byte, MutUntrackedOrigin]](
-        c_int(error_number)
-    )
-    return _copy_c_string(message)
+    var buffer = Array[Byte, 256](fill=0)
+    var destination = Pointer(to=buffer).unsafe_bitcast[Byte]()
+    comptime if _DARWIN:
+        _ = external_call["strerror_r", c_int](
+            c_int(error_number), destination, c_size_t(256)
+        )
+        return _copy_c_string(destination)
+    else:
+        var message = external_call[
+            "strerror_r", Pointer[Byte, MutUntrackedOrigin]
+        ](c_int(error_number), destination, c_size_t(256))
+        return _copy_c_string(message)
 
 
 def _system_error(operation: String, error_number: Int32) -> NetError:
