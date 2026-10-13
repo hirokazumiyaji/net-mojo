@@ -1634,7 +1634,7 @@ def test_http2_streaming_flow_credit_preserves_chunk_order_before_trailers() rai
     assert_true(scheduler.push_body(UInt32(1), second^))
     var trailers = List[Byte]()
     _append_hpack_field(trailers, "x-digest", "done")
-    assert_true(scheduler.finish(UInt32(1), trailers^, 1))
+    assert_true(scheduler.finish(UInt32(1), trailers^, 1, 4096, 32))
     var blocked = scheduler.drain(
         session, deflater, "Thu, 01 Jan 1970 00:00:00 GMT", 16384, 65536
     )
@@ -1679,6 +1679,72 @@ def test_http2_streaming_flow_credit_preserves_chunk_order_before_trailers() rai
         offset += frame.consumed
     assert_equal(String(from_utf8_lossy=Span(body)), "bcd")
     assert_true(saw_trailers)
+
+
+def test_http2_streaming_finish_uses_current_trailer_limits() raises:
+    var session = Http2RequestSession("build/http2/libnet_hpack", 4, 1024)
+    _bootstrap_session(session)
+    _open_stream(session, UInt32(1))
+    var scheduler = Http2ResponseScheduler()
+    var deflater = _make_deflater()
+    var fields = List[Byte]()
+    _append_hpack_field(fields, ":status", "200")
+    assert_true(
+        scheduler.enqueue_streaming(UInt32(1), fields^, 1, 128, 32, 128)
+    )
+    var initial = scheduler.drain(
+        session, deflater, "Thu, 01 Jan 1970 00:00:00 GMT", 16384, 65536
+    )
+    assert_equal(len(initial.completed_streams), 0)
+    var trailers = List[Byte]()
+    var value = String(
+        from_utf8_lossy=Span(List[Byte](length=256, fill=Byte(120)))
+    )
+    _append_hpack_field(trailers, "x-meta", value)
+    assert_true(scheduler.finish(UInt32(1), trailers^, 1, 8192, 32))
+    var finished = scheduler.drain(
+        session, deflater, "Thu, 01 Jan 1970 00:00:00 GMT", 16384, 65536
+    )
+    assert_false(finished.deflater_failed)
+    assert_equal(len(finished.failed_streams), 0)
+    assert_equal(len(finished.completed_streams), 1)
+    var frame = parse_frame(Span(finished.wire))
+    assert_equal(frame.frame_type, Byte(1))
+    assert_equal(frame.flags & Byte(1), Byte(1))
+
+
+def test_http2_streaming_header_fallback_reports_failure_and_refunds_chunks() raises:
+    var session = Http2RequestSession("build/http2/libnet_hpack", 4, 1024)
+    _bootstrap_session(session)
+    _open_stream(session, UInt32(1))
+    var scheduler = Http2ResponseScheduler()
+    var deflater = _make_deflater()
+    var budget = SharedBufferBudget(2 * 1024 * 1024)
+    var fields = List[Byte]()
+    _append_hpack_field(fields, ":status", "200")
+    var value = String(
+        from_utf8_lossy=Span(List[Byte](length=70000, fill=Byte(120)))
+    )
+    _append_hpack_field(fields, "x-pad", value)
+    assert_true(
+        scheduler.enqueue_streaming(
+            UInt32(1), fields^, 2, 131072, 32, 131072, budget=budget.copy()
+        )
+    )
+    var chunk: List[Byte] = [1, 2, 3, 4]
+    assert_true(scheduler.push_body(UInt32(1), chunk^))
+    assert_true(budget.used() > 0)
+    var batch = scheduler.drain(
+        session, deflater, "Thu, 01 Jan 1970 00:00:00 GMT", 16384, 65536
+    )
+    assert_false(batch.deflater_failed)
+    assert_equal(len(batch.failed_streams), 1)
+    assert_equal(batch.failed_streams[0], UInt32(1))
+    assert_equal(len(batch.completed_streams), 1)
+    assert_equal(batch.completed_streams[0], UInt32(1))
+    assert_equal(len(batch.consumed_bytes), 0)
+    assert_equal(scheduler.queued_count(), 0)
+    assert_equal(budget.used(), 0)
 
 
 def test_http2_streaming_chunk_metadata_budget_failure_refunds_body() raises:

@@ -59,6 +59,8 @@ struct _PendingHttp2Response(Movable):
     var reserved_trailer_bytes: Int
     var max_header_list_size: Int
     var max_header_fields: Int
+    var trailer_max_header_list_size: Int
+    var trailer_max_header_fields: Int
     var compressed_capacity: Int
     var headers_sent: Bool
     var body: List[Byte]
@@ -86,6 +88,7 @@ struct _PendingHttp2Response(Movable):
 struct Http2ScheduledOutput(Movable):
     var wire: List[Byte]
     var completed_streams: List[UInt32]
+    var failed_streams: List[UInt32]
     var released_bytes: Int
     var deflater_failed: Bool
     var consumed_bytes: List[Http2ConsumedBytes]
@@ -138,6 +141,8 @@ struct Http2ResponseScheduler(Movable):
             reserved_trailer_bytes=reserved_trailer_bytes,
             max_header_list_size=max_header_list_size,
             max_header_fields=max_header_fields,
+            trailer_max_header_list_size=max_header_list_size,
+            trailer_max_header_fields=max_header_fields,
             compressed_capacity=compressed_capacity,
             headers_sent=False,
             body=body^,
@@ -227,6 +232,8 @@ struct Http2ResponseScheduler(Movable):
         stream_id: UInt32,
         var trailers: List[Byte] = List[Byte](),
         trailer_field_count: Int = 0,
+        trailer_max_header_list_size: Int = 0,
+        trailer_max_header_fields: Int = 0,
     ) -> Bool:
         var index = self._find(stream_id)
         if index < 0:
@@ -240,11 +247,23 @@ struct Http2ResponseScheduler(Movable):
         self._responses[index].reserved_trailer_bytes = len(trailers)
         self._responses[index].trailers = trailers^
         self._responses[index].trailer_field_count = trailer_field_count
+        self._responses[
+            index
+        ].trailer_max_header_list_size = trailer_max_header_list_size
+        self._responses[
+            index
+        ].trailer_max_header_fields = trailer_max_header_fields
         self._responses[index].end_stream_queued = True
         return True
 
     def queued_count(self) -> Int:
         return len(self._responses)
+
+    def has_buffered_responses(self) -> Bool:
+        for i in range(len(self._responses)):
+            if not self._responses[i].streaming:
+                return True
+        return False
 
     def cancel(mut self, stream_id: UInt32) -> Int:
         var index = self._find(stream_id)
@@ -312,12 +331,14 @@ struct Http2ResponseScheduler(Movable):
     ) -> Http2ScheduledOutput:
         var output = List[Byte]()
         var completed = List[UInt32]()
+        var failed = List[UInt32]()
         var released = 0
         var consumed = List[Http2ConsumedBytes]()
         if max_frame_size < 1 or max_output_bytes < 9:
             return Http2ScheduledOutput(
                 wire=output^,
                 completed_streams=completed^,
+                failed_streams=failed^,
                 released_bytes=0,
                 consumed_bytes=consumed^,
                 deflater_failed=False,
@@ -356,6 +377,7 @@ struct Http2ResponseScheduler(Movable):
                     return Http2ScheduledOutput(
                         wire=output^,
                         completed_streams=completed^,
+                        failed_streams=failed^,
                         released_bytes=released,
                         consumed_bytes=consumed^,
                         deflater_failed=True,
@@ -389,6 +411,7 @@ struct Http2ResponseScheduler(Movable):
                             ):
                                 break
                             output.extend(Span(rst.wire))
+                            failed.append(stream_id)
                             session.reset_response(stream_id)
                             completed.append(stream_id)
                             released += (
@@ -434,6 +457,7 @@ struct Http2ResponseScheduler(Movable):
                                 ):
                                     break
                                 output.extend(Span(rst.wire))
+                                failed.append(stream_id)
                                 session.reset_response(stream_id)
                                 completed.append(stream_id)
                                 released += (
@@ -449,6 +473,7 @@ struct Http2ResponseScheduler(Movable):
                             # Only this batch is tight; wait for the next
                             # drain batch to retry the fallback.
                             break
+                        failed.append(stream_id)
                         self._responses[index].header_fields = minimal.fields^
                         minimal.fields = List[Byte]()
                         self._responses[
@@ -490,11 +515,13 @@ struct Http2ResponseScheduler(Movable):
                     max_frame_size,
                     end_on_headers,
                     output,
+                    failed,
                 )
                 if emit_result == _EMIT_DEFLATER_FAILED:
                     return Http2ScheduledOutput(
                         wire=output^,
                         completed_streams=completed^,
+                        failed_streams=failed^,
                         released_bytes=released,
                         consumed_bytes=consumed^,
                         deflater_failed=True,
@@ -506,6 +533,7 @@ struct Http2ResponseScheduler(Movable):
                     ):
                         break
                     output.extend(Span(rst.wire))
+                    failed.append(stream_id)
                     session.reset_response(stream_id)
                     completed.append(stream_id)
                     released += (
@@ -709,10 +737,10 @@ struct Http2ResponseScheduler(Movable):
                 var trailer_count = self._responses[index].trailer_field_count
                 var trailer_max_hls = self._responses[
                     index
-                ].max_header_list_size
+                ].trailer_max_header_list_size
                 var trailer_max_fields = self._responses[
                     index
-                ].max_header_fields
+                ].trailer_max_header_fields
                 # Native deflate bound so a tighter conservative
                 # estimate does not reset valid trailer sections that
                 # the encoder would actually fit under the drain batch.
@@ -721,6 +749,7 @@ struct Http2ResponseScheduler(Movable):
                     return Http2ScheduledOutput(
                         wire=output^,
                         completed_streams=completed^,
+                        failed_streams=failed^,
                         released_bytes=released,
                         consumed_bytes=consumed^,
                         deflater_failed=True,
@@ -750,6 +779,7 @@ struct Http2ResponseScheduler(Movable):
                         ):
                             break
                         output.extend(Span(rst.wire))
+                        failed.append(stream_id)
                         session.reset_response(stream_id)
                         completed.append(stream_id)
                         released += (
@@ -774,6 +804,7 @@ struct Http2ResponseScheduler(Movable):
                     return Http2ScheduledOutput(
                         wire=output^,
                         completed_streams=completed^,
+                        failed_streams=failed^,
                         released_bytes=released,
                         consumed_bytes=consumed^,
                         deflater_failed=True,
@@ -785,6 +816,7 @@ struct Http2ResponseScheduler(Movable):
                     ):
                         break
                     output.extend(Span(rst.wire))
+                    failed.append(stream_id)
                     session.reset_response(stream_id)
                     completed.append(stream_id)
                     released += (
@@ -821,6 +853,7 @@ struct Http2ResponseScheduler(Movable):
                     return Http2ScheduledOutput(
                         wire=output^,
                         completed_streams=completed^,
+                        failed_streams=failed^,
                         released_bytes=released,
                         consumed_bytes=consumed^,
                         deflater_failed=True,
@@ -843,6 +876,7 @@ struct Http2ResponseScheduler(Movable):
         return Http2ScheduledOutput(
             wire=output^,
             completed_streams=completed^,
+            failed_streams=failed^,
             released_bytes=released,
             consumed_bytes=consumed^,
             deflater_failed=False,
@@ -856,6 +890,7 @@ struct Http2ResponseScheduler(Movable):
         max_frame_size: Int,
         end_on_headers: Bool,
         mut output: List[Byte],
+        mut failed: List[UInt32],
     ) -> Int:
         var capacity = self._responses[index].compressed_capacity
         var max_hls = self._responses[index].max_header_list_size
@@ -871,6 +906,7 @@ struct Http2ResponseScheduler(Movable):
             return _EMIT_DEFLATER_FAILED
         var effective_end_on_headers = end_on_headers
         if attempt.is_too_large():
+            failed.append(self._responses[index].stream_id)
             var fallback = encode_http2_minimal_500_fields(
                 date, max_hls, max_fields
             )

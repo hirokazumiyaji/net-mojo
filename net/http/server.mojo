@@ -38,13 +38,15 @@ Ownership and resources:
   (reads are paused) so one slow reader cannot grow user buffers.
 """
 
+from std.sys import size_of
+
 from net import SocketAddress, TCPConn, TCPListener, Timeout, listen_tcp
 from net._actor import WakeupChannel
 from net._reactor import Reactor, ReactorToken
 from net.error import NetError, NetErrorKind
 from net.quic import QuicUDPEndpoint
 
-from ._buffer import SharedBufferBudget, _reserve_capacity
+from ._buffer import SharedBufferBudget, _CapacityTicket, _reserve_capacity
 from ._control import ServerControl
 from ._connection import (
     HttpConnection,
@@ -70,6 +72,7 @@ from ._detach import (
     MSG_KIND_START,
     _cancel_detach_state,
     _mark_detach_cancelled,
+    _consume_detach_bytes,
     _detach_state,
     _DetachTarget,
     _release_detach_state,
@@ -111,6 +114,7 @@ from net.http._http2.request_session import (
 from net.http._http2.response_headers import (
     _content_length_matches,
     encode_http2_response_headers,
+    encode_http2_minimal_500_fields,
     encode_http2_response_trailers,
 )
 from net.http._http2.control_frames import encode_rst_stream_frame
@@ -134,6 +138,23 @@ def _bounded_hpack_table_size(peer_value: UInt32) -> Int:
 struct _HeapEntry(Copyable, ImplicitlyCopyable, Movable):
     var deadline: Int
     var idx: Int
+
+
+@fieldwise_init
+struct _Http2DetachedStream(Movable):
+    var target: _DetachTarget
+    var addr: Int
+    var deadline: Int
+    var is_head: Bool
+    var status: Int
+    var allows_body: Bool
+    var initial_field_count: Int
+    var initial_field_bytes: Int
+    var headers: Headers
+
+    def __deinit__(deinit self):
+        if self.addr != 0:
+            _cancel_detach_state(self.addr)
 
 
 struct Server(Movable):
@@ -173,6 +194,8 @@ struct Server(Movable):
     var _wakeup_channel: WakeupChannel
     var _wakeup_token: ReactorToken
     var _detached_conns: List[Int]
+    var _http2_detached: List[_Http2DetachedStream]
+    var _http2_detached_ticket: _CapacityTicket
 
     def __init__(out self, var config: ServerConfig) raises:
         var budget_total = config.total_buffer_budget
@@ -207,12 +230,15 @@ struct Server(Movable):
         var wtoken = self._reactor.register(self._wakeup_channel.read_fd())
         self._wakeup_token = wtoken.copy()
         self._detached_conns = List[Int]()
+        self._http2_detached = List[_Http2DetachedStream]()
+        self._http2_detached_ticket = _CapacityTicket(self._budget.copy())
         while len(self._slot_map) <= wtoken.slot:
             self._slot_map.append(-1)
 
     def __deinit__(deinit self):
         self._finish_control()
         for idx in range(len(self._conns)):
+            self._discard_http2_detached(idx)
             var addr = self._conns[idx].detach_state_addr
             if addr != 0:
                 self._conns[idx].detach_state_addr = 0
@@ -558,9 +584,13 @@ struct Server(Movable):
                 self._conns[idx].state == STATE_READING
                 and self._conns[idx].pending_remaining() == 0
                 and self._conns[idx].http2_responses.queued_count() == 0
+                and not self._has_http2_detached(idx)
             ):
                 if best == NO_DEADLINE or self._conns[idx].idle_at < best:
                     best = self._conns[idx].idle_at
+            for i in range(len(self._http2_detached)):
+                if self._http2_detached[i].target.slot == idx:
+                    best = min(best, self._http2_detached[i].deadline)
             return best
         if self._conns[idx].state == STATE_READING:
             if self._conns[idx].buffered_len() > 0:
@@ -692,6 +722,9 @@ struct Server(Movable):
                 self._conns[idx].protocol == PROTOCOL_HTTP2
                 and self._conns[idx].http2_session
             ):
+                self._expire_http2_detached(idx, now)
+                if not self._conns[idx].active:
+                    continue
                 if (
                     self._conns[idx].write_at != NO_DEADLINE
                     and now >= self._conns[idx].write_at
@@ -1117,6 +1150,7 @@ struct Server(Movable):
         if not self._conns[idx].active:
             return
         self._discard_detached(idx)
+        self._discard_http2_detached(idx)
         var token = self._conns[idx].token.copy()
         _ = self._reactor.remove(token)
         if token.slot >= 0 and token.slot < len(self._slot_map):
@@ -1530,6 +1564,7 @@ struct Server(Movable):
             if result.consumed > 0:
                 self._consume_receive(idx, result.consumed)
             if result.reset_stream_id != UInt32(0):
+                self._drop_http2_detached(idx, result.reset_stream_id)
                 var reset_result = self._conns[
                     idx
                 ].http2_responses.on_peer_reset(result.reset_stream_id)
@@ -1603,13 +1638,26 @@ struct Server(Movable):
             cap = room
         if cap < 0:
             cap = 0
-        var writer = ResponseWriter(cap)
+        var writer = ResponseWriter(
+            cap,
+            slot=idx,
+            generation=self._conns[idx].token.generation,
+            wakeup_fd=self._wakeup_channel.write_fd(),
+            queue_limit=self.config.stream_queue_limit,
+        )
+        writer._set_detach_target(
+            _DetachTarget.http2(
+                idx, self._conns[idx].token.generation, stream_id
+            )
+        )
+        writer._set_mailbox_budget(self._budget.copy())
         self._conns[idx].requests_this_tick += 1
         self._conns[idx].requests_served += 1
         try:
             handler.handle(request^, writer)
         except e:
             _ = e
+            writer._cancel_detach()
             writer.set_status(500)
             writer.headers.clear()
             writer.trailers.clear()
@@ -1618,27 +1666,11 @@ struct Server(Movable):
         self._budget.release(request_body_bytes)
         self._conns[idx].http2_body_reserved -= request_body_bytes
 
-        if writer.is_detached():
-            # Streaming/SSE on HTTP/2 would need per-stream credit tracking
-            # that the shared H1 writer cannot express; keep siblings alive by
-            # falling back to a stream-level 500 instead of closing.
-            writer._cancel_detach()
-            writer.set_status(500)
-            writer.headers.clear()
-            writer.trailers.clear()
-            writer.body.clear()
         if len(writer.body) > cap:
             writer.set_status(500)
             writer.headers.clear()
             writer.trailers.clear()
             writer.body.clear()
-
-        try:
-            self._inject_alt_svc_for_tls(idx, writer)
-        except e:
-            _ = e
-            self._close_conn(idx)
-            return
 
         if not self._conns[idx].http2_deflater:
             try:
@@ -1655,6 +1687,7 @@ struct Server(Movable):
                 )
             except e:
                 _ = e
+                writer._cancel_detach()
                 self._close_conn(idx)
                 return
         else:
@@ -1669,8 +1702,32 @@ struct Server(Movable):
                 .http2_deflater.value()
                 .set_max_table_size(table_size)
             ):
+                writer._cancel_detach()
                 self._close_conn(idx)
                 return
+
+        if writer.is_detached() and writer._detach_state_addr != 0:
+            var addr = writer._detach_state_addr
+            writer._detach_state_addr = 0
+            if self._register_http2_detached(idx, stream_id, addr, is_head):
+                writer._drop_body()
+                writer._drop_headers()
+                if not self._flush_http2_control_output(idx, control_output^):
+                    return
+                self._arm_deadline(idx)
+                self._sync_interests(idx)
+                return
+            _cancel_detach_state(addr)
+            writer.set_status(500)
+            writer._drop_body()
+            writer._drop_headers()
+
+        try:
+            self._inject_alt_svc_for_tls(idx, writer)
+        except e:
+            _ = e
+            self._close_conn(idx)
+            return
 
         var max_response_header_bytes = self.config.max_response_headers_bytes
         var peer_header_list_size = Int(
@@ -1797,6 +1854,375 @@ struct Server(Movable):
             self._conns[idx].state = STATE_SENDING_HTTP2_CONTROL
         self._drain_http2_responses(idx)
 
+    def _has_http2_detached(self, idx: Int) -> Bool:
+        for i in range(len(self._http2_detached)):
+            if self._http2_detached[i].target.slot == idx:
+                return True
+        return False
+
+    def _find_http2_detached(self, idx: Int, stream_id: UInt32) -> Int:
+        for i in range(len(self._http2_detached)):
+            if self._http2_detached[
+                i
+            ].target.slot == idx and self._http2_detached[
+                i
+            ].target.stream_id == UInt64(
+                stream_id
+            ):
+                return i
+        return -1
+
+    def _register_http2_detached(
+        mut self, idx: Int, stream_id: UInt32, addr: Int, is_head: Bool
+    ) -> Bool:
+        var reservation = 0
+        if not _reserve_capacity(
+            self._http2_detached,
+            self._budget,
+            len(self._http2_detached) + 1,
+            reservation,
+        ):
+            return False
+        self._http2_detached_ticket.amount = (
+            self._http2_detached.capacity() * size_of[_Http2DetachedStream]()
+        )
+        # Detached streams use their own deadline to bound admission occupancy.
+        self._http2_detached.append(
+            _Http2DetachedStream(
+                target=_DetachTarget.http2(
+                    idx, self._conns[idx].token.generation, stream_id
+                ),
+                addr=addr,
+                deadline=deadline_from_now(
+                    self.config.detached_response_timeout
+                ),
+                is_head=is_head,
+                status=200,
+                allows_body=True,
+                initial_field_count=0,
+                initial_field_bytes=0,
+                headers=Headers(),
+            )
+        )
+        self._conns[idx].idle_at = NO_DEADLINE
+        return True
+
+    def _remove_http2_detached(mut self, position: Int):
+        var last = self._http2_detached.pop()
+        if position < len(self._http2_detached):
+            self._http2_detached[position] = last^
+        if len(self._http2_detached) == 0:
+            self._http2_detached = List[_Http2DetachedStream]()
+            self._http2_detached_ticket.release()
+
+    def _drop_http2_detached(mut self, idx: Int, stream_id: UInt32):
+        var position = self._find_http2_detached(idx, stream_id)
+        if position >= 0:
+            self._remove_http2_detached(position)
+
+    def _discard_http2_detached(mut self, idx: Int):
+        var position = 0
+        while position < len(self._http2_detached):
+            if self._http2_detached[position].target.slot != idx:
+                position += 1
+                continue
+            var stream_id = UInt32(
+                self._http2_detached[position].target.stream_id
+            )
+            var released = self._conns[idx].http2_responses.cancel(stream_id)
+            self._budget.release(released)
+            self._conns[idx].http2_response_bytes_reserved -= released
+            self._remove_http2_detached(position)
+
+    def _cancel_http2_detached(
+        mut self, idx: Int, stream_id: UInt32, error_code: UInt32
+    ) raises NetError:
+        var released = self._conns[idx].http2_responses.cancel(stream_id)
+        self._budget.release(released)
+        self._conns[idx].http2_response_bytes_reserved -= released
+        self._drop_http2_detached(idx, stream_id)
+        self._refuse_http2_stream(idx, stream_id, error_code)
+        if self._conns[idx].active:
+            self._arm_deadline(idx)
+            self._sync_interests(idx)
+
+    def _expire_http2_detached(mut self, idx: Int, now: Int) raises NetError:
+        var position = 0
+        while position < len(self._http2_detached):
+            if (
+                self._http2_detached[position].target.slot == idx
+                and now >= self._http2_detached[position].deadline
+            ):
+                var stream_id = UInt32(
+                    self._http2_detached[position].target.stream_id
+                )
+                self._cancel_http2_detached(idx, stream_id, UInt32(8))
+            else:
+                position += 1
+
+    def _http2_response_header_room(self, idx: Int) -> Int:
+        return min(
+            self.config.max_response_headers_bytes,
+            Int(
+                self._conns[idx]
+                .http2_session.value()
+                .peer_settings()
+                .max_header_list_size
+            ),
+        )
+
+    def _fail_http2_detached(
+        mut self, idx: Int, stream_id: UInt32
+    ) raises NetError:
+        var released = self._conns[idx].http2_responses.cancel(stream_id)
+        self._budget.release(released)
+        self._conns[idx].http2_response_bytes_reserved -= released
+        self._drop_http2_detached(idx, stream_id)
+        var limit = self._http2_response_header_room(idx)
+        var fields = encode_http2_minimal_500_fields(
+            self._tick_date, limit, self.config.max_response_headers_count
+        )
+        if not fields.is_valid():
+            self._refuse_http2_stream(idx, stream_id, UInt32(2))
+            return
+        var charge = len(fields.fields)
+        if not self._budget.try_reserve(charge):
+            self._refuse_http2_stream(idx, stream_id, UInt32(2))
+            return
+        var raw = fields.fields^
+        fields.fields = List[Byte]()
+        if not self._conns[idx].http2_responses.enqueue(
+            stream_id,
+            raw^,
+            fields.field_count,
+            limit,
+            self.config.max_response_headers_count,
+            max(1, limit),
+            List[Byte](),
+        ):
+            self._budget.release(charge)
+            self._refuse_http2_stream(idx, stream_id, UInt32(2))
+            return
+        self._conns[idx].http2_response_bytes_reserved += charge
+
+    def _begin_http2_detached(
+        mut self,
+        idx: Int,
+        stream_id: UInt32,
+        mut msg: DetachMessage,
+        streaming: Bool,
+    ) raises NetError:
+        var position = self._find_http2_detached(idx, stream_id)
+        var is_head = self._http2_detached[position].is_head
+        var writer = ResponseWriter(self.config.max_response_body)
+        writer.status = msg.status
+        writer.headers = msg.headers^
+        msg.headers = Headers()
+        if not streaming:
+            writer.body = msg.body^
+            msg.body = List[Byte]()
+        var ticket = msg.body_ticket^
+        msg.body_ticket = _CapacityTicket()
+        var valid = len(writer.body) <= self.config.max_response_body
+        try:
+            self._inject_alt_svc_for_tls(idx, writer)
+        except:
+            valid = False
+        var limit = self._http2_response_header_room(idx)
+        var fields = encode_http2_response_headers(
+            writer,
+            is_head,
+            self._tick_date,
+            limit,
+            self.config.max_response_headers_count,
+            streaming=streaming,
+        )
+        if not valid or not fields.is_valid():
+            writer._drop_body()
+            writer._drop_headers()
+            ticket.release()
+            self._fail_http2_detached(idx, stream_id)
+            return
+        var charge = len(fields.fields)
+        if not self._budget.try_reserve(charge):
+            writer._drop_body()
+            writer._drop_headers()
+            ticket.release()
+            self._fail_http2_detached(idx, stream_id)
+            return
+        self._http2_detached[position].status = writer.status
+        self._http2_detached[position].allows_body = fields.send_body
+        self._http2_detached[position].initial_field_count = fields.field_count
+        self._http2_detached[position].initial_field_bytes = (
+            charge + 24 * fields.field_count
+        )
+        self._http2_detached[position].headers = writer.headers^
+        writer.headers = Headers()
+        var raw = fields.fields^
+        fields.fields = List[Byte]()
+        if not self._conns[idx].http2_responses.enqueue_streaming(
+            stream_id,
+            raw^,
+            fields.field_count,
+            limit,
+            self.config.max_response_headers_count,
+            max(1, limit),
+            budget=self._budget.copy(),
+        ):
+            self._budget.release(charge)
+            writer._drop_body()
+            ticket.release()
+            self._fail_http2_detached(idx, stream_id)
+            return
+        self._conns[idx].http2_response_bytes_reserved += charge
+        if not fields.send_body:
+            writer._drop_body()
+            ticket.release()
+            _ = self._conns[idx].http2_responses.finish(stream_id)
+            return
+        if not streaming:
+            var body = writer.body^
+            writer.body = List[Byte]()
+            if not self._conns[idx].http2_responses.push_body(
+                stream_id, body^, ticket^
+            ):
+                self._cancel_http2_detached(idx, stream_id, UInt32(2))
+                return
+            _ = self._conns[idx].http2_responses.finish(stream_id)
+
+    def _finish_http2_detached(
+        mut self, idx: Int, stream_id: UInt32, var trailers: Headers
+    ) raises NetError:
+        var position = self._find_http2_detached(idx, stream_id)
+        if not self._http2_detached[position].allows_body:
+            return
+        if len(trailers) == 0:
+            _ = self._conns[idx].http2_responses.finish(stream_id)
+            return
+        var writer = ResponseWriter(0)
+        writer.status = self._http2_detached[position].status
+        var headers_ptr = Pointer(to=self._http2_detached[position].headers)
+        writer.headers = headers_ptr.unsafe_take_pointee()
+        headers_ptr.unsafe_write(Headers())
+        writer.trailers = trailers^
+        var local_bytes = (
+            self.config.max_response_headers_bytes
+            - self._http2_detached[position].initial_field_bytes
+        )
+        var field_room = (
+            self.config.max_response_headers_count
+            - self._http2_detached[position].initial_field_count
+        )
+        var byte_room = min(
+            local_bytes,
+            Int(
+                self._conns[idx]
+                .http2_session.value()
+                .peer_settings()
+                .max_header_list_size
+            ),
+        )
+        var fields = encode_http2_response_trailers(
+            writer,
+            self._http2_detached[position].is_head,
+            byte_room,
+            field_room,
+        )
+        if not fields.is_valid():
+            writer._drop_headers()
+            self._cancel_http2_detached(idx, stream_id, UInt32(2))
+            return
+        var charge = len(fields.fields)
+        if not self._budget.try_reserve(charge):
+            writer._drop_headers()
+            self._cancel_http2_detached(idx, stream_id, UInt32(2))
+            return
+        var raw = fields.fields^
+        fields.fields = List[Byte]()
+        if not self._conns[idx].http2_responses.finish(
+            stream_id, raw^, fields.field_count, byte_room, field_room
+        ):
+            self._budget.release(charge)
+            self._cancel_http2_detached(idx, stream_id, UInt32(2))
+            return
+        self._conns[idx].http2_response_bytes_reserved += charge
+
+    def _process_http2_detached(mut self, now: Int) raises NetError:
+        var index = 0
+        while index < len(self._http2_detached):
+            var target = self._http2_detached[index].target.copy()
+            var idx = target.slot
+            var stream_id = UInt32(target.stream_id)
+            var addr = self._http2_detached[index].addr
+            if not self._conns[idx].active or target != _DetachTarget.http2(
+                idx, self._conns[idx].token.generation, stream_id
+            ):
+                self._remove_http2_detached(index)
+                continue
+            if now >= self._http2_detached[index].deadline:
+                self._cancel_http2_detached(idx, stream_id, UInt32(8))
+                if self._conns[idx].active:
+                    self._pump_send(idx, True)
+                continue
+            var batch = _take_batch(_detach_state(addr))
+            if batch.target != target:
+                self._cancel_http2_detached(idx, stream_id, UInt32(8))
+                continue
+            if (
+                len(batch.messages) == 0
+                and batch.terminal_kind == MSG_KIND_NONE
+            ):
+                index += 1
+                continue
+            self._http2_detached[index].deadline = deadline_from_now(
+                self.config.detached_response_timeout
+            )
+            batch.messages.reverse()
+            while len(batch.messages) > 0:
+                var msg = batch.messages.pop()
+                var position = self._find_http2_detached(idx, stream_id)
+                if position < 0 or not self._conns[idx].active:
+                    break
+                if msg.kind == MSG_KIND_RESPOND:
+                    self._begin_http2_detached(idx, stream_id, msg, False)
+                elif msg.kind == MSG_KIND_START:
+                    self._begin_http2_detached(idx, stream_id, msg, True)
+                elif msg.kind == MSG_KIND_CHUNK:
+                    if not self._http2_detached[position].allows_body:
+                        _consume_detach_bytes(addr, len(msg.body))
+                        continue
+                    var body = msg.body^
+                    msg.body = List[Byte]()
+                    var ticket = msg.body_ticket^
+                    msg.body_ticket = _CapacityTicket()
+                    if not self._conns[idx].http2_responses.push_body(
+                        stream_id, body^, ticket^
+                    ):
+                        self._cancel_http2_detached(idx, stream_id, UInt32(2))
+            var position = self._find_http2_detached(idx, stream_id)
+            if position >= 0 and batch.terminal_kind != MSG_KIND_NONE:
+                if batch.terminal_kind == MSG_KIND_FINISH:
+                    var trailers = batch.trailers^
+                    batch.trailers = Headers()
+                    self._finish_http2_detached(idx, stream_id, trailers^)
+                else:
+                    var state = _detach_state(addr)
+                    state[].mutex.lock()
+                    var failed = state[].cancelled
+                    state[].mutex.unlock()
+                    self._cancel_http2_detached(
+                        idx, stream_id, UInt32(2) if failed else UInt32(8)
+                    )
+            if self._conns[idx].active:
+                self._drain_http2_responses(idx)
+                self._pump_send(idx, True)
+                if self._conns[idx].active:
+                    self._sync_interests(idx)
+                    self._arm_deadline(idx)
+            position = self._find_http2_detached(idx, stream_id)
+            if position >= 0:
+                index = position + 1
+
     def _flush_http2_control_output(
         mut self, idx: Int, var control_output: List[Byte]
     ) raises NetError -> Bool:
@@ -1869,6 +2295,28 @@ struct Server(Movable):
             16384,
             65536,
         )
+        for item in batch.consumed_bytes:
+            var position = self._find_http2_detached(idx, item.stream_id)
+            if position >= 0:
+                _consume_detach_bytes(
+                    self._http2_detached[position].addr, item.amount
+                )
+                self._http2_detached[position].deadline = deadline_from_now(
+                    self.config.detached_response_timeout
+                )
+        for stream_id in batch.failed_streams:
+            var position = self._find_http2_detached(idx, stream_id)
+            if position >= 0:
+                _mark_detach_cancelled(self._http2_detached[position].addr)
+        for stream_id in batch.completed_streams:
+            var position = self._find_http2_detached(idx, stream_id)
+            if position >= 0:
+                var addr = self._http2_detached[position].addr
+                if not self._http2_detached[position].allows_body:
+                    _mark_detach_cancelled(addr)
+                self._http2_detached[position].addr = 0
+                _release_detach_state(addr, from_sender=False)
+                self._remove_http2_detached(position)
         if batch.released_bytes > 0:
             self._budget.release(batch.released_bytes)
             self._conns[
@@ -1888,7 +2336,7 @@ struct Server(Movable):
             )
             batch.wire.extend(Span(goaway))
         if len(batch.wire) == 0:
-            if self._conns[idx].http2_responses.queued_count() > 0:
+            if self._conns[idx].http2_responses.has_buffered_responses():
                 # Still waiting for WINDOW_UPDATE credit; keep the write
                 # deadline so stalled responses cannot pin budget forever.
                 if self._conns[idx].write_at == NO_DEADLINE:
@@ -1899,9 +2347,11 @@ struct Server(Movable):
                 return
             self._conns[idx].state = STATE_READING
             self._conns[idx].write_at = NO_DEADLINE
-            self._conns[idx].idle_at = deadline_from_now(
-                self.config.idle_timeout
-            )
+            self._conns[idx].idle_at = NO_DEADLINE
+            if not self._has_http2_detached(idx):
+                self._conns[idx].idle_at = deadline_from_now(
+                    self.config.idle_timeout
+                )
             return
         var output = batch.wire^
         batch.wire = List[Byte]()
@@ -2391,8 +2841,10 @@ struct Server(Movable):
         self._budget.release(sent_capacity)
         if was_http2_control:
             self._conns[idx].state = STATE_READING
-            if self._conns[idx].http2_responses.queued_count() == 0:
+            # Streaming can outlive one write deadline while batches keep flushing.
+            if not self._conns[idx].http2_responses.has_buffered_responses():
                 self._conns[idx].write_at = NO_DEADLINE
+            if self._conns[idx].http2_responses.queued_count() == 0:
                 self._conns[idx].idle_at = deadline_from_now(
                     self.config.idle_timeout
                 )
@@ -2487,6 +2939,7 @@ struct Server(Movable):
         self._arm_deadline(idx)
 
     def _process_detached_messages(mut self, now: Int) raises NetError:
+        self._process_http2_detached(now)
         if len(self._detached_conns) == 0:
             return
         var i = 0
