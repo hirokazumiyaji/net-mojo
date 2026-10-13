@@ -23,3 +23,7 @@ Recent history uses concise imperative subjects, often with prefixes such as `do
 ## Security & Configuration
 
 Do not commit real credentials or deployment certificates. TLS examples use generated test certificates; replace them for deployment. Keep optional native provider dependencies out of core-only changes unless required.
+
+## Property Tests
+
+Semantic property tests live in `tests/prop/` and run separately with `pixi run -e proptest test-prop`. The optional environment requires the `proptest` 0.1.0 conda package, currently published for macOS ARM64 and Linux x86_64. CI sets `PROPTEST_SEED=1`; local runs may set `PROPTEST_SEED` and `PROPTEST_MAX_EXAMPLES`. Keep property names stable for replay database entries. Preserve failure reports with their `Seed:` and `Reproduce with:` lines, and reproduce a counterexample with `Settings(replay="...")`. The `.proptest-mojo/` database stays untracked.

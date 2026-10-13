@@ -275,6 +275,17 @@ fuzz-driver-test = { cmd = "python3 tests/fuzz/test_driver.py", depends-on = ["f
 fuzz-minimize = { cmd = "python3 scripts/minimize_fuzz.py", depends-on = ["fuzz-build"] }
 fuzz-minimize-test = "python3 tests/fuzz/test_minimize.py"
 
+[feature.proptest]
+channels = ["https://prefix.dev/hirokazumiyaji/mojo"]
+platforms = ["osx-arm64", "linux-64-glibc-2-34"]
+
+[feature.proptest.dependencies]
+proptest = "==0.1.0"
+
+[feature.proptest.tasks]
+test-prop-ip = "mojo run --Werror -I . tests/prop/test_prop_ip.mojo"
+test-prop = { depends-on = ["test-prop-ip"] }
+
 [feature.mojo-1-1.dependencies]
 mojo = ">=1.1.0,<1.2"
 
@@ -284,6 +295,7 @@ compiler-rt = "==23.1.2"
 
 [environments]
 default = ["mojo-1-1"]
+proptest = ["proptest", "mojo-1-1"]
 sanitize = ["sanitize", "mojo-1-1"]
 fuzz = ["fuzz", "sanitize", "mojo-1-1"]
 conformance = ["conformance", "tls", "http2", "mojo-1-1"]
