@@ -18,11 +18,19 @@ from net.error import NetError, NetErrorKind
 from ._detach import (
     ResponseSender,
     _DetachTarget,
+    _DETACH_HTTP1,
     _cancel_detach_state,
     _create_detach_state,
 )
-from ._buffer import SharedBufferBudget, _reserve_capacity
 from ._offload import HandlerJob, OffloadError, WorkerPool
+from ._control import ServerControl
+from ._buffer import SharedBufferBudget, _CapacityTicket, _reserve_capacity
+from ._hijack import (
+    HijackSender,
+    _create_hijack_state,
+    _cancel_hijack_state,
+    _release_hijack_state,
+)
 from .headers import Headers, _trailer_forbidden
 from .request import Request, RequestBodyReceiver
 from ._body_pipe import _BodyPipe
@@ -36,6 +44,16 @@ struct RequestBodyEndpoints(Movable):
     var sender: ResponseSender
 
 
+@fieldwise_init
+struct _HijackContext(Movable):
+    var is_connect: Bool
+    var is_http11: Bool
+    var control: ServerControl
+    var date: String
+    var max_headers: Int
+    var max_bytes: Int
+
+
 struct ResponseWriter(Movable, Sized):
     """Owned response under construction."""
 
@@ -47,6 +65,8 @@ struct ResponseWriter(Movable, Sized):
     var _limit: Int
     var _detached: Bool
     var _detach_state_addr: Int
+    var _hijack_state_addr: Int
+    var _hijack_context: Optional[_HijackContext]
     var _target: _DetachTarget
     var _wakeup_fd: Int32
     var _queue_limit: Int
@@ -71,6 +91,8 @@ struct ResponseWriter(Movable, Sized):
         self._limit = body_limit
         self._detached = False
         self._detach_state_addr = 0
+        self._hijack_state_addr = 0
+        self._hijack_context = None
         self._target = _DetachTarget.http1(slot, generation)
         # Note on _wakeup_fd: raw descriptor borrowed from Server._wakeup_channel.
         # The channel owns descriptor lifecycle; DetachState.cancelled guards
@@ -91,6 +113,8 @@ struct ResponseWriter(Movable, Sized):
         self._limit = move._limit
         self._detached = move._detached
         self._detach_state_addr = move._detach_state_addr
+        self._hijack_state_addr = move._hijack_state_addr
+        self._hijack_context = move._hijack_context^
         self._target = move._target^
         self._wakeup_fd = move._wakeup_fd
         self._queue_limit = move._queue_limit
@@ -100,6 +124,7 @@ struct ResponseWriter(Movable, Sized):
         self._request_body_pipe = move._request_body_pipe^
 
     def __deinit__(deinit self):
+        self._cancel_hijack()
         self._drop_body()
 
     def _set_body_budget(mut self, var budget: SharedBufferBudget):
@@ -138,6 +163,149 @@ struct ResponseWriter(Movable, Sized):
     def _set_detach_target(mut self, var target: _DetachTarget):
         self._target = target^
 
+    def _set_hijack_context(mut self, var context: _HijackContext):
+        self._hijack_context = context^
+
+    def is_hijacked(self) -> Bool:
+        return self._hijack_state_addr != 0
+
+    def _cancel_hijack(mut self):
+        if self.is_hijacked():
+            var addr = self._take_hijack_state()
+            _cancel_hijack_state(addr)
+            _release_hijack_state(addr, from_sender=False)
+
+    def _take_hijack_state(mut self) -> Int:
+        var addr = self._hijack_state_addr
+        self._hijack_state_addr = 0
+        return addr
+
+    def _check_hijack(self) raises NetError:
+        if self._detached or self._detach_state_addr != 0 or self.is_hijacked():
+            raise NetError(
+                NetErrorKind.invalid_state(),
+                "hijack",
+                None,
+                "response already transferred",
+            )
+        if self._target.protocol != _DETACH_HTTP1 or not self._hijack_context:
+            raise NetError(
+                NetErrorKind.unsupported(),
+                "hijack",
+                None,
+                "hijack requires an HTTP/1.1 server writer",
+            )
+        if not self._hijack_context.value().is_http11:
+            raise NetError(
+                NetErrorKind.unsupported(),
+                "hijack",
+                None,
+                "hijack requires HTTP/1.1",
+            )
+        if self._hijack_context.value().control.is_shutdown_requested():
+            raise NetError(
+                NetErrorKind.closed(), "hijack", None, "server is shutting down"
+            )
+        if (
+            self._request_body_pipe
+            and not self._request_body_pipe.value()._can_hijack()
+        ):
+            raise NetError(
+                NetErrorKind.invalid_state(),
+                "hijack",
+                None,
+                "request body requires consumed EOF with no active receiver",
+            )
+        if len(self.body) != 0 or len(self.trailers) != 0:
+            raise NetError(
+                NetErrorKind.invalid_state(),
+                "hijack",
+                None,
+                "response content already buffered",
+            )
+
+    def hijack(mut self) raises NetError -> HijackSender:
+        """Transfers raw ownership after the handler returns; receive it on a worker.
+        """
+        self._check_hijack()
+        self._hijack_state_addr = _create_hijack_state(
+            self._target.slot,
+            self._target.generation,
+            self._wakeup_fd,
+            budget=self._mailbox_budget.copy(),
+        )
+        return HijackSender(self._hijack_state_addr)
+
+    def switch_protocols(
+        mut self, var headers: Headers, status: Int = 101
+    ) raises NetError -> HijackSender:
+        """Flushes switching headers before a worker receives raw ownership."""
+        from ._encoder import _encode_response_budgeted
+
+        self._check_hijack()
+        ref context = self._hijack_context.value()
+        if (context.is_connect and not (200 <= status < 300)) or (
+            not context.is_connect and status != 101
+        ):
+            raise NetError(
+                NetErrorKind.invalid_argument(),
+                "switch protocols",
+                None,
+                "CONNECT requires 2xx and Upgrade requires 101",
+            )
+        if not context.is_connect:
+            var upgrade = headers.get_first("upgrade")
+            var has_upgrade = False
+            for index in range(len(headers)):
+                if headers._lower_names[index] == "connection":
+                    for token in headers.value_at(index).split(","):
+                        if token.strip().lower() == "upgrade":
+                            has_upgrade = True
+            if (
+                not has_upgrade
+                or not upgrade
+                or upgrade.value().strip().byte_length() == 0
+            ):
+                raise NetError(
+                    NetErrorKind.invalid_argument(),
+                    "switch protocols",
+                    None,
+                    "101 requires Connection Upgrade and an Upgrade protocol",
+                )
+        var response = ResponseWriter(0)
+        response.status = status
+        response.headers = headers^
+        if not response.headers._adopt_capacity_budget(
+            self._mailbox_budget.copy()
+        ):
+            raise NetError(
+                NetErrorKind.invalid_argument(),
+                "switch protocols",
+                None,
+                "switch headers exceed buffer budget",
+            )
+        var wire = _encode_response_budgeted(
+            response,
+            False,
+            context.date,
+            context.max_headers,
+            context.max_bytes,
+            self._mailbox_budget.value(),
+            switching=True,
+        )
+        var ticket = _CapacityTicket(
+            self._mailbox_budget.copy(), wire.capacity()
+        )
+        self._hijack_state_addr = _create_hijack_state(
+            self._target.slot,
+            self._target.generation,
+            self._wakeup_fd,
+            budget=self._mailbox_budget.copy(),
+            pending_response=wire^,
+            response_ticket=ticket^,
+        )
+        return HijackSender(self._hijack_state_addr)
+
     def is_detached(self) -> Bool:
         return self._detached
 
@@ -165,7 +333,7 @@ struct ResponseWriter(Movable, Sized):
         complete or stream the response asynchronously.
         Once detached, the handler must not write further data directly to `ResponseWriter`.
         """
-        if self._detached:
+        if self._detached or self.is_hijacked():
             raise NetError(
                 NetErrorKind.invalid_state(),
                 "detach",
@@ -210,6 +378,13 @@ struct ResponseWriter(Movable, Sized):
     def write[
         origin: ImmOrigin
     ](mut self, data: Span[Byte, origin]) raises NetError:
+        if self.is_hijacked():
+            raise NetError(
+                NetErrorKind.invalid_state(),
+                "write response body",
+                None,
+                "response already hijacked",
+            )
         if len(self.body) + len(data) > self._limit:
             raise NetError(
                 NetErrorKind.invalid_argument(),
@@ -245,6 +420,13 @@ struct ResponseWriter(Movable, Sized):
         """Appends a response trailer after validating the name against
         the RFC 9110 §6.5.1 trailer deny-list; the underlying Headers
         store rejects CR/LF/NUL and non-token name bytes."""
+        if self.is_hijacked():
+            raise NetError(
+                NetErrorKind.invalid_state(),
+                "add trailer",
+                None,
+                "response already hijacked",
+            )
         if _trailer_forbidden(name):
             raise NetError(
                 NetErrorKind.invalid_argument(),

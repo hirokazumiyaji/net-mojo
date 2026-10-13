@@ -75,6 +75,7 @@ struct RequestBodyReceiver(Movable):
             self._pipe.discard()
         except:
             pass
+        self._pipe._release_detached_reader()
 
     def receive[
         origin: MutOrigin

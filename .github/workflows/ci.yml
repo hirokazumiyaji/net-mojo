@@ -248,6 +248,16 @@ jobs:
         run: pixi run test-http2
       - name: Test TLS and HTTPS
         run: pixi run -e tls tls-suite
+      - name: Test HTTP/1 connection switching
+        run: pixi run test-http-hijack
+      - name: Test CONNECT tunnels
+        run: pixi run test-http-connect
+      - name: Test independent raw switching interoperability
+        run: pixi run http-hijack-interop
+      - name: Run Upgrade echo example
+        run: pixi run example-http-upgrade-echo
+      - name: Run CONNECT tunnel example
+        run: pixi run example-http-connect
       - name: Test HTTP detach
         run: pixi run test-http-detach
       - name: Test HTTP offload
@@ -351,6 +361,8 @@ jobs:
         run: pixi run sanitize-http-hijack-actor
       - name: Sanitize HTTP/2 frame parser
         run: pixi run sanitize-http2
+      - name: Sanitize HTTP/1 connection switching
+        run: pixi run sanitize-http-hijack
       - name: Sanitize HTTP detach
         run: pixi run sanitize-http-detach
       - name: Sanitize HTTP offload

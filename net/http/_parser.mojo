@@ -930,10 +930,6 @@ def parse_head[
                 HttpError.version_not_supported(String("unsupported version"))
             )
         return HeadOutcome.failure(HttpError.bad_request(String("bad version")))
-    if method == "CONNECT":
-        return HeadOutcome.failure(
-            HttpError.bad_request(String("CONNECT not supported"))
-        )
     # --- Headers. ---
     var headers = Headers()
     var pos = line_end + 2
@@ -946,7 +942,9 @@ def parse_head[
     var expect_invalid = False
     var expect_seen = False
     var connection_close = False
+    var connection_upgrade = False
     var has_upgrade = False
+    var has_h2c = False
     var host_count = 0
     var host_value = String("")
     while True:
@@ -1075,8 +1073,27 @@ def parse_head[
             for i in range(len(tokens)):
                 if tokens[i].lower() == "close":
                     connection_close = True
+                elif tokens[i].lower() == "upgrade":
+                    connection_upgrade = True
         elif lowered == "upgrade":
             has_upgrade = True
+            var protocols = _split_comma_tokens(value)
+            if len(protocols) == 0:
+                return HeadOutcome.failure(
+                    HttpError.bad_request(String("empty Upgrade"))
+                )
+            for protocol in protocols:
+                var parts = protocol.split("/")
+                if len(parts) > 2 or not _is_token(parts[0]):
+                    return HeadOutcome.failure(
+                        HttpError.bad_request(String("bad Upgrade"))
+                    )
+                if len(parts) == 2 and not _is_token(parts[1]):
+                    return HeadOutcome.failure(
+                        HttpError.bad_request(String("bad Upgrade"))
+                    )
+                if parts[0].lower() == "h2c":
+                    has_h2c = True
         try:
             headers.add_bytes(String(raw_name), buf[value_start:value_end])
         except e:
@@ -1093,9 +1110,15 @@ def parse_head[
             return HeadOutcome.failure(
                 HttpError.bad_request(String("obs-fold not supported"))
             )
-    if has_upgrade:
+    if has_upgrade and (not connection_upgrade or has_h2c):
         return HeadOutcome.failure(
-            HttpError.bad_request(String("Upgrade not supported"))
+            HttpError.bad_request(String("unsupported Upgrade"))
+        )
+    if method == "CONNECT" and (
+        content_length_count > 0 or transfer_encoding_seen
+    ):
+        return HeadOutcome.failure(
+            HttpError.bad_request(String("CONNECT body not supported"))
         )
     if host_count != 1 or not _host_is_valid(host_value):
         return HeadOutcome.failure(HttpError.bad_request(String("bad Host")))
@@ -1129,7 +1152,23 @@ def parse_head[
     var scheme = String("http")
     var authority = String(host_value)
     var is_options_star = method == "OPTIONS" and target == "*"
-    if not is_options_star:
+    if method == "CONNECT":
+        var bytes = target.as_bytes()
+        var port_separator = -1
+        for i in range(len(bytes)):
+            if bytes[i] == Byte(ord(":")):
+                port_separator = i
+        if (
+            not _host_is_valid(target)
+            or port_separator < 0
+            or target.endswith("]")
+        ):
+            return HeadOutcome.failure(
+                HttpError.bad_request(String("bad CONNECT authority"))
+            )
+        authority = String(target)
+        path = String("")
+    elif not is_options_star:
         var matched, abs_authority, abs_path, abs_query = (
             _parse_absolute_authority(target)
         )

@@ -50,11 +50,19 @@ from ._buffer import SharedBufferBudget, _CapacityTicket, _reserve_capacity
 from ._body_decoder import _BodyDecoder
 from ._body_pipe import _BodyPipe
 from ._control import ServerControl
+from ._hijack import (
+    _hijack_state,
+    _cancel_hijack_state,
+    _complete_hijack_state,
+    _release_hijack_state,
+)
 from ._connection import (
     HttpConnection,
     PROTOCOL_HTTP2,
     STATE_DETACHED,
     STATE_HANDSHAKING,
+    STATE_HIJACKING_FLUSH,
+    STATE_HIJACKED,
     STATE_READING,
     STATE_SENDING,
     STATE_SENDING_HTTP2_CONTROL,
@@ -105,6 +113,7 @@ from .handler import Handler
 from .headers import Headers, _check_value_bytes, _trailer_forbidden
 from .response import (
     ResponseWriter,
+    _HijackContext,
     has_body_for_status,
     maybe_inject_alt_svc,
 )
@@ -291,6 +300,7 @@ struct Server(Movable):
     var _wakeup_channel: WakeupChannel
     var _wakeup_token: ReactorToken
     var _detached_conns: List[Int]
+    var _hijacking_conns: List[Int]
     var _http2_detached: List[_Http2DetachedStream]
     var _http2_detached_ticket: _CapacityTicket
     var _http3_detached: List[_Http3DetachedStream]
@@ -332,6 +342,7 @@ struct Server(Movable):
         var wtoken = self._reactor.register(self._wakeup_channel.read_fd())
         self._wakeup_token = wtoken.copy()
         self._detached_conns = List[Int]()
+        self._hijacking_conns = List[Int]()
         self._http2_detached = List[_Http2DetachedStream]()
         self._http2_detached_ticket = _CapacityTicket(self._budget.copy())
         self._http3_detached = List[_Http3DetachedStream]()
@@ -352,6 +363,7 @@ struct Server(Movable):
             self._discard_http2_detached(idx)
             if self._conns[idx].body_pipe:
                 self._conns[idx].body_pipe.value().cancel()
+            self._discard_hijack(idx)
             var addr = self._conns[idx].detach_state_addr
             if addr != 0:
                 self._conns[idx].detach_state_addr = 0
@@ -474,6 +486,7 @@ struct Server(Movable):
         self._tick_id += 1
         self._retry_request_body_budget()
         var wait_timeout = self._compute_timeout(now, timeout)
+        self._process_hijacks()
         self._process_detached_messages(now)
         # Capped pipelines from the previous tick re-drive without a kernel
         # event; blocking up to the wait cap here would stall a pipelined
@@ -510,6 +523,7 @@ struct Server(Movable):
         for i in range(len(events)):
             if events[i].token == self._wakeup_token:
                 self._wakeup_channel.drain()
+                self._process_hijacks()
                 self._process_detached_messages(now)
                 var body_conns = self._request_body_conns.copy()
                 for idx in body_conns:
@@ -542,6 +556,11 @@ struct Server(Movable):
                 continue
             if not (self._conns[idx].token == events[k].token):
                 continue
+            if events[k].has_hangup:
+                self._conns[idx].peer_hangup = True
+                if self._conns[idx].state == STATE_HIJACKING_FLUSH:
+                    self._close_conn(idx)
+                    continue
             var mask: UInt8 = 0
             if events[k].readable:
                 mask |= 1
@@ -581,6 +600,7 @@ struct Server(Movable):
             else:
                 self._arm_deadline(idx)
         self._expire_deadlines(now_ns())
+        self._process_hijacks()
         self._process_detached_messages(now_ns())
         self._retry_request_body_budget()
         if (
@@ -1902,6 +1922,7 @@ struct Server(Movable):
             return
         if not self._conns[idx].active:
             return
+        self._discard_hijack(idx)
         self._discard_detached(idx)
         self._discard_http2_detached(idx)
         self._cancel_request_body(idx)
@@ -2016,6 +2037,7 @@ struct Server(Movable):
             self._conns[idx].token,
             want_read,
             self._conns[idx].wants_write(),
+            watch_hangup=self._conns[idx].state == STATE_HIJACKING_FLUSH,
         )
 
     def _drive_tls_handshake(mut self, idx: Int) raises NetError:
@@ -2105,6 +2127,12 @@ struct Server(Movable):
         now: Int,
     ) raises:
         if not self._conns[idx].active:
+            return
+        if self._conns[idx].state == STATE_HIJACKING_FLUSH:
+            if self._conns[idx].write_ready(readable, writable):
+                self._pump_hijack(idx)
+            if self._conns[idx].active:
+                self._sync_interests(idx)
             return
         if self._conns[idx].state == STATE_HANDSHAKING:
             if (self._conns[idx].tls_handshake_wants_read and readable) or (
@@ -3708,7 +3736,19 @@ struct Server(Movable):
             queue_limit=self.config.stream_queue_limit,
         )
         writer._set_body_budget(self._budget.copy())
-        writer._set_request_body_pipe(self._conns[idx].body_pipe.copy())
+        writer._set_request_body_pipe(req._body_pipe.copy())
+        var is_connect = req.method == "CONNECT"
+        self._conns[idx].is_connect = is_connect
+        writer._set_hijack_context(
+            _HijackContext(
+                is_connect,
+                req.version == HttpVersion.http11(),
+                self.control.copy(),
+                String(self._tick_date),
+                self.config.max_response_headers_count,
+                self.config.max_response_headers_bytes,
+            )
+        )
         # The wire must advertise close whenever the connection will not
         # persist, even when the handler leaves the writer untouched.
         if req_close or self._shutdown_at != NO_DEADLINE:
@@ -3721,6 +3761,7 @@ struct Server(Movable):
             self._release_http1_body(idx)
             if writer.is_detached():
                 writer._cancel_detach()
+            writer._cancel_hijack()
             writer._drop_body()
             writer._drop_headers()
             self._send_error(idx, 500, is_head=is_head)
@@ -3740,6 +3781,32 @@ struct Server(Movable):
             writer.set_should_close(True)
         _ = req^
         self._release_http1_body(idx)
+        if writer.is_hijacked():
+            if (
+                writer._request_body_pipe
+                and not writer._request_body_pipe.value()._can_hijack()
+            ):
+                writer._cancel_hijack()
+                writer._drop_body()
+                writer._drop_headers()
+                self._send_error(idx, 500, is_head=is_head)
+                return
+            writer._drop_body()
+            writer._drop_headers()
+            self._conns[idx].hijack_state_addr = writer._take_hijack_state()
+            self._conns[idx].state = STATE_HIJACKING_FLUSH
+            self._conns[idx].header_at = NO_DEADLINE
+            self._conns[idx].body_at = NO_DEADLINE
+            self._conns[idx].idle_at = NO_DEADLINE
+            self._conns[idx].write_at = deadline_from_now(
+                self.config.write_deadline
+            )
+            self._hijacking_conns.append(idx)
+            self._pump_hijack(idx)
+            if self._conns[idx].active:
+                self._arm_deadline(idx)
+                self._sync_interests(idx)
+            return
         if writer.is_detached():
             writer._drop_body()
             writer._drop_headers()
@@ -3768,6 +3835,12 @@ struct Server(Movable):
             self._sync_interests(idx)
             return
 
+        if is_connect and 200 <= writer.status < 300:
+            writer._cancel_detach()
+            writer._drop_body()
+            writer._drop_headers()
+            self._send_error(idx, 500, is_head=is_head)
+            return
         if (
             len(writer.body) > cap
             or not writer._reconcile_body_budget()
@@ -3843,6 +3916,144 @@ struct Server(Movable):
             self._finish_connection(idx)
             return
         self._resume_http1_reading(idx)
+
+    def _remove_hijacking_conn(mut self, idx: Int):
+        for position in range(len(self._hijacking_conns)):
+            if self._hijacking_conns[position] == idx:
+                _ = self._hijacking_conns.pop(position)
+                return
+
+    def _discard_hijack(mut self, idx: Int):
+        var addr = self._conns[idx].hijack_state_addr
+        if addr != 0:
+            self._conns[idx].hijack_state_addr = 0
+            _cancel_hijack_state(addr)
+            _release_hijack_state(addr, from_sender=False)
+            self._remove_hijacking_conn(idx)
+
+    def _process_hijacks(mut self) raises NetError:
+        var position = 0
+        while position < len(self._hijacking_conns):
+            var idx = self._hijacking_conns[position]
+            var state = _hijack_state(self._conns[idx].hijack_state_addr)
+            state[].mutex.lock()
+            var cancelled = state[].cancelled
+            state[].mutex.unlock()
+            if cancelled:
+                self._close_conn(idx)
+            else:
+                position += 1
+
+    def _pump_hijack(mut self, idx: Int) raises NetError:
+        var addr = self._conns[idx].hijack_state_addr
+        var state = _hijack_state(addr)
+        state[].mutex.lock()
+        var cancelled = state[].cancelled
+        state[].mutex.unlock()
+        if (
+            cancelled
+            or self._conns[idx].read_eof
+            or self._conns[idx].peer_hangup
+            or now_ns() >= min(self._conns[idx].write_at, self._shutdown_at)
+        ):
+            self._close_conn(idx)
+            return
+        var allowance = (
+            self.config.max_bytes_per_tick - self._conns[idx].bytes_this_tick
+        )
+        if not self._conns[idx].pending_done():
+            if allowance <= 0:
+                return
+            try:
+                var count = self._conns[idx].try_write_pending_capped(allowance)
+                self._conns[idx].bytes_this_tick += count
+            except e:
+                if e.kind == NetErrorKind.timeout():
+                    return
+                self._close_conn(idx)
+                return
+            if self._conns[idx].tls_write_closed:
+                self._close_conn(idx)
+                return
+            if not self._conns[idx].pending_done():
+                return
+        var capacity = self._conns[idx].pending.capacity()
+        if capacity > 0:
+            self._conns[idx].clear_pending()
+            self._budget.release(capacity)
+        allowance = (
+            self.config.max_bytes_per_tick - self._conns[idx].bytes_this_tick
+        )
+        state[].mutex.lock()
+        if state[].pending_offset < len(state[].pending_response):
+            var bound = min(
+                allowance,
+                len(state[].pending_response) - state[].pending_offset,
+            )
+            if self._conns[idx].tls_write_retry_length > 0:
+                bound = self._conns[idx].tls_write_retry_length
+                if bound > allowance:
+                    state[].mutex.unlock()
+                    return
+            if bound <= 0:
+                state[].mutex.unlock()
+                return
+            try:
+                var count = self._conns[idx].try_write_bytes(
+                    Span(state[].pending_response)[
+                        state[].pending_offset : state[].pending_offset + bound
+                    ]
+                )
+                state[].pending_offset += count
+                self._conns[idx].bytes_this_tick += count
+            except e:
+                state[].mutex.unlock()
+                if e.kind == NetErrorKind.timeout():
+                    return
+                self._close_conn(idx)
+                return
+            if self._conns[idx].tls_write_closed:
+                state[].mutex.unlock()
+                self._close_conn(idx)
+                return
+        var done = state[].pending_offset >= len(state[].pending_response)
+        if done:
+            state[].pending_response = List[Byte]()
+            state[].response_ticket.release()
+        state[].mutex.unlock()
+        if not done:
+            return
+        var peer_hangup: Bool
+        try:
+            peer_hangup = Reactor._probe_hangup(self._conns[idx].raw_fd())
+        except error:
+            _ = error
+            self._close_conn(idx)
+            return
+        if peer_hangup:
+            self._close_conn(idx)
+            return
+        self._note_shutdown(now_ns())
+        if now_ns() >= min(self._conns[idx].write_at, self._shutdown_at):
+            self._close_conn(idx)
+            return
+        var moved_capacity = (
+            self._conns[idx].buf.capacity()
+            + self._conns[idx].tls_read_buffer.capacity()
+        )
+        var connection = self._conns[idx]._take_hijacked_connection()
+        self._conns[idx].hijack_state_addr = 0
+        self._conns[idx].state = STATE_HIJACKED
+        self._remove_hijacking_conn(idx)
+        self._budget.release(moved_capacity)
+        try:
+            self._close_conn(idx)
+        except e:
+            _cancel_hijack_state(addr)
+            _release_hijack_state(addr, from_sender=False)
+            raise e^
+        _ = _complete_hijack_state(addr, connection^)
+        _release_hijack_state(addr, from_sender=False)
 
     def _pump_send(mut self, idx: Int, event: Bool) raises NetError:
         if not self._conns[idx].active:
@@ -4150,6 +4361,10 @@ struct Server(Movable):
             self._fail_detached(idx, is_head, rw)
             return
 
+        if self._conns[idx].is_connect and 200 <= rw.status < 300:
+            self._fail_detached(idx, is_head, rw)
+            return
+
         try:
             self._inject_alt_svc_for_tls(idx, rw)
         except e:
@@ -4215,6 +4430,10 @@ struct Server(Movable):
         msg.headers = Headers()
         rw.headers = h^
         rw.set_should_close(req_close or (self._shutdown_at != NO_DEADLINE))
+
+        if self._conns[idx].is_connect and 200 <= rw.status < 300:
+            self._fail_detached(idx, is_head, rw)
+            return
 
         try:
             self._inject_alt_svc_for_tls(idx, rw)

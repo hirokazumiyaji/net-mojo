@@ -76,11 +76,11 @@ HTTP/1.1 の close に相当する処理を一律に connection close へ変換�
 
 HTTP/1.1 の平文 origin server を対象にする。TLS は前段で終端できる構成とする。
 HTTP/2 と HTTP/3、および server 自身の TLS 終端は後続の必須 Phase で実装する。
-HTTP/1.0、HTTP client、WebSocket、CONNECT tunnel、Upgrade、multipart の高水準 API、body 圧縮、静的ファイル配信は本 Issue の対象外とする。
+HTTP/1.0、HTTP client、WebSocket フレーミング、multipart の高水準 API、body 圧縮、静的ファイル配信はこの初期 Phase の対象外とする。HTTP/1.1 の CONNECT／Upgrade と raw transport の移譲は Issue #235 で追加する。
 
 - incremental parser を実装し、任意の byte 境界で分割された入力、複数 request の同時到着、binary body を扱う。
 - request line と header は CRLF を厳密に扱い、不正 token、改行注入、obs-fold、Host の欠落／重複／不正値を拒否する。
-- origin-form と absolute-form を扱い、absolute-form の authority を Host に優先する。`OPTIONS *` を扱う。CONNECT と Upgrade は切替を行わず、明示的なエラーにする。
+- origin-form と absolute-form を扱い、absolute-form の authority を Host に優先する。`OPTIONS *` を扱う。CONNECT は明示的な port を持つ authority-form のみ受理し、body framing は拒否する。Upgrade は `Connection: Upgrade` を要求し、h2c は拒否する。
 - `Content-Length` と chunked request を扱う。Transfer-Encoding と Content-Length の併存、矛盾する長さ、不正 chunk、overflow を拒否して close する。重複 Content-Length は同値でも拒否する保守的方針を仕様化する。
 - chunk extension と trailer は別の byte／件数上限で検証する。trailer を header に混ぜず別に保持し、framing や routing を変更させない。
 - `Expect: 100-continue` は header 検証と既知の body 上限判定後に 100 を送信して受信を継続する。他の expectation は 417 と close。
@@ -744,7 +744,7 @@ parser と encoder の単体 fixture は wire bytes を入力または出力し�
 | C2 | CRLF を要求し、不正 field name、colon 前の空白、obs-fold を 400 にする | 9112 §2.2、§5.1、§5.2。9110 §5.5、§5.6.2 | P `test_strict_crlf_token_obs_fold` の bare LF、`Bad Header`、`X-A :`、折返し行が 400。P `test_obs_text_header_value_preserved` は 0x80 を保持。R `test_response_injection_rejected` は CRLF を含む value の追加を拒否 |
 | C3 | HTTP/1.1 の Host 欠落、複数行、空値、不正 authority を 400 にする | 9112 §3.2。9110 §7.2 | P `test_host_missing_duplicate_invalid` の欠落、重複、空値、空白と、`test_host_authority_structure` の host／port／IPv6 の有効例と不正例を確認 |
 | C4 | origin-form、absolute-form、`OPTIONS *` を受理し、absolute-form の authority を優先する | 9112 §3.2.1、§3.2.2、§3.2.4 | P `test_path_query_split_without_decoding` は percent escape を保持。`test_absolute_form_and_options_star` は Host と異なる absolute authority と `*` を確認。`test_absolute_query_only_normalizes_to_root` は空 path を `/` にする。URI 全体の再構築への適合はこの例から判断しない |
-| C5 | CONNECT と Upgrade は未対応で、現在は 400 にする（実装方針） | CONNECT: 9112 §3.2.3、9110 §9.3.6。Upgrade: 9110 §7.8 | P `test_strict_crlf_token_obs_fold` は CONNECT と `Upgrade: h2c` に 400。505 は同じ fixture の `HTTP/2.0` に対する別の結果。切替成功の適合試験は含まない |
+| C5 | CONNECT authority-form と Upgrade を handler に渡す。CONNECT の body framing、h2c、Connection upgrade token の欠落は 400 | CONNECT: 9112 §3.2.3、9110 §9.3.6。Upgrade: 9110 §7.8 | P `test_connect_authority_form_preserves_following_raw_bytes`、`test_upgrade_requires_connection_and_keeps_h2c_rejected`。Server の raw 移譲は `test-http-hijack`／`test-http-connect` で確認する |
 | C6 | CL と chunked を処理し、CL/TE 併存、重複 CL、不正 framing、overflow を拒否する。同値 CL も拒否する方針 | 9112 §6.1、§6.2、§6.3、§7.1。9110 §8.6 | P `test_content_length_and_transfer_encoding` は同値の重複 CL、CL/TE、非数値 CL、`gzip` 単独を 400、`Chunked` を受理。P `test_overflow_and_limits` は decimal overflow と不正 hex を 400。S `test_chunked_echo_roundtrip` は decoded `hello` を返す。これらの parser の 400 assertion 自体は TCP close を検証しない |
 | C7 | chunk extension を検証し、trailer を通常 header と別に保持する。metadata と trailer に別上限を適用する | 9112 §7.1.1、§7.1.2。9110 §6.5、§6.5.1、§6.5.2 | P `test_chunked_with_extension_and_trailer` は `X-Trailer` の値と別 storage を確認。`test_chunk_extension_grammar` は token／quoted extension と不正例。`test_chunk_metadata_and_trailer_limits` は trailer 件数超過を 431、指定した framing、認証、content 等の field を 400 |
 | C8 | header 検証と宣言 body 上限判定後に 100 Continue を送り、未対応 Expect は 417 と close にする | 9110 §10.1.1、§15.2.1、§15.5.18 | S `test_100_continue_flow` は body 送信前に 100 を受信し、3-byte body 送信後に 200 と `abc` を確認。P `test_multiple_expect_fields_all_must_agree` は両 field 順序で 417。S `test_unknown_expectation_is_417` は 417 の status のみ確認 |
@@ -756,7 +756,7 @@ parser と encoder の単体 fixture は wire bytes を入力または出力し�
 malformed corpus は `tests/support._malformed_corpus()` を共有辞書とし、`P test_malformed_corpus_matches_parser_status` が parser の status を、`S test_malformed_corpus_wire_closes_connection` が wire 上の status 行と `Connection: close` と EOF をそれぞれ全件確認する。
 HTTP/1 の `scheme` は接続の TLS 状態を表し、平文では `http`、TLS では `https` になる。
 absolute-form の記載 scheme をそのまま公開する契約ではなく、target URI 全体の再構築（9112 §3.3）への適合は別に検証する。
-CONNECT／Upgrade の 400 と、未対応 transfer-coding の一律 400 は実装方針であり、RFC の要求する唯一の応答ではない（9112 §6.1 は未理解 coding に 501 を推奨する）。
+未対応 transfer-coding の一律 400 は実装方針であり、RFC の要求する唯一の応答ではない（9112 §6.1 は未理解 coding に 501 を推奨する）。
 この表だけで HTTP/2、HTTP/3、proxy、cache の適合を判定しない。
 
 ### HTTP/2 と HTTP/3 の request 変換
@@ -1152,3 +1152,23 @@ Cancellation returns `NetError(closed)`. Dropping or aborting an incomplete
 sender wakes the loop; dropping an unclaimed completed sender closes its raw
 transport. Each handoff has two references, held by the loop and worker;
 its response-wire and state-allocation budget tickets return on cleanup.
+
+
+`ResponseWriter.switch_protocols(headers, status=101)` accepts 101 for Upgrade
+or a successful 2xx status for CONNECT. Switching responses have no HTTP body,
+trailers, Content-Length or Transfer-Encoding. CONNECT responses in the buffered,
+deferred or HTTP streaming paths must use a non-2xx status; success requires raw
+takeover. `hijack()` sends no status or headers, so its receiving worker writes the
+CONNECT status line when needed. Both methods are exclusive with `detach()`;
+body and trailer writes after hijack raise `invalid_state`.
+
+Only an HTTP/1.1 server writer can switch protocols. HTTP/2, HTTP/3 and standalone
+writers return `unsupported`. An attached streaming request body must have reached
+and consumed EOF before takeover. An active standalone body receiver prohibits
+takeover, even after EOF; dropping it releases that ownership. Keep it released
+through the handler return. New takeover requests after shutdown has been
+requested return `closed`. Already started switching output drains within the
+shutdown grace and write deadline. Abort, peer hangup, send failure, handler error,
+server destruction or an expired flush deadline cancels the handoff. After transfer,
+server shutdown, deadlines and connection admission limits no longer own the raw
+transport; the receiver supplies its own I/O timeouts and close responsibility.

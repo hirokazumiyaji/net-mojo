@@ -533,5 +533,45 @@ def test_acknowledged_half_close_can_disarm_terminal_watch_with_blocked_output()
     listener.close()
 
 
+def test_terminal_probe_preserves_unread_bytes_and_registered_ready_events() raises:
+    var listener = listen_tcp("127.0.0.1:0")
+    var first = dial_tcp(String(listener.local_address()), Timeout.seconds(1))
+    var accepted = listener.accept(Timeout.seconds(1))
+    var second = dial_tcp(String(listener.local_address()), Timeout.seconds(1))
+    var sibling = listener.accept(Timeout.seconds(1))
+    var reactor = Reactor()
+    var first_token = reactor.register(accepted.raw_fd())
+    var second_token = reactor.register(sibling.raw_fd())
+    first.write_all("raw".as_bytes(), Timeout.seconds(1))
+    second.write_all("sibling".as_bytes(), Timeout.seconds(1))
+    assert_false(Reactor._probe_hangup(accepted.raw_fd()))
+    first.shutdown(False, True)
+    var expires = Int(perf_counter_ns()) + 1_000_000_000
+    var hangup = False
+    while not hangup and Int(perf_counter_ns()) < expires:
+        hangup = Reactor._probe_hangup(accepted.raw_fd())
+    assert_true(hangup)
+    var events = reactor.wait(Timeout.seconds(1))
+    var first_ready = False
+    var sibling_ready = False
+    for event in events:
+        first_ready = first_ready or event.token == first_token
+        sibling_ready = sibling_ready or event.token == second_token
+    assert_true(first_ready)
+    assert_true(sibling_ready)
+    var bytes = Array[Byte, 7](fill=0)
+    assert_equal(accepted.read(Span(bytes), Timeout.seconds(1)), 3)
+    assert_equal(String(from_utf8_lossy=Span(bytes)[0:3]), "raw")
+    assert_equal(sibling.read(Span(bytes), Timeout.seconds(1)), 7)
+    assert_equal(String(from_utf8_lossy=Span(bytes)), "sibling")
+    assert_true(reactor.remove(first_token))
+    assert_true(reactor.remove(second_token))
+    accepted.close()
+    sibling.close()
+    first.close()
+    second.close()
+    listener.close()
+
+
 def main() raises:
     TestSuite.discover_tests[__functions_in_module()]().run()

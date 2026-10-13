@@ -45,6 +45,20 @@ from tests.support import (
 from tests.test_http_server import _drain_head_error_to_eof
 
 
+def test_detached_writer_rejects_raw_hijack() raises:
+    var writer = ResponseWriter(32)
+    var sender = writer.detach()
+    var rejected = False
+    try:
+        _ = writer.hijack()
+    except e:
+        assert_equal(e.kind, NetErrorKind.invalid_state())
+        rejected = True
+    assert_true(rejected)
+    writer._cancel_detach()
+    sender.abort()
+
+
 def _move_sender(var sender: ResponseSender) -> ResponseSender:
     return sender^
 

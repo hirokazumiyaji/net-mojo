@@ -9,6 +9,8 @@ from net.http import (
     RecoverHandler,
     Request,
     ServerPool,
+    HijackedConn,
+    HijackSender,
     ResponseSender,
     ResponseWriter,
     RouteHandler,
@@ -127,8 +129,18 @@ def main() raises:
     var count = server.read(Span(received), Timeout.seconds(1))
     if count != 4 or received[0] != 1 or received[3] != 4:
         raise Error("packaged artifact roundtrip mismatch")
+    var switched = HijackedConn(server^, _to_bytes("pref"))
+    if switched.is_tls() or switched.raw_fd() < 0:
+        raise Error("packaged switched transport mismatch")
+    count = switched.read(Span(received), Timeout.seconds(1))
+    if count != 4 or String(from_utf8_lossy=Span(received)) != "pref":
+        raise Error("packaged switched buffered bytes mismatch")
+    _ = switched.write(Span(ping), Timeout.seconds(1))
+    count = client.read(Span(received), Timeout.seconds(1))
+    if count != 4 or received[0] != 1 or received[3] != 4:
+        raise Error("packaged switched roundtrip mismatch")
     client.close()
-    server.close()
+    switched^.close()
     listener.close()
     print("packaged artifact roundtrip succeeded")
     _check_http_codec()

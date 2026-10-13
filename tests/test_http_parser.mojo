@@ -476,9 +476,86 @@ def test_strict_crlf_token_obs_fold() raises:
     _assert_status("GET /a HTTP/1.1\r\nHost: h\r\nBad Header: 1\r\n\r\n", 400)
     _assert_status("GET /a HTTP/1.1\r\nHost: h\r\nX-A : 1\r\n\r\n", 400)
     _assert_status("GET /a HTTP/1.1\r\nHost: h\r\nX-A: 1\r\n 2\r\n\r\n", 400)
-    _assert_status("CONNECT h:443 HTTP/1.1\r\nHost: h\r\n\r\n", 400)
     _assert_status("GET /a HTTP/1.1\r\nHost: h\r\nUpgrade: h2c\r\n\r\n", 400)
     _assert_status("GET /a HTTP/2.0\r\nHost: h\r\n\r\n", 505)
+
+
+def test_connect_authority_form_preserves_following_raw_bytes() raises:
+    var config = ServerConfig.default()
+    for target in ["example.com:443", "[::1]:8443"]:
+        var head = (
+            String("CONNECT ")
+            + target
+            + String(" HTTP/1.1\r\nHost: proxy\r\n\r\n")
+        )
+        var buf = _to_bytes(head + String("raw-tunnel"))
+        var result = parse_one(Span(buf), config)
+        assert_true(result.is_complete())
+        assert_equal(result.request.method, "CONNECT")
+        assert_equal(result.request.authority, target)
+        assert_equal(result.request.path, "")
+        assert_equal(result.request.query, "")
+        assert_equal(len(result.request.body), 0)
+        assert_equal(result.consumed, head.byte_length())
+    for target in [
+        "example.com",
+        "/example.com:443",
+        "https://example.com:443",
+        "user@example.com:443",
+        "[::1]",
+        "example.com:bad",
+        "example.com:65536",
+    ]:
+        _assert_status(
+            String("CONNECT ")
+            + target
+            + String(" HTTP/1.1\r\nHost: proxy\r\n\r\n"),
+            400,
+        )
+    for framing in [
+        "Content-Length: 0",
+        "Content-Length: 1",
+        "Transfer-Encoding: chunked",
+    ]:
+        _assert_status(
+            String("CONNECT example.com:443 HTTP/1.1\r\nHost: proxy\r\n")
+            + framing
+            + String("\r\n\r\n"),
+            400,
+        )
+
+
+def test_upgrade_requires_connection_and_keeps_h2c_rejected() raises:
+    _assert_complete(
+        (
+            "GET /chat HTTP/1.1\r\nHost: h\r\nConnection: keep-alive,"
+            " UpGrAdE\r\nUpgrade: websocket\r\n\r\n"
+        ),
+        "GET",
+        "/chat",
+        0,
+    )
+    for protocol in ["h2c", "H2C", "websocket, h2c", "h2c/1"]:
+        _assert_status(
+            String(
+                "GET /chat HTTP/1.1\r\nHost: h\r\nConnection:"
+                " Upgrade\r\nUpgrade: "
+            )
+            + protocol
+            + String("\r\n\r\n"),
+            400,
+        )
+    _assert_status(
+        "GET /chat HTTP/1.1\r\nHost: h\r\nUpgrade: websocket\r\n\r\n", 400
+    )
+    _assert_status(
+        (
+            "GET /chat HTTP/1.1\r\nHost: h\r\nConnection: Upgrade\r\nUpgrade:"
+            " websocket\r\nContent-Length: 1\r\nTransfer-Encoding:"
+            " chunked\r\n\r\n"
+        ),
+        400,
+    )
 
 
 def test_absolute_form_and_options_star() raises:

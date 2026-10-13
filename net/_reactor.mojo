@@ -91,6 +91,18 @@ struct Reactor(Movable, Sized):
     def is_empty(self) -> Bool:
         return self._active_count == 0
 
+    @staticmethod
+    def _probe_hangup(fd: Int32) raises NetError -> Bool:
+        """Inspect terminal readiness without consuming pending reactor events.
+        """
+        var queue = _EventQueue()
+        queue.register(fd, False, True, UInt64(0), watch_hangup=True)
+        var ready = queue.wait(_Deadline.from_timeout(Timeout.nanoseconds(0)))
+        for event in ready:
+            if event.eof or event.has_error:
+                return True
+        return False
+
     def register(
         mut self,
         fd: Int32,

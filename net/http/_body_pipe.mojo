@@ -33,6 +33,7 @@ struct _BodyPipeState(Movable):
     var cancelled: Bool
     var claimed: Bool
     var detached_reader: Bool
+    var active_detached_reader: Bool
     var discarded: Bool
     var terminal_trailers: Headers
     var retain_capacity: Bool
@@ -53,6 +54,7 @@ struct _BodyPipeState(Movable):
         self.cancelled = False
         self.claimed = False
         self.detached_reader = False
+        self.active_detached_reader = False
         self.discarded = False
         self.terminal_trailers = Headers()
         self.retain_capacity = False
@@ -321,7 +323,26 @@ struct _BodyPipe(Copyable):
         ref state = self._state[]
         state.mutex.lock()
         state.detached_reader = True
+        state.active_detached_reader = True
         state.mutex.unlock()
+
+    def _release_detached_reader(self):
+        ref state = self._state[]
+        state.mutex.lock()
+        state.active_detached_reader = False
+        state.mutex.unlock()
+
+    def _can_hijack(self) -> Bool:
+        ref state = self._state[]
+        state.mutex.lock()
+        var ready = (
+            state.finished
+            and not state.cancelled
+            and state.head == len(state.bytes)
+            and not state.active_detached_reader
+        )
+        state.mutex.unlock()
+        return ready
 
     def has_detached_reader(self) -> Bool:
         ref state = self._state[]
