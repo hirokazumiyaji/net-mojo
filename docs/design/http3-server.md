@@ -96,12 +96,14 @@ a detached receiver can continue reading DATA and trailers afterward.
 input is incomplete. Completed input needs no informational response. Unsupported
 expectations return 417 without invoking the handler.
 
-The server reserves body queue capacity from `max_total_buffer_bytes`, copies at
+The server reserves body queue capacity from `total_buffer_budget`, copies at
 most 4 KiB per input per turn, and returns native receive credit only after the
 reader consumes or discards those bytes. A full queue pauses DATA copying while
 still observing EOF, resets, and body deadlines. Unclaimed input is discarded
 when the handler returns. Invalid trailers or an exhausted trailer budget cancel
-that stream while sibling requests continue.
+that stream while sibling requests continue. Temporary trailer budget pressure
+retries admission until `body_deadline`; consumption renews that deadline. If
+admission still cannot finish, the receiver is cancelled even after response FIN.
 
 Shutdown refuses new requests and lets accepted input finish during the grace
 period. Expiry cancels unfinished receivers. Run the independent client cases

@@ -169,6 +169,7 @@ struct _Http3RequestInput(Movable):
     var pipe: _BodyPipe
     var wire_eof: Bool
     var eof_published: Bool
+    var eof_admission_at: Int
     var trailers: Headers
 
     def __deinit__(deinit self):
@@ -1305,7 +1306,9 @@ struct Server(Movable):
             self._http3_inputs.capacity() * size_of[_Http3RequestInput]()
         )
         self._http3_inputs.append(
-            _Http3RequestInput(request_id, pipe.copy(), False, False, Headers())
+            _Http3RequestInput(
+                request_id, pipe.copy(), False, False, NO_DEADLINE, Headers()
+            )
         )
         return True
 
@@ -1321,16 +1324,30 @@ struct Server(Movable):
         if not self._quic_endpoint:
             return
         var scratch = Array[Byte, 4096](fill=0)
+        var now = now_ns()
         var index = 0
         while index < len(self._http3_inputs):
             var id = self._http3_inputs[index].request_id
             var pipe = self._http3_inputs[index].pipe.copy()
             var consumed = pipe.take_consumed()
-            if consumed > 0 and not self._quic_endpoint.value().consume_body(
-                id, consumed
+            if consumed > 0:
+                if not self._quic_endpoint.value().consume_body(id, consumed):
+                    pipe.cancel()
+                elif (
+                    self._http3_inputs[index].wire_eof
+                    and not self._http3_inputs[index].eof_published
+                ):
+                    self._http3_inputs[
+                        index
+                    ].eof_admission_at = deadline_from_now(
+                        self.config.body_deadline
+                    )
+            if pipe.is_cancelled() or (
+                self._http3_inputs[index].wire_eof
+                and not self._http3_inputs[index].eof_published
+                and now >= self._http3_inputs[index].eof_admission_at
             ):
                 pipe.cancel()
-            if pipe.is_cancelled():
                 _ = self._quic_endpoint.value().release_body(id, True)
                 self._cancel_http3_detached(id, UInt64(0x10C))
                 self._remove_http3_input(index)
@@ -1369,6 +1386,11 @@ struct Server(Movable):
                             fields[i].name.copy(), Span(fields[i].value)
                         )
                     self._http3_inputs[index].wire_eof = True
+                    self._http3_inputs[
+                        index
+                    ].eof_admission_at = deadline_from_now(
+                        self.config.body_deadline
+                    )
             if (
                 self._http3_inputs[index].wire_eof
                 and not self._http3_inputs[index].eof_published
@@ -4356,6 +4378,14 @@ struct Server(Movable):
             best = _sooner(best, self._quic_close_at, now)
         for i in range(len(self._http3_detached)):
             best = _sooner(best, self._http3_detached[i].deadline, now)
+        for i in range(len(self._http3_inputs)):
+            if (
+                self._http3_inputs[i].wire_eof
+                and not self._http3_inputs[i].eof_published
+            ):
+                best = _sooner(
+                    best, self._http3_inputs[i].eof_admission_at, now
+                )
         while len(self._deadline_heap) > 0:
             var top = self._deadline_heap[0]
             var mark = self._next_deadline(top.idx)

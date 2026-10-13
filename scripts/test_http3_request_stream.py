@@ -53,6 +53,17 @@ class Client(Http3ClientProtocol):
             await asyncio.sleep(0.01)
         raise AssertionError((path, expected))
 
+    def send_large_trailers(self, stream, fields):
+        encoder = pylsqpack.Encoder()
+        encoder.apply_settings(0, 0)
+        block = b"\0\0"
+        for field in fields:
+            _, encoded = encoder.encode(stream, [field])
+            assert encoded[:2] == b"\0\0"
+            block += encoded[2:]
+        self._quic.send_stream_data(stream, encode_frame(FrameType.HEADERS, block), end_stream=True)
+        self.transmit()
+
 
 async def run(port):
     config = QuicConfiguration(is_client=True, alpn_protocols=["h3"])
@@ -131,23 +142,34 @@ async def run(port):
         await client.wait_value("/calls", b"6")
         client.http.send_data(overflow, b"a" * 100, end_stream=False)
         fields = [(b"x-finish", b"yes"), *[(f"x-budget-{i}".encode(), b"x" * 2048) for i in range(10)]]
-        encoder = pylsqpack.Encoder()
-        encoder.apply_settings(0, 0)
-        block = b"\0\0"
-        for field in fields:
-            _, encoded = encoder.encode(overflow, [field])
-            assert encoded[:2] == b"\0\0"
-            block += encoded[2:]
-        client._quic.send_stream_data(overflow, encode_frame(FrameType.HEADERS, block), end_stream=True)
-        client.transmit()
+        client.send_large_trailers(overflow, fields)
         await client.wait_value("/cancelled", b"2")
         assert await client.get("/calls") == b"6"
         idle, response = client.begin("/upload", True)
         await client.wait_value("/calls", b"7")
         await client.wait_value("/cancelled", b"3")
         assert await asyncio.wait_for(client.resets[idle], 2) == 0x10C
+        fields = [(f"x-budget-{i}".encode(), b"x" * 2048) for i in range(3)]
+        for refund in (True, False):
+            before = int(await client.get("/done"))
+            waiting, response = client.begin("/early", True)
+            assert (await asyncio.wait_for(response["future"], 5))["body"] == b"early"
+            client.http.send_data(waiting, b"a" * 64, end_stream=False)
+            client.transmit()
+            await client.wait_value("/bytes", b"64")
+            assert await client.get("/hold-budget") == b"held"
+            client.send_large_trailers(waiting, fields)
+            await asyncio.sleep(0.1)
+            assert await client.get("/done") == str(before).encode()
+            if refund:
+                assert await client.get("/refund-budget") == b"refunded"
+                await client.wait_value("/done", str(before + 1).encode())
+            else:
+                await client.wait_value("/cancelled", b"4")
+                assert await client.get("/refund-budget") == b"refunded"
+            await client.wait_value("/inputs", b"0")
         shutdown, response = client.begin("/upload", True)
-        await client.wait_value("/calls", b"8")
+        await client.wait_value("/calls", b"10")
         assert await client.get("/shutdown") == b"shutdown"
         client.http.send_data(shutdown, b"a" * 4096, end_stream=True)
         client.transmit()

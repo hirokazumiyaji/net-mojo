@@ -27,6 +27,7 @@ struct _StreamingHandler(Handler):
     var early: Bool
     var done: Int
     var standalone: Optional[RequestBodyReceiver]
+    var hold_budget: Bool
 
     def __init__(out self):
         self.endpoints = None
@@ -39,6 +40,7 @@ struct _StreamingHandler(Handler):
         self.early = False
         self.done = 0
         self.standalone = None
+        self.hold_budget = False
 
     def handle(mut self, request: Request, mut writer: ResponseWriter) raises:
         writer.should_close = True
@@ -56,6 +58,12 @@ struct _StreamingHandler(Handler):
             writer.write_string(String(self.cancelled))
         elif request.path == "/done":
             writer.write_string(String(self.done))
+        elif request.path == "/hold-budget":
+            self.hold_budget = True
+            writer.write_string("held")
+        elif request.path == "/refund-budget":
+            self.hold_budget = False
+            writer.write_string("refunded")
         elif request.path == "/pause":
             self.paused = True
             writer.write_string("paused")
@@ -173,10 +181,17 @@ def main() raises:
         Optional[Pointer[Byte, MutUntrackedOrigin]](None)
     )
     var handler = _StreamingHandler()
+    var held_budget = 0
     while not handler.shutdown:
         _ = server.tick(handler, Timeout.milliseconds(10))
         handler.consume()
         handler.input_count = len(server._http3_inputs)
+        if handler.hold_budget and held_budget == 0:
+            held_budget = server._budget.remaining() - 1024
+            assert_equal(server._budget.try_reserve(held_budget), True)
+        elif not handler.hold_budget and held_budget > 0:
+            server._budget.release(held_budget)
+            held_budget = 0
     server.request_shutdown()
     while server.tick(handler, Timeout.milliseconds(10)):
         handler.consume()
