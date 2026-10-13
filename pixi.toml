@@ -272,6 +272,8 @@ fuzz-smoke = { cmd = "python3 scripts/run_fuzz.py smoke", depends-on = ["fuzz-bu
 fuzz-nightly = { cmd = "python3 scripts/run_fuzz_nightly.py", depends-on = ["fuzz-build"] }
 fuzz-nightly-test = { cmd = "python3 tests/fuzz/test_nightly.py", depends-on = ["fuzz-build"] }
 fuzz-driver-test = { cmd = "python3 tests/fuzz/test_driver.py", depends-on = ["fuzz-build"] }
+fuzz-minimize = { cmd = "python3 scripts/minimize_fuzz.py", depends-on = ["fuzz-build"] }
+fuzz-minimize-test = "python3 tests/fuzz/test_minimize.py"
 
 [feature.mojo-1-1.dependencies]
 mojo = ">=1.1.0,<1.2"

@@ -371,3 +371,25 @@ running in CI; long RSS/soak runs and formal 30 s x 5 performance
 comparisons stay manual and are recorded in `benchmarks/http/README.md`.
 
 `pixi run test` and `pixi run sanitize` run the full test and sanitizer suites locally; per-module tasks (`pixi run test-tcp`, `pixi run sanitize-tcp`, ...) match what CI executes step by step.
+
+### Fuzzing and conformance regressions
+
+Issue #227 adds native HPACK libFuzzer/ASan/UBSan, Rust QUIC receive
+cargo-fuzz/ASan, Mojo parser mutation/replay under ASan, and unmodified pinned
+h2spec against the repository's own loopback TLS fixture. Smoke jobs cover PRs;
+Linux x86_64 and arm64 scheduled jobs retain reproduction inputs and metadata.
+HTTP/2 conformance also runs on macOS arm64.
+
+Preserve the original binary, artifact, metadata, commit and toolchain before
+minimization. Reduce native artifacts with libFuzzer's `-minimize_crash`; reduce
+structured Mojo batches with `pixi run -e fuzz fuzz-minimize`, preserving the
+observed diagnostic and exit code. Promote small reviewed raw cases into
+`tests/fuzz-regressions/<target>/` and load them in matching ordinary tests.
+Assert the intended parser/native behavior and replay the fixed target under
+sanitizers. Evolving corpora remain outside tracked source. Commands and the
+retained serialized `x: y` encode-path example are documented in
+[the fuzz harness guide](../../tests/fuzz/README.md).
+
+Scheduled acceptance is observed after deployment to the default branch:
+record completed 30-minute target runs, artifact retention and recurrence over
+the following week before closing the remaining Issue #227 observation items.

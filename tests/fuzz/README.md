@@ -100,3 +100,58 @@ or bounded startup/run/shutdown timeout fails the job. Standard h2spec log/XML,
 source revision/command metadata, and fixture stderr remain under
 `build/conformance/` and are retained as CI artifacts for 14 days. Scheduled
 execution begins once the workflow reaches the default branch.
+
+## Minimize and promote retained inputs
+
+Keep the original artifact, metadata, binary, commit, and pinned toolchain.
+Reproduce the failure before reducing it. Use a stable diagnostic from that
+failure as the signature; the reducer requires that signature and the original
+exit code for every candidate. Timeouts abort reduction instead of qualifying
+as the original failure.
+
+For Mojo targets, retain the four-byte big-endian length prefixes around each
+case. The reducer removes complete cases first, then payload chunks, while
+rewriting valid lengths:
+
+```sh
+pixi run -e fuzz fuzz-minimize http1 build/fuzz/http1-nightly.bin \
+  build/fuzz/http1-minimal.bin --signature '<stable diagnostic from the retained log>'
+pixi run -e fuzz python3 scripts/run_fuzz.py http1 --replay build/fuzz/http1-minimal.bin
+pixi run -e fuzz fuzz-minimize-test
+```
+
+The original file is preserved. A JSON sidecar records the target, signature,
+exit code, remaining case count, and payload lengths. A failure that also
+occurs with no input is rejected so harness setup errors do not become cases.
+Unit tests reduce only a harmless fixed marker; they do not introduce defects
+into protocol implementations.
+
+Native HPACK and QUIC artifacts already contain one raw libFuzzer input:
+
+```sh
+pixi run -e fuzz build/fuzz/hpack build/fuzz/crash-HASH \
+  -minimize_crash=1 -exact_artifact_path=build/fuzz/hpack-minimal.bin \
+  -max_total_time=60 -timeout=10 -rss_limit_mb=2048
+pixi run -e tls-http3 fuzz-quic-build
+pixi run -e tls-http3 env NET_HTTP_TEST_CERT="$PWD/build/tls/test-cert.pem" \
+  NET_HTTP_TEST_KEY="$PWD/build/tls/test-key.pem" \
+  build/fuzz/quic-recv build/fuzz/quic-recv-crash-HASH \
+  -minimize_crash=1 -exact_artifact_path=build/fuzz/quic-minimal.bin \
+  -max_total_time=60 -timeout=10 -rss_limit_mb=2048
+```
+
+Replay the minimized input with the same target before changing production
+code. Extract raw payloads from a minimized Mojo batch with `read_batch()` in
+`scripts/minimize_fuzz.py`; keep multiple cases in order if the failure requires
+a sequence. Add the small raw payloads to `tests/fuzz-regressions/<target>/`
+and make the matching ordinary test load them directly. Assert the expected
+parser error or native success path, then verify the fix with that test and the
+sanitizer target. Keep generated evolving corpora under ignored `build/fuzz/`.
+
+`hpack/serialized-xy.bin` demonstrates promotion of the discovered encode-path
+harness gap: an ordinary serialized field must reach successful encoding.
+The 10-byte fixture is read by native HPACK bound/field-count/header-accounting/
+content assertions and replayed by both native and Mojo seed corpora. Run
+`pixi run -e tls-http2 hpack-test`, `pixi run -e fuzz fuzz-driver-test`, and
+`pixi run -e fuzz build/fuzz/hpack tests/fuzz-regressions/hpack/serialized-xy.bin -runs=1`
+to replay its ordinary and sanitizer coverage.
