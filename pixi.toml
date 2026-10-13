@@ -86,6 +86,9 @@ benchmark-loopback = "mojo run --Werror -I . benchmarks/loopback_io.mojo"
 benchmark-http-parse = "mojo run --Werror -I . benchmarks/http_parse.mojo"
 benchmark-http-server = "mojo run --Werror -I . benchmarks/http_server.mojo"
 benchmark-http-stream = "mojo run --Werror -I . benchmarks/http_stream.mojo"
+# Harness/loader regression only — no long performance runs or thresholds.
+benchmark-harness-test = "python3 tests/test_http_benchmark_harness.py"
+benchmark-go-test = "GOTOOLCHAIN=local go -C benchmarks/http_go test ./..."
 
 [feature.tls.dependencies]
 c-compiler = "*"

@@ -18,8 +18,8 @@ from net._sys.common import (
 from ._stream import (
     _read_with_deadline,
     _try_recv,
-    _try_send,
-    _write_with_deadline,
+    _try_send_datagram,
+    _write_datagram_with_deadline,
 )
 from .address import (
     SocketAddress,
@@ -85,7 +85,9 @@ struct UDPConn(Movable):
         if not self._connected:
             raise _invalid_udp_mode("write")
         var deadline = _Deadline.from_optional(timeout)
-        var written = _write_with_deadline(self._fd.raw(), buffer, deadline)
+        var written = _write_datagram_with_deadline(
+            self._fd.raw(), buffer, deadline
+        )
         if written != len(buffer):
             raise NetError(
                 NetErrorKind.invalid_state(),
@@ -218,7 +220,7 @@ struct UDPConn(Movable):
         `TCPConn.try_read`."""
         if not self._connected:
             raise _invalid_udp_mode("write")
-        var written = _try_send(self._fd.raw(), buffer)
+        var written = _try_send_datagram(self._fd.raw(), buffer)
         if written != len(buffer):
             raise NetError(
                 NetErrorKind.invalid_state(),

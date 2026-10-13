@@ -30,6 +30,62 @@ struct BenchHandler(Handler):
             writer.write_string("not found")
 
 
+def _header_end(buf: List[Byte]) -> Int:
+    var i = 0
+    while i + 3 < len(buf):
+        if (
+            buf[i] == Byte(ord("\r"))
+            and buf[i + 1] == Byte(ord("\n"))
+            and buf[i + 2] == Byte(ord("\r"))
+            and buf[i + 3] == Byte(ord("\n"))
+        ):
+            return i + 4
+        i += 1
+    return -1
+
+
+def _content_length_of(buf: List[Byte]) -> Int:
+    var end = _header_end(buf)
+    if end < 0:
+        return -1
+    var head = String(from_utf8_lossy=Span(buf)[0:end]).lower()
+    var needle = String("\r\ncontent-length:")
+    var at = head.find(needle)
+    if at < 0:
+        return -1
+    var value_start = at + len(needle.as_bytes())
+    var value_end = value_start
+    var head_bytes = head.as_bytes()
+    while value_end < len(head_bytes) and (
+        head_bytes[value_end] == Byte(ord(" "))
+        or head_bytes[value_end] == Byte(ord("\t"))
+    ):
+        value_end += 1
+    var digits_start = value_end
+    while value_end < len(head_bytes) and (
+        head_bytes[value_end] >= Byte(ord("0"))
+        and head_bytes[value_end] <= Byte(ord("9"))
+    ):
+        value_end += 1
+    if value_end == digits_start:
+        return -1
+    var value = 0
+    for i in range(digits_start, value_end):
+        value = value * 10 + Int(head_bytes[i] - Byte(ord("0")))
+    return value
+
+
+def _response_complete(buf: List[Byte]) -> Bool:
+    """True once headers and the Content-Length body have fully arrived."""
+    var end = _header_end(buf)
+    if end < 0:
+        return False
+    var length = _content_length_of(buf)
+    if length < 0:
+        return False
+    return len(buf) >= end + length
+
+
 def _drain(
     mut server: Server,
     mut handler: BenchHandler,
@@ -46,11 +102,8 @@ def _drain(
                 break
             for i in range(n):
                 out.append(tmp[i])
-            if len(out) >= 200:
-                # One small response fits well within 200B; stop early.
-                var text = String(from_utf8_lossy=Span(out))
-                if text.find("Content-Length:") >= 0 and text.find("aaaa") >= 0:
-                    break
+            if _response_complete(out):
+                break
         except e:
             _ = e
             continue

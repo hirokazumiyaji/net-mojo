@@ -48,6 +48,48 @@ def test_empty_datagram_is_success() raises:
     assert_equal(received[0], Byte(99))
 
 
+def test_connected_empty_datagram_write_and_try_write() raises:
+    var receiver = listen_udp("127.0.0.1:0")
+    var sender = dial_udp(String(receiver.local_address()), Timeout.seconds(1))
+    var empty = Array[Byte, 0](fill=0)
+    var buffer = Array[Byte, 2](fill=99)
+
+    assert_equal(sender.write(Span(empty), Timeout.seconds(1)), 0)
+    var first = receiver.recv_from(Span(buffer), Timeout.seconds(1))
+    assert_equal(first.count, 0)
+    assert_false(first.truncated)
+    assert_equal(first.source, sender.local_address())
+    assert_equal(buffer[0], Byte(99))
+
+    assert_equal(sender.try_write(Span(empty)), 0)
+    var second = receiver.recv_from(Span(buffer), Timeout.seconds(1))
+    assert_equal(second.count, 0)
+    assert_false(second.truncated)
+    assert_equal(second.source, sender.local_address())
+
+    var payload: Array[Byte, 2] = [11, 22]
+    assert_equal(sender.write(Span(payload), Timeout.seconds(1)), 2)
+    var third = receiver.recv_from(Span(buffer), Timeout.seconds(1))
+    assert_equal(third.count, 2)
+    assert_false(third.truncated)
+    assert_equal(third.source, sender.local_address())
+    assert_equal(buffer[0], Byte(11))
+    assert_equal(buffer[1], Byte(22))
+
+
+def test_connected_empty_write_after_close_is_closed() raises:
+    var receiver = listen_udp("127.0.0.1:0")
+    var sender = dial_udp(String(receiver.local_address()), Timeout.seconds(1))
+    sender.close()
+    var empty = Array[Byte, 0](fill=0)
+    try:
+        _ = sender.write(Span(empty))
+    except error:
+        assert_equal(error.kind, NetErrorKind.closed())
+        return
+    raise Error("closed connected UDP accepted empty write")
+
+
 def test_oversized_datagram_reports_truncation() raises:
     var receiver = listen_udp("127.0.0.1:0")
     var sender = listen_udp("127.0.0.1:0")

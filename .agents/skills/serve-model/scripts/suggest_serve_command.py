@@ -39,6 +39,7 @@ from __future__ import annotations
 import argparse
 import json
 import re
+import shlex
 import sys
 from pathlib import Path
 
@@ -290,16 +291,26 @@ def main() -> int:
     if _mp.name == "config.json" and _mp.is_file():
         model_path = str(_mp.parent)
     served = pkg.name
-    cmd = [
-        "max serve",
-        f"--model-path {model_path}",
-        f"--custom-architectures {pkg}",
-        f"--devices {devices}",
-        f"--quantization-encoding {encoding}",
-        f"--max-length {max_length}",
-        "--max-batch-size 1",
-        f"--served-model-name {served}",
-        f"--port {args.port}",
+    # Build argv as individual arguments, then shell-quote for display.
+    cmd: list[str] = [
+        "max",
+        "serve",
+        "--model-path",
+        model_path,
+        "--custom-architectures",
+        str(pkg),
+        "--devices",
+        devices,
+        "--quantization-encoding",
+        encoding,
+        "--max-length",
+        str(max_length),
+        "--max-batch-size",
+        "1",
+        "--served-model-name",
+        served,
+        "--port",
+        str(args.port),
     ]
     notes.append(
         "Included --max-batch-size 1: some custom models assert it is set "
@@ -309,12 +320,17 @@ def main() -> int:
     if trust:
         cmd.append("--trust-remote-code")
     if arch["chat_template"]:
-        cmd.append(f"--chat-template {arch['chat_template']}")
+        cmd.extend(["--chat-template", str(arch["chat_template"])])
     if moe:
         cmd.append("--device-graph-capture")
 
+    quoted = [shlex.quote(part) for part in cmd]
+    # Line wrapping is presentation only; shlex.split of the joined form
+    # must recover the original argv values.
+    display = f"{quoted[0]} {quoted[1]} \\\n  " + " \\\n  ".join(quoted[2:])
+
     print("# Suggested serve command (review the notes, then run):")
-    print(" \\\n  ".join(cmd))
+    print(display)
     print()
     print(
         f"# arch name={arch['name']}  default_encoding={arch['default_encoding']}  "

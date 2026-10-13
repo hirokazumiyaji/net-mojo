@@ -437,6 +437,11 @@ func TestSlowReaderFreshIOBudgetAllowsLongerFiniteBatch(t *testing.T) {
 	defer s.Close()
 	c := readerConfig(s.URL + "/fixed")
 	c.SetupTimeout = 2 * time.Second
+	// Per-op budget must tolerate slow localhost write stalls (Linux CI),
+	// while paced reads (8 responses × 16 quanta × SlowInterval) still make
+	// the full batch exceed one budget — proving budgets are refreshed.
+	const ioBudget = 200 * time.Millisecond
+	c.SlowInterval = 5 * time.Millisecond
 	w, err := prepare(c)
 	if err != nil {
 		t.Fatal(err)
@@ -460,13 +465,13 @@ func TestSlowReaderFreshIOBudgetAllowsLongerFiniteBatch(t *testing.T) {
 	g.observe(2*time.Second, true)
 	begin := time.Now()
 	ready := make(chan error, 1)
-	if err := g.readerCycle(slot, c, ready, true, 30*time.Millisecond); err != nil {
+	if err := g.readerCycle(slot, c, ready, true, ioBudget); err != nil {
 		t.Fatal(err)
 	}
 	if err := <-ready; err != nil {
 		t.Fatal(err)
 	}
-	if elapsed := time.Since(begin); elapsed <= 30*time.Millisecond || elapsed >= 2*time.Second || g.stats.ReaderResponsesTotal != 8 || g.stats.ReaderWritesTotal != 8 {
+	if elapsed := time.Since(begin); elapsed <= ioBudget || elapsed >= 2*time.Second || g.stats.ReaderResponsesTotal != 8 || g.stats.ReaderWritesTotal != 8 {
 		t.Fatalf("fresh operation budget became aggregate or lost batch: elapsed=%s stats=%+v", elapsed, g.stats)
 	}
 	if err := slot.probe(g.ctx, c, w); err != nil {

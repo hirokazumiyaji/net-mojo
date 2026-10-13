@@ -108,6 +108,57 @@ def _try_send[
         raise _system_error("send", status.error_number)
 
 
+def _write_datagram_with_deadline[
+    origin: ImmOrigin
+](
+    fd: Int32, buffer: Span[Byte, origin], deadline: _Deadline
+) raises NetError -> Int:
+    """Connected datagram send: empty buffers still call `send` so a
+    zero-length UDP datagram is delivered."""
+    while True:
+        var status = _send_status(fd, buffer)
+        if status.error_number == 0:
+            if status.value == 0 and len(buffer) != 0:
+                raise NetError(
+                    NetErrorKind.invalid_state(),
+                    "write",
+                    None,
+                    "non-empty write made no progress",
+                )
+            return status.value
+        if _is_interrupted(status.error_number):
+            if deadline.expired():
+                raise _timeout_error("write")
+            continue
+        if not _is_would_block(status.error_number):
+            raise _system_error("send", status.error_number)
+        if not _wait_writable(fd, deadline):
+            raise _timeout_error("write")
+
+
+def _try_send_datagram[
+    origin: ImmOrigin
+](fd: Int32, buffer: Span[Byte, origin]) raises NetError -> Int:
+    """One connected datagram `send` without waiting; empty buffers still
+    perform the syscall."""
+    while True:
+        var status = _send_status(fd, buffer)
+        if status.error_number == 0:
+            if status.value == 0 and len(buffer) != 0:
+                raise NetError(
+                    NetErrorKind.invalid_state(),
+                    "write",
+                    None,
+                    "non-empty write made no progress",
+                )
+            return status.value
+        if _is_interrupted(status.error_number):
+            continue
+        if _is_would_block(status.error_number):
+            raise _timeout_error("write")
+        raise _system_error("send", status.error_number)
+
+
 def _try_accept(fd: Int32) raises NetError -> _OwnedFD:
     """One `accept` attempt without waiting, with the same mapping as
     `_try_recv`."""

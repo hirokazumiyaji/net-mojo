@@ -236,8 +236,19 @@ be lost when active entry counters reach zero.
 The opt-in native receive-budget patch now provides independent backing and
 slot limits, with exhaustion, atomic rejection and release regressions in
 `quic-suite`. These diagnostics supply actual unlimited budgets to preserve
-their receive-allocation experiment. The provider still selects unlimited
-limits; finite provider policy remains separate work.
+their receive-allocation experiment. That unlimited setting is diagnostic-only
+fixture policy for this measurement path; it is not the production provider
+default.
+
+The current provider (`net/quic/provider/src/lib.rs`, `default_receive_limits`
+since `c4f867635b873d1594e9897ddeb8a83e13a449c4`, 2026-10-04) installs finite
+shared receive pools on `QuicServer::new`: request = 64 MiB backing /
+65,536 slots, control = 4 MiB / 131,072 slots, CRYPTO = 16 MiB / 131,072 slots.
+Design and configuration surface:
+[docs/design/quic-transport.md](../../docs/design/quic-transport.md) and
+`ServerConfig.quic_receive_{request,control,crypto}_{bytes,slots}`. These are
+logical retained-backing and fragment-slot budgets, not an allocator or process
+RSS hard cap.
 
 With this fifth patch, the 16 KiB low-level held sizes are 19,088 bytes
 contiguous, 2,394,792 sparse and 2,246,552 overlap. The corresponding server
@@ -245,8 +256,9 @@ transport sizes after H3 drop are 42,324, 2,418,028 and 2,269,788 bytes.
 Nodes, unique bytes and backing are unchanged. A partial one-byte view still
 retains 1,024 backing bytes; low-level Rust drop sizes are now 1,952 for that
 state, 912 after reading, and 192 after reset. The shared default ledger object
-adds measured overhead; historical figures in SCALING.md retain their recorded
-source attribution. These Rust sizes are not the budget's charged byte count.
+adds measured overhead; historical figures in SCALING.md and the tables above
+retain their recorded source attribution under the diagnostic unlimited
+budgets. These Rust sizes are not the budget's charged byte count.
 
 ## Limits of this evidence
 

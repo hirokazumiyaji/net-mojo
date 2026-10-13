@@ -176,8 +176,8 @@ def _process_stream_buffer(
                     var lat_us = (now_ns - val) // 1000
                     if lat_us < 0:
                         lat_us = 0
-                    if lat_us < 10000000:
-                        latencies.append(lat_us)
+                    # Include slow samples; discarding them would bias percentiles.
+                    latencies.append(lat_us)
                 j = num_end + 1
                 consumed_to = j
             else:
@@ -192,6 +192,11 @@ def _process_stream_buffer(
         buf = remaining^
 
     return has_stream_end
+
+
+def _buffer_has_ok_status(buf: List[Byte]) -> Bool:
+    var s = String(from_utf8_lossy=Span(buf))
+    return s.find("HTTP/1.1 200") >= 0
 
 
 def main() raises:
@@ -335,9 +340,13 @@ def main() raises:
     var latencies = List[Int]()
     var finished_streams = 0
     var stream_finished = List[Bool]()
+    var stream_ok_status = List[Bool]()
+    var stream_event_counts = List[Int]()
     var remainders = List[List[Byte]]()
     for _ in range(num_streams):
         stream_finished.append(False)
+        stream_ok_status.append(False)
+        stream_event_counts.append(0)
         remainders.append(List[Byte]())
 
     var read_buf = Array[Byte, 8192](fill=0)
@@ -367,26 +376,69 @@ def main() raises:
                 if n > 0:
                     for k in range(n):
                         remainders[i].append(read_buf[k])
+                    if not stream_ok_status[i] and _buffer_has_ok_status(
+                        remainders[i]
+                    ):
+                        stream_ok_status[i] = True
+                    var before = len(latencies)
                     var is_ended = _process_stream_buffer(
                         remainders[i], read_time, latencies
                     )
+                    stream_event_counts[i] += len(latencies) - before
                     if is_ended:
+                        if not stream_ok_status[i]:
+                            loop_error_msg = (
+                                "stream finished without HTTP/1.1 200 status"
+                            )
+                            break
+                        if stream_event_counts[i] != events_per_stream:
+                            loop_error_msg = (
+                                "stream finished with incomplete event count"
+                            )
+                            break
                         stream_finished[i] = True
                         finished_streams += 1
                 elif n == 0:
-                    _ = _process_stream_buffer(
+                    # EOF without a terminal chunk is not a completed stream.
+                    var before = len(latencies)
+                    var is_ended = _process_stream_buffer(
                         remainders[i], read_time, latencies
                     )
-                    stream_finished[i] = True
-                    finished_streams += 1
+                    stream_event_counts[i] += len(latencies) - before
+                    if (
+                        is_ended
+                        and stream_ok_status[i]
+                        and (stream_event_counts[i] == events_per_stream)
+                    ):
+                        stream_finished[i] = True
+                        finished_streams += 1
+                    else:
+                        loop_error_msg = (
+                            "stream closed before terminal chunk/complete"
+                            " events"
+                        )
+                        break
             except e:
                 if e.kind == NetErrorKind.closed():
                     var read_time = Int(perf_counter_ns())
-                    _ = _process_stream_buffer(
+                    var before = len(latencies)
+                    var is_ended = _process_stream_buffer(
                         remainders[i], read_time, latencies
                     )
-                    stream_finished[i] = True
-                    finished_streams += 1
+                    stream_event_counts[i] += len(latencies) - before
+                    if (
+                        is_ended
+                        and stream_ok_status[i]
+                        and (stream_event_counts[i] == events_per_stream)
+                    ):
+                        stream_finished[i] = True
+                        finished_streams += 1
+                    else:
+                        loop_error_msg = (
+                            "stream closed before terminal chunk/complete"
+                            " events"
+                        )
+                        break
                 elif e.kind == NetErrorKind.timeout():
                     pass
                 else:
@@ -408,6 +460,22 @@ def main() raises:
                 Optional[Pointer[Byte, MutUntrackedOrigin]](None),
             )
 
+    # Verify workers completed the planned send workload before freeing.
+    var worker_ok = True
+    var worker_error_msg = String()
+    for i in range(num_streams):
+        var ctx_p = _get_ptr(ctx_array, i)
+        if not ctx_p[].done:
+            worker_ok = False
+            worker_error_msg = "worker did not complete successfully"
+            break
+        if ctx_p[].success_count != events_per_stream:
+            worker_ok = False
+            worker_error_msg = (
+                "worker success_count does not match planned events"
+            )
+            break
+
     # Cleanup clients and memory
     for i in range(num_streams):
         clients[i].close()
@@ -419,6 +487,10 @@ def main() raises:
 
     if loop_error_msg.byte_length() > 0:
         raise Error(loop_error_msg)
+    if not worker_ok:
+        raise Error(worker_error_msg)
+    if finished_streams != num_streams:
+        raise Error("incomplete streaming workload: not all streams finished")
 
     var wall_seconds = Float64(Int(bench_end) - Int(bench_start)) / 1e9
     var cpu_seconds: Float64 = 0.0
@@ -426,6 +498,12 @@ def main() raises:
         cpu_seconds = Float64(Int(cpu_end) - Int(cpu_start)) / 1000000.0
     var cpu_percent = (cpu_seconds / wall_seconds) * 100.0
     var total_events = len(latencies)
+    var expected_events = num_streams * events_per_stream
+    if total_events != expected_events:
+        raise Error(
+            "incomplete streaming workload: measured events do not match"
+            " planned streams x events"
+        )
     var throughput = Float64(total_events) / wall_seconds
 
     _sort_latencies(latencies)
@@ -442,6 +520,7 @@ def main() raises:
     print("Elapsed wall time (s):", wall_seconds)
     print("CPU time (s):", cpu_seconds)
     print("CPU utilization (%):", cpu_percent)
+    print("Finished streams:", finished_streams)
     print("Total events measured:", total_events)
     print("Aggregate throughput (events/s):", throughput)
     print("Latency p50 (us):", p50)

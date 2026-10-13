@@ -264,14 +264,16 @@ def _unix_address_from_raw[
     origin: MutOrigin
 ](raw: Pointer[Byte, origin], length: UInt32) raises NetError -> String:
     var path_offset = 2
-    var path_max = UNIX_PATH_MAX
+    # Encoder emits 2 + path + trailing NUL; accept the full sockaddr_un
+    # size so UNIX_PATH_MAX pathnames round-trip through address queries.
+    var max_raw_length = UInt32(2 + UNIX_PATH_MAX + 1)
     comptime if _DARWIN:
-        if length < 2 or length > UInt32(2 + path_max):
+        if length < 2 or length > max_raw_length:
             raise _invalid_unix_path()
         if UInt16(raw[unsafe_offset=1]) != UInt16(AF_UNIX):
             raise _invalid_unix_path()
     else:
-        if length < 2 or length > UInt32(2 + path_max):
+        if length < 2 or length > max_raw_length:
             raise _invalid_unix_path()
         var family = UInt16(raw[unsafe_offset=0]) | (
             UInt16(raw[unsafe_offset=1]) << 8

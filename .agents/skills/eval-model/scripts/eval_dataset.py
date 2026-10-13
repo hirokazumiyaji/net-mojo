@@ -111,6 +111,20 @@ def log(message: str = "") -> None:
     print(message, file=sys.stderr, flush=True)
 
 
+def _reap_owned_child(proc: subprocess.Popen | None, *, grace_sec: float = 5.0) -> None:
+    """Terminate an owned child if still running, then wait or kill+wait."""
+    if proc is None:
+        return
+    if proc.poll() is not None:
+        return
+    proc.terminate()
+    try:
+        proc.wait(timeout=grace_sec)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        proc.wait()
+
+
 def resolve_run_id(model: str, run_id: str | None = None) -> str:
     """Return a safe label for the default output directory."""
     value = run_id or model.replace("/", "_")
@@ -590,6 +604,7 @@ def run_lm_eval_full(
 
         stdout_file = tempfile.TemporaryFile(mode="w+")
         stderr_file = tempfile.TemporaryFile(mode="w+")
+        process: subprocess.Popen | None = None
         try:
             process = subprocess.Popen(
                 command,
@@ -621,6 +636,8 @@ def run_lm_eval_full(
             except EvaluationError as exc:
                 raise EvaluationError(str(exc), task) from exc
         finally:
+            # Reap the child before deleting its result directory.
+            _reap_owned_child(process)
             stdout_file.close()
             stderr_file.close()
             shutil.rmtree(output_path, ignore_errors=True)

@@ -25,7 +25,7 @@ from net.http._encoder import (
 
 
 def test_stream_wire_exact_capacity_preserves_framing_and_foreign_reservations() raises:
-    for status in [100, 200, 204, 205, 304]:
+    for status in [200, 204, 205, 304]:
         for is_head in [False, True]:
             var writer = ResponseWriter(32)
             writer.status = status
@@ -179,7 +179,9 @@ def test_encoder_borrowed_duplicate_obs_text_headers_match_exact_wire() raises:
 
 
 def test_budgeted_wire_exact_capacity_matches_framing_and_raw_headers() raises:
-    for status in [100, 200, 204, 205, 304]:
+    # 205 forces Content-Length: 0; omit it here so the caller CL:5 fixture
+    # stays valid for statuses that keep or drop length without rewriting.
+    for status in [200, 204, 304]:
         for is_head in [False, True]:
             var writer = ResponseWriter(32)
             writer.status = status
@@ -297,7 +299,7 @@ def test_head_keeps_length_but_omits_body() raises:
 
 
 def test_no_body_statuses_drop_body_and_length() raises:
-    for status in [204, 205, 304]:
+    for status in [204, 304]:
         var writer = ResponseWriter(1024)
         writer.set_status(status)
         writer.headers.add(String("Content-Type"), String("text/plain"))
@@ -313,17 +315,51 @@ def test_no_body_statuses_drop_body_and_length() raises:
         assert_true(text.find("Content-Length") < 0)
         assert_true(text.endswith("\r\n\r\n"))
         assert_false(has_body_for_status(status, False))
-    var informational = ResponseWriter(1024)
-    informational.set_status(100)
-    var wire_info = encode_response(
-        informational,
+    var reset = ResponseWriter(1024)
+    reset.set_status(205)
+    reset.headers.add(String("Content-Type"), String("text/plain"))
+    reset.write_string("dropped")
+    var wire_205 = encode_response(
+        reset,
         False,
         "Thu, 01 Jan 1970 00:00:00 GMT",
         100,
         32768,
     )
-    var text_info = _bytes_to_string(Span(wire_info))
-    assert_true(text_info.find("Content-Length") < 0)
+    var text_205 = _bytes_to_string(Span(wire_205))
+    assert_true(text_205.find("Content-Length: 0\r\n") >= 0)
+    assert_true(text_205.endswith("\r\n\r\n"))
+    assert_false(has_body_for_status(205, False))
+    # 1xx is intermediate only; final encode paths must reject it.
+    for status in [100, 101, 103]:
+        var informational = ResponseWriter(1024)
+        informational.set_status(status)
+        var rejected = False
+        try:
+            _ = encode_response(
+                informational,
+                False,
+                "Thu, 01 Jan 1970 00:00:00 GMT",
+                100,
+                32768,
+            )
+        except e:
+            assert_equal(e.kind, NetErrorKind.invalid_argument())
+            rejected = True
+        assert_true(rejected)
+        var chunked_rejected = False
+        try:
+            _ = encode_chunked_start(
+                informational,
+                False,
+                "Thu, 01 Jan 1970 00:00:00 GMT",
+                100,
+                32768,
+            )
+        except e:
+            assert_equal(e.kind, NetErrorKind.invalid_argument())
+            chunked_rejected = True
+        assert_true(chunked_rejected)
 
 
 def test_duplicate_response_headers_preserved() raises:
@@ -512,7 +548,7 @@ def test_100_continue_encoding() raises:
 
 
 def test_invalid_status_codes_are_rejected() raises:
-    for bad in [99, 1000]:
+    for bad in [99, 100, 103, 1000]:
         var writer = ResponseWriter(1024)
         writer.set_status(bad)
         writer.write_string("x")

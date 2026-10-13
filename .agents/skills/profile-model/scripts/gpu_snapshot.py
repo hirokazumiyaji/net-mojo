@@ -35,6 +35,20 @@ import sys
 import time
 
 
+def _reap_owned_child(proc: subprocess.Popen | None, *, grace_sec: float = 5.0) -> None:
+    """Terminate an owned child if still running, then wait or kill+wait."""
+    if proc is None:
+        return
+    if proc.poll() is not None:
+        return
+    proc.terminate()
+    try:
+        proc.wait(timeout=grace_sec)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        proc.wait()
+
+
 def _summarize(samples: list[dict]) -> None:
     """Print peak/mean utilization and peak memory per GPU."""
     if not samples:
@@ -127,19 +141,20 @@ def main() -> int:
     if args.run:
         proc = subprocess.Popen(shlex.split(args.run))
 
-    with BackgroundRecorder(interval=args.interval) as rec:
-        deadline = time.monotonic() + args.duration
-        while time.monotonic() < deadline:
-            if proc is not None and proc.poll() is not None:
-                break
-            time.sleep(
-                min(args.interval, max(0.0, deadline - time.monotonic()))
-            )
+    try:
+        with BackgroundRecorder(interval=args.interval) as rec:
+            deadline = time.monotonic() + args.duration
+            while time.monotonic() < deadline:
+                if proc is not None and proc.poll() is not None:
+                    break
+                time.sleep(
+                    min(args.interval, max(0.0, deadline - time.monotonic()))
+                )
+        samples = rec.stats
+    finally:
+        _reap_owned_child(proc)
 
-    if proc is not None and proc.poll() is None:
-        proc.terminate()
-
-    _summarize(rec.stats)
+    _summarize(samples)
     return 0
 
 

@@ -6,7 +6,12 @@ from std.time import perf_counter_ns
 
 from net import Timeout, UnixAddress, dial_unix, listen_unix
 from net.error import NetErrorKind
-from net._sys.common import AF_UNIX, UNIX_PATH_MAX, _unix_address_to_raw
+from net._sys.common import (
+    AF_UNIX,
+    UNIX_PATH_MAX,
+    _unix_address_from_raw,
+    _unix_address_to_raw,
+)
 from tests.support import _assert_bytes_equal
 
 
@@ -48,6 +53,19 @@ def _repeated_ascii(length: Int) -> String:
     return String(from_utf8_lossy=Span(bytes))
 
 
+def _max_socket_path() raises -> String:
+    var directory = gettempdir()
+    if not directory:
+        raise Error("no temporary directory is available")
+    var directory_path = directory.value()
+    var process = external_call["getpid", c_int]()
+    var prefix = String(t"{directory_path}/n{process}-")
+    var prefix_length = len(prefix.as_bytes())
+    if prefix_length >= UNIX_PATH_MAX:
+        raise Error("temporary directory leaves no room for a Unix path")
+    return prefix + _repeated_ascii(UNIX_PATH_MAX - prefix_length)
+
+
 def _assert_invalid_path(path: StringSlice) raises:
     try:
         _ = UnixAddress.parse(path)
@@ -69,6 +87,49 @@ def test_unix_address_enforces_platform_byte_limit() raises:
     var maximum = _repeated_ascii(UNIX_PATH_MAX)
     assert_equal(UnixAddress.parse(maximum).path, maximum)
     _assert_invalid_path(_repeated_ascii(UNIX_PATH_MAX + 1))
+
+
+def test_unix_max_path_raw_round_trip() raises:
+    var maximum = _repeated_ascii(UNIX_PATH_MAX)
+    var raw = _unix_address_to_raw(maximum)
+    assert_equal(raw.length, UInt32(2 + UNIX_PATH_MAX + 1))
+    var decoded = _unix_address_from_raw(raw.unsafe_ptr(), raw.length)
+    assert_equal(decoded, maximum)
+
+
+def test_unix_raw_rejects_oversized_length() raises:
+    var raw = _unix_address_to_raw("abc")
+    raw.length = UInt32(2 + UNIX_PATH_MAX + 2)
+    try:
+        _ = _unix_address_from_raw(raw.unsafe_ptr(), raw.length)
+    except error:
+        assert_equal(error.kind, NetErrorKind.invalid_address())
+        return
+    raise Error("Unix raw decoder accepted an oversized sockaddr length")
+
+
+def test_unix_max_path_address_queries() raises:
+    var path = _max_socket_path()
+    assert_equal(len(path.as_bytes()), UNIX_PATH_MAX)
+    _unlink(path)
+    var cleanup = _PathCleanup(path)
+    var listener = listen_unix(path)
+    assert_equal(String(listener.local_address()), path)
+    var client = dial_unix(path, Timeout.seconds(1))
+    var server = listener.accept(Timeout.seconds(1))
+    assert_equal(String(client.remote_address()), path)
+    assert_equal(String(server.local_address()), path)
+    try:
+        _ = client.local_address()
+    except error:
+        assert_equal(error.kind, NetErrorKind.invalid_address())
+    else:
+        raise Error("unbound Unix client reported a local address")
+    client.close()
+    server.close()
+    listener.close()
+    _unlink(path)
+    _ = cleanup.path
 
 
 def test_unix_address_value_traits() raises:

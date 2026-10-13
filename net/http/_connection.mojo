@@ -194,7 +194,9 @@ struct HttpConnection(Movable):
         if self.state == STATE_DETACHED or self.state == STATE_STREAMING:
             # While detached or streaming, only read if buffer is empty, so pipelined
             # data does not consume the shared buffer budget unparsed.
-            # Reading when buffer is empty allows detecting peer disconnect (EOF).
+            # Reading when buffer is empty observes peer write half-close (EOF)
+            # without treating it as a full disconnect; wants_read is False
+            # once read_eof is set so read interest drops after the first EOF.
             return self.buffered_len() == 0
         return False
 
