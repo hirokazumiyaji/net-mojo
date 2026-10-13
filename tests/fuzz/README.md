@@ -80,3 +80,23 @@ Artifacts contain reproduction metadata, the current Mojo batch and native
 crash/timeout/oom/leak inputs for 14 days. Native metadata records its seed, budget,
 input limit and corpus path. Use the same commit and pinned toolchain when
 rebuilding a target to replay downloaded inputs.
+
+## HTTP/2 conformance
+
+```sh
+pixi run -e conformance http2-conformance
+```
+
+The task retrieves upstream h2spec commit
+`70ac2294010887f48b18e2d64f5cccd48421fad1` through `gh`, builds it with pinned
+Go 1.27.2, and runs its unmodified TLS suite against the repository's own
+ASan loopback fixture. GitHub CLI authentication is required for the source
+download; CI supplies its read-only repository token. The fixture uses the
+generated local test certificate and an ephemeral loopback port.
+
+`http2-conformance.yml` runs on PRs, daily at 17:42 UTC, and manual dispatch on
+Linux x86_64, Linux arm64, and macOS arm64. A suite failure, fixture failure,
+or bounded startup/run/shutdown timeout fails the job. Standard h2spec log/XML,
+source revision/command metadata, and fixture stderr remain under
+`build/conformance/` and are retained as CI artifacts for 14 days. Scheduled
+execution begins once the workflow reaches the default branch.

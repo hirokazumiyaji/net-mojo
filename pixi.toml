@@ -16,6 +16,7 @@ sysroot_linux-aarch64 = "==2.34"
 
 [tasks]
 fuzz-parser-build = { cmd = "bash scripts/build_fuzz_parser.sh", default-environment = "sanitize" }
+http2-conformance-fixture-build = { cmd = "bash scripts/build_http2_conformance_fixture.sh", default-environment = "sanitize" }
 format = "mojo format net tests examples benchmarks"
 test-core = "mojo run --Werror -I . tests/test_core.mojo"
 test-ip = "mojo run --Werror -I . tests/test_ip.mojo"
@@ -238,6 +239,18 @@ example-https-hello = { cmd = "mojo run --Werror -I . examples/https_hello.mojo"
   "tls-build",
 ] }
 
+[feature.conformance.dependencies]
+go = "==1.27.2"
+
+[feature.conformance.tasks]
+h2spec-build = "bash scripts/install_h2spec.sh"
+http2-conformance = { cmd = "python3 scripts/run_http2_conformance.py", depends-on = [
+  "tls-build",
+  "hpack-test",
+  "h2spec-build",
+  { task = "http2-conformance-fixture-build", environment = "sanitize" },
+] }
+
 [feature.fuzz.dependencies]
 clang = "==23.1.2"
 compiler-rt = "==23.1.2"
@@ -271,6 +284,7 @@ compiler-rt = "==23.1.2"
 default = ["mojo-1-1"]
 sanitize = ["sanitize", "mojo-1-1"]
 fuzz = ["fuzz", "sanitize", "mojo-1-1"]
+conformance = ["conformance", "tls", "http2", "mojo-1-1"]
 tls = ["tls", "mojo-1-1"]
 http2 = ["http2", "mojo-1-1"]
 http3 = ["http3", "mojo-1-1"]
