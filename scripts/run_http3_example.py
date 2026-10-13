@@ -38,7 +38,7 @@ class _Http3Client(QuicConnectionProtocol):
             if http_event.stream_ended and not self.response["future"].done():
                 self.response["future"].set_result(self.response)
 
-    async def get(self):
+    async def get(self, path="/"):
         self.stream_id = self._quic.get_next_available_stream_id()
         self.http.send_headers(
             self.stream_id,
@@ -46,7 +46,7 @@ class _Http3Client(QuicConnectionProtocol):
                 (b":method", b"GET"),
                 (b":scheme", b"https"),
                 (b":authority", b"localhost"),
-                (b":path", b"/"),
+                (b":path", path.encode()),
             ],
             end_stream=True,
         )
@@ -93,11 +93,11 @@ def _wait_ready(process):
     return int(ready.split()[1])
 
 
-def main():
+def main(example="examples/http3_hello.mojo"):
     env = dict(os.environ)
     env["HELLO_ADDRESS"] = "127.0.0.1:0"
     process = subprocess.Popen(
-        ["mojo", "run", "--Werror", "-I", ".", "examples/http3_hello.mojo"],
+        ["mojo", "run", "--Werror", "-I", ".", example],
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         text=True,
@@ -122,4 +122,5 @@ def main():
             )
 
 
-main()
+if __name__ == "__main__":
+    main()

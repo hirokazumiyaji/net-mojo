@@ -192,7 +192,13 @@ quic-rust-test = { cmd = "bash scripts/test_quic_provider.sh", depends-on = [
   "tls-build",
   "quic-build",
 ] }
-quic-suite = { depends-on = ["quic-test", "quic-mojo-test", "quic-rust-test"] }
+http-pool-quic-test = { cmd = "mojo run --Werror -I . tests/test_http_pool_quic.mojo", depends-on = [
+  "tls-build", "quic-build",
+] }
+http-pool-quic-integration-test = { cmd = "python3 scripts/test_http_pool_quic_integration.py", depends-on = [
+  "tls-build", "quic-build",
+] }
+quic-suite = { depends-on = ["quic-test", "quic-mojo-test", "quic-rust-test", "http-pool-quic-test"] }
 http3-client-test = { cmd = "python3 scripts/test_http3_server.py", depends-on = [
   "tls-build",
   "quic-build",
@@ -209,6 +215,9 @@ http3-package-smoke = { cmd = "python3 scripts/test_http3_package_smoke.py", dep
 http3-example-build = { cmd = "bash scripts/check_http3_example.sh", depends-on = [
   "tls-build",
   "quic-build",
+] }
+http3-pool-example-run = { cmd = "python3 scripts/run_http3_pool_example.py", depends-on = [
+  "tls-build", "quic-build",
 ] }
 http3-example-run = { cmd = "python3 scripts/run_http3_example.py", depends-on = [
   "tls-build",

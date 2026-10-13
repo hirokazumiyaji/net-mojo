@@ -139,6 +139,8 @@ jobs:
         run: pixi run -e tls-http3 quic-suite
       - name: Test independent HTTP/3 client
         run: pixi run -e tls-http3 http3-client-test
+      - name: Test shared TCP and worker-zero QUIC pool
+        run: pixi run -e tls-http3 http-pool-quic-integration-test
       - name: Test HTTP same-origin fallback
         run: pixi run -e tls-http3 http-same-origin-test
       - name: Test packaged HTTP/3 provider
@@ -147,6 +149,8 @@ jobs:
         run: pixi run -e tls-http3 http3-example-build
       - name: Run HTTP/3 example with independent client
         run: pixi run -e tls-http3 http3-example-run
+      - name: Run HTTP/3 worker pool example with independent client
+        run: pixi run -e tls-http3 http3-pool-example-run
 
   test:
     name: Test (${{ matrix.os }})
@@ -231,6 +235,18 @@ jobs:
         with:
           go-version: "1.26.x"
           cache-dependency-path: benchmarks/http_go/go.sum
+      - name: Measure HTTP worker counts (descriptive)
+        timeout-minutes: 5
+        run: |
+          set -o pipefail
+          pixi run benchmark-http-server | tee http-worker-benchmark.txt
+      - name: Retain HTTP worker benchmark
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: http-worker-benchmark-${{ matrix.os }}
+          path: http-worker-benchmark.txt
+          if-no-files-found: ignore
       - name: Test HTTP benchmark harness regression
         run: pixi run benchmark-harness-test
       - name: Test Go HTTP loader

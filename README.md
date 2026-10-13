@@ -288,9 +288,15 @@ worker errors after shutdown cleanup. A pool serves once. Linux listener
 registrations use `EPOLLEXCLUSIVE`; macOS uses kqueue and handles competing
 accepts as would-block.
 
+`add_quic_endpoint(endpoint^)` assigns QUIC/HTTP/3 exclusively to worker zero.
+Other workers serve TCP/TLS; a pool with only QUIC runs one worker. See
+`examples/http3_pool_hello.mojo` and run
+`pixi run -e tls-http3 http3-pool-example-run`.
+
 Run `pixi run test-http-pool` and
 `pixi run -e tls-http2 http-pool-integration-test` for plain/TLS HTTP/1.1 and
-HTTP/2 coverage.
+HTTP/2 coverage. `pixi run -e tls-http3 http-pool-quic-integration-test`
+checks mixed TCP/QUIC and QUIC-only pools.
 
 Reproduce the performance comparison with
 `benchmarks/http/README.md` (Go baseline in `benchmarks/http_go`,

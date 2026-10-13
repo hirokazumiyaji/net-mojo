@@ -11,3 +11,5 @@ done
 
 mojo build --Werror --emit=llvm -I . examples/http3_hello.mojo \
     -o build/check/http3_hello.ll
+
+mojo build --Werror -I . examples/http3_pool_hello.mojo -Xlinker -ldl -o build/http3_pool_hello

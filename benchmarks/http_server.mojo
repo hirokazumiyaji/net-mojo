@@ -8,10 +8,19 @@ Measures the epoll/kqueue server (no poll fallback):
 Run: `pixi run benchmark-http-server`.
 """
 
+from std.ffi import c_int, external_call
 from std.time import perf_counter_ns
 
 from net import TCPConn, Timeout, dial_tcp, listen_tcp
-from net.http import Handler, Request, ResponseWriter, Server, ServerConfig
+from net.http import (
+    Handler,
+    HandlerFactory,
+    Request,
+    ResponseWriter,
+    Server,
+    ServerConfig,
+    ServerPool,
+)
 
 
 struct BenchHandler(Handler):
@@ -110,6 +119,120 @@ def _drain(
     return out^
 
 
+@fieldwise_init
+struct PoolBenchHandler(Handler):
+    var worker_id: Int
+
+    def handle(mut self, req: Request, mut writer: ResponseWriter) raises:
+        var value = UInt64(req.path.byte_length() + self.worker_id)
+        for _ in range(200_000):
+            value = value * UInt64(6364136223846793005) + UInt64(1)
+        writer.write_string(String(value))
+
+
+struct PoolBenchFactory(HandlerFactory):
+    comptime HandlerType = PoolBenchHandler
+
+    def __init__(out self):
+        pass
+
+    def build(mut self, worker_id: Int) raises -> PoolBenchHandler:
+        return PoolBenchHandler(worker_id)
+
+
+@fieldwise_init
+struct PoolBenchContext(Movable):
+    var pool: ServerPool
+    var failed: Bool
+
+
+def _pool_bench_entry(
+    arg: Pointer[Byte, MutUntrackedOrigin]
+) -> Pointer[Byte, MutUntrackedOrigin]:
+    var context = arg.unsafe_bitcast[PoolBenchContext]()
+    var factory = PoolBenchFactory()
+    try:
+        context[].pool.serve(factory)
+    except:
+        context[].failed = True
+    return arg
+
+
+def _pool_round(mut clients: List[TCPConn]) raises:
+    var request = String(
+        "GET /cpu HTTP/1.1\r\nHost: localhost\r\nConnection: keep-alive\r\n\r\n"
+    )
+    for i in range(len(clients)):
+        clients[i].write_all(request.as_bytes(), Timeout.seconds(10))
+    for i in range(len(clients)):
+        var response = List[Byte]()
+        var buffer = Array[Byte, 1024](fill=0)
+        while not _response_complete(response):
+            var count = clients[i].read(Span(buffer), Timeout.seconds(10))
+            if count == 0:
+                raise Error("pool benchmark connection closed")
+            for j in range(count):
+                response.append(buffer[j])
+
+
+def _pool_clients(address: String) raises -> List[TCPConn]:
+    var clients = List[TCPConn]()
+    for _ in range(32):
+        clients.append(dial_tcp(address, Timeout.seconds(5)))
+    return clients^
+
+
+def _benchmark_pool(workers: Int) raises:
+    var pool = ServerPool(ServerConfig.default(), workers=workers)
+    var control = pool.control()
+    var listener = listen_tcp("127.0.0.1:0")
+    var address = String(listener.local_address())
+    pool.add_listener(listener^)
+    var context = PoolBenchContext(pool^, False)
+    var thread: UInt64 = 0
+    var started = external_call["pthread_create", c_int](
+        Pointer(to=thread),
+        Optional[Pointer[Byte, MutUntrackedOrigin]](None),
+        _pool_bench_entry,
+        Pointer(to=context).unsafe_bitcast[Byte](),
+    )
+    if started != 0:
+        raise Error("pool benchmark pthread_create failed")
+    var failure = String()
+    try:
+        var clients = _pool_clients(address)
+        for _ in range(5):
+            _pool_round(clients)
+        var start = perf_counter_ns()
+        var batches = 50
+        for _ in range(batches):
+            _pool_round(clients)
+        var elapsed = Int(perf_counter_ns()) - Int(start)
+        print(
+            "pool workers:",
+            workers,
+            "connections:",
+            len(clients),
+            "requests/s:",
+            Float64(batches * len(clients)) * 1e9 / Float64(elapsed),
+        )
+        for i in range(len(clients)):
+            clients[i].close()
+    except error:
+        failure = String(error)
+    control.request_shutdown()
+    var joined = external_call["pthread_join", c_int](
+        thread,
+        Optional[
+            Pointer[Pointer[Byte, MutUntrackedOrigin], MutUntrackedOrigin]
+        ](None),
+    )
+    if joined != 0 or context.failed:
+        raise Error("pool benchmark worker failed")
+    if failure:
+        raise Error(failure)
+
+
 def main() raises:
     var config = ServerConfig.default()
     var server = Server(config^)
@@ -181,4 +304,7 @@ def main() raises:
     for _ in range(50):
         _ = server.tick(handler, Timeout.nanoseconds(0))
     print("active after close:", server.active_connections())
+    _benchmark_pool(1)
+    _benchmark_pool(2)
+    _benchmark_pool(4)
     print("benchmark-http-server done")

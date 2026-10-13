@@ -955,3 +955,10 @@ thread 起動途中または worker 実行中の失敗では停止を通知し�
 
 `tests/test_http_pool.mojo` は共有 listener の受理件数、一括停止、起動前停止、factory と worker の失敗時の所有権を確認する。
 `http-pool-integration-test` は一つの TLS listener で HTTP/1.1 と HTTP/2 を並行に検証する。
+
+`add_quic_endpoint(endpoint^)` は endpoint を worker 0 だけに移動する。
+他の worker は TCP/TLS を処理する。
+TCP listener がない pool は、設定した worker 数によらず worker 0 だけを起動する。
+QUIC の Connection ID による複数 loop への振り分けは行わない。
+`http-pool-quic-test` は endpoint の唯一所有と失敗時の解放を確認する。
+`http-pool-quic-integration-test` は TCP の分散と HTTP/3 の worker 0 固定、一括停止を確認する。

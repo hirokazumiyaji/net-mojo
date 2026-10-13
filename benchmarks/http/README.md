@@ -968,3 +968,28 @@ one, because `dnctl pipe N config` targets an existing pipe instead of
 allocating a private one; the chosen id is recorded in the scenario detail
 and only that pipe is deleted afterwards, so a run never reconfigures or
 removes shaping that already existed on the host.
+
+## ServerPool worker comparison (issue #229)
+
+Local macOS arm64 loopback, Mojo 1.1.0, 2026-10-14;
+`pixi run benchmark-http-server` excludes compilation and startup. The pool
+case sends batches over 32 persistent connections, warms up five batches,
+and measures 50 batches (1,600 requests). Each handler performs 200,000
+UInt64 recurrence steps and returns its result. No timing threshold applies.
+
+| Workers | Requests/s | Relative to one worker |
+| --- | ---: | ---: |
+| 1 | 4,827.64 | 1.00 |
+| 2 | 4,996.75 | 1.04 |
+| 4 | 5,330.67 | 1.10 |
+
+This single run uses a synchronous load generator on the same machine, no CPU
+pinning, and fixed batches that wait for their slowest connection. It records
+the requested comparison; it does not establish linear multicore scaling or
+a Linux performance result. The original sequential/idle benchmark remains
+in the same task: 17,657.86 round-trips/s and 12.06 µs/tick with 1,000 idle
+connections in this run.
+
+The CI core matrix runs the same bounded worker comparison on macOS, Linux
+x86_64, and Linux arm64 and retains `http-worker-benchmark-<runner>` artifacts.
+Linux acceptance counts and benchmark output remain pending that CI run.
