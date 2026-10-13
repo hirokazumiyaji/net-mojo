@@ -137,6 +137,7 @@ python = ">=3.10,<3.15"
 h2 = "==4.4.1"
 
 [feature.http2.tasks]
+http-router-h2-test = { cmd = "python3 scripts/test_http_router_h2.py", depends-on = ["tls-build", "hpack-test"] }
 hpack-test = "bash scripts/build_hpack_shim.sh"
 hpack-mojo-test = { cmd = "mojo run --Werror -I . tests/test_hpack.mojo", depends-on = [
   "hpack-test",
@@ -188,6 +189,7 @@ aioquic = "==1.3.0"
 [feature.http3.tasks]
 fuzz-quic-build = { cmd = "bash scripts/build_fuzz_quic.sh", depends-on = ["tls-build"] }
 fuzz-quic-recv = { cmd = "python3 scripts/run_fuzz_quic.py", depends-on = ["fuzz-quic-build"] }
+http-router-h3-test = { cmd = "python3 scripts/test_http_router_h3.py", depends-on = ["tls-build", "quic-build"] }
 quic-build = "bash scripts/build_quic_provider.sh"
 quic-test = { cmd = "build/quic/test_quic_provider build/tls/test-cert.pem build/tls/test-key.pem", depends-on = [
   "tls-build",

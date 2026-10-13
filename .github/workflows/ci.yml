@@ -110,6 +110,8 @@ jobs:
         run: pixi run -e tls-http2 http2-example-build
       - name: Test shared HTTP/1.1 and HTTP/2 application contract
         run: pixi run -e tls-http2 http-app-contract-test
+      - name: Test HTTP/1.1 and HTTP/2 router contract
+        run: pixi run -e tls-http2 http-router-h2-test
       - name: Test HTTP/2 integration gaps
         run: pixi run -e tls-http2 http2-integration-test
       - name: Test shared-listener HTTP worker pool
@@ -141,6 +143,8 @@ jobs:
         run: pixi run -e tls-http3 http3-client-test
       - name: Test shared TCP and worker-zero QUIC pool
         run: pixi run -e tls-http3 http-pool-quic-integration-test
+      - name: Test HTTP/3 router contract
+        run: pixi run -e tls-http3 http-router-h3-test
       - name: Test HTTP same-origin fallback
         run: pixi run -e tls-http3 http-same-origin-test
       - name: Test packaged HTTP/3 provider
