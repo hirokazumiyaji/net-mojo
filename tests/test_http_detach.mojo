@@ -25,6 +25,8 @@ from net.http._detach import (
     MSG_KIND_RESPOND,
     MSG_KIND_START,
     _create_detach_state,
+    _DetachTarget,
+    _detach_state,
     _DetachedBatch,
     _take_batch,
     _release_detach_state,
@@ -244,6 +246,28 @@ def test_response_sender_callable_from_pthread() raises:
 
     # Server releases its reference to complete deallocation
     _release_detach_state(state_addr, from_sender=False)
+
+
+def test_detach_targets_distinguish_protocol_stream_and_generation() raises:
+    var first = _DetachTarget.http2(3, UInt64(7), UInt32(1))
+    assert_false(first == _DetachTarget.http2(3, UInt64(7), UInt32(3)))
+    assert_false(first == _DetachTarget.http2(3, UInt64(8), UInt32(1)))
+    assert_false(first == _DetachTarget.http1(3, UInt64(7)))
+    assert_false(
+        _DetachTarget.http3(UInt64(1)) == _DetachTarget.http3(UInt64(2))
+    )
+
+
+def test_writer_detach_preserves_multiplexed_target_in_batch() raises:
+    var target = _DetachTarget.http2(3, UInt64(7), UInt32(5))
+    var writer = ResponseWriter(64)
+    writer._set_detach_target(target.copy())
+    var sender = writer.detach()
+    sender.start()
+    var batch = _take_batch(_detach_state(writer._detach_state_addr))
+    assert_equal(batch.target, target)
+    assert_equal(len(batch.messages), 1)
+    _release_detach_state(writer._detach_state_addr, from_sender=False)
 
 
 def test_detach_state_lifecycle_and_cleanup() raises:

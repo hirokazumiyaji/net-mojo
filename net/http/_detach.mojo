@@ -41,6 +41,42 @@ comptime MSG_KIND_FINISH: UInt8 = 4
 comptime MSG_KIND_ABORT: UInt8 = 5
 
 
+comptime _DETACH_HTTP1: UInt8 = 1
+comptime _DETACH_HTTP2: UInt8 = 2
+comptime _DETACH_HTTP3: UInt8 = 3
+
+
+@fieldwise_init
+struct _DetachTarget(Copyable, Equatable, Writable):
+    var protocol: UInt8
+    var slot: Int
+    var generation: UInt64
+    var stream_id: UInt64
+
+    @staticmethod
+    def http1(slot: Int, generation: UInt64) -> Self:
+        return Self(_DETACH_HTTP1, slot, generation, 0)
+
+    @staticmethod
+    def http2(slot: Int, generation: UInt64, stream_id: UInt32) -> Self:
+        return Self(_DETACH_HTTP2, slot, generation, UInt64(stream_id))
+
+    @staticmethod
+    def http3(request_id: UInt64) -> Self:
+        return Self(_DETACH_HTTP3, -1, 0, request_id)
+
+    def write_to[W: Writer](self, mut writer: W):
+        writer.write(
+            self.protocol,
+            ":",
+            self.slot,
+            ":",
+            self.generation,
+            ":",
+            self.stream_id,
+        )
+
+
 struct DetachMessage(Movable):
     """Actor message dispatched from ResponseSender to the connection actor."""
 
@@ -126,7 +162,7 @@ struct _DetachedBatch(Movable):
     var messages: List[DetachMessage]
     var ticket: _CapacityTicket
     var terminal_kind: UInt8
-    var generation: UInt64
+    var target: _DetachTarget
 
     def __deinit__(deinit self):
         _ = self.messages^
@@ -142,8 +178,7 @@ struct _SharedDetachState:
     var mutex: PthreadMutex
     var ref_count: Int
     var wakeup_fd: Int32
-    var slot: Int
-    var generation: UInt64
+    var target: _DetachTarget
     var cancelled: Bool
     var responded: Bool
     var started: Bool
@@ -164,12 +199,13 @@ struct _SharedDetachState:
         wakeup_fd: Int32 = -1,
         queue_limit: Int = 1048576,
         var budget: Optional[SharedBufferBudget] = None,
+        protocol: UInt8 = _DETACH_HTTP1,
+        stream_id: UInt64 = 0,
     ):
         self.mutex = PthreadMutex._uninitialized()
         self.ref_count = 2  # 1 for connection actor, 1 for ResponseSender
         self.wakeup_fd = wakeup_fd
-        self.slot = slot
-        self.generation = generation
+        self.target = _DetachTarget(protocol, slot, generation, stream_id)
         self.cancelled = False
         self.responded = False
         self.started = False
@@ -223,11 +259,11 @@ def _take_batch(
     var ticket = ticket_ptr.unsafe_take_pointee()
     ticket_ptr.unsafe_write(_CapacityTicket(state[].budget.copy()))
     var terminal_kind = state[].terminal_kind
-    var generation = state[].generation
+    var target = state[].target.copy()
     state[].queued_bytes = 0
     state[].terminal_kind = MSG_KIND_NONE
     state[].mutex.unlock()
-    return _DetachedBatch(messages^, ticket^, terminal_kind, generation)
+    return _DetachedBatch(messages^, ticket^, terminal_kind, target^)
 
 
 def _create_detach_state(
@@ -236,6 +272,8 @@ def _create_detach_state(
     wakeup_fd: Int32 = -1,
     queue_limit: Int = 1048576,
     var budget: Optional[SharedBufferBudget] = None,
+    protocol: UInt8 = _DETACH_HTTP1,
+    stream_id: UInt64 = 0,
 ) raises NetError -> Int:
     """Allocates a new heap _SharedDetachState and returns its integer address.
     """
@@ -271,6 +309,8 @@ def _create_detach_state(
             wakeup_fd=wakeup_fd,
             queue_limit=queue_limit,
             budget=budget^,
+            protocol=protocol,
+            stream_id=stream_id,
         )
     )
     s_ptr[].mutex._initialize()

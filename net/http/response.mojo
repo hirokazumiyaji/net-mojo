@@ -17,6 +17,7 @@ from net.error import NetError, NetErrorKind
 
 from ._detach import (
     ResponseSender,
+    _DetachTarget,
     _cancel_detach_state,
     _create_detach_state,
 )
@@ -35,8 +36,7 @@ struct ResponseWriter(Movable, Sized):
     var _limit: Int
     var _detached: Bool
     var _detach_state_addr: Int
-    var _slot: Int
-    var _generation: UInt64
+    var _target: _DetachTarget
     var _wakeup_fd: Int32
     var _queue_limit: Int
     var _body_budget: Optional[SharedBufferBudget]
@@ -58,8 +58,7 @@ struct ResponseWriter(Movable, Sized):
         self._limit = body_limit
         self._detached = False
         self._detach_state_addr = 0
-        self._slot = slot
-        self._generation = generation
+        self._target = _DetachTarget.http1(slot, generation)
         # Note on _wakeup_fd: raw descriptor borrowed from Server._wakeup_channel.
         # The channel owns descriptor lifecycle; DetachState.cancelled guards
         # against late signaling if Server deinitializes.
@@ -77,8 +76,7 @@ struct ResponseWriter(Movable, Sized):
         self._limit = move._limit
         self._detached = move._detached
         self._detach_state_addr = move._detach_state_addr
-        self._slot = move._slot
-        self._generation = move._generation
+        self._target = move._target^
         self._wakeup_fd = move._wakeup_fd
         self._queue_limit = move._queue_limit
         self._body_budget = move._body_budget^
@@ -113,6 +111,9 @@ struct ResponseWriter(Movable, Sized):
             self._body_budget.value().release(self._body_capacity_reserved)
         self._body_capacity_reserved = 0
 
+    def _set_detach_target(mut self, var target: _DetachTarget):
+        self._target = target^
+
     def is_detached(self) -> Bool:
         return self._detached
 
@@ -142,8 +143,10 @@ struct ResponseWriter(Movable, Sized):
             self._detached = True
             return ResponseSender(self._detach_state_addr)
         var addr = _create_detach_state(
-            slot=self._slot,
-            generation=self._generation,
+            slot=self._target.slot,
+            generation=self._target.generation,
+            protocol=self._target.protocol,
+            stream_id=self._target.stream_id,
             wakeup_fd=self._wakeup_fd,
             queue_limit=self._queue_limit,
             budget=self._body_budget.copy(),

@@ -70,6 +70,7 @@ from ._detach import (
     MSG_KIND_START,
     _cancel_detach_state,
     _detach_state,
+    _DetachTarget,
     _release_detach_state,
     _take_batch,
     DetachMessage,
@@ -2549,7 +2550,9 @@ struct Server(Movable):
                     break
                 if self._conns[idx].detach_state_addr != addr:
                     break
-                if self._conns[idx].token.generation != batch.generation:
+                if batch.target != _DetachTarget.http1(
+                    idx, self._conns[idx].token.generation
+                ):
                     self._mark_detached_cancelled(idx)
                     if self._conns[idx].detach_state_addr == addr:
                         self._cleanup_detached_state(idx)
@@ -2569,7 +2572,8 @@ struct Server(Movable):
                 batch.terminal_kind != MSG_KIND_NONE
                 and self._conns[idx].active
                 and self._conns[idx].detach_state_addr == addr
-                and self._conns[idx].token.generation == batch.generation
+                and batch.target
+                == _DetachTarget.http1(idx, self._conns[idx].token.generation)
             ):
                 if batch.terminal_kind == MSG_KIND_FINISH:
                     self._handle_detached_finish(idx)
