@@ -95,14 +95,14 @@ struct Http2ConnectionInputResult(Movable):
         )
 
     @staticmethod
-    def error(consumed: Int) -> Self:
+    def error(consumed: Int, error_code: UInt32 = UInt32(1)) -> Self:
         return Self(
             kind=7,
             consumed=consumed,
             frame_type=Byte(0),
             flags=Byte(0),
             stream_id=UInt32(0),
-            value=UInt32(0),
+            value=error_code,
             output=List[Byte](),
             payload=List[Byte](),
         )
@@ -191,7 +191,12 @@ struct Http2ServerConnectionInput(Movable):
             var bootstrap = self._bootstrap.consume(data)
             if bootstrap.is_error():
                 self._failed = True
-                return Http2ConnectionInputResult.error(bootstrap.consumed)
+                var result = Http2ConnectionInputResult.error(
+                    bootstrap.consumed, bootstrap.error_code
+                )
+                result.output = bootstrap.output^
+                bootstrap.output = List[Byte]()
+                return result^
             if bootstrap.is_ready():
                 self._dispatcher = Http2FrameDispatcher(
                     self._bootstrap.peer_settings(),
@@ -210,7 +215,9 @@ struct Http2ServerConnectionInput(Movable):
         var read = self._reader.consume(data)
         if read.is_error():
             self._failed = True
-            return Http2ConnectionInputResult.error(read.consumed)
+            return Http2ConnectionInputResult.error(
+                read.consumed, read.error_code
+            )
         if read.is_need_more():
             return Http2ConnectionInputResult.need_more(read.consumed)
 
@@ -227,7 +234,9 @@ struct Http2ServerConnectionInput(Movable):
         )
         if dispatched.is_error():
             self._failed = True
-            return Http2ConnectionInputResult.error(read.consumed)
+            return Http2ConnectionInputResult.error(
+                read.consumed, dispatched.value
+            )
         if dispatched.is_flood():
             self._failed = True
             return Http2ConnectionInputResult.flood(consumed)

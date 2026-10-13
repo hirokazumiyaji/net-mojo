@@ -673,6 +673,9 @@ struct Server(Movable):
             if mark == NO_DEADLINE or mark > now:
                 self._arm_deadline(idx)
                 continue
+            if self._conns[idx].state == STATE_TLS_SHUTDOWN:
+                self._close_conn(idx)
+                continue
             if self._conns[idx].state == STATE_DETACHED:
                 self._handle_detached_timeout(idx)
                 continue
@@ -1332,7 +1335,7 @@ struct Server(Movable):
                 self._conns[idx].http2_failed()
                 and self._conns[idx].pending_remaining() == 0
             ):
-                self._close_conn(idx)
+                self._finish_connection(idx)
                 return
             if self._conns[idx].http2_failed():
                 # Failed session draining GOAWAY: flush pending output only.
@@ -1344,7 +1347,7 @@ struct Server(Movable):
                 self._sync_interests(idx)
                 return
             if self._http2_drained(idx):
-                self._close_conn(idx)
+                self._finish_connection(idx)
                 return
             var read_event = (
                 self._conns[idx].read_ready(readable, writable)
@@ -1376,7 +1379,7 @@ struct Server(Movable):
                     self._conns[idx].http2_failed()
                     and self._conns[idx].pending_remaining() == 0
                 ):
-                    self._close_conn(idx)
+                    self._finish_connection(idx)
                     return
                 if self._conns[idx].buffered_len() >= buffered_before:
                     break
@@ -1393,7 +1396,7 @@ struct Server(Movable):
                 # draining one (e.g. after acknowledging a peer GOAWAY).
                 # Re-check here or the connection would wait for a tick
                 # trigger that no further input will supply.
-                self._close_conn(idx)
+                self._finish_connection(idx)
                 return
             if (
                 self._conns[idx].active
@@ -1499,6 +1502,14 @@ struct Server(Movable):
                 self._close_conn(idx)
                 return
             if result.is_error():
+                if len(result.output) > 0:
+                    var output = result.output^
+                    result.output = List[Byte]()
+                    if not self._conns[idx].append_pending(
+                        output^, self._budget
+                    ):
+                        self._close_conn(idx)
+                        return
                 if self._conns[idx].pending_remaining() > 0:
                     self._conns[idx].state = STATE_SENDING_HTTP2_CONTROL
                     self._conns[idx].write_at = deadline_from_now(

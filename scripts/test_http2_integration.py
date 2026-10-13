@@ -967,7 +967,22 @@ def _shutdown(port: int) -> None:
         peer.close()
 
 
+def case_connection_protocol_error_goaway(port: int) -> None:
+    peer = H2Peer(port)
+    try:
+        def frame(kind: int, flags: int, payload: bytes) -> bytes:
+            return (len(payload).to_bytes(3, "big") + bytes([kind, flags])
+                    + (1).to_bytes(4, "big") + payload)
+        peer.send_raw(frame(1, 1, b"\x82") + frame(2, 0, bytes(5)))
+        peer.wait_terminated(time.perf_counter() + TIMEOUT_S)
+        _assert(peer.terminated == int(ErrorCodes.PROTOCOL_ERROR),
+                f"expected PROTOCOL_ERROR GOAWAY, got {peer.terminated!r}")
+    finally:
+        peer.close()
+
+
 def _run_cases(port: int) -> None:
+    case_connection_protocol_error_goaway(port)
     case_large_request_body(port)
     case_large_response_body(port)
     case_continuation_header_block(port)

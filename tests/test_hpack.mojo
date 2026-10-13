@@ -20,6 +20,7 @@ from net.http._http2.request_headers import decode_http2_request_headers
 from net.http.response import ResponseWriter
 from net.http.request import HttpVersion
 from tests.support import _append_hpack_field
+from net.http._deadline import NO_DEADLINE
 
 
 def _enqueue_response(
@@ -124,6 +125,92 @@ def test_hpack_deflater_encodes_bounded_header_fields() raises:
     assert_true(decoded.is_success())
     assert_equal(decoded.field_count, 2)
     assert_equal(decoded.output_length, len(fields))
+
+
+def _assert_connection_goaway[
+    origin: Origin
+](output: Span[Byte, origin], expected: UInt32,) raises:
+    var offset = 0
+    var error_code = UInt32(0)
+    while offset < len(output):
+        var frame = parse_frame(output[offset:])
+        assert_true(frame.is_complete())
+        if frame.frame_type == Byte(7):
+            var goaway = parse_goaway_frame(
+                frame, output[offset + 9 : offset + frame.consumed]
+            )
+            assert_true(goaway.is_valid())
+            error_code = goaway.error_code
+        offset += frame.consumed
+    assert_equal(error_code, expected)
+
+
+def test_http2_connection_window_overflow_reports_flow_control_error() raises:
+    var session = Http2RequestSession("build/http2/libnet_hpack", 4, 1024)
+    var wire = List[Byte]("PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n".as_bytes())
+    var empty = List[Byte]()
+    _append_frame(wire, Byte(4), Byte(0), UInt32(0), Span(empty))
+    var first: List[Byte] = [Byte(0x7F), Byte(0xFF), Byte(0), Byte(0)]
+    var second: List[Byte] = [Byte(0), Byte(0), Byte(0), Byte(1)]
+    _append_frame(wire, Byte(8), Byte(0), UInt32(0), Span(first))
+    _append_frame(wire, Byte(8), Byte(0), UInt32(0), Span(second))
+    var result = session.consume(Span(wire))
+    assert_true(result.is_error())
+    _assert_connection_goaway(Span(result.output), UInt32(3))
+
+
+def test_http2_initial_settings_preserve_preface_and_flow_control_error() raises:
+    var session = Http2RequestSession("build/http2/libnet_hpack", 4, 1024)
+    var wire = List[Byte]("PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n".as_bytes())
+    var invalid_window: List[Byte] = [
+        Byte(0),
+        Byte(4),
+        Byte(0x80),
+        Byte(0),
+        Byte(0),
+        Byte(0),
+    ]
+    _append_frame(wire, Byte(4), Byte(0), UInt32(0), Span(invalid_window))
+    var result = session.consume(Span(wire))
+    assert_true(result.is_error())
+    var first = parse_frame(Span(result.output))
+    assert_true(first.is_complete())
+    assert_equal(first.frame_type, Byte(4))
+    _assert_connection_goaway(Span(result.output), UInt32(3))
+
+
+def test_http2_settings_ack_payload_reports_frame_size_error() raises:
+    var session = Http2RequestSession("build/http2/libnet_hpack", 4, 1024)
+    var wire = List[Byte]("PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n".as_bytes())
+    var empty = List[Byte]()
+    _append_frame(wire, Byte(4), Byte(0), UInt32(0), Span(empty))
+    var payload: List[Byte] = [Byte(0)]
+    _append_frame(wire, Byte(4), Byte(1), UInt32(0), Span(payload))
+    var result = session.consume(Span(wire))
+    assert_true(result.is_error())
+    _assert_connection_goaway(Span(result.output), UInt32(6))
+
+
+def test_http2_session_preserves_connection_frame_size_error() raises:
+    var session = Http2RequestSession("build/http2/libnet_hpack", 4, 1024)
+    var wire = List[Byte]("PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n".as_bytes())
+    var empty = List[Byte]()
+    _append_frame(wire, Byte(4), Byte(0), UInt32(0), Span(empty))
+    var oversized: List[Byte] = [
+        Byte(0),
+        Byte(0x40),
+        Byte(1),
+        Byte(0),
+        Byte(0),
+        Byte(0),
+        Byte(0),
+        Byte(0),
+        Byte(1),
+    ]
+    wire.extend(Span(oversized))
+    var result = session.consume(Span(wire))
+    assert_true(result.is_error())
+    _assert_connection_goaway(Span(result.output), UInt32(6))
 
 
 def test_shared_response_encodes_to_http2_header_frames() raises:
@@ -1385,6 +1472,26 @@ def _bootstrap_session(mut session: Http2RequestSession) raises:
     var empty = List[Byte]()
     _append_frame(wire, Byte(4), Byte(0), UInt32(0), Span(empty))
     assert_true(session.consume(Span(wire)).is_pending())
+
+
+def test_http2_failed_session_ignores_header_and_body_deadlines() raises:
+    for flags in [Byte(0), Byte(4)]:
+        var session = Http2RequestSession("build/http2/libnet_hpack", 4, 1024)
+        _bootstrap_session(session)
+        var compressed: List[Byte] = [0x82, 0x87, 0x84, 0x01, 0x01, 0x78]
+        var opening = List[Byte]()
+        _append_frame(opening, Byte(1), flags, UInt32(1), Span(compressed))
+        assert_true(session.consume(Span(opening)).is_pending())
+        var deadline = session.next_deadline()
+        assert_true(deadline != NO_DEADLINE)
+        var malformed = List[Byte]()
+        var payload: List[Byte] = [Byte(0)]
+        _append_frame(malformed, Byte(6), Byte(0), UInt32(0), Span(payload))
+        assert_true(session.consume(Span(malformed)).is_error())
+        assert_true(session.is_failed())
+        assert_equal(session.next_deadline(), NO_DEADLINE)
+        assert_equal(len(session.expire(deadline)), 0)
+        assert_equal(session.next_deadline(), NO_DEADLINE)
 
 
 def test_http2_scheduler_peer_reset_before_headers_sent_drops_entry() raises:

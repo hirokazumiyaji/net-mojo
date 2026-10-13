@@ -189,6 +189,8 @@ struct Http2RequestSession(Movable):
         return output^
 
     def next_deadline(self) -> Int:
+        if self._failed:
+            return NO_DEADLINE
         var best = self._pending_headers_at
         for i in range(len(self._streams)):
             var body_at = self._streams[i].body_at
@@ -222,6 +224,18 @@ struct Http2RequestSession(Movable):
             self._remove_stream(stream_id)
         return output^
 
+    def _connection_error(
+        mut self,
+        consumed: Int,
+        var output: List[Byte],
+        error_code: UInt32 = UInt32(1),
+    ) -> Http2RequestSessionResult:
+        self._failed = True
+        self._draining = True
+        var goaway = encode_goaway_frame(self._last_stream_id, error_code)
+        output.extend(Span(goaway.wire))
+        return Http2RequestSessionResult.error(consumed, output^)
+
     def consume[
         origin: Origin
     ](mut self, data: Span[Byte, origin]) raises -> Http2RequestSessionResult:
@@ -234,8 +248,8 @@ struct Http2RequestSession(Movable):
             var input = self._input.consume(data[consumed:])
             consumed += input.consumed
             if input.is_error():
-                self._failed = True
-                return Http2RequestSessionResult.error(consumed, output^)
+                output.extend(Span(input.output))
+                return self._connection_error(consumed, output^, input.value)
             var initial_stream_window = Int(
                 self._input.peer_settings().initial_window_size
             )
@@ -243,8 +257,7 @@ struct Http2RequestSession(Movable):
                 if not self._send_streams[i].window.update_initial_send_window(
                     initial_stream_window
                 ):
-                    self._failed = True
-                    return Http2RequestSessionResult.error(consumed, output^)
+                    return self._connection_error(consumed, output^, UInt32(3))
             output.extend(Span(input.output))
             if input.is_flood():
                 # Flooded: queue ENHANCE_YOUR_CALM GOAWAY and mark the
@@ -444,9 +457,11 @@ struct Http2RequestSession(Movable):
                         increment == 0
                         or not self._send_window.apply_window_update(increment)
                     ):
-                        self._failed = True
-                        return Http2RequestSessionResult.error(
-                            consumed, output^
+                        var error_code = UInt32(
+                            1
+                        ) if increment == 0 else UInt32(3)
+                        return self._connection_error(
+                            consumed, output^, error_code
                         )
                 else:
                     var send_index = self._find_send_stream(input.stream_id)
