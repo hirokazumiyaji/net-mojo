@@ -1088,13 +1088,17 @@ receiver を破棄すると、残りの本文は discard として扱う。
 一時的なトレーラー容量不足では EOF 通知を再試行し、総 budget を超える容量は 503 の失敗として扱う。
 
 本文受信と応答送信の完了は別々に管理する。
-未完の本文を同期 handler が discard せずに返した場合は、応答に `Connection: close` を付けて接続を閉じる。
+未完の本文を持つ同期 handler が receiver を detach せず、本文も discard せずに返した場合は、応答に `Connection: close` を付けて接続を閉じる。
 明示的な discard は残りのフレーミングを検証しながら排出し、応答と入力が両方完了した後に接続を再利用する。
 本文完了前に detached response を終えた場合も、discard 済みでなければ接続を閉じる。
 `sender.start()` 時点で本文が未完かつ未 discard の場合は、応答ヘッダーに `Connection: close` を付ける。
 
 ストリーミングの `body_deadline` は、本文またはフレーミングを消費した最後の進捗から更新する。
 応答側の期限と本文側の期限のうち、早い方を接続に適用する。
+`RequestBody.detach()` で receiver だけを所有した同期 handler は、応答を終えた後も本文を受信できる。
+`Connection: close` を指定した場合も accepted body を完了してから接続を閉じ、完了済みの本文とトレーラーは receiver に残す。
+shutdown grace 中も受信を続けるが、猶予や本文期限の満了は receiver をキャンセルする。
+
 未完本文の EOF、ソケットの失敗、本文期限と shutdown grace の満了は、pipe と sender をキャンセルする。
 本文の wire EOF 後には pipe の wakeup descriptor 参照を外し、完了済み receiver が接続再利用後に残っても、新しい入力を起こさない。
 

@@ -3137,6 +3137,7 @@ struct Server(Movable):
             self._conns[idx].body_pipe.value().cancel()
         self._conns[idx].body_pipe = None
         self._conns[idx].body_decoder = None
+        self._conns[idx].body_receiver_after_response = False
         self._conns[idx].body_blocked_budget = -1
         self._conns[idx].body_at = NO_DEADLINE
         self._remove_request_body(idx)
@@ -3173,7 +3174,15 @@ struct Server(Movable):
             self._conns[idx].body_at = NO_DEADLINE
             self._remove_request_body(idx)
             if self._conns[idx].state == STATE_READING:
-                self._resume_http1_reading(idx)
+                if self._conns[idx].body_receiver_after_response and (
+                    self._conns[idx].should_close
+                    or self._shutdown_at != NO_DEADLINE
+                ):
+                    self._conns[idx].body_pipe = None
+                    self._conns[idx].body_receiver_after_response = False
+                    self._finish_connection(idx)
+                else:
+                    self._resume_http1_reading(idx)
         elif self._conns[idx].read_eof:
             self._close_conn(idx)
 
@@ -3495,10 +3504,16 @@ struct Server(Movable):
             self._send_error(idx, 500, is_head=is_head)
             return
 
+        self._conns[idx].body_receiver_after_response = (
+            self._conns[idx].body_pipe
+            and self._conns[idx].body_pipe.value().has_detached_reader()
+            and not writer.is_detached()
+        )
         if (
             self._conns[idx].body_decoder
             and not writer.is_detached()
             and not self._conns[idx].body_pipe.value().is_discarded()
+            and not self._conns[idx].body_receiver_after_response
         ):
             writer.set_should_close(True)
         _ = req^
@@ -3684,6 +3699,12 @@ struct Server(Movable):
             self._complete_stream(idx)
             return
         self._conns[idx].requests_served += 1
+        if self._conns[idx].body_receiver_after_response:
+            if self._conns[idx].body_decoder:
+                self._resume_http1_reading(idx)
+                return
+            self._conns[idx].body_pipe = None
+            self._conns[idx].body_receiver_after_response = False
         if (
             self._conns[idx].body_decoder
             and not self._conns[idx].body_pipe.value().is_discarded()
@@ -3704,6 +3725,7 @@ struct Server(Movable):
             self._conns[idx].idle_at = NO_DEADLINE
         else:
             self._conns[idx].body_pipe = None
+            self._conns[idx].body_receiver_after_response = False
             self._conns[idx].body_at = NO_DEADLINE
             self._conns[idx].header_at = (
                 deadline_from_now(self.config.header_deadline) if self._conns[

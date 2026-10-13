@@ -77,6 +77,7 @@ struct HttpConnection(Movable):
     var body_pipe: Optional[_BodyPipe]
     var body_decoder: Optional[_BodyDecoder]
     var body_blocked_budget: Int
+    var body_receiver_after_response: Bool
     var more_work: Bool
     var active: Bool
     var _no_deadline: Int
@@ -144,6 +145,7 @@ struct HttpConnection(Movable):
         self.body_pipe = None
         self.body_decoder = None
         self.body_blocked_budget = -1
+        self.body_receiver_after_response = False
         self.more_work = False
         self.active = True
         self.tls_handshake_at = handshake_at

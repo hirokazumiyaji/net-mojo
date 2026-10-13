@@ -11,6 +11,7 @@ from net.http import (
     Headers,
     Request,
     RequestBodyEndpoints,
+    RequestBodyReceiver,
     ResponseSender,
     ResponseWriter,
     Server,
@@ -54,6 +55,151 @@ struct _DiscardHandler(Handler):
 struct _IgnoreBodyHandler(Handler):
     def handle(mut self, req: Request, mut writer: ResponseWriter) raises:
         writer.write_string("ignored")
+
+
+struct _StandaloneBodyHandler(Handler):
+    var receiver: Optional[RequestBodyReceiver]
+
+    def __init__(out self):
+        self.receiver = None
+
+    def handle(mut self, req: Request, mut writer: ResponseWriter) raises:
+        if req.path == "/next":
+            writer.write_string("next")
+            return
+        var reader = req.body_reader()
+        self.receiver = reader.detach()
+        writer.write_string("standalone")
+
+
+def _standalone_after_sync_response(close: Bool, shutdown: Bool) raises:
+    var config = ServerConfig.default()
+    config.enable_request_body_streaming = True
+    config.max_body_bytes = 4
+    config.shutdown_grace = Timeout.seconds(1)
+    var server = Server(config^)
+    var client = _connect(server)
+    var handler = _StandaloneBodyHandler()
+    var head = String("POST / HTTP/1.1\r\nHost: x\r\nContent-Length: 4\r\n")
+    if close:
+        head += "Connection: close\r\n"
+    head += "\r\n"
+    client.write_all(head.as_bytes(), Timeout.seconds(1))
+    assert_equal(_status_of(_tick_and_read(server, handler, client)), 200)
+    assert_equal(server.active_connections(), 1)
+    if shutdown:
+        server.request_shutdown()
+        _ = server.tick(handler, Timeout.nanoseconds(0))
+        assert_equal(server.active_connections(), 1)
+    client.write_all("body".as_bytes(), Timeout.seconds(1))
+    for _ in range(100):
+        _ = server.tick(handler, Timeout.milliseconds(1))
+        if len(server._request_body_conns) == 0:
+            break
+    var buffer = Array[Byte, 4](fill=0)
+    assert_equal(
+        handler.receiver.value().receive(Span(buffer), Timeout.nanoseconds(0)),
+        4,
+    )
+    assert_equal(String(from_utf8_lossy=Span(buffer)), "body")
+    assert_equal(
+        handler.receiver.value().receive(Span(buffer), Timeout.nanoseconds(0)),
+        0,
+    )
+    assert_true(handler.receiver.value().is_eof())
+    if close or shutdown:
+        assert_equal(server.active_connections(), 0)
+    else:
+        client.write_all(
+            "GET /next HTTP/1.1\r\nHost: x\r\n\r\n".as_bytes(),
+            Timeout.seconds(1),
+        )
+        assert_equal(_status_of(_tick_and_read(server, handler, client)), 200)
+    client.close()
+
+
+def test_standalone_receiver_survives_synchronous_response_fin() raises:
+    _standalone_after_sync_response(False, False)
+
+
+def test_standalone_receiver_fin_closes_after_accepted_body() raises:
+    _standalone_after_sync_response(True, False)
+
+
+def test_standalone_receiver_fin_completes_during_shutdown_grace() raises:
+    _standalone_after_sync_response(False, True)
+
+
+def test_standalone_complete_unread_body_and_trailers_survive_close() raises:
+    var config = ServerConfig.default()
+    config.enable_request_body_streaming = True
+    var server = Server(config^)
+    var client = _connect(server)
+    var handler = _StandaloneBodyHandler()
+    client.write_all(
+        "POST / HTTP/1.1\r\nHost: x\r\nConnection: close\r\nTransfer-Encoding:"
+        " chunked\r\n\r\n4\r\nbody\r\n0\r\nx-end: yes\r\n\r\n".as_bytes(),
+        Timeout.seconds(1),
+    )
+    assert_equal(_status_of(_tick_and_read(server, handler, client)), 200)
+    assert_equal(server.active_connections(), 0)
+    assert_false(handler.receiver.value().is_eof())
+    assert_equal(handler.receiver.value()._pipe._state[].loop_wakeup_fd, -1)
+    var buffer = Array[Byte, 4](fill=0)
+    assert_equal(
+        handler.receiver.value().receive(Span(buffer), Timeout.nanoseconds(0)),
+        4,
+    )
+    assert_equal(
+        handler.receiver.value().receive(Span(buffer), Timeout.nanoseconds(0)),
+        0,
+    )
+    var trailers = handler.receiver.value().trailers()
+    assert_equal(trailers.get_first("x-end").value().copy(), "yes")
+    client.close()
+
+
+def _standalone_deadline_cancels(shutdown: Bool) raises:
+    var config = ServerConfig.default()
+    config.enable_request_body_streaming = True
+    config.body_deadline = Timeout.seconds(
+        1
+    ) if shutdown else Timeout.milliseconds(30)
+    config.shutdown_grace = Timeout.milliseconds(30)
+    var server = Server(config^)
+    var client = _connect(server)
+    var handler = _StandaloneBodyHandler()
+    client.write_all(
+        "POST / HTTP/1.1\r\nHost: x\r\nContent-Length: 4\r\n\r\n".as_bytes(),
+        Timeout.seconds(1),
+    )
+    assert_equal(_status_of(_tick_and_read(server, handler, client)), 200)
+    assert_equal(server.active_connections(), 1)
+    if shutdown:
+        server.request_shutdown()
+        _ = server.tick(handler, Timeout.nanoseconds(0))
+    sleep(0.04)
+    _ = server.tick(handler, Timeout.nanoseconds(0))
+    assert_equal(server.active_connections(), 0)
+    var buffer = Array[Byte, 4](fill=0)
+    var cancelled = False
+    try:
+        _ = handler.receiver.value().receive(
+            Span(buffer), Timeout.nanoseconds(0)
+        )
+    except error:
+        cancelled = error.kind == NetErrorKind.cancelled()
+    assert_true(cancelled)
+    assert_equal(handler.receiver.value()._pipe._state[].loop_wakeup_fd, -1)
+    client.close()
+
+
+def test_standalone_body_deadline_after_fin_cancels_receiver() raises:
+    _standalone_deadline_cancels(False)
+
+
+def test_standalone_shutdown_grace_after_fin_cancels_receiver() raises:
+    _standalone_deadline_cancels(True)
 
 
 def _connect(mut server: Server) raises -> TCPConn:
