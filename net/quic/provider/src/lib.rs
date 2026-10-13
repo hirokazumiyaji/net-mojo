@@ -2960,6 +2960,9 @@ impl QuicServer {
             Err(_) => return -1,
         };
         if let Some(response) = connection.responses.get(&stream_id) {
+            if !response.final_queued {
+                return 0;
+            }
             if !response.streaming || response.end_stream_queued {
                 return -1;
             }
@@ -3969,6 +3972,84 @@ mod tests {
             }
         }
         (statuses, body, finished)
+    }
+
+    fn continue_placeholder_remains_live_for_detached_start(sent: bool) {
+        let (mut server, mut client, mut h3, local, remote) = request_timer_peer();
+        let request = completed_ready_request(&mut server, &mut client, &mut h3, local, remote);
+        assert!(server.send_continue(request.id));
+        if sent {
+            for _ in 0..32 {
+                pump_in_memory(
+                    &mut client,
+                    &mut server,
+                    &mut [0; 65535],
+                    local,
+                    remote,
+                    false,
+                    false,
+                );
+            }
+            assert_eq!(
+                drain_continue_response(&mut client, &mut h3, request.stream_id),
+                (vec![b"100".to_vec()], vec![], false)
+            );
+        }
+        assert_eq!(server.stream_capacity(request.id), 0);
+        assert!(server.request_routes.contains_key(&request.id));
+        assert!(server.start_response(request.id, 200, vec![]));
+        for _ in 0..32 {
+            pump_in_memory(
+                &mut client,
+                &mut server,
+                &mut [0; 65535],
+                local,
+                remote,
+                false,
+                false,
+            );
+        }
+        let statuses = if sent {
+            vec![b"200".to_vec()]
+        } else {
+            vec![b"100".to_vec(), b"200".to_vec()]
+        };
+        assert_eq!(
+            drain_continue_response(&mut client, &mut h3, request.stream_id),
+            (statuses, vec![], false)
+        );
+        assert!(server.stream_capacity(request.id) > 0);
+        assert_eq!(server.send_stream_body(request.id, b"final", false), 5);
+        assert_eq!(server.send_stream_body(request.id, b"", true), 0);
+        for _ in 0..32 {
+            pump_in_memory(
+                &mut client,
+                &mut server,
+                &mut [0; 65535],
+                local,
+                remote,
+                false,
+                false,
+            );
+        }
+        assert_eq!(
+            drain_continue_response(&mut client, &mut h3, request.stream_id),
+            (vec![], b"final".to_vec(), true)
+        );
+        assert!(server.poll_stream_events(16).contains(&(request.id, 1)));
+        assert_eq!(server.buffered_response_bytes, 0);
+        assert!(server.request_routes.is_empty());
+        assert!(server.response_timeouts.is_empty());
+    }
+
+    #[test]
+    fn continue_pending_capacity_retains_detached_start() {
+        continue_placeholder_remains_live_for_detached_start(false);
+    }
+
+    #[test]
+    fn continue_sent_capacity_retains_detached_start() {
+        continue_placeholder_remains_live_for_detached_start(true);
     }
 
     #[test]
