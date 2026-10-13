@@ -631,13 +631,151 @@ pub unsafe extern "C" fn net_quic_server_respond(
     if header_length + trailer_length > inner.max_response_headers_bytes {
         return -1;
     }
-    i32::from(inner.enqueue_response(
-        request_id,
-        status as u16,
-        headers,
-        body,
-        trailers,
-    ))
+    i32::from(inner.enqueue_response(request_id, status as u16, headers, body, trailers))
+}
+
+fn http3_body_capacity(capacity: usize) -> usize {
+    if capacity >= 1_073_741_833 {
+        return capacity - 9;
+    }
+    if capacity >= 16_389 {
+        return (capacity - 5).min(1_073_741_823);
+    }
+    if capacity >= 67 {
+        return (capacity - 3).min(16_383);
+    }
+    capacity.saturating_sub(2).min(63)
+}
+
+fn parse_response_fields(data: &[u8], max_count: usize) -> Option<Vec<(Vec<u8>, Vec<u8>)>> {
+    let mut offset = 0;
+    let count = read_u32(data, &mut offset)? as usize;
+    if count > max_count {
+        return None;
+    }
+    let mut fields = Vec::with_capacity(count);
+    for _ in 0..count {
+        fields.push((
+            read_bytes(data, &mut offset)?,
+            read_bytes(data, &mut offset)?,
+        ));
+    }
+    (offset == data.len()).then_some(fields)
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn net_quic_server_start_response(
+    server: *mut NetQuicServer,
+    request_id: u64,
+    status: u32,
+    data: *const u8,
+    length: usize,
+) -> i32 {
+    if server.is_null() || data.is_null() || !(100..=599).contains(&status) {
+        return -1;
+    }
+    let inner = &mut unsafe { &mut *server }._inner;
+    if length > inner.max_response_headers_bytes {
+        return -1;
+    }
+    let Some(headers) = parse_response_fields(
+        unsafe { slice::from_raw_parts(data, length) },
+        inner.max_response_headers_count,
+    ) else {
+        return -1;
+    };
+    i32::from(inner.start_response(request_id, status as u16, headers))
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn net_quic_server_stream_capacity(
+    server: *mut NetQuicServer,
+    request_id: u64,
+) -> i64 {
+    if server.is_null() {
+        return -1;
+    }
+    unsafe { &mut *server }._inner.stream_capacity(request_id)
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn net_quic_server_send_stream_body(
+    server: *mut NetQuicServer,
+    request_id: u64,
+    data: *const u8,
+    length: usize,
+    fin: i32,
+) -> i64 {
+    if server.is_null() || (length > 0 && data.is_null()) || !(0..=1).contains(&fin) {
+        return -1;
+    }
+    let body = if length == 0 {
+        &[][..]
+    } else {
+        unsafe { slice::from_raw_parts(data, length) }
+    };
+    unsafe { &mut *server }
+        ._inner
+        .send_stream_body(request_id, body, fin == 1)
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn net_quic_server_add_stream_trailers(
+    server: *mut NetQuicServer,
+    request_id: u64,
+    data: *const u8,
+    length: usize,
+) -> i32 {
+    if server.is_null() || data.is_null() {
+        return -1;
+    }
+    let inner = &mut unsafe { &mut *server }._inner;
+    if length > inner.max_response_headers_bytes {
+        return -1;
+    }
+    let Some(trailers) = parse_response_fields(
+        unsafe { slice::from_raw_parts(data, length) },
+        inner.max_response_headers_count,
+    ) else {
+        return -1;
+    };
+    i32::from(inner.add_stream_trailers(request_id, trailers))
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn net_quic_server_cancel_response(
+    server: *mut NetQuicServer,
+    request_id: u64,
+    error_code: u64,
+) -> i32 {
+    if server.is_null() || error_code > (1u64 << 62) - 1 {
+        return -1;
+    }
+    i32::from(
+        unsafe { &mut *server }
+            ._inner
+            .cancel_response_with_error(request_id, error_code),
+    )
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn net_quic_server_poll_stream_events(
+    server: *mut NetQuicServer,
+    ids: *mut u64,
+    kinds: *mut u8,
+    capacity: usize,
+) -> i32 {
+    if server.is_null() || ids.is_null() || kinds.is_null() {
+        return -1;
+    }
+    let events = unsafe { &mut *server }._inner.poll_stream_events(capacity);
+    for (index, (id, kind)) in events.iter().enumerate() {
+        unsafe {
+            ids.add(index).write(*id);
+            kinds.add(index).write(*kind);
+        }
+    }
+    events.len() as i32
 }
 
 fn read_u32(data: &[u8], offset: &mut usize) -> Option<u32> {
@@ -1042,6 +1180,8 @@ pub struct QuicServer {
     routes: HashMap<Vec<u8>, Vec<u8>>,
     requests: CompletedRequestQueue,
     request_routes: HashMap<u64, (Vec<u8>, u64)>,
+    stream_watches: HashMap<u64, (u8, bool)>,
+    stream_watch_queue: VecDeque<u64>,
     next_request_id: u64,
     random: File,
     max_connections: usize,
@@ -1116,6 +1256,7 @@ const H3_EXCESSIVE_LOAD: u64 = 0x107;
 // RFC 9114 assigns 0x105 to H3_FRAME_UNEXPECTED and 0x10b to H3_REQUEST_REJECTED.
 const H3_FRAME_UNEXPECTED: u64 = 0x105;
 const H3_REQUEST_REJECTED: u64 = 0x10b;
+const H3_REQUEST_CANCELLED: u64 = 0x10c;
 const H3_GENERAL_PROTOCOL_ERROR: u64 = 0x101;
 
 struct PendingResponse {
@@ -1123,6 +1264,10 @@ struct PendingResponse {
     headers: Vec<quiche::h3::Header>,
     body: Vec<u8>,
     trailers: Vec<quiche::h3::Header>,
+    streaming: bool,
+    end_stream_queued: bool,
+    initial_header_bytes: usize,
+    initial_header_count: usize,
     headers_sent: bool,
     body_offset: usize,
     trailers_sent: bool,
@@ -1289,6 +1434,8 @@ impl QuicServer {
             routes: HashMap::new(),
             requests: CompletedRequestQueue::new(),
             request_routes: HashMap::new(),
+            stream_watches: HashMap::new(),
+            stream_watch_queue: VecDeque::new(),
             next_request_id: 1,
             random: File::open("/dev/urandom")?,
             max_connections: 10_000,
@@ -1518,6 +1665,7 @@ impl QuicServer {
             return Err(error.into());
         }
 
+        let mut reset_streams = Vec::new();
         let mut cancelled_requests = Vec::new();
         let mut touched = HashSet::new();
         let completed = {
@@ -1527,6 +1675,7 @@ impl QuicServer {
                 &mut self.buffered_request_bytes,
                 &mut self.buffered_response_bytes,
                 &mut cancelled_requests,
+                &mut reset_streams,
                 &mut touched,
                 self.max_request_body_bytes,
                 self.max_request_headers_bytes,
@@ -1556,6 +1705,20 @@ impl QuicServer {
             self.response_timeouts
                 .remove(&(deadline, key.clone(), stream_id));
             self.remove_request_route(request_id);
+        }
+        for stream_id in reset_streams {
+            let ids: Vec<u64> = self.connections[&key]
+                .request_route_ids
+                .iter()
+                .copied()
+                .filter(|id| self.request_routes[id].1 == stream_id)
+                .collect();
+            for id in ids {
+                self.remove_request_route(id);
+                if let Some(request) = self.requests.remove(id) {
+                    self.buffered_request_bytes -= completed_request_retained_bytes(&request);
+                }
+            }
         }
         self.refresh_idle_timeout(&key);
         self.refresh_response_ready(&key);
@@ -1769,6 +1932,9 @@ impl QuicServer {
                 self.request_route_visits += 1;
                 self.completed_request_visits += 1;
             }
+            if let Some(watch) = self.stream_watches.get_mut(&request_id) {
+                watch.0 = 2;
+            }
             self.request_routes.remove(&request_id);
             if let Some(request) = self.requests.remove(request_id) {
                 let retained_bytes = completed_request_retained_bytes(&request);
@@ -1808,6 +1974,7 @@ impl QuicServer {
         buffered_request_bytes: &mut usize,
         buffered_response_bytes: &mut usize,
         cancelled_requests: &mut Vec<(u64, u64, Instant)>,
+        reset_streams: &mut Vec<u64>,
         touched: &mut HashSet<u64>,
         max_request_body_bytes: usize,
         max_request_headers_bytes: usize,
@@ -2132,6 +2299,7 @@ impl QuicServer {
                     }
                 }
                 Ok((stream_id, quiche::h3::Event::Reset(error))) => {
+                    reset_streams.push(stream_id);
                     touched.insert(stream_id);
                     connection.header_deadlines.remove(&stream_id);
                     http3.cancel_request(&mut connection.transport, stream_id, error)?;
@@ -2156,6 +2324,11 @@ impl QuicServer {
     }
 
     fn remove_request_route(&mut self, request_id: u64) {
+        if let Some(watch) = self.stream_watches.get_mut(&request_id) {
+            if watch.0 == 0 {
+                watch.0 = 2;
+            }
+        }
         let (key, _) = self.request_routes.remove(&request_id).unwrap();
         self.connections
             .get_mut(&key)
@@ -2194,6 +2367,11 @@ impl QuicServer {
             return false;
         }
         self.send_ready.push(&connection_key);
+        let initial_header_bytes = 4 + headers
+            .iter()
+            .map(|(name, value)| 8 + name.len() + value.len())
+            .sum::<usize>();
+        let initial_header_count = headers.len();
         let status_value = status.to_string();
         let trailer_bytes: usize = trailers
             .iter()
@@ -2263,6 +2441,10 @@ impl QuicServer {
                 headers: response_headers,
                 body,
                 trailers: response_trailers,
+                streaming: false,
+                end_stream_queued: true,
+                initial_header_bytes,
+                initial_header_count,
                 headers_sent: false,
                 body_offset: 0,
                 trailers_sent: false,
@@ -2274,6 +2456,252 @@ impl QuicServer {
         self.refresh_idle_timeout(&connection_key);
         self.refresh_response_ready(&connection_key);
         true
+    }
+
+    fn start_response(
+        &mut self,
+        request_id: u64,
+        status: u16,
+        headers: Vec<(Vec<u8>, Vec<u8>)>,
+    ) -> bool {
+        if !self.request_routes.contains_key(&request_id)
+            || self.stream_watches.contains_key(&request_id)
+        {
+            return false;
+        }
+        if !reserve_response_bytes(&mut self.buffered_response_bytes, 128) {
+            return false;
+        }
+        self.stream_watches.insert(request_id, (0, false));
+        self.stream_watch_queue.push_back(request_id);
+        if !self.enqueue_response(request_id, status, headers, vec![], vec![]) {
+            self.stream_watches.remove(&request_id);
+            self.stream_watch_queue.pop_back();
+            self.trim_stream_watch_storage();
+            self.buffered_response_bytes -= 128;
+            return false;
+        }
+        if let Some((key, stream_id)) = self.request_routes.get(&request_id).cloned() {
+            let response = self
+                .connections
+                .get_mut(&key)
+                .unwrap()
+                .responses
+                .get_mut(&stream_id)
+                .unwrap();
+            response.streaming = true;
+            response.end_stream_queued = false;
+        }
+        true
+    }
+
+    fn stream_capacity(&mut self, request_id: u64) -> i64 {
+        let Some((key, stream_id)) = self.request_routes.get(&request_id).cloned() else {
+            return -1;
+        };
+        let connection = self.connections.get_mut(&key).unwrap();
+        let capacity = match connection.transport.stream_capacity(stream_id) {
+            Ok(capacity) => capacity,
+            Err(quiche::Error::StreamStopped(_)) => {
+                self.cancel_response(request_id);
+                return -1;
+            }
+            Err(_) => return -1,
+        };
+        if let Some(response) = connection.responses.get(&stream_id) {
+            if !response.streaming || response.end_stream_queued {
+                return -1;
+            }
+            if !response.headers_sent {
+                return 0;
+            }
+        } else {
+            return 0;
+        }
+        http3_body_capacity(capacity).min(i64::MAX as usize) as i64
+    }
+
+    fn send_stream_body(&mut self, request_id: u64, body: &[u8], fin: bool) -> i64 {
+        let Some((key, stream_id)) = self.request_routes.get(&request_id).cloned() else {
+            return -1;
+        };
+        let connection = self.connections.get_mut(&key).unwrap();
+        let Some(response) = connection.responses.get_mut(&stream_id) else {
+            return -1;
+        };
+        if !response.streaming || response.end_stream_queued {
+            return -1;
+        }
+        if fin {
+            if !body.is_empty() {
+                return -1;
+            }
+            self.queue_stream_finish(&key, stream_id);
+            return 0;
+        }
+        if !response.headers_sent {
+            return 0;
+        }
+        let capacity = match connection.transport.stream_capacity(stream_id) {
+            Ok(capacity) => http3_body_capacity(capacity),
+            Err(_) => {
+                self.cancel_response(request_id);
+                return -1;
+            }
+        };
+        let body = &body[..body.len().min(capacity)];
+        let result = connection.http3.as_mut().unwrap().send_body(
+            &mut connection.transport,
+            stream_id,
+            body,
+            false,
+        );
+        match result {
+            Ok(written) => {
+                self.send_ready.push(&key);
+                self.stream_watches.get_mut(&request_id).unwrap().1 = false;
+                written as i64
+            }
+            Err(quiche::h3::Error::Done | quiche::h3::Error::StreamBlocked) => {
+                self.stream_watches.get_mut(&request_id).unwrap().1 = false;
+                0
+            }
+            Err(quiche::h3::Error::TransportError(quiche::Error::SendBufferExceeded)) => {
+                self.terminate_send_quota(&key);
+                -1
+            }
+            Err(_) => {
+                self.cancel_response(request_id);
+                -1
+            }
+        }
+    }
+
+    fn add_stream_trailers(&mut self, request_id: u64, trailers: Vec<(Vec<u8>, Vec<u8>)>) -> bool {
+        let Some((key, stream_id)) = self.request_routes.get(&request_id).cloned() else {
+            return false;
+        };
+        let Some(response) = self.connections[&key].responses.get(&stream_id) else {
+            return false;
+        };
+        let trailer_bytes = 4 + trailers
+            .iter()
+            .map(|(name, value)| 8 + name.len() + value.len())
+            .sum::<usize>();
+        if !response.streaming
+            || response.end_stream_queued
+            || response.initial_header_count + trailers.len() > self.max_response_headers_count
+            || response.initial_header_bytes + trailer_bytes > self.max_response_headers_bytes
+        {
+            return false;
+        }
+        let mut normalized = Vec::with_capacity(trailers.len());
+        let mut retained = 0;
+        for (name, value) in trailers {
+            let Some(name) = normalize_http3_response_trailer_name(&name) else {
+                return false;
+            };
+            if !is_valid_http_field_value(&value) {
+                return false;
+            }
+            retained += name.len() + value.len();
+            normalized.push(quiche::h3::Header::new(&name, &value));
+        }
+        if !reserve_response_bytes(&mut self.buffered_response_bytes, retained) {
+            self.cancel_response(request_id);
+            return false;
+        }
+        let response = self
+            .connections
+            .get_mut(&key)
+            .unwrap()
+            .responses
+            .get_mut(&stream_id)
+            .unwrap();
+        response.trailers = normalized;
+        response.buffered_bytes += retained;
+        self.queue_stream_finish(&key, stream_id);
+        true
+    }
+
+    fn queue_stream_finish(&mut self, key: &[u8], stream_id: u64) {
+        self.remove_response_timeout(key, stream_id);
+        let response = self
+            .connections
+            .get_mut(key)
+            .unwrap()
+            .responses
+            .get_mut(&stream_id)
+            .unwrap();
+        response.end_stream_queued = true;
+        if response.headers_sent {
+            response.write_deadline_at = Instant::now() + self.write_deadline;
+        }
+        self.index_response_timeout(key, stream_id);
+        self.response_ready.push(key);
+    }
+
+    fn cancel_response(&mut self, request_id: u64) -> bool {
+        self.cancel_response_with_error(request_id, H3_REQUEST_CANCELLED)
+    }
+
+    fn cancel_response_with_error(&mut self, request_id: u64, error_code: u64) -> bool {
+        let Some((key, stream_id)) = self.request_routes.get(&request_id).cloned() else {
+            return false;
+        };
+        let connection = self.connections.get_mut(&key).unwrap();
+        if let Some(response) = connection.responses.remove(&stream_id) {
+            self.response_timeouts
+                .remove(&(response.write_deadline_at, key.clone(), stream_id));
+            self.buffered_response_bytes -= response.buffered_bytes;
+        }
+        cancel_http3_request(connection, stream_id, error_code);
+        self.send_ready.push(&key);
+        self.remove_request_route(request_id);
+        self.refresh_transport_timeout(&key);
+        self.refresh_idle_timeout(&key);
+        self.refresh_response_ready(&key);
+        self.refresh_goaway_ready(&key);
+        true
+    }
+
+    fn poll_stream_events(&mut self, capacity: usize) -> Vec<(u64, u8)> {
+        let mut events = Vec::new();
+        let count = self.stream_watch_queue.len();
+        for _ in 0..count {
+            if events.len() == capacity.min(256) {
+                break;
+            }
+            let id = self.stream_watch_queue.pop_front().unwrap();
+            let state = self.stream_watches[&id].0;
+            if state != 0 {
+                events.push((id, state));
+                self.stream_watches.remove(&id);
+                self.buffered_response_bytes -= 128;
+            } else {
+                self.stream_watch_queue.push_back(id);
+                if self.stream_capacity(id) > 0 {
+                    let watch = self.stream_watches.get_mut(&id).unwrap();
+                    if !watch.1 {
+                        events.push((id, 0));
+                        watch.1 = true;
+                    }
+                } else {
+                    self.stream_watches.get_mut(&id).unwrap().1 = false;
+                }
+            }
+        }
+        self.trim_stream_watch_storage();
+        events
+    }
+
+    fn trim_stream_watch_storage(&mut self) {
+        if self.stream_watches.len() * 4 < self.stream_watches.capacity() {
+            self.stream_watches.shrink_to_fit();
+        }
+        if self.stream_watch_queue.len() * 4 < self.stream_watch_queue.capacity() {
+            self.stream_watch_queue.shrink_to_fit();
+        }
     }
 
     fn drive_responses(&mut self) -> Result<(), QuicServerError> {
@@ -2295,7 +2723,7 @@ impl QuicServer {
                 };
                 let has_trailers = !response.trailers.is_empty();
                 if !response.headers_sent {
-                    let fin = response.body.is_empty() && !has_trailers;
+                    let fin = !response.streaming && response.body.is_empty() && !has_trailers;
                     match http3.send_response(
                         &mut connection.transport,
                         stream_id,
@@ -2304,6 +2732,13 @@ impl QuicServer {
                     ) {
                         Ok(()) => {
                             response.headers_sent = true;
+                            if response.streaming && !response.end_stream_queued {
+                                self.response_timeouts.remove(&(
+                                    response.write_deadline_at,
+                                    connection_key.clone(),
+                                    stream_id,
+                                ));
+                            }
                             self.send_ready.push(&connection_key);
                         }
                         Err(quiche::h3::Error::TransportError(quiche::Error::StreamStopped(_))) => {
@@ -2328,6 +2763,42 @@ impl QuicServer {
                         }
                     }
                 }
+                if response.streaming {
+                    if !response.end_stream_queued {
+                        continue;
+                    }
+                    if !has_trailers {
+                        match http3.send_body(&mut connection.transport, stream_id, &[], true) {
+                            Ok(_) => {
+                                self.send_ready.push(&connection_key);
+                                self.stream_watches.get_mut(&response.request_id).unwrap().0 = 1;
+                                completed.push((
+                                    connection_key.clone(),
+                                    stream_id,
+                                    response.request_id,
+                                ));
+                            }
+                            Err(quiche::h3::Error::Done | quiche::h3::Error::StreamBlocked) => (),
+                            Err(quiche::h3::Error::TransportError(
+                                quiche::Error::StreamStopped(_),
+                            )) => {
+                                completed.push((
+                                    connection_key.clone(),
+                                    stream_id,
+                                    response.request_id,
+                                ));
+                            }
+                            Err(quiche::h3::Error::TransportError(
+                                quiche::Error::SendBufferExceeded,
+                            )) => {
+                                self.terminate_send_quota(&connection_key);
+                                continue 'connections;
+                            }
+                            Err(error) => return Err(error.into()),
+                        }
+                        continue;
+                    }
+                }
                 if response.body_offset < response.body.len() {
                     let body_fin = !has_trailers;
                     match http3.send_body(
@@ -2345,9 +2816,7 @@ impl QuicServer {
                                 continue;
                             }
                         }
-                        Err(quiche::h3::Error::TransportError(quiche::Error::StreamStopped(
-                            _,
-                        ))) => {
+                        Err(quiche::h3::Error::TransportError(quiche::Error::StreamStopped(_))) => {
                             self.send_ready.push(&connection_key);
                             completed.push((
                                 connection_key.clone(),
@@ -2382,12 +2851,11 @@ impl QuicServer {
                 ) {
                     Ok(()) => {
                         response.trailers_sent = true;
+                        if response.streaming {
+                            self.stream_watches.get_mut(&response.request_id).unwrap().0 = 1;
+                        }
                         self.send_ready.push(&connection_key);
-                        completed.push((
-                            connection_key.clone(),
-                            stream_id,
-                            response.request_id,
-                        ));
+                        completed.push((connection_key.clone(), stream_id, response.request_id));
                     }
                     Err(quiche::h3::Error::TransportError(quiche::Error::StreamStopped(_))) => {
                         self.send_ready.push(&connection_key);
@@ -2841,15 +3309,29 @@ mod tests {
         SocketAddr,
         SocketAddr,
     ) {
+        request_timer_peer_with_window(1_000_000)
+    }
+
+    fn request_timer_peer_with_window(
+        window: u64,
+    ) -> (
+        super::QuicServer,
+        quiche::Connection,
+        quiche::h3::Connection,
+        SocketAddr,
+        SocketAddr,
+    ) {
         let mut server = super::QuicServer::new(stress_server_config()).unwrap();
         let local: SocketAddr = "127.0.0.1:4433".parse().unwrap();
         let remote: SocketAddr = "127.0.0.1:30400".parse().unwrap();
+        let mut config = stress_client_config();
+        config.set_initial_max_stream_data_bidi_local(window);
         let mut client = quiche::connect(
             Some("localhost"),
             &ConnectionId::from_ref(&[0x97; 16]),
             remote,
             local,
-            &mut stress_client_config(),
+            &mut config,
         )
         .unwrap();
         establish_http3_in_memory(
@@ -2888,6 +3370,471 @@ mod tests {
         let request = server.next_request().unwrap();
         assert_eq!(request.stream_id, id);
         request
+    }
+
+    #[test]
+    fn streaming_response_keeps_headers_open_until_finish() {
+        let (mut server, mut client, mut h3, local, remote) = request_timer_peer();
+        let request = completed_ready_request(&mut server, &mut client, &mut h3, local, remote);
+        assert!(server.start_response(request.id, 200, vec![]));
+        for _ in 0..32 {
+            pump_in_memory(
+                &mut client,
+                &mut server,
+                &mut [0; 65535],
+                local,
+                remote,
+                false,
+                false,
+            );
+        }
+        assert_eq!(
+            drain_ready_body(&mut client, &mut h3, request.stream_id),
+            (vec![], false)
+        );
+        assert!(server.stream_capacity(request.id) > 0);
+        assert_eq!(server.send_stream_body(request.id, b"hello", false), 5);
+        assert_eq!(server.send_stream_body(request.id, b"", true), 0);
+        for _ in 0..32 {
+            pump_in_memory(
+                &mut client,
+                &mut server,
+                &mut [0; 65535],
+                local,
+                remote,
+                false,
+                false,
+            );
+        }
+        assert_eq!(
+            drain_ready_body(&mut client, &mut h3, request.stream_id),
+            (b"hello".to_vec(), true)
+        );
+        assert!(
+            server
+                .poll_stream_events(64)
+                .iter()
+                .any(|event| *event == (request.id, 1))
+        );
+        assert_eq!(server.buffered_response_bytes, 0);
+    }
+
+    #[test]
+    fn streaming_response_trailers_follow_body_and_refund_budget() {
+        let (mut server, mut client, mut h3, local, remote) = request_timer_peer();
+        let request = completed_ready_request(&mut server, &mut client, &mut h3, local, remote);
+        assert!(server.start_response(request.id, 200, vec![]));
+        for _ in 0..32 {
+            pump_in_memory(
+                &mut client,
+                &mut server,
+                &mut [0; 65535],
+                local,
+                remote,
+                false,
+                false,
+            );
+        }
+        assert_eq!(server.send_stream_body(request.id, b"first", false), 5);
+        assert!(
+            server.add_stream_trailers(request.id, vec![(b"x-end".to_vec(), b"done".to_vec())])
+        );
+        for _ in 0..32 {
+            pump_in_memory(
+                &mut client,
+                &mut server,
+                &mut [0; 65535],
+                local,
+                remote,
+                false,
+                false,
+            );
+        }
+        let mut body = vec![];
+        let mut trailer = false;
+        let mut finished = false;
+        loop {
+            match h3.poll(&mut client) {
+                Ok((id, quiche::h3::Event::Headers { list, .. })) if id == request.stream_id => {
+                    if list.iter().any(|field| field.name() == b"x-end") {
+                        assert_eq!(body, b"first");
+                        trailer = true;
+                    }
+                }
+                Ok((id, quiche::h3::Event::Data)) if id == request.stream_id => {
+                    let mut bytes = [0; 4096];
+                    while let Ok(n) = h3.recv_body(&mut client, id, &mut bytes) {
+                        if n == 0 {
+                            break;
+                        }
+                        body.extend_from_slice(&bytes[..n]);
+                    }
+                }
+                Ok((id, quiche::h3::Event::Finished)) if id == request.stream_id => finished = true,
+                Ok(_) => (),
+                Err(quiche::h3::Error::Done) => break,
+                Err(error) => panic!("{error:?}"),
+            }
+        }
+        assert!(trailer && finished);
+        assert!(server.poll_stream_events(64).contains(&(request.id, 1)));
+        assert_eq!(server.buffered_response_bytes, 0);
+    }
+
+    #[test]
+    fn streaming_response_peer_stop_cancels_only_target() {
+        let (mut server, mut client, mut h3, local, remote) = request_timer_peer();
+        let request = completed_ready_request(&mut server, &mut client, &mut h3, local, remote);
+        let sibling = completed_ready_request(&mut server, &mut client, &mut h3, local, remote);
+        assert!(server.start_response(request.id, 200, vec![]));
+        client
+            .stream_shutdown(request.stream_id, quiche::Shutdown::Read, 0x10c)
+            .unwrap();
+        for _ in 0..32 {
+            pump_in_memory(
+                &mut client,
+                &mut server,
+                &mut [0; 65535],
+                local,
+                remote,
+                false,
+                false,
+            );
+        }
+        assert!(server.stream_capacity(request.id) < 0);
+        assert!(server.poll_stream_events(64).contains(&(request.id, 2)));
+        assert!(server.request_routes.contains_key(&sibling.id));
+        assert_eq!(server.buffered_response_bytes, 0);
+    }
+
+    #[test]
+    fn streaming_response_limits_share_headers_and_trailers() {
+        let (mut server, mut client, mut h3, local, remote) = request_timer_peer();
+        let request = completed_ready_request(&mut server, &mut client, &mut h3, local, remote);
+        server.max_response_headers_count = 1;
+        assert!(server.start_response(
+            request.id,
+            200,
+            vec![(b"x-start".to_vec(), b"yes".to_vec())]
+        ));
+        assert!(
+            !server.add_stream_trailers(request.id, vec![(b"x-end".to_vec(), b"done".to_vec())])
+        );
+        assert!(server.cancel_response(request.id));
+        assert!(server.poll_stream_events(64).contains(&(request.id, 2)));
+        assert_eq!(server.buffered_response_bytes, 0);
+    }
+
+    #[test]
+    fn streaming_response_partial_send_waits_for_credit_without_copying_body() {
+        let (mut server, mut client, mut h3, local, remote) = request_timer_peer();
+        let request = completed_ready_request(&mut server, &mut client, &mut h3, local, remote);
+        assert!(server.start_response(request.id, 200, vec![]));
+        for _ in 0..32 {
+            pump_in_memory(
+                &mut client,
+                &mut server,
+                &mut [0; 65535],
+                local,
+                remote,
+                false,
+                false,
+            );
+        }
+        assert!(server.poll_stream_events(64).contains(&(request.id, 0)));
+        let retained = server.buffered_response_bytes;
+        let body = vec![b'x'; 2_000_000];
+        let accepted = server.send_stream_body(request.id, &body, false);
+        assert!(accepted > 0 && accepted < body.len() as i64);
+        assert_eq!(server.buffered_response_bytes, retained);
+
+        assert_eq!(server.stream_capacity(request.id), 0);
+        for _ in 0..256 {
+            pump_in_memory(
+                &mut client,
+                &mut server,
+                &mut [0; 65535],
+                local,
+                remote,
+                false,
+                false,
+            );
+            drain_ready_body(&mut client, &mut h3, request.stream_id);
+            if server.stream_capacity(request.id) > 0 {
+                break;
+            }
+        }
+        assert!(server.stream_capacity(request.id) > 0);
+        assert!(server.poll_stream_events(64).contains(&(request.id, 0)));
+        assert!(server.cancel_response(request.id));
+        assert!(server.poll_stream_events(64).contains(&(request.id, 2)));
+        assert_eq!(server.buffered_response_bytes, 0);
+    }
+
+    #[test]
+    fn streaming_response_deferred_peer_stop_removes_owned_route() {
+        let (mut server, mut client, mut h3, local, remote) = request_timer_peer();
+        let request = completed_ready_request(&mut server, &mut client, &mut h3, local, remote);
+        client
+            .stream_shutdown(request.stream_id, quiche::Shutdown::Read, 0x10c)
+            .unwrap();
+        for _ in 0..32 {
+            pump_in_memory(
+                &mut client,
+                &mut server,
+                &mut [0; 65535],
+                local,
+                remote,
+                false,
+                false,
+            );
+        }
+        assert_eq!(server.stream_capacity(request.id), -1);
+        assert!(!server.request_routes.contains_key(&request.id));
+        assert_eq!(server.buffered_response_bytes, 0);
+    }
+
+    #[test]
+    fn streaming_response_small_credit_reports_and_accepts_available_payload() {
+        let (mut server, mut client, mut h3, local, remote) = request_timer_peer_with_window(64);
+        let request = completed_ready_request(&mut server, &mut client, &mut h3, local, remote);
+        assert!(server.start_response(request.id, 200, vec![]));
+        for _ in 0..32 {
+            pump_in_memory(
+                &mut client,
+                &mut server,
+                &mut [0; 65535],
+                local,
+                remote,
+                false,
+                false,
+            );
+        }
+        assert!(server.poll_stream_events(64).contains(&(request.id, 0)));
+        let (key, stream) = server.request_routes[&request.id].clone();
+        let raw = server
+            .connections
+            .get_mut(&key)
+            .unwrap()
+            .transport
+            .stream_capacity(stream)
+            .unwrap();
+        assert!(raw > 7 && raw < 64);
+        let body = vec![b'x'; raw - 7];
+        assert_eq!(
+            server.send_stream_body(request.id, &body, false),
+            body.len() as i64
+        );
+        assert_eq!(server.stream_capacity(request.id), 3);
+        assert!(server.poll_stream_events(64).contains(&(request.id, 0)));
+        assert_eq!(server.send_stream_body(request.id, &[b'x'; 1024], false), 3);
+        assert!(server.cancel_response(request.id));
+        assert!(server.poll_stream_events(64).contains(&(request.id, 2)));
+        assert_eq!(server.buffered_response_bytes, 0);
+    }
+
+    #[test]
+    fn streaming_response_event_poll_rotates_rearmed_streams() {
+        let (mut server, mut client, mut h3, local, remote) = request_timer_peer();
+        let mut ids = Vec::new();
+        for _ in 0..65 {
+            let request = completed_ready_request(&mut server, &mut client, &mut h3, local, remote);
+            ids.push(request.id);
+            assert!(server.start_response(request.id, 200, vec![]));
+        }
+        for _ in 0..32 {
+            pump_in_memory(
+                &mut client,
+                &mut server,
+                &mut [0; 65535],
+                local,
+                remote,
+                false,
+                false,
+            );
+        }
+        let mut seen = std::collections::HashSet::new();
+        for _ in 0..10 {
+            let events = server.poll_stream_events(64);
+            assert_eq!(events.len(), 64);
+            for (id, kind) in events {
+                assert_eq!(kind, 0);
+                seen.insert(id);
+                assert_eq!(server.send_stream_body(id, b"x", false), 1);
+            }
+        }
+        assert_eq!(seen.len(), 65);
+        for id in ids {
+            assert!(server.cancel_response(id));
+        }
+        assert_eq!(server.poll_stream_events(64).len(), 64);
+        assert_eq!(server.poll_stream_events(64).len(), 1);
+        assert_eq!(server.buffered_response_bytes, 0);
+    }
+
+    #[test]
+    fn streaming_response_payload_capacity_accounts_for_varint_boundaries() {
+        for (credit, payload) in [
+            (0, 0),
+            (1, 0),
+            (2, 0),
+            (3, 1),
+            (64, 62),
+            (65, 63),
+            (66, 63),
+            (67, 64),
+            (16_386, 16_383),
+            (16_387, 16_383),
+            (16_388, 16_383),
+            (16_389, 16_384),
+            (1_073_741_828, 1_073_741_823),
+            (1_073_741_832, 1_073_741_823),
+            (1_073_741_833, 1_073_741_824),
+        ] {
+            assert_eq!(super::http3_body_capacity(credit), payload);
+        }
+    }
+
+    #[test]
+    fn streaming_response_ffi_caps_event_output_and_releases_metadata() {
+        let mut server = super::QuicServer::new(stress_server_config()).unwrap();
+        for id in 1..=257 {
+            server.stream_watches.insert(id, (1, false));
+            server.stream_watch_queue.push_back(id);
+            server.buffered_response_bytes += 128;
+        }
+        let mut handle = super::NetQuicServer { _inner: server };
+        let mut ids = [0; 257];
+        let mut kinds = [0; 257];
+        let count = unsafe {
+            super::net_quic_server_poll_stream_events(
+                &mut handle,
+                ids.as_mut_ptr(),
+                kinds.as_mut_ptr(),
+                ids.len(),
+            )
+        };
+        assert_eq!(count, 256);
+        assert!(kinds[..256].iter().all(|kind| *kind == 1));
+        assert_eq!(ids[256], 0);
+        assert_eq!(handle._inner.buffered_response_bytes, 128);
+        let count = unsafe {
+            super::net_quic_server_poll_stream_events(
+                &mut handle,
+                ids.as_mut_ptr(),
+                kinds.as_mut_ptr(),
+                ids.len(),
+            )
+        };
+        assert_eq!(count, 1);
+        assert_eq!(handle._inner.buffered_response_bytes, 0);
+        assert_eq!(handle._inner.stream_watches.capacity(), 0);
+        assert_eq!(handle._inner.stream_watch_queue.capacity(), 0);
+    }
+
+    #[test]
+    fn streaming_response_blocked_headers_keep_native_write_deadline() {
+        for finish in 0..3 {
+            let (mut server, mut client, mut h3, local, remote) = request_timer_peer_with_window(1);
+            let request = completed_ready_request(&mut server, &mut client, &mut h3, local, remote);
+            server.write_deadline = std::time::Duration::ZERO;
+            assert!(server.start_response(request.id, 200, vec![]));
+            server.write_deadline = std::time::Duration::from_secs(30);
+            if finish == 1 {
+                assert_eq!(server.send_stream_body(request.id, &[], true), 0);
+            } else if finish == 2 {
+                assert!(
+                    server.add_stream_trailers(
+                        request.id,
+                        vec![(b"x-end".to_vec(), b"yes".to_vec())]
+                    )
+                );
+            }
+            server.drive_responses().unwrap();
+            assert!(!server.request_routes.contains_key(&request.id));
+            assert!(server.poll_stream_events(64).contains(&(request.id, 2)));
+            assert_eq!(server.buffered_response_bytes, 0);
+        }
+    }
+
+    #[test]
+    fn streaming_response_idle_producer_is_exempt_but_finish_writes_are_bounded() {
+        for trailers in [false, true] {
+            let (mut server, mut client, mut h3, local, remote) =
+                request_timer_peer_with_window(64);
+            let request = completed_ready_request(&mut server, &mut client, &mut h3, local, remote);
+            assert!(server.start_response(request.id, 200, vec![]));
+            for _ in 0..32 {
+                pump_in_memory(
+                    &mut client,
+                    &mut server,
+                    &mut [0; 65535],
+                    local,
+                    remote,
+                    false,
+                    false,
+                );
+            }
+            assert!(server.response_timeouts.is_empty());
+            let capacity = server.stream_capacity(request.id);
+            assert!(capacity > 0);
+            assert_eq!(
+                server.send_stream_body(request.id, &vec![b'x'; capacity as usize], false),
+                capacity
+            );
+            assert_eq!(server.stream_capacity(request.id), 0);
+            server.write_deadline = std::time::Duration::ZERO;
+            if trailers {
+                assert!(
+                    server.add_stream_trailers(
+                        request.id,
+                        vec![(b"x-end".to_vec(), b"yes".to_vec())]
+                    )
+                );
+            } else {
+                assert_eq!(server.send_stream_body(request.id, &[], true), 0);
+            }
+            assert_eq!(server.response_timeouts.len(), 1);
+            server.drive_responses().unwrap();
+            assert!(!server.request_routes.contains_key(&request.id));
+            assert!(server.poll_stream_events(64).contains(&(request.id, 2)));
+            assert_eq!(server.buffered_response_bytes, 0);
+        }
+    }
+
+    #[test]
+    fn streaming_response_cancel_preserves_requested_application_error() {
+        for code in [super::H3_REQUEST_CANCELLED, 0x102] {
+            let (mut server, mut client, mut h3, local, remote) = request_timer_peer();
+            let request = completed_ready_request(&mut server, &mut client, &mut h3, local, remote);
+            assert!(server.start_response(request.id, 200, vec![]));
+            assert!(server.cancel_response_with_error(request.id, code));
+            for _ in 0..32 {
+                pump_in_memory(
+                    &mut client,
+                    &mut server,
+                    &mut [0; 65535],
+                    local,
+                    remote,
+                    false,
+                    false,
+                );
+            }
+            let mut reset = None;
+            loop {
+                match h3.poll(&mut client) {
+                    Ok((id, quiche::h3::Event::Reset(error))) if id == request.stream_id => {
+                        reset = Some(error)
+                    }
+                    Ok(_) => (),
+                    Err(quiche::h3::Error::Done) => break,
+                    Err(error) => panic!("{error:?}"),
+                }
+            }
+            assert_eq!(reset, Some(code));
+            assert!(server.poll_stream_events(64).contains(&(request.id, 2)));
+            assert_eq!(server.buffered_response_bytes, 0);
+        }
     }
 
     fn drain_ready_body(

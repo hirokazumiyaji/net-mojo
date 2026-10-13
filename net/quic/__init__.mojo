@@ -385,6 +385,102 @@ struct QuicServer(Movable):
             "QUIC provider could not queue the response",
         )
 
+    def start_response[
+        origin: Origin
+    ](
+        mut self, request_id: UInt64, status: Int, headers: Span[Byte, origin]
+    ) raises NetError:
+        _require_ok(
+            self._library.call["net_quic_start_response", c_int](
+                self._server,
+                request_id,
+                UInt32(status),
+                headers.unsafe_ptr(),
+                c_size_t(len(headers)),
+            ),
+            "start HTTP/3 response",
+            "QUIC provider could not start the response",
+        )
+
+    def stream_capacity(mut self, request_id: UInt64) -> Int:
+        return Int(
+            self._library.call["net_quic_stream_capacity", Int64](
+                self._server, request_id
+            )
+        )
+
+    def send_stream_body[
+        origin: Origin
+    ](
+        mut self,
+        request_id: UInt64,
+        body: Span[Byte, origin],
+        fin: Bool = False,
+    ) -> Int:
+        return Int(
+            self._library.call["net_quic_send_stream_body", Int64](
+                self._server,
+                request_id,
+                body.unsafe_ptr(),
+                c_size_t(len(body)),
+                c_int(fin),
+            )
+        )
+
+    def add_stream_trailers[
+        origin: Origin
+    ](
+        mut self, request_id: UInt64, trailers: Span[Byte, origin]
+    ) raises NetError:
+        _require_ok(
+            self._library.call["net_quic_add_stream_trailers", c_int](
+                self._server,
+                request_id,
+                trailers.unsafe_ptr(),
+                c_size_t(len(trailers)),
+            ),
+            "finish HTTP/3 response",
+            "QUIC provider could not queue the trailers",
+        )
+
+    def cancel_response(
+        mut self, request_id: UInt64, error_code: UInt64 = UInt64(0x10C)
+    ) -> Bool:
+        return (
+            self._library.call["net_quic_cancel_response", c_int](
+                self._server, request_id, error_code
+            )
+            > 0
+        )
+
+    def poll_stream_events(mut self) raises NetError -> List[QuicStreamEvent]:
+        var ids = List[UInt64](capacity=64)
+        var kinds = List[Byte](capacity=64)
+        ids.resize(64, 0)
+        kinds.resize(64, 0)
+        var count = Int(
+            self._library.call["net_quic_poll_stream_events", c_int](
+                self._server, ids.unsafe_ptr(), kinds.unsafe_ptr(), c_size_t(64)
+            )
+        )
+        if count < 0:
+            raise NetError(
+                NetErrorKind.system_error(),
+                "poll HTTP/3 stream events",
+                None,
+                "QUIC provider could not poll stream events",
+            )
+        var events = List[QuicStreamEvent]()
+        for i in range(count):
+            events.append(QuicStreamEvent(ids[i], kinds[i]))
+        return events^
+
+
+@fieldwise_init
+struct QuicStreamEvent(Copyable, Movable):
+    var request_id: UInt64
+    var kind: Byte
+
 
 @fieldwise_init
 struct QuicRequestHeader(Movable):
@@ -728,6 +824,41 @@ struct QuicUDPEndpoint(Movable):
         trailers: Span[Byte, trailers_origin],
     ) raises NetError:
         self._server.respond(request_id, status, headers, body, trailers)
+
+    def start_response[
+        origin: Origin
+    ](
+        mut self, request_id: UInt64, status: Int, headers: Span[Byte, origin]
+    ) raises NetError:
+        self._server.start_response(request_id, status, headers)
+
+    def stream_capacity(mut self, request_id: UInt64) -> Int:
+        return self._server.stream_capacity(request_id)
+
+    def send_stream_body[
+        origin: Origin
+    ](
+        mut self,
+        request_id: UInt64,
+        body: Span[Byte, origin],
+        fin: Bool = False,
+    ) -> Int:
+        return self._server.send_stream_body(request_id, body, fin)
+
+    def add_stream_trailers[
+        origin: Origin
+    ](
+        mut self, request_id: UInt64, trailers: Span[Byte, origin]
+    ) raises NetError:
+        self._server.add_stream_trailers(request_id, trailers)
+
+    def cancel_response(
+        mut self, request_id: UInt64, error_code: UInt64 = UInt64(0x10C)
+    ) -> Bool:
+        return self._server.cancel_response(request_id, error_code)
+
+    def poll_stream_events(mut self) raises NetError -> List[QuicStreamEvent]:
+        return self._server.poll_stream_events()
 
 
 def _read_request_u32[

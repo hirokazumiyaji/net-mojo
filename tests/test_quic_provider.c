@@ -56,6 +56,25 @@ static int test_pool_limits(struct NetQuicServer *server,
     return 0;
 }
 
+static int test_streaming_response_ffi(struct NetQuicServer *server) {
+    const uint8_t fields[4] = {0};
+    uint64_t ids[64];
+    uint8_t kinds[64];
+    if (net_quic_start_response(server, 1, 200, fields, sizeof(fields)) != 0 ||
+        net_quic_stream_capacity(server, 1) != -1 ||
+        net_quic_send_stream_body(server, 1, fields, sizeof(fields), 0) != -1 ||
+        net_quic_add_stream_trailers(server, 1, fields, sizeof(fields)) != 0 ||
+        net_quic_cancel_response(server, 1, 0x10c) != 0 ||
+        net_quic_poll_stream_events(server, ids, kinds, 64) != 0 ||
+        net_quic_start_response(server, 1, 99, fields, sizeof(fields)) != -1 ||
+        net_quic_send_stream_body(server, 1, fields, sizeof(fields), 2) != -1 ||
+        net_quic_add_stream_trailers(server, 1, fields, 3) != -1 ||
+        net_quic_cancel_response(server, 1, UINT64_MAX) != -1) {
+        return 12;
+    }
+    return 0;
+}
+
 int main(int argc, char **argv) {
     if (argc != 3 || strcmp(net_quic_version(), "0.29.3") != 0) {
         return 1;
@@ -71,6 +90,8 @@ int main(int argc, char **argv) {
     if (server == NULL) {
         return 3;
     }
+    int stream_result = test_streaming_response_ffi(server);
+    if (stream_result != 0) { return stream_result; }
     uint8_t packet[1200];
     char destination[64];
     uint64_t send_delay_ns = UINT64_MAX;

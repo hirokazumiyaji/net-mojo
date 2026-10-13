@@ -238,7 +238,55 @@ def test_send_limits_reject_negative_capacities() raises:
     endpoint.set_send_limits(0, 0, 0, 0, 0, 0)
 
 
+def test_streaming_response_ffi_rejects_unknown_request() raises:
+    var provider = QuicProvider("build/quic/libnet_quic_provider")
+    var config = provider.server_config(
+        "build/tls/test-cert.pem", "build/tls/test-key.pem"
+    )
+    var server = provider.server(config^)
+    var fields = Array[Byte, 4](fill=0)
+    assert_true(server.stream_capacity(1) == -1)
+    assert_true(server.send_stream_body(1, Span(fields)) == -1)
+    assert_true(server.send_stream_body(1, Span(fields), True) == -1)
+    assert_false(server.cancel_response(1))
+    assert_false(server.cancel_response(1, UInt64(0x102)))
+    assert_true(len(server.poll_stream_events()) == 0)
+    var rejected = False
+    try:
+        server.start_response(1, 200, Span(fields))
+    except:
+        rejected = True
+    assert_true(rejected)
+    rejected = False
+    try:
+        server.add_stream_trailers(1, Span(fields))
+    except:
+        rejected = True
+    assert_true(rejected)
+
+    var listener = listen_udp("127.0.0.1:0")
+    var endpoint = QuicUDPEndpoint(server^, listener^)
+    assert_true(endpoint.stream_capacity(1) == -1)
+    assert_true(endpoint.send_stream_body(1, Span(fields)) == -1)
+    assert_false(endpoint.cancel_response(1))
+    assert_false(endpoint.cancel_response(1, UInt64(0x102)))
+    assert_true(len(endpoint.poll_stream_events()) == 0)
+    rejected = False
+    try:
+        endpoint.start_response(1, 200, Span(fields))
+    except:
+        rejected = True
+    assert_true(rejected)
+    rejected = False
+    try:
+        endpoint.add_stream_trailers(1, Span(fields))
+    except:
+        rejected = True
+    assert_true(rejected)
+
+
 def main() raises:
+    test_streaming_response_ffi_rejects_unknown_request()
     var provider = QuicProvider("build/quic/libnet_quic_provider")
     assert_true(provider.version() == "0.29.3")
     var config = provider.server_config(
