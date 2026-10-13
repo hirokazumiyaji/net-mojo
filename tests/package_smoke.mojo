@@ -4,12 +4,15 @@ from net.http import (
     Handler,
     Headers,
     HttpVersion,
+    MiddlewareFn,
     Request,
     ServerPool,
     ResponseSender,
     ResponseWriter,
+    RouteHandler,
     ServerConfig,
     ServeMux,
+    apply_middleware,
     has_body_for_status,
 )
 from net.http._parser import parse_one
@@ -74,9 +77,21 @@ def _packaged_route(req: Request, mut writer: ResponseWriter) raises:
     writer.write_string(ServeMux.param(req, "name").value())
 
 
+def _packaged_layer(
+    req: Request, mut writer: ResponseWriter, mut next: RouteHandler
+) raises:
+    next.handle(req, writer)
+    writer.headers.add("X-Middleware", "packaged")
+
+
 def _check_http_router() raises:
     var mux = ServeMux()
-    mux.handle("GET /hello/{name}", _packaged_route)
+    var layers = List[MiddlewareFn]()
+    layers.append(MiddlewareFn(_packaged_layer))
+    mux.register(
+        "GET /hello/{name}",
+        apply_middleware(RouteHandler(_packaged_route), layers^),
+    )
     var req = Request(
         "GET", "/hello/package", "/hello/package", "", HttpVersion.http11()
     )
@@ -87,6 +102,8 @@ def _check_http_router() raises:
         or String(from_utf8_lossy=Span(writer.body)) != "package"
     ):
         raise Error("packaged net.http router mismatch")
+    if writer.headers.get_first("x-middleware").value() != "packaged":
+        raise Error("packaged net.http middleware mismatch")
 
 
 def main() raises:

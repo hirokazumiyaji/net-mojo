@@ -214,6 +214,8 @@ jobs:
         run: pixi run test-http-response
       - name: Test HTTP route patterns
         run: pixi run test-http-router
+      - name: Test HTTP middleware
+        run: pixi run test-http-middleware
       - name: Test HTTP server
         run: pixi run test-http-server
       - name: Run HTTP router example
@@ -307,6 +309,8 @@ jobs:
         run: pixi run sanitize-http-response
       - name: Sanitize HTTP router
         run: pixi run sanitize-http-router
+      - name: Sanitize HTTP middleware
+        run: pixi run sanitize-http-middleware
       - name: Sanitize HTTP server
         run: pixi run sanitize-http-server
       - name: Sanitize HTTP/2 frame parser

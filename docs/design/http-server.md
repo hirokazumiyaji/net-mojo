@@ -58,7 +58,7 @@ request の views と response writer は handler 呼び出し中だけ有効と
 受信 buffer は呼び出し中に移動、拡張、再利用しない。保持したい値は明示的にコピーする。
 response は送信完了まで接続が所有する。短命な handler の値を送信待ち queue に借用しない。
 初版では request body 全体を上限付きで受信してから handler を呼ぶ。
-request streaming、response streaming、`Flush`、middleware framework は初版に含めない。
+request streaming、response streaming、`Flush` は初版に含めない。
 `ServeMux` は method/path パターンを登録し、未登録 path に 404 を返す。
 
 ## 最終形から逆算する共通境界
@@ -452,6 +452,19 @@ struct ServeMux(Handler, Movable):
     @staticmethod
     def param(req: Request, name: StringSlice) -> Optional[String]
 
+# net/http/middleware.mojo
+struct MiddlewareFn(Movable):
+    def __init__[F: def(Request, mut ResponseWriter, mut RouteHandler) raises -> None](
+        out self, var callback: F
+    )
+    def handle(
+        mut self, req: Request, mut writer: ResponseWriter, mut next: RouteHandler
+    ) raises
+
+def apply_middleware(
+    var final: RouteHandler, var layers: List[MiddlewareFn]
+) -> RouteHandler
+
 # net/http/error.mojo
 struct HttpError(Copyable, Movable, Writable):
     var status: Int
@@ -630,7 +643,7 @@ HTTP/3 の record buffer と handler の `Request.body` は同じ借用 storage 
 request の view や mutable writer の借用を handler 終了後まで保持する用途には使わない。
 HTTP/2 と HTTP/3 の共通 handler は bounded buffered response を返す。
 両 protocol での detach は未対応で、現在の HTTP/2 adapter は接続を閉じ、HTTP/3 adapter は sender を取り消して 500 応答にする。
-request streaming、`Flush`、middleware は含めない。
+request streaming、`Flush` は含めない。
 
 所有値へのコピーは `tests/test_http_api.mojo` の `test_response_writer_owns_copies_of_handler_locals` と `test_header_value_span_borrows_storage_and_owned_copy_survives_clear` で検証する。
 HTTP/2 の request 組立ては `tests/test_http2.mojo` の `test_http2_request_stream_combines_headers_body_and_trailers`、HTTP/3 の native record と Mojo decode は `tests/test_quic_provider.mojo` で検証する。
@@ -652,6 +665,17 @@ callback はコピー捕捉か移動捕捉で値を所有し、捕捉した view
 percent decoding は行わず、`a%2Fb` をそのまま返す。
 パラメータは選択した handler の呼び出し中だけ参照でき、入れ子の mux から戻ると外側の変数を復元する。
 handler が例外を返した場合も同じ復元を行う。
+
+### 関数による middleware 合成
+
+`MiddlewareFn` は request と response writer、次の `RouteHandler` の借用を受け取る callback を所有する。
+callback は `next.handle(req, writer)` を呼んで後続へ進むか、呼ばずに応答を完成させる。
+`apply_middleware` は最終 handler と外側から並べた callback の List を消費し、一つの `RouteHandler` を返す。
+合成は serve 開始前に行い、保持する捕捉値の所有権は route callback と同じ契約に従う。
+
+後続が例外を返すと、その例外は呼び出し元の middleware に伝わる。
+`next.handle` の後の処理を例外時にも実行する場合は callback が `try`/`except` を使う。
+合成自体は応答 status と body を変更せず、前後処理と短絡処理を callback が決める。
 
 ### エラー契約
 

@@ -33,6 +33,7 @@ test-http-api = "mojo run --Werror -I . tests/test_http_api.mojo"
 test-http-parser = "mojo run --Werror -I . tests/test_http_parser.mojo"
 test-http-response = "mojo run --Werror -I . tests/test_http_response.mojo"
 test-http-router = "mojo run --Werror -I . tests/test_http_router.mojo"
+test-http-middleware = "mojo run --Werror -I . tests/test_http_middleware.mojo"
 test-http-server = "mojo run --Werror -I . tests/test_http_server.mojo"
 test-http2 = "mojo run --Werror -I . tests/test_http2.mojo"
 test-http-detach = "mojo run --Werror -I . tests/test_http_detach.mojo"
@@ -49,6 +50,7 @@ sanitize-http-control = { cmd = "bash scripts/run_sanitized.sh tests/test_http_c
 sanitize-http-parser = { cmd = "bash scripts/run_sanitized.sh tests/test_http_parser.mojo", default-environment = "sanitize" }
 sanitize-http-response = { cmd = "bash scripts/run_sanitized.sh tests/test_http_response.mojo", default-environment = "sanitize" }
 sanitize-http-router = { cmd = "bash scripts/run_sanitized.sh tests/test_http_router.mojo", default-environment = "sanitize" }
+sanitize-http-middleware = { cmd = "bash scripts/run_sanitized.sh tests/test_http_middleware.mojo", default-environment = "sanitize" }
 sanitize-http-server = { cmd = "bash scripts/run_sanitized.sh tests/test_http_server.mojo", default-environment = "sanitize" }
 sanitize-http2 = { cmd = "bash scripts/run_sanitized.sh tests/test_http2.mojo", default-environment = "sanitize", depends-on = [
   { task = "hpack-test", environment = "http2" },
@@ -68,6 +70,7 @@ sanitize = { depends-on = [
   { task = "sanitize-http-parser", environment = "sanitize" },
   { task = "sanitize-http-response", environment = "sanitize" },
   { task = "sanitize-http-router", environment = "sanitize" },
+  { task = "sanitize-http-middleware", environment = "sanitize" },
   { task = "sanitize-http-server", environment = "sanitize" },
   { task = "sanitize-http2", environment = "sanitize" },
   { task = "sanitize-http-detach", environment = "sanitize" },
@@ -88,6 +91,7 @@ test = { depends-on = [
   "test-http-parser",
   "test-http-response",
   "test-http-router",
+  "test-http-middleware",
   "test-http-server",
   "test-http2",
   "test-http-detach",

@@ -4,9 +4,9 @@ Import from here, not from `net`:
 
 ```mojo
 from net.http import (
-    Handler, Headers, HttpError, HttpVersion, Request, ResponseWriter,
+    Handler, Headers, HttpError, HttpVersion, MiddlewareFn, Request, ResponseWriter,
     RouteHandler, ServeMux, Server, ServerConfig, ServerControl, has_body_for_status,
-    maybe_inject_alt_svc, split_path_query,
+    apply_middleware, maybe_inject_alt_svc, split_path_query,
 )
 ```
 """
@@ -15,6 +15,7 @@ from .config import ServerConfig
 from .error import HttpError, _status_reason
 from .handler import Handler, HandlerFactory, DefaultHandlerFactory
 from .headers import Headers
+from .middleware import MiddlewareFn, apply_middleware
 from .request import HttpVersion, Request, split_path_query
 from .response import (
     ResponseSender,

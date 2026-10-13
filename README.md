@@ -138,8 +138,8 @@ Constraints (see `docs/design/http-server.md` for the full contract):
 - Bounded buffered request body: the full request body (up to
   `max_body_bytes`, default 1 MiB) is received before `handle` runs.
   HTTP/1 response streaming and deferred responses use
-  `ResponseWriter.detach()` and `ResponseSender`; request body streaming,
-  and middleware frameworks are not included.
+  `ResponseWriter.detach()` and `ResponseSender`; request body streaming
+  is not included.
 - Response trailers: `writer.add_trailer(name, value)` queues a trailer
   on a buffered HTTP/1.1 response. The encoder switches to
   `Transfer-Encoding: chunked`, advertises the names in `Trailer:`, and
@@ -211,6 +211,30 @@ handler call. Register concrete stateful handlers with `handle_handler`;
 callbacks passed to `handle` must own their captures, using `{var value}`
 or `{var value^}`. Captured views require their backing storage to outlive
 the mux. Each mux and its handlers belong to one event loop.
+
+### Function middleware
+
+`MiddlewareFn` receives the request, writer and a borrowed `RouteHandler`.
+Calling `next.handle(req, writer)` continues the chain; returning without
+that call produces a response directly. `apply_middleware` consumes the
+final handler and layers in outermost-first order:
+
+```mojo
+from net.http import MiddlewareFn, RouteHandler, apply_middleware
+
+def trace(req: Request, mut writer: ResponseWriter, mut next: RouteHandler) raises:
+    print(req.method, req.path)
+    next.handle(req, writer)
+    print(writer.status)
+
+var layers = List[MiddlewareFn]()
+layers.append(MiddlewareFn(trace))
+mux.register("GET /hello/{name}", apply_middleware(RouteHandler(greeting), layers^))
+```
+
+Construct the chain before serving. Middleware callbacks own their captures
+under the same contract as route callbacks. Errors propagate through `next`;
+use `try`/`except` when cleanup must also run after an error.
 
 Optional provider pins live in `pixi.toml` (`openssl`, `libnghttp2`) and
 `net/quic/provider/Cargo.toml` (quiche). After bumping a pin, refresh
