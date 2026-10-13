@@ -65,3 +65,18 @@ retains a separate response reference and never releases the connection
 actor's ownership. Condition storage and timed waits support macOS and
 64-bit Linux. No request creates a fresh thread, and no shutdown uses
 `pthread_cancel`.
+
+## Owned streaming input
+
+Enable request streaming, claim `req.body_reader()`, and move its detached
+`RequestBodyReceiver` into a job before calling `writer.offload(pool, job)`.
+The job receives into bounded scratch with `receive(buffer, timeout)` and
+obtains trailers after EOF. It never retains a borrowed Request or invokes
+socket methods. The receiver's destruction discards remaining input, including
+when a full pool refuses the job. Server shutdown cancels a blocked receiver;
+the pool's separate grace policy still applies to arbitrary user code.
+
+`examples/http_offload_body.mojo` reads an 8 KiB chunked upload using a 32-byte
+input queue and 17-byte scratch buffer while a sibling connection completes.
+The pool integration tests also cover refusal followed by a pipelined request
+and cancellation after Server destruction.

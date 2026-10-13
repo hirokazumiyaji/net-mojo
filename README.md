@@ -389,6 +389,14 @@ Run `pixi run example-http-offload` for a buffered-body example and
 `pixi run example-http-sse` for streaming responses through the same pool.
 `pixi run benchmark-http-offload` compares loop and pool latency for sixteen
 concurrent 100 ms sleep and CPU jobs, with a synchronous sibling request.
+For streaming input, claim `var body = req.body_reader()`, move
+`body.detach()` into the job, then call `writer.offload(pool, job)`. The owned
+`RequestBodyReceiver` survives the handler return and waits in the worker with
+`receive(buffer, timeout)`. Read trailers after EOF. Enable
+`ServerConfig.enable_request_body_streaming` and run
+`pixi run example-http-offload-body` for an 8 KiB upload through a 32-byte input
+queue and 17-byte worker buffer, with a sibling request completing first.
+
 See [the offload design contract](docs/design/http-offload.md) for ownership,
 shutdown, and platform details.
 

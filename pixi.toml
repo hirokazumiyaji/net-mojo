@@ -127,6 +127,7 @@ dogfood-build = "mkdir -p build && mojo build --Werror -I . examples/http_dogfoo
 dogfood-smoke = { cmd = "python3 scripts/test_dogfood.py", depends-on = ["dogfood-build"] }
 example-http-sse = "mojo run --Werror -I . examples/http_sse.mojo"
 example-http-offload = "mojo run --Werror -I . examples/http_offload.mojo"
+example-http-offload-body = "mojo run --Werror -I . examples/http_offload_body.mojo"
 package = "mkdir -p build && mojo precompile net -o build/net.mojoc"
 test-package = "mojo run --Werror -I build tests/package_smoke.mojo"
 benchmark-ip = "mojo run --Werror -I . benchmarks/ip_parse.mojo"

@@ -11,6 +11,8 @@ from net.http import (
     ResponseSender,
     Handler,
     Request,
+    RequestBodyReceiver,
+    HttpVersion,
     ResponseWriter,
     Server,
     ServerConfig,
@@ -20,6 +22,7 @@ from net.http import (
     WorkerPoolConfig,
 )
 from net.http._buffer import SharedBufferBudget
+from net.http._body_pipe import _BodyPipe
 from net.http._detach import (
     MSG_KIND_ABORT,
     MSG_KIND_RESPOND,
@@ -840,6 +843,199 @@ def test_blocked_worker_outlives_server_and_pool_safely() raises:
     assert_equal(budget.used(), 0)
     assert_true(gate.observed_cancel)
     client.close()
+
+
+@fieldwise_init
+struct _ReceiverJob(HandlerJob):
+    var receiver: RequestBodyReceiver
+    var gate_addr: Int
+
+    def run(mut self, mut sender: ResponseSender) raises:
+        _record_start(self.gate_addr, 0, True)
+        var total = 0
+        var scratch = Array[Byte, 17](fill=0)
+        try:
+            while True:
+                var count = self.receiver.receive(
+                    Span(scratch), Timeout.nanoseconds(1_000_000_000)
+                )
+                if count == 0:
+                    break
+                total += count
+        except error:
+            if error.kind != NetErrorKind.cancelled():
+                raise error^
+            var gate = _gate(self.gate_addr)
+            gate[].mutex.lock()
+            gate[].observed_cancel = True
+            gate[].mutex.unlock()
+            return
+        var trailers = self.receiver.trailers()
+        var trailer = trailers.get_first("X-Result")
+        var body = List[Byte]()
+        body.extend(
+            (
+                String(total)
+                + ":"
+                + (String(trailer.value()) if trailer else String("none"))
+            ).as_bytes()
+        )
+        sender.respond(body=body^)
+
+    def __deinit__(deinit self):
+        _record_destroy(self.gate_addr, 0)
+
+
+@fieldwise_init
+struct _ReceiverHandler(Handler):
+    var pool_addr: Int
+    var gate_addr: Int
+    var accepted: Bool
+
+    def handle(mut self, req: Request, mut writer: ResponseWriter) raises:
+        if req.path == "/fast":
+            writer.write_string("fast")
+            return
+        var pool = Pointer[WorkerPool, MutUntrackedOrigin](
+            unsafe_from_address=self.pool_addr
+        )
+        var body = req.body_reader()
+        self.accepted = writer.offload(
+            pool[], _ReceiverJob(body.detach(), self.gate_addr)
+        )
+
+
+def test_pool_job_owns_streaming_receiver_with_trailers_and_sibling_progress() raises:
+    var gate = _JobGate()
+    gate.mutex._initialize()
+    var pool = WorkerPool(WorkerPoolConfig(workers=1))
+    var config = ServerConfig.default()
+    config.enable_request_body_streaming = True
+    config.max_body_bytes = 32
+    var server = Server(config^)
+    server.add_listener(listen_tcp("127.0.0.1:0"))
+    var address = String("127.0.0.1:") + String(server.local_address().port)
+    var handler = _ReceiverHandler(
+        Int(Pointer(to=pool)), _gate_address(gate), False
+    )
+    var client = dial_tcp(address, Timeout.seconds(1))
+    client.write_all(
+        String(
+            "POST /body HTTP/1.1\r\nHost: x\r\nTransfer-Encoding:"
+            " chunked\r\nTrailer: X-Result\r\n\r\n"
+        ).as_bytes(),
+        Timeout.seconds(1),
+    )
+    for _ in range(20):
+        _ = server.tick(handler, Timeout.nanoseconds(0))
+    _wait_started(gate)
+    var sibling = dial_tcp(address, Timeout.seconds(1))
+    sibling.write_all(
+        String("GET /fast HTTP/1.1\r\nHost: x\r\n\r\n").as_bytes(),
+        Timeout.seconds(1),
+    )
+    var fast = _tick_and_read(server, handler, sibling)
+    var wire = List[Byte]()
+    wire.extend(String("2000\r\n").as_bytes())
+    wire.extend(List[Byte](length=8192, fill=97))
+    wire.extend(String("\r\n0\r\nX-Result: done\r\n\r\n").as_bytes())
+    client.write_all(Span(wire), Timeout.seconds(1))
+    var response = _tick_and_read(server, handler, client, max_ticks=5000)
+    pool.shutdown()
+    assert_true(handler.accepted)
+    assert_equal(_body_of(fast), "fast")
+    assert_equal(_body_of(response), "8192:done")
+    assert_equal(len(gate.destroyed), 1)
+    sibling.close()
+    client.close()
+
+
+def test_pool_refusal_discards_owned_receiver_and_preserves_pipeline() raises:
+    var gate = _JobGate()
+    gate.mutex._initialize()
+    var pool = WorkerPool(WorkerPoolConfig(workers=1, queue_limit=0))
+    var config = ServerConfig.default()
+    config.enable_request_body_streaming = True
+    var server = Server(config^)
+    server.add_listener(listen_tcp("127.0.0.1:0"))
+    var handler = _ReceiverHandler(
+        Int(Pointer(to=pool)), _gate_address(gate), True
+    )
+    var client = dial_tcp(
+        String("127.0.0.1:") + String(server.local_address().port),
+        Timeout.seconds(1),
+    )
+    client.write_all(
+        String(
+            "POST /body HTTP/1.1\r\nHost: x\r\nContent-Length: 4\r\n\r\n"
+        ).as_bytes(),
+        Timeout.seconds(1),
+    )
+    var refusal = _tick_and_read(server, handler, client)
+    client.write_all(
+        String("bodyGET /fast HTTP/1.1\r\nHost: x\r\n\r\n").as_bytes(),
+        Timeout.seconds(1),
+    )
+    var next = _tick_and_read(server, handler, client)
+    pool.shutdown()
+    assert_false(handler.accepted)
+    assert_equal(_status_of(refusal), 503)
+    assert_equal(_body_of(next), "fast")
+    assert_equal(len(gate.order), 0)
+    assert_equal(len(gate.destroyed), 1)
+    client.close()
+
+
+def test_server_destruction_cancels_pool_owned_blocking_receiver() raises:
+    var gate = _JobGate()
+    gate.mutex._initialize()
+    var pool = WorkerPool(WorkerPoolConfig(workers=1))
+    var config = ServerConfig.default()
+    config.enable_request_body_streaming = True
+    var server = Server(config^)
+    server.add_listener(listen_tcp("127.0.0.1:0"))
+    var handler = _ReceiverHandler(
+        Int(Pointer(to=pool)), _gate_address(gate), False
+    )
+    var client = dial_tcp(
+        String("127.0.0.1:") + String(server.local_address().port),
+        Timeout.seconds(1),
+    )
+    client.write_all(
+        String(
+            "POST /body HTTP/1.1\r\nHost: x\r\nContent-Length: 4\r\n\r\n"
+        ).as_bytes(),
+        Timeout.seconds(1),
+    )
+    for _ in range(20):
+        _ = server.tick(handler, Timeout.nanoseconds(0))
+    _wait_started(gate)
+    _ = server^
+    pool.shutdown()
+    assert_true(gate.observed_cancel)
+    assert_equal(len(gate.destroyed), 1)
+    client.close()
+
+
+def test_receiver_cancel_is_observed_before_response_cancel() raises:
+    var gate = _JobGate()
+    gate.mutex._initialize()
+    var pool = WorkerPool(WorkerPoolConfig(workers=1))
+    var request = Request("POST", "/", "/", "", HttpVersion.http11())
+    var pipe = _BodyPipe(32, SharedBufferBudget(128))
+    request._body_pipe = pipe.copy()
+    var body = request.body_reader()
+    var sender = _sender()
+    var addr = sender._addr
+    assert_true(
+        pool.submit(sender^, _ReceiverJob(body.detach(), _gate_address(gate)))
+    )
+    _wait_started(gate)
+    pipe.cancel()
+    pool.shutdown()
+    _cancel_detach_state(addr)
+    assert_true(gate.observed_cancel)
+    assert_equal(len(gate.destroyed), 1)
 
 
 def main() raises:
