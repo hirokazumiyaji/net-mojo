@@ -113,6 +113,7 @@ benchmark-loopback = "mojo run --Werror -I . benchmarks/loopback_io.mojo"
 benchmark-http-parse = "mojo run --Werror -I . benchmarks/http_parse.mojo"
 benchmark-http-server = "mojo run --Werror -I . benchmarks/http_server.mojo"
 benchmark-http-stream = "mojo run --Werror -I . benchmarks/http_stream.mojo"
+benchmark-http-stream-sse = { cmd = "python3 benchmarks/http_stream_sse.py", default-environment = "http-stream-sse", depends-on = [{ task = "tls-build", environment = "http-stream-sse" }, { task = "hpack-test", environment = "http-stream-sse" }, { task = "quic-build", environment = "http-stream-sse" }] }
 # Harness/loader regression only — no long performance runs or thresholds.
 benchmark-harness-test = "python3 tests/test_http_benchmark_harness.py"
 benchmark-go-test = "GOTOOLCHAIN=local go -C benchmarks/http_go test ./..."
@@ -347,3 +348,4 @@ http2 = ["http2", "mojo-1-1"]
 http3 = ["http3", "mojo-1-1"]
 tls-http2 = ["tls", "http2", "mojo-1-1"]
 tls-http3 = ["tls", "http3", "mojo-1-1"]
+http-stream-sse = ["tls", "http2", "http3", "mojo-1-1"]

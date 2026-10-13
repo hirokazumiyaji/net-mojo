@@ -131,13 +131,12 @@ def main() raises:
 
 Constraints (see `docs/design/http-server.md` for the full contract):
 
-- The handler runs synchronously on the loop thread. HTTP/1 handlers can
+- The handler runs synchronously on the loop thread. HTTP/1, HTTP/2 and HTTP/3 handlers can
   move a `ResponseSender` returned by `writer.detach()` to a background
-  thread. HTTP/2 and HTTP/3 handlers return buffered responses; detach is
-  unsupported on those adapters.
+  thread for deferred or streaming responses.
 - Bounded buffered request body: the full request body (up to
   `max_body_bytes`, default 1 MiB) is received before `handle` runs.
-  HTTP/1 response streaming and deferred responses use
+  Response streaming and deferred responses use
   `ResponseWriter.detach()` and `ResponseSender`; request body streaming
   is not included.
 - Response trailers: `writer.add_trailer(name, value)` queues a trailer
@@ -264,34 +263,52 @@ numbers are recorded in `benchmarks/http/README.md`.
 
 For long-running tasks (such as LLM token generation or async workers),
 call `writer.detach()` to decouple the response from the event loop.
-The returned `ResponseSender` is `Movable` and thread-safe, backed by an
-Erlang-inspired actor/message-passing architecture:
+The returned `ResponseSender` is `Movable` and thread-safe on HTTP/1, HTTP/2
+and HTTP/3. Move it to a worker, or retain it between server ticks. The event
+loop sends the queued response data:
 
 ```mojo
-from net.http import Handler, Request, ResponseSender, ResponseWriter
+from net.http import Handler, Headers, Request, ResponseWriter
 
 struct SseHandler(Handler):
     def handle(mut self, req: Request, mut writer: ResponseWriter) raises:
         if req.path == "/events":
-            var sender = writer.detach() # Connection enters detached state
-            # Hand off sender to background thread (e.g. pthread)
-            # worker: sender.start(200, headers) -> sender.send(data) -> sender.finish()
+            var sender = writer.detach()
+            var headers = Headers()
+            headers.add("content-type", "text/event-stream")
+            sender.start(200, headers^)
+            if sender.send(String("data: ready\n\n").as_bytes()):
+                sender.finish()
 ```
 
 - **Deferred response**: `sender.respond(status, headers, body)` sends a
   standard Content-Length response asynchronously.
-- **Streaming response**: `sender.start(status, headers)` begins chunked
-  streaming, `sender.send(chunk)` pushes chunks, and `sender.finish()`
+- **Streaming response**: `sender.start(status, headers)` begins the response,
+  `sender.send(chunk)` queues chunks, and `sender.finish()`
   completes the stream. Pass `sender.finish(trailers=trailers)` to send
   validated trailing headers after the final body chunk. Framing and routing
   headers are rejected, and trailer storage counts against the server budget.
-- **Cancellation**: `sender.send(...)` returns `False` immediately upon
-  client disconnect, deadline expiry, or shutdown.
+  HTTP/1.1 uses chunked encoding; HTTP/2 and HTTP/3 use DATA frames.
+- **Backpressure**: On HTTP/2 and HTTP/3, `sender.send(...)` returns `False`
+  when its bounded queue is full. Retain the chunk and retry after the loop
+  drains output. `sender.is_cancelled()` distinguishes terminal cancellation.
+  HTTP/1 queue overflow and shared buffer budget exhaustion raise and cancel
+  the response.
+- **Cancellation**: Client disconnect, deadline expiry or shutdown cancels
+  the sender. HTTP/2 and HTTP/3 cancel the affected stream while sibling
+  streams continue.
 - **Thread safety**: Background threads never touch socket descriptors
   directly; messages are queued and the event loop wakes up via a
   nonblocking wakeup channel (`socketpair`).
 
 See `examples/http_sse.mojo` for a complete runnable Server-Sent Events example.
+
+Run `pixi run benchmark-http-stream-sse` to measure HTTP/2 and HTTP/3 with
+100 concurrent streams and 1,000 events per second per stream for one second.
+The JSON output records received event counts, elapsed time, achieved event
+rate, p99 request-to-headers TTFB and p99 scheduled-event-to-receipt latency.
+The loopback driver checks clock compatibility and complete, ordered delivery;
+latency measurements have no pass/fail threshold.
 
 Resource bounds default to `max_connections=10,000`,
 request line 8 KiB, headers 32 KiB / 100 entries, body 1 MiB,
