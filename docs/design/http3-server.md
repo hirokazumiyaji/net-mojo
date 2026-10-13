@@ -8,7 +8,8 @@ behind the optional C ABI artifact. It owns QUIC connections and delegates HTTP/
 framing, QPACK, stream flow control, and transport recovery to quiche 0.29.3.
 The provider returns a completed request record to Mojo; the HTTP server maps it
 to the shared `Request`, invokes the same synchronous `Handler` used by HTTP/1.1
-and HTTP/2, then queues the buffered response on the originating stream.
+and HTTP/2. Buffered responses and detached producer messages remain bound to
+the originating request ID.
 
 The provider receives datagrams with their local and remote addresses and sends
 one pending datagram at a time with its destination. Mojo keeps UDP socket
@@ -111,6 +112,44 @@ same way response header names do, and trailer wire bytes are reserved
 against the shared `buffered_response_bytes` budget on enqueue so a
 rejected or completed stream releases both sections together. HEAD and
 non-body statuses drop trailers before the request reaches the provider.
+
+## Detached responses
+
+`ResponseWriter.detach()` gives the producer a `ResponseSender` bound to one
+HTTP/3 request ID. The server loop owns the native stream. Producers may queue
+one buffered `respond`, or `start`, ordered `send` chunks and `finish` with
+optional trailers. No HTTP/3 DATA frame ends the stream before `finish`; HEAD
+and bodyless statuses discard payload and trailers while still awaiting the
+producer's explicit finish.
+
+The shared server budget charges detached state, actor and message arrays,
+header storage, serialized field sections and retained chunk capacities. A
+chunk stays owned by its actor until quiche accepts every byte. Partial writes
+advance an offset; accepted bytes restore `stream_queue_limit` credit, and the
+capacity ticket is released when the entire chunk is dropped. A full queue
+makes `send` return false, letting producers retry without changing byte order.
+Native response watches, field sections and transport send storage retain their
+separate provider budgets.
+
+Trailers share the configured response header count and byte limits with the
+initial fields, reject forbidden names, and are queued only after all body
+chunks are accepted. Invalid initial responses become a minimal 500 when the
+native response has not started. Later encoding or budget failures cancel only
+the originating stream with `H3_INTERNAL_ERROR`; explicit abort, peer
+cancellation and producer timeout use `H3_REQUEST_CANCELLED`.
+
+The actor's `detached_response_timeout` refreshes on producer messages and
+accepted body bytes. Native write deadlines cover pending headers and the
+queued final FIN or trailer section; an open producer with no native write
+pending does not inherit that deadline. The reactor wait includes producer
+deadlines. Peer RESET_STREAM, STOP_SENDING, connection loss and shutdown expiry
+cancel the sender and release its mailbox and owned chunks. A successful final
+write releases the actor without marking its sender cancelled.
+
+`pixi run -e tls-http3 http3-detach-test` checks concurrent deferred and sibling
+responses, ordered chunks, trailers, HEAD completion, withheld stream credit,
+backpressure recovery, sustained progress, cancellation before response start,
+STOP_SENDING, timeout, header fallback and complete Mojo budget refund.
 
 ## Current verification
 

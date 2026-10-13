@@ -279,6 +279,24 @@ def case_detached_head_body_suppression(port: int) -> None:
         peer.close()
 
 
+def case_detached_head_waits_for_finish(port: int) -> None:
+    peer = H2Peer(port, raise_conn_window=1 << 20)
+    try:
+        idle = peer.open_request("HEAD", "/idle-detached")
+        peer.wait_response_only(idle, time.perf_counter() + TIMEOUT_S)
+        deadline = time.perf_counter() + 0.1
+        while time.perf_counter() < deadline:
+            peer.pump(deadline)
+        _assert(not peer._streams[idle]["ended"], "HEAD streaming ended before producer finish")
+        expired = peer.wait_stream(idle, time.perf_counter() + TIMEOUT_S)
+        _assert(expired["reset"] == int(ErrorCodes.CANCEL), f"HEAD detach timeout {expired}")
+        sibling = peer.open_request("GET", "/sibling")
+        rec = peer.wait_stream(sibling, time.perf_counter() + TIMEOUT_S)
+        _assert(bytes(rec["body"]) == b"sibling ok", "HEAD timeout closed sibling")
+    finally:
+        peer.close()
+
+
 def case_detached_timeout_preserves_sibling(port: int) -> None:
     peer = H2Peer(port, raise_conn_window=1 << 20)
     try:
@@ -1153,6 +1171,7 @@ def _run_cases(port: int) -> None:
     case_connection_protocol_error_goaway(port)
     case_detached_deferred_and_streaming(port)
     case_detached_head_body_suppression(port)
+    case_detached_head_waits_for_finish(port)
     case_detached_timeout_preserves_sibling(port)
     case_detached_backpressure_and_reset(port)
     case_detached_stream_admission_occupancy(port)

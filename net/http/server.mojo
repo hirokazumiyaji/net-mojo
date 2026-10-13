@@ -157,6 +157,82 @@ struct _Http2DetachedStream(Movable):
             _cancel_detach_state(self.addr)
 
 
+struct _Http3DetachedStream(Movable):
+    var target: _DetachTarget
+    var addr: Int
+    var deadline: Int
+    var is_head: Bool
+    var started: Bool
+    var allows_body: Bool
+    var initial_field_count: Int
+    var initial_field_bytes: Int
+    var chunks: List[DetachMessage]
+    var chunk_head: Int
+    var body_offset: Int
+    var chunks_ticket: _CapacityTicket
+    var finished: Bool
+    var finish_sent: Bool
+    var trailers: Headers
+
+    def __init__(
+        out self,
+        request_id: UInt64,
+        addr: Int,
+        deadline: Int,
+        is_head: Bool,
+        var budget: SharedBufferBudget,
+    ):
+        self.target = _DetachTarget.http3(request_id)
+        self.addr = addr
+        self.deadline = deadline
+        self.is_head = is_head
+        self.started = False
+        self.allows_body = True
+        self.initial_field_count = 0
+        self.initial_field_bytes = 0
+        self.chunks = List[DetachMessage]()
+        self.chunk_head = 0
+        self.body_offset = 0
+        self.chunks_ticket = _CapacityTicket(budget^)
+        self.finished = False
+        self.finish_sent = False
+        self.trailers = Headers()
+
+    def __deinit__(deinit self):
+        if self.addr != 0:
+            _cancel_detach_state(self.addr)
+        _ = self.chunks^
+        self.chunks_ticket.release()
+
+    def push(
+        mut self, mut msg: DetachMessage, mut budget: SharedBufferBudget
+    ) -> Bool:
+        if self.chunk_head > 0 and self.chunk_head * 2 >= len(self.chunks):
+            var remaining = len(self.chunks) - self.chunk_head
+            for i in range(remaining):
+                var source = Pointer(to=self.chunks[self.chunk_head + i])
+                var item = source.unsafe_take_pointee()
+                source.unsafe_write(DetachMessage.chunk(List[Byte]()))
+                self.chunks[i] = item^
+            while len(self.chunks) > remaining:
+                _ = self.chunks.pop()
+            self.chunk_head = 0
+        var reservation = 0
+        if not _reserve_capacity(
+            self.chunks, budget, len(self.chunks) + 1, reservation
+        ):
+            return False
+        self.chunks_ticket.amount = (
+            self.chunks.capacity() * size_of[DetachMessage]()
+        )
+        var body = msg.body^
+        msg.body = List[Byte]()
+        var ticket = msg.body_ticket^
+        msg.body_ticket = _CapacityTicket()
+        self.chunks.append(DetachMessage.chunk(body^, ticket^))
+        return True
+
+
 struct Server(Movable):
     var config: ServerConfig
     var control: ServerControl
@@ -196,6 +272,8 @@ struct Server(Movable):
     var _detached_conns: List[Int]
     var _http2_detached: List[_Http2DetachedStream]
     var _http2_detached_ticket: _CapacityTicket
+    var _http3_detached: List[_Http3DetachedStream]
+    var _http3_detached_ticket: _CapacityTicket
 
     def __init__(out self, var config: ServerConfig) raises:
         var budget_total = config.total_buffer_budget
@@ -232,10 +310,14 @@ struct Server(Movable):
         self._detached_conns = List[Int]()
         self._http2_detached = List[_Http2DetachedStream]()
         self._http2_detached_ticket = _CapacityTicket(self._budget.copy())
+        self._http3_detached = List[_Http3DetachedStream]()
+        self._http3_detached_ticket = _CapacityTicket(self._budget.copy())
         while len(self._slot_map) <= wtoken.slot:
             self._slot_map.append(-1)
 
     def __deinit__(deinit self):
+        self._http3_detached = List[_Http3DetachedStream]()
+        self._http3_detached_ticket.release()
         self._finish_control()
         for idx in range(len(self._conns)):
             self._discard_http2_detached(idx)
@@ -380,6 +462,7 @@ struct Server(Movable):
                 break
         self._drive_quic()
         self._dispatch_quic_requests(handler)
+        self._process_http3_detached(now)
         self._finish_quic_shutdown_if_due(now)
         self._flush_quic()
         if self._listener:
@@ -693,6 +776,8 @@ struct Server(Movable):
                     self._close_conn(i)
             self._finish_quic_shutdown()
             if self._quic_endpoint:
+                self._http3_detached = List[_Http3DetachedStream]()
+                self._http3_detached_ticket.release()
                 self._quic_endpoint.value().close_connections()
                 self._flush_quic()
                 self._quic_close_at = now + _QUIC_CLOSE_DRAIN_NS
@@ -832,6 +917,8 @@ struct Server(Movable):
             self._listener_paused = False
 
     def _drop_quic_endpoint(mut self):
+        self._http3_detached = List[_Http3DetachedStream]()
+        self._http3_detached_ticket.release()
         if self._quic_endpoint:
             _ = self._reactor.remove(self._quic_token)
             self._quic_endpoint = None
@@ -885,7 +972,13 @@ struct Server(Movable):
             )
             request.scheme = quic_request.scheme.copy()
             request.authority = quic_request.authority.copy()
-            var response = ResponseWriter(self.config.max_response_body)
+            var response = ResponseWriter(
+                self.config.max_response_body,
+                wakeup_fd=self._wakeup_channel.write_fd(),
+                queue_limit=self.config.stream_queue_limit,
+            )
+            response._set_mailbox_budget(self._budget.copy())
+            response._set_detach_target(_DetachTarget.http3(request_id))
             var body_size = len(quic_request.body)
             if body_size > self.config.max_body_bytes:
                 response.status = 413
@@ -908,6 +1001,7 @@ struct Server(Movable):
                         handler.handle(request^, response)
                     except e:
                         _ = e
+                        response._cancel_detach()
                         response.status = 500
                         response.body.clear()
                         response.trailers.clear()
@@ -917,8 +1011,13 @@ struct Server(Movable):
                     response.body.clear()
                     response.trailers.clear()
                 self._budget.release(body_size)
-            if response.is_detached():
-                response._cancel_detach()
+            if response.is_detached() and response._detach_state_addr != 0:
+                var addr = response._detach_state_addr
+                response._detach_state_addr = 0
+                if self._register_http3_detached(request_id, addr, is_head):
+                    processed += 1
+                    continue
+                _cancel_detach_state(addr)
                 response.status = 500
                 response.body.clear()
                 response.trailers.clear()
@@ -1044,6 +1143,388 @@ struct Server(Movable):
             except e:
                 _ = e
             processed += 1
+
+    def _find_http3_detached(self, request_id: UInt64) -> Int:
+        for i in range(len(self._http3_detached)):
+            if self._http3_detached[i].target.stream_id == request_id:
+                return i
+        return -1
+
+    def _register_http3_detached(
+        mut self, request_id: UInt64, addr: Int, is_head: Bool
+    ) -> Bool:
+        var reservation = 0
+        if not _reserve_capacity(
+            self._http3_detached,
+            self._budget,
+            len(self._http3_detached) + 1,
+            reservation,
+        ):
+            return False
+        self._http3_detached_ticket.amount = (
+            self._http3_detached.capacity() * size_of[_Http3DetachedStream]()
+        )
+        self._http3_detached.append(
+            _Http3DetachedStream(
+                request_id,
+                addr,
+                deadline_from_now(self.config.detached_response_timeout),
+                is_head,
+                self._budget.copy(),
+            )
+        )
+        return True
+
+    def _remove_http3_detached(mut self, position: Int):
+        var last = self._http3_detached.pop()
+        if position < len(self._http3_detached):
+            self._http3_detached[position] = last^
+        if len(self._http3_detached) == 0:
+            self._http3_detached = List[_Http3DetachedStream]()
+            self._http3_detached_ticket.release()
+
+    def _cancel_http3_detached(
+        mut self, request_id: UInt64, error_code: UInt64
+    ):
+        var position = self._find_http3_detached(request_id)
+        if position >= 0:
+            self._remove_http3_detached(position)
+        if self._quic_endpoint:
+            _ = self._quic_endpoint.value().cancel_response(
+                request_id, error_code
+            )
+
+    def _fail_http3_detached(mut self, request_id: UInt64):
+        var position = self._find_http3_detached(request_id)
+        var started = self._http3_detached[position].started
+        self._remove_http3_detached(position)
+        if not started:
+            var fields = List[Byte]()
+            var ticket = _CapacityTicket(self._budget.copy())
+            var reservation = 0
+            if not _reserve_capacity(fields, self._budget, 4, reservation):
+                _ = self._quic_endpoint.value().cancel_response(
+                    request_id, UInt64(0x102)
+                )
+                return
+            ticket.amount = fields.capacity()
+            _append_quic_u32(fields, UInt32(0))
+            var empty = List[Byte]()
+            var trailers = List[Byte]()
+            try:
+                self._quic_endpoint.value().respond(
+                    request_id, 500, Span(fields), Span(empty), Span(trailers)
+                )
+                _ = fields^
+                ticket.release()
+                return
+            except:
+                _ = fields^
+                ticket.release()
+        _ = self._quic_endpoint.value().cancel_response(
+            request_id, UInt64(0x102)
+        )
+
+    def _begin_http3_detached(
+        mut self, request_id: UInt64, mut msg: DetachMessage, streaming: Bool
+    ):
+        var position = self._find_http3_detached(request_id)
+        var status = msg.status
+        var wire_length = -1
+        if not streaming and has_body_for_status(status, False):
+            wire_length = len(msg.body)
+        var valid = status >= 200 and status <= 599
+        if not streaming:
+            valid = valid and len(msg.body) <= self.config.max_response_body
+        var count = len(msg.headers) - msg.headers.count("content-length")
+        if wire_length >= 0:
+            count += 1
+        var bytes = 4
+        for i in range(len(msg.headers)):
+            var name = msg.headers._lower_names[i]
+            if (
+                name == "connection"
+                or name == "proxy-connection"
+                or name == "keep-alive"
+                or name == "transfer-encoding"
+                or name == "upgrade"
+                or name == "te"
+            ):
+                valid = False
+            if msg.headers._lower_names[i] == "content-length":
+                if streaming or (
+                    wire_length >= 0
+                    and not _content_length_matches(
+                        msg.headers.value_at(i), wire_length
+                    )
+                ):
+                    valid = False
+                continue
+            bytes += (
+                msg.headers.name_at(i).byte_length()
+                + msg.headers.value_byte_length(i)
+                + 8
+            )
+        var length = String(wire_length)
+        if wire_length >= 0:
+            bytes += 22 + length.byte_length()
+        if (
+            not valid
+            or count > self.config.max_response_headers_count
+            or bytes > self.config.max_response_headers_bytes
+        ):
+            self._fail_http3_detached(request_id)
+            return
+        var fields = List[Byte]()
+        var ticket = _CapacityTicket(self._budget.copy())
+        var reservation = 0
+        if not _reserve_capacity(fields, self._budget, bytes, reservation):
+            self._fail_http3_detached(request_id)
+            return
+        ticket.amount = fields.capacity()
+        _append_quic_u32(fields, UInt32(count))
+        for i in range(len(msg.headers)):
+            if msg.headers._lower_names[i] == "content-length":
+                continue
+            _append_quic_field(fields, msg.headers._names[i].as_bytes())
+            _append_quic_field(fields, msg.headers._value_bytes_span(i))
+        if wire_length >= 0:
+            _append_quic_field(fields, String("content-length").as_bytes())
+            _append_quic_field(fields, length.as_bytes())
+        try:
+            self._quic_endpoint.value().start_response(
+                request_id, status, Span(fields)
+            )
+        except:
+            _ = fields^
+            ticket.release()
+            self._fail_http3_detached(request_id)
+            return
+        _ = fields^
+        ticket.release()
+        self._http3_detached[position].started = True
+        self._http3_detached[position].allows_body = has_body_for_status(
+            status, self._http3_detached[position].is_head
+        )
+        self._http3_detached[position].initial_field_count = count
+        self._http3_detached[position].initial_field_bytes = bytes
+        if not streaming:
+            self._http3_detached[position].finished = True
+            if self._http3_detached[position].allows_body:
+                if not self._http3_detached[position].push(msg, self._budget):
+                    self._cancel_http3_detached(request_id, UInt64(0x102))
+
+    def _finish_http3_detached(
+        mut self, request_id: UInt64, var trailers: Headers
+    ):
+        var position = self._find_http3_detached(request_id)
+        if not self._http3_detached[position].allows_body:
+            trailers.clear()
+        if len(trailers) == 0:
+            self._http3_detached[position].finished = True
+            return
+        var bytes = 4
+        for i in range(len(trailers)):
+            if _trailer_forbidden(trailers._lower_names[i]):
+                self._cancel_http3_detached(request_id, UInt64(0x102))
+                return
+            bytes += (
+                trailers.name_at(i).byte_length()
+                + trailers.value_byte_length(i)
+                + 8
+            )
+        if (
+            len(trailers) + self._http3_detached[position].initial_field_count
+            > self.config.max_response_headers_count
+            or bytes + self._http3_detached[position].initial_field_bytes
+            > self.config.max_response_headers_bytes
+        ):
+            self._cancel_http3_detached(request_id, UInt64(0x102))
+            return
+        self._http3_detached[position].trailers = trailers^
+        self._http3_detached[position].finished = True
+
+    def _pump_http3_detached(mut self, request_id: UInt64):
+        var position = self._find_http3_detached(request_id)
+        if not self._http3_detached[position].started:
+            return
+        var moved = 0
+        while self._http3_detached[position].chunk_head < len(
+            self._http3_detached[position].chunks
+        ):
+            var head = self._http3_detached[position].chunk_head
+            var offset = self._http3_detached[position].body_offset
+            var bytes = Span(self._http3_detached[position].chunks[head].body)
+            var room = min(
+                len(bytes) - offset, self.config.max_bytes_per_tick - moved
+            )
+            if room <= 0 and len(bytes) > offset:
+                return
+            var accepted = self._quic_endpoint.value().send_stream_body(
+                request_id, bytes[offset : offset + room]
+            )
+            if accepted < 0:
+                self._cancel_http3_detached(request_id, UInt64(0x102))
+                return
+            if accepted == 0 and len(bytes) > offset:
+                return
+            _consume_detach_bytes(self._http3_detached[position].addr, accepted)
+            self._http3_detached[position].body_offset += accepted
+            moved += accepted
+            if accepted > 0:
+                self._http3_detached[position].deadline = deadline_from_now(
+                    self.config.detached_response_timeout
+                )
+            if self._http3_detached[position].body_offset < len(bytes):
+                return
+            self._http3_detached[position].chunks[head] = DetachMessage.chunk(
+                List[Byte]()
+            )
+            self._http3_detached[position].chunk_head += 1
+            self._http3_detached[position].body_offset = 0
+        self._http3_detached[position].chunks = List[DetachMessage]()
+        self._http3_detached[position].chunk_head = 0
+        self._http3_detached[position].chunks_ticket.release()
+        if (
+            not self._http3_detached[position].finished
+            or self._http3_detached[position].finish_sent
+        ):
+            return
+        var count = len(self._http3_detached[position].trailers)
+        if count == 0:
+            var empty = List[Byte]()
+            if (
+                self._quic_endpoint.value().send_stream_body(
+                    request_id, Span(empty), True
+                )
+                < 0
+            ):
+                self._cancel_http3_detached(request_id, UInt64(0x102))
+                return
+        else:
+            var bytes = 4
+            for i in range(count):
+                bytes += (
+                    self._http3_detached[position]
+                    .trailers.name_at(i)
+                    .byte_length()
+                    + self._http3_detached[position].trailers.value_byte_length(
+                        i
+                    )
+                    + 8
+                )
+            var fields = List[Byte]()
+            var ticket = _CapacityTicket(self._budget.copy())
+            var reservation = 0
+            if not _reserve_capacity(fields, self._budget, bytes, reservation):
+                self._cancel_http3_detached(request_id, UInt64(0x102))
+                return
+            ticket.amount = fields.capacity()
+            _append_quic_u32(fields, UInt32(count))
+            for i in range(count):
+                _append_quic_field(
+                    fields,
+                    self._http3_detached[position]
+                    .trailers._names[i]
+                    .as_bytes(),
+                )
+                _append_quic_field(
+                    fields,
+                    self._http3_detached[position].trailers._value_bytes_span(
+                        i
+                    ),
+                )
+            try:
+                self._quic_endpoint.value().add_stream_trailers(
+                    request_id, Span(fields)
+                )
+            except:
+                _ = fields^
+                ticket.release()
+                self._cancel_http3_detached(request_id, UInt64(0x102))
+                return
+            _ = fields^
+            ticket.release()
+        self._http3_detached[position].finish_sent = True
+        self._http3_detached[position].trailers = Headers()
+
+    def _process_http3_detached(mut self, now: Int):
+        if not self._quic_endpoint:
+            return
+        try:
+            var events = self._quic_endpoint.value().poll_stream_events()
+            for i in range(len(events)):
+                var position = self._find_http3_detached(events[i].request_id)
+                if position < 0 or events[i].kind == 0:
+                    continue
+                if events[i].kind == 1:
+                    var addr = self._http3_detached[position].addr
+                    self._http3_detached[position].addr = 0
+                    _release_detach_state(addr, False)
+                self._remove_http3_detached(position)
+        except:
+            self._http3_detached = List[_Http3DetachedStream]()
+            self._http3_detached_ticket.release()
+            return
+        var index = 0
+        while index < len(self._http3_detached):
+            var target = self._http3_detached[index].target.copy()
+            var request_id = target.stream_id
+            var addr = self._http3_detached[index].addr
+            if (
+                not self._http3_detached[index].finish_sent
+                and self._quic_endpoint.value().stream_capacity(request_id) < 0
+            ):
+                self._remove_http3_detached(index)
+                continue
+            if now >= self._http3_detached[index].deadline:
+                self._cancel_http3_detached(request_id, UInt64(0x10C))
+                continue
+            var batch = _take_batch(_detach_state(addr))
+            if batch.target != target:
+                self._cancel_http3_detached(request_id, UInt64(0x10C))
+                continue
+            if len(batch.messages) > 0 or batch.terminal_kind != MSG_KIND_NONE:
+                self._http3_detached[index].deadline = deadline_from_now(
+                    self.config.detached_response_timeout
+                )
+            batch.messages.reverse()
+            while len(batch.messages) > 0:
+                var msg = batch.messages.pop()
+                var position = self._find_http3_detached(request_id)
+                if position < 0:
+                    break
+                if msg.kind == MSG_KIND_RESPOND or msg.kind == MSG_KIND_START:
+                    self._begin_http3_detached(
+                        request_id, msg, msg.kind == MSG_KIND_START
+                    )
+                elif msg.kind == MSG_KIND_CHUNK:
+                    if not self._http3_detached[position].allows_body:
+                        _consume_detach_bytes(addr, len(msg.body))
+                    elif not self._http3_detached[position].push(
+                        msg, self._budget
+                    ):
+                        self._cancel_http3_detached(request_id, UInt64(0x102))
+            var position = self._find_http3_detached(request_id)
+            if position >= 0 and batch.terminal_kind != MSG_KIND_NONE:
+                if batch.terminal_kind == MSG_KIND_FINISH:
+                    var trailers = batch.trailers^
+                    batch.trailers = Headers()
+                    self._finish_http3_detached(request_id, trailers^)
+                else:
+                    var state = _detach_state(addr)
+                    state[].mutex.lock()
+                    var failed = state[].cancelled
+                    state[].mutex.unlock()
+                    self._cancel_http3_detached(
+                        request_id, UInt64(0x102) if failed else UInt64(0x10C)
+                    )
+            position = self._find_http3_detached(request_id)
+            if position >= 0:
+                self._pump_http3_detached(request_id)
+            position = self._find_http3_detached(request_id)
+            if position >= 0:
+                index = position + 1
 
     def _pause_listener(mut self):
         if self._listener and not self._listener_paused:
@@ -2078,7 +2559,8 @@ struct Server(Movable):
         if not fields.send_body:
             writer._drop_body()
             ticket.release()
-            _ = self._conns[idx].http2_responses.finish(stream_id)
+            if not streaming:
+                _ = self._conns[idx].http2_responses.finish(stream_id)
             return
         if not streaming:
             var body = writer.body^
@@ -2095,6 +2577,7 @@ struct Server(Movable):
     ) raises NetError:
         var position = self._find_http2_detached(idx, stream_id)
         if not self._http2_detached[position].allows_body:
+            _ = self._conns[idx].http2_responses.finish(stream_id)
             return
         if len(trailers) == 0:
             _ = self._conns[idx].http2_responses.finish(stream_id)
@@ -2940,6 +3423,8 @@ struct Server(Movable):
 
     def _process_detached_messages(mut self, now: Int) raises NetError:
         self._process_http2_detached(now)
+        self._process_http3_detached(now)
+        self._flush_quic()
         if len(self._detached_conns) == 0:
             return
         var i = 0
@@ -3294,6 +3779,8 @@ struct Server(Movable):
                 best = Int(left_ms)
         if self._quic_close_at != NO_DEADLINE:
             best = _sooner(best, self._quic_close_at, now)
+        for i in range(len(self._http3_detached)):
+            best = _sooner(best, self._http3_detached[i].deadline, now)
         while len(self._deadline_heap) > 0:
             var top = self._deadline_heap[0]
             var mark = self._next_deadline(top.idx)

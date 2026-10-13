@@ -75,9 +75,8 @@ fail validation at enqueue time (e.g. an invalid status, over the peer's
 body), the server rebuilds a minimal 500 field list on the same stream and
 enqueues that; a stream whose compressed block exceeds the configured capacity
 at drain time retries with the same minimal 500 before the deflater runs on
-it, and only if that retry also fails is the stream reset with INTERNAL_ERROR. A handler that detaches/streams on
-HTTP/2 (SSE) also falls back to a stream-level 500 instead of closing the
-connection. A client-sent GOAWAY marks the session draining: new peer HEADERS
+it, and only if that retry also fails is the stream reset with INTERNAL_ERROR.
+A client-sent GOAWAY marks the session draining: new peer HEADERS
 are answered with RST_STREAM(REFUSED_STREAM), in-flight streams finish, the
 server emits its own acknowledging GOAWAY, and the connection closes once the
 scheduler and send-stream list drain. The one place where the connection still
@@ -192,6 +191,31 @@ buffered bodies into DATA frames, under peer frame-size and total wire-byte caps
 The shared response encoder composes header adaptation, connection-owned HPACK
 compression, and frame generation; output failure after compression makes that
 deflater terminal because the peer did not receive its updated table state.
+
+## Detached responses
+
+`ResponseWriter.detach()` binds a `ResponseSender` to the connection slot,
+generation and HTTP/2 stream ID. The server owns the protocol scheduler and
+HPACK encoder. Producers queue `respond`, or `start`, ordered body chunks and
+`finish` with optional trailers. Streaming headers omit Content-Length. HEAD
+and bodyless statuses discard chunks and trailers, but await explicit producer
+finish before emitting END_STREAM.
+
+The shared budget charges mailbox state and arrays, headers, retained chunk
+capacities, scheduler metadata and pending frame storage. Accepted DATA bytes
+restore producer queue credit; the body capacity ticket stays owned until its
+whole chunk is consumed. Per-stream and connection flow control bound each
+scheduler turn, while a blocked stream lets writable siblings progress.
+Trailers use the peer's current header limit and share the local count and byte
+limits with initial fields. FIN is emitted only after queued body data drains.
+
+Peer reset, connection loss, producer timeout, abort and shutdown cancel only
+the affected sender or connection's senders and release their storage. Detached
+streams retain admission occupancy until completion or cancellation. Producer
+messages and output progress refresh their respective idle deadlines; an open
+producer with no queued wire does not expire under the write deadline. Invalid
+initial fields fall back to a minimal stream-level 500; failures after a stream
+starts reset it without affecting siblings.
 
 ## Response trailers
 

@@ -210,6 +210,10 @@ http-pool-quic-integration-test = { cmd = "python3 scripts/test_http_pool_quic_i
   "tls-build", "quic-build",
 ] }
 quic-suite = { depends-on = ["quic-test", "quic-mojo-test", "quic-rust-test", "http-pool-quic-test"] }
+http3-detach-test = { cmd = "python3 scripts/test_http3_detach.py", depends-on = [
+  "tls-build",
+  "quic-build",
+] }
 http3-client-test = { cmd = "python3 scripts/test_http3_server.py", depends-on = [
   "tls-build",
   "quic-build",
