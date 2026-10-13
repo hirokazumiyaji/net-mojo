@@ -1,0 +1,66 @@
+name: Nightly parser replay
+
+on:
+  schedule:
+    - cron: '41 17 * * *'
+  workflow_dispatch:
+    inputs:
+      seconds:
+        description: 'Seconds per target (1–1800)'
+        default: '1800'
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  replay:
+    name: Replay ${{ matrix.target }} (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 40
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, ubuntu-24.04-arm]
+        target: [http1, authority, http2-frames, ip, address, hpack-mojo, hpack]
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      - name: Install pixi
+        uses: prefix-dev/setup-pixi@f00437f565399d418b0acc85936d12c1fb668347
+        with:
+          frozen: true
+      - name: Restore native corpus
+        if: matrix.target == 'hpack'
+        uses: actions/cache@0400d5f644dc74513175e3cd8d07132dd4860809
+        with:
+          path: build/fuzz/hpack-corpus
+          key: fuzz-corpus-${{ matrix.os }}-${{ github.run_id }}
+          restore-keys: fuzz-corpus-${{ matrix.os }}-
+      - name: Replay bounded protocol fixtures
+        env:
+          REPLAY_TARGET: ${{ matrix.target }}
+          REPLAY_SECONDS: ${{ inputs.seconds || '1800' }}
+        run: |
+          [[ "$REPLAY_SECONDS" =~ ^[1-9][0-9]{0,3}$ ]] || exit 1
+          (( REPLAY_SECONDS >= 1 && REPLAY_SECONDS <= 1800 )) || exit 1
+          pixi run -e fuzz fuzz-nightly "$REPLAY_TARGET" --seconds "$REPLAY_SECONDS"
+      - name: Retain reproduction metadata
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: parser-replay-${{ matrix.target }}-${{ matrix.os }}
+          path: |
+            build/fuzz/*-nightly.bin
+            build/fuzz/*-nightly.json
+            build/fuzz/crash-*
+            build/fuzz/timeout-*
+            build/fuzz/oom-*
+            build/fuzz/leak-*
+          if-no-files-found: ignore
+          retention-days: 14

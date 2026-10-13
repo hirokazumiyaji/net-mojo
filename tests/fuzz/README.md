@@ -3,8 +3,9 @@
 Issue #227 is delivered in stages. Current targets cover HTTP/1 `parse_one`,
 Host/authority validation, HTTP/2 complete and incremental frame parsing,
 IP/socket address parsing and formatting, and the native and Mojo HPACK
-encode/decode boundaries. QUIC targets, nightly corpus evolution, minimization
-and h2spec conformance follow in separate PRs.
+encode/decode boundaries. Nightly runs retain evolving native corpora and
+reproducible Mojo batches. QUIC targets, minimization and h2spec conformance
+follow in separate PRs.
 
 Run `pixi run -e fuzz fuzz-smoke`. It compiles the Mojo replay target with ASan
 in the existing `sanitize` environment and the native HPACK target with
@@ -51,3 +52,28 @@ batch to reproduce a Mojo failure. For native failures, invoke
 Use `--seed`, `--iterations`, and `--seconds` on `scripts/run_fuzz.py` to adjust
 local exploration. Keep minimized, reviewed regressions in ordinary parser or
 HPACK tests; evolving corpora remain outside tracked source.
+
+## Scheduled replay
+
+`fuzz-nightly.yml` runs all seven targets independently on Linux x86_64 and
+arm64 at 17:41 UTC daily. Manual dispatch accepts a 1–1800 second target budget;
+the default is 1800 seconds. Each job has a 40 minute limit, including builds.
+The scheduled workflow starts once it exists on the default branch.
+
+```sh
+pixi run -e fuzz fuzz-nightly http2-frames --seconds 30 --seed 227
+pixi run -e fuzz fuzz-nightly hpack --seconds 30 --seed 227
+pixi run -e fuzz fuzz-nightly-test
+```
+
+Mojo runs repeated 10,000-mutation batches with successive seeds until its
+budget expires. A batch already started may continue for up to its 60 second
+process timeout. Only the current batch and its JSON target, seed, iteration
+count and round are retained, including on failure; storage does not grow with
+runtime. Replay the downloaded `*-nightly.bin` with the smoke replay command
+above and its JSON target. Native HPACK uses libFuzzer's time budget and
+retains its corpus across workflow runs using an OS-specific cache.
+Artifacts contain reproduction metadata, the current Mojo batch and native
+crash/timeout/oom/leak inputs for 14 days. Native metadata records its seed, budget,
+input limit and corpus path. Use the same commit and pinned toolchain when
+rebuilding a target to replay downloaded inputs.

@@ -254,6 +254,8 @@ fuzz-address = { cmd = "python3 scripts/run_fuzz.py address", depends-on = ["fuz
 fuzz-hpack-mojo = { cmd = "python3 scripts/run_fuzz.py hpack-mojo", depends-on = ["fuzz-build"] }
 fuzz-hpack = { cmd = "python3 scripts/run_fuzz.py hpack", depends-on = ["fuzz-build"] }
 fuzz-smoke = { cmd = "python3 scripts/run_fuzz.py smoke", depends-on = ["fuzz-build"] }
+fuzz-nightly = { cmd = "python3 scripts/run_fuzz_nightly.py", depends-on = ["fuzz-build"] }
+fuzz-nightly-test = { cmd = "python3 tests/fuzz/test_nightly.py", depends-on = ["fuzz-build"] }
 fuzz-driver-test = { cmd = "python3 tests/fuzz/test_driver.py", depends-on = ["fuzz-build"] }
 
 [feature.mojo-1-1.dependencies]

@@ -277,6 +277,9 @@ HTTP examples: `pixi run example-http-hello`, `pixi run example-http-json`, and 
 Format source with `pixi run format`.
 CI runs the complete warning-clean suite on all supported runners and keeps separate AddressSanitizer steps defined in `pixi.toml`.
 Mojo marks foundational standard APIs unstable, so CI uses `--Werror` without `--warn-on-unstable-apis`.
+Parser mutation smoke runs with `pixi run -e fuzz fuzz-smoke`; scheduled
+Linux replay retains input batches and native corpora. See
+[tests/fuzz/README.md](tests/fuzz/README.md) for targets and reproduction.
 Sanitizer tasks build standalone ASan executables in the dedicated `sanitize` environment.
 macOS uses a pinned upstream LLVM runtime; Linux requires a system C compiler, such as GCC.
 
