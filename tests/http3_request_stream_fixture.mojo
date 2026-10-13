@@ -93,7 +93,9 @@ struct _StreamingHandler(Handler):
             while True:
                 var count: Int
                 try:
-                    count = self.standalone.value().receive(Span(buffer), Timeout.nanoseconds(0))
+                    count = self.standalone.value().receive(
+                        Span(buffer), Timeout.nanoseconds(0)
+                    )
                 except error:
                     if error.kind == NetErrorKind.timeout():
                         return
@@ -106,7 +108,10 @@ struct _StreamingHandler(Handler):
         if not self.endpoints:
             return
         while True:
-            assert_equal(self.endpoints.value().receiver._pipe.pending_bytes() <= 4096, True)
+            assert_equal(
+                self.endpoints.value().receiver._pipe.pending_bytes() <= 4096,
+                True,
+            )
             var count: Int
             try:
                 count = self.endpoints.value().receiver.receive(

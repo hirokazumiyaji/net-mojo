@@ -43,8 +43,13 @@ async def run(port):
     config.verify_mode = ssl.CERT_NONE
     async with connect("127.0.0.1", port, configuration=config,
                        create_protocol=Client) as client:
-        stream, response = client.begin("/upload", True, [(b"content-length", b"1048576")])
+        stream, response = client.begin("/upload", True, [
+            (b"content-length", b"1048576"), (b"expect", b"100-continue")])
         await client.wait_value("/calls", b"1")
+        deadline = client._loop.time() + 0.4
+        while (b":status", b"100") not in response["headers"]:
+            assert client._loop.time() < deadline, response
+            await asyncio.sleep(0.005)
         assert not response["future"].done()
         for offset in range(0, 1048576, 16384):
             client.http.send_data(stream, b"a" * 16384, end_stream=False)
@@ -55,6 +60,7 @@ async def run(port):
         client.transmit()
         result = await asyncio.wait_for(response["future"], 10)
         assert result["body"] == b"1048576:yes", result
+        assert [value for name, value in result["headers"] if name == b":status"] == [b"100", b"200"]
         stream, response = client.begin("/upload", True)
         await client.wait_value("/calls", b"2")
         client.http.send_data(stream, b"a" * 100, end_stream=False)
@@ -92,6 +98,9 @@ async def run(port):
         assert await client.get("/bytes") == b"8192"
         ignored, response = client.begin("/ignored", True)
         assert (await asyncio.wait_for(response["future"], 5))["body"] == b"ignored"
+        _, response = client.begin("/ignored", headers=[(b"expect", b"100-continue")])
+        result = await asyncio.wait_for(response["future"], 5)
+        assert [value for name, value in result["headers"] if name == b":status"] == [b"200"]
         bad, response = client.begin("/upload", True, [(b"expect", b"other")])
         rejected = await asyncio.wait_for(response["future"], 5)
         assert (b":status", b"417") in rejected["headers"], rejected

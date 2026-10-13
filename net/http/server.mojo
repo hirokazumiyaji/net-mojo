@@ -1108,6 +1108,19 @@ struct Server(Movable):
                                     Optional(pipe.copy())
                                 )
                                 self._process_http3_inputs()
+                                var input_position = self._find_http3_input(
+                                    request_id
+                                )
+                                if (
+                                    len(expectations) > 0
+                                    and input_position >= 0
+                                    and not self._http3_inputs[
+                                        input_position
+                                    ].wire_eof
+                                ):
+                                    dispatch = self._quic_endpoint.value().send_continue(
+                                        request_id
+                                    )
                         except:
                             dispatch = False
                         if not dispatch:
@@ -1361,7 +1374,9 @@ struct Server(Movable):
                 and not self._http3_inputs[index].eof_published
             ):
                 try:
-                    self._http3_inputs[index].eof_published = pipe._try_push_eof(
+                    self._http3_inputs[
+                        index
+                    ].eof_published = pipe._try_push_eof(
                         self._http3_inputs[index].trailers
                     )
                 except:

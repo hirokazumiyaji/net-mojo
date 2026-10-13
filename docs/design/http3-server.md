@@ -92,6 +92,9 @@ server. The handler runs after validated initial headers, with empty `req.body`
 and a bounded body reader. `req.detach_body()` transfers the receiver to a worker
 independently of response output. Response FIN does not end an accepted upload;
 a detached receiver can continue reading DATA and trailers afterward.
+`Expect: 100-continue` queues informational headers before the handler runs when
+input is incomplete. Completed input needs no informational response. Unsupported
+expectations return 417 without invoking the handler.
 
 The server reserves body queue capacity from `max_total_buffer_bytes`, copies at
 most 4 KiB per input per turn, and returns native receive credit only after the
