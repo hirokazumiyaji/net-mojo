@@ -6,7 +6,10 @@ The Arc allocation and consumer-owned trailer copies remain separate.
 
 from std.memory import ArcPointer
 
-from net._actor import PthreadMutex
+from net._actor import PthreadMutex, signal_wakeup_fd
+from net import Timeout
+from net.timeout import _Deadline
+from ._body_signal import _BodyCondition, _TIMED_OUT
 from net.error import NetError, NetErrorKind
 from ._buffer import SharedBufferBudget, _reserve_capacity
 from .headers import Headers
@@ -14,6 +17,8 @@ from .headers import Headers
 
 struct _BodyPipeState(Movable):
     var mutex: PthreadMutex
+    var condition: _BodyCondition
+    var loop_wakeup_fd: Int32
     var budget: SharedBufferBudget
     var limit: Int
     var bytes: List[Byte]
@@ -26,8 +31,12 @@ struct _BodyPipeState(Movable):
     var discarded: Bool
     var terminal_trailers: Headers
 
-    def __init__(out self, limit: Int, var budget: SharedBufferBudget):
+    def __init__(
+        out self, limit: Int, var budget: SharedBufferBudget, wakeup_fd: Int32
+    ):
         self.mutex = PthreadMutex._uninitialized()
+        self.condition = _BodyCondition()
+        self.loop_wakeup_fd = wakeup_fd
         self.budget = budget^
         self.limit = limit
         self.bytes = List[Byte]()
@@ -42,6 +51,7 @@ struct _BodyPipeState(Movable):
 
     def __deinit__(deinit self):
         _drop_body_bytes(Pointer(to=self))
+        self.condition.destroy()
         self.mutex.destroy()
 
 
@@ -71,14 +81,18 @@ struct _BodyPipe(Copyable):
     var _state: ArcPointer[_BodyPipeState]
 
     def __init__(
-        out self, limit: Int, var budget: SharedBufferBudget
+        out self,
+        limit: Int,
+        var budget: SharedBufferBudget,
+        wakeup_fd: Int32 = -1,
     ) raises NetError:
         if limit < 1:
             raise _body_error(
                 NetErrorKind.invalid_argument(), "body limit must be positive"
             )
-        self._state = ArcPointer(_BodyPipeState(limit, budget^))
+        self._state = ArcPointer(_BodyPipeState(limit, budget^, wakeup_fd))
         self._state[].mutex._initialize()
+        self._state[].condition.initialize()
 
     def push[origin: ImmOrigin](self, data: Span[Byte, origin]) -> Bool:
         ref state = self._state[]
@@ -109,6 +123,7 @@ struct _BodyPipe(Copyable):
         for byte in data:
             state.bytes.append(byte)
         state.decoded += len(data)
+        state.condition.broadcast()
         state.mutex.unlock()
         return True
 
@@ -131,6 +146,7 @@ struct _BodyPipe(Copyable):
         trailers_ptr.unsafe_write(trailers^)
         _ = previous^
         state.finished = True
+        state.condition.broadcast()
         state.mutex.unlock()
 
     def pop[
@@ -164,8 +180,44 @@ struct _BodyPipe(Copyable):
         state.consumed += count
         if state.head == len(state.bytes):
             _drop_body_bytes(Pointer(to=state))
+        signal_wakeup_fd(state.loop_wakeup_fd)
         state.mutex.unlock()
         return count
+
+    def receive[
+        origin: MutOrigin
+    ](
+        self,
+        buffer: Span[mut=True, Byte, origin],
+        timeout: Optional[Timeout] = None,
+    ) raises NetError -> Int:
+        if len(buffer) == 0:
+            raise _body_error(
+                NetErrorKind.invalid_argument(), "body receive buffer is empty"
+            )
+        var deadline = _Deadline.from_optional(timeout)
+        ref state = self._state[]
+        state.mutex.lock()
+        while (
+            state.head == len(state.bytes)
+            and not state.finished
+            and not state.cancelled
+        ):
+            var result = state.condition.wait(state.mutex, deadline)
+            if result != 0:
+                state.mutex.unlock()
+                if result == _TIMED_OUT:
+                    raise _body_error(
+                        NetErrorKind.timeout(), "request body receive timed out"
+                    )
+                raise NetError(
+                    NetErrorKind.system_error(),
+                    "wait request body",
+                    Int(result),
+                    "condition wait failed",
+                )
+        state.mutex.unlock()
+        return self.pop(buffer)
 
     def is_eof(self) -> Bool:
         ref state = self._state[]
@@ -240,6 +292,7 @@ struct _BodyPipe(Copyable):
         state.consumed += len(state.bytes) - state.head
         _drop_body_bytes(Pointer(to=state))
         state.discarded = True
+        signal_wakeup_fd(state.loop_wakeup_fd)
         state.mutex.unlock()
 
     def cancel(self):
@@ -251,6 +304,8 @@ struct _BodyPipe(Copyable):
         trailers_ptr.unsafe_write(Headers())
         _ = trailers^
         state.cancelled = True
+        state.loop_wakeup_fd = -1
+        state.condition.broadcast()
         state.mutex.unlock()
 
     def claim_reader(self) raises NetError:

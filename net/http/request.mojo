@@ -20,7 +20,8 @@ shape before calling the handler:
 from .headers import Headers
 from std.memory import ArcPointer
 from ._body_pipe import _BodyPipe, _copy_body_trailers
-from net.error import NetError
+from net.error import NetError, NetErrorKind
+from net import Timeout
 
 
 @fieldwise_init
@@ -60,6 +61,43 @@ struct HttpVersion(Copyable, Equatable, Writable):
             writer.write("HTTP/unknown")
 
 
+struct RequestBodyReceiver(Movable):
+    """Owned receive endpoint for one detached worker, independent of Request.
+    """
+
+    var _pipe: _BodyPipe
+
+    def __init__(out self, var pipe: _BodyPipe):
+        self._pipe = pipe^
+
+    def __deinit__(deinit self):
+        try:
+            self._pipe.discard()
+        except:
+            pass
+
+    def receive[
+        origin: MutOrigin
+    ](
+        mut self,
+        buffer: Span[mut=True, Byte, origin],
+        timeout: Optional[Timeout] = None,
+    ) raises NetError -> Int:
+        return self._pipe.receive(buffer, timeout)
+
+    def is_eof(self) -> Bool:
+        return self._pipe.is_eof()
+
+    def total_decoded(self) -> Int:
+        return self._pipe.total_decoded()
+
+    def trailers(self) raises NetError -> Headers:
+        return self._pipe.trailers()
+
+    def discard(mut self) raises NetError:
+        self._pipe.discard()
+
+
 @fieldwise_init
 struct RequestBody[origin: ImmOrigin](Movable):
     """Borrowed body view; streaming reads never block the event loop.
@@ -71,6 +109,7 @@ struct RequestBody[origin: ImmOrigin](Movable):
 
     var _request: Pointer[Request, Self.origin]
     var _pipe: Optional[_BodyPipe]
+    var _detached: Bool
 
     def is_streaming(self) -> Bool:
         return Bool(self._pipe)
@@ -91,6 +130,13 @@ struct RequestBody[origin: ImmOrigin](Movable):
     ](
         mut self, buffer: Span[mut=True, Byte, buffer_origin]
     ) raises NetError -> Int:
+        if self._detached:
+            raise NetError(
+                NetErrorKind.invalid_state(),
+                "read request body",
+                None,
+                "body reader was detached",
+            )
         if self._pipe:
             return self._pipe.value().pop(buffer)
         return 0
@@ -100,7 +146,25 @@ struct RequestBody[origin: ImmOrigin](Movable):
             return self._pipe.value().trailers()
         return _copy_body_trailers(self._request[].trailers)
 
+    def detach(mut self) raises NetError -> RequestBodyReceiver:
+        if self._detached or not self._pipe:
+            raise NetError(
+                NetErrorKind.invalid_state(),
+                "detach request body",
+                None,
+                "body reader cannot be detached",
+            )
+        self._detached = True
+        return RequestBodyReceiver(self._pipe.value().copy())
+
     def discard(mut self) raises NetError:
+        if self._detached:
+            raise NetError(
+                NetErrorKind.invalid_state(),
+                "discard request body",
+                None,
+                "body reader was detached",
+            )
         if self._pipe:
             self._pipe.value().discard()
 
@@ -152,7 +216,7 @@ struct Request(Movable):
     def body_reader(self) raises NetError -> RequestBody[origin_of(self)]:
         if self._body_pipe:
             self._body_pipe.value().claim_reader()
-        return RequestBody(Pointer(to=self), self._body_pipe.copy())
+        return RequestBody(Pointer(to=self), self._body_pipe.copy(), False)
 
 
 def split_path_query(

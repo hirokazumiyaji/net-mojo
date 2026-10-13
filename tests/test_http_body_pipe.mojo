@@ -3,8 +3,12 @@ from std.time import perf_counter_ns, sleep
 from tests.support import _join_thread
 from std.testing import assert_equal, assert_false, assert_true, TestSuite
 
+from net import Timeout
+from net._actor import WakeupChannel, signal_wakeup_fd
+from net._sys.common import _wait_readable
+from net.timeout import _Deadline
 from net.error import NetError, NetErrorKind
-from net.http import Headers, HttpVersion, Request
+from net.http import Headers, HttpVersion, Request, RequestBodyReceiver
 from net.http._body_pipe import _BodyPipe
 from net.http._buffer import SharedBufferBudget
 
@@ -259,6 +263,150 @@ def _exercise_cross_thread_producer_and_consumer() raises:
 def test_cross_thread_producer_and_consumer() raises:
     for _ in range(16):
         _exercise_cross_thread_producer_and_consumer()
+
+
+def test_detached_receiver_outlives_request() raises:
+    var request = Request("POST", "/", "/", "", HttpVersion.http11())
+    var pipe = _BodyPipe(16, SharedBufferBudget(128))
+    request._body_pipe = pipe.copy()
+    var view = request.body_reader()
+    var receiver = view.detach()
+    var unavailable = False
+    var buffer = List[Byte](length=16, fill=0)
+    try:
+        _ = view.read(Span(buffer))
+    except error:
+        unavailable = error.kind == NetErrorKind.invalid_state()
+    assert_true(unavailable)
+    _ = view^
+    _ = request^
+    assert_true(pipe.push(String("owned").as_bytes()))
+    pipe.push_eof()
+    assert_equal(receiver.receive(Span(buffer), Timeout.nanoseconds(0)), 5)
+    assert_equal(String(from_utf8_lossy=Span(buffer)[0:5]), "owned")
+    assert_equal(receiver.receive(Span(buffer), Timeout.nanoseconds(0)), 0)
+    assert_true(receiver.is_eof())
+
+
+def test_detached_receive_timeout_and_cancellation() raises:
+    var request = Request("POST", "/", "/", "", HttpVersion.http11())
+    var pipe = _BodyPipe(16, SharedBufferBudget(128))
+    request._body_pipe = pipe.copy()
+    var view = request.body_reader()
+    var receiver = view.detach()
+    var buffer = List[Byte](length=1, fill=0)
+    var timed_out = False
+    try:
+        _ = receiver.receive(Span(buffer), Timeout.milliseconds(1))
+    except error:
+        timed_out = error.kind == NetErrorKind.timeout()
+    assert_true(timed_out)
+    pipe.cancel()
+    var cancelled = False
+    try:
+        _ = receiver.receive(Span(buffer))
+    except error:
+        cancelled = error.kind == NetErrorKind.cancelled()
+    assert_true(cancelled)
+
+
+@fieldwise_init
+struct _ReceiverContext(Movable):
+    var receiver: RequestBodyReceiver
+    var buffer: Array[Byte, 8]
+    var count: Int
+    var error_kind: NetErrorKind
+    var ready_fd: Int32
+
+
+def _receive_pipe(
+    arg: Pointer[Byte, MutUntrackedOrigin]
+) -> Pointer[Byte, MutUntrackedOrigin]:
+    var context = arg.unsafe_bitcast[_ReceiverContext]()
+    signal_wakeup_fd(context[].ready_fd)
+    try:
+        context[].count = context[].receiver.receive(
+            Span(context[].buffer), Timeout.seconds(1)
+        )
+    except error:
+        context[].error_kind = error.kind.copy()
+    return arg
+
+
+def test_blocked_receiver_wakes_on_input_eof_and_cancel() raises:
+    for mode in range(3):
+        var ready = WakeupChannel()
+        var pipe = _BodyPipe(16, SharedBufferBudget(128))
+        var request = Request("POST", "/", "/", "", HttpVersion.http11())
+        request._body_pipe = pipe.copy()
+        var view = request.body_reader()
+        var context = _ReceiverContext(
+            view.detach(),
+            Array[Byte, 8](fill=0),
+            -1,
+            NetErrorKind.unsupported(),
+            ready.write_fd(),
+        )
+        var thread: UInt64 = 0
+        var result = external_call["pthread_create", c_int](
+            Pointer(to=thread),
+            Optional[Pointer[Byte, MutUntrackedOrigin]](None),
+            _receive_pipe,
+            Pointer(to=context).unsafe_bitcast[Byte](),
+        )
+        assert_equal(Int(result), 0)
+        var notified = _wait_readable(
+            ready.read_fd(), _Deadline.from_timeout(Timeout.seconds(1))
+        )
+        if mode == 0:
+            _ = pipe.push(String("ready").as_bytes())
+        elif mode == 1:
+            pipe.push_eof()
+        else:
+            pipe.cancel()
+        _join_thread(thread)
+        assert_true(notified)
+        if mode == 0:
+            assert_equal(context.count, 5)
+            assert_equal(
+                String(from_utf8_lossy=Span(context.buffer)[0:5]), "ready"
+            )
+        elif mode == 1:
+            assert_equal(context.count, 0)
+        else:
+            assert_equal(context.error_kind, NetErrorKind.cancelled())
+        ready.drain()
+
+
+def test_consumption_signals_server_wakeup() raises:
+    var wakeup = WakeupChannel()
+    var pipe = _BodyPipe(16, SharedBufferBudget(128), wakeup.write_fd())
+    assert_true(pipe.push(String("credit").as_bytes()))
+    var buffer = Array[Byte, 8](fill=0)
+    assert_equal(pipe.pop(Span(buffer)), 6)
+    assert_true(
+        _wait_readable(
+            wakeup.read_fd(), _Deadline.from_timeout(Timeout.milliseconds(10))
+        )
+    )
+    wakeup.drain()
+    pipe.cancel()
+    wakeup.drain()
+
+
+def test_empty_detached_receive_buffer_is_rejected() raises:
+    var request = Request("POST", "/", "/", "", HttpVersion.http11())
+    var pipe = _BodyPipe(16, SharedBufferBudget(128))
+    request._body_pipe = pipe.copy()
+    var view = request.body_reader()
+    var receiver = view.detach()
+    var empty = List[Byte]()
+    var rejected = False
+    try:
+        _ = receiver.receive(Span(empty))
+    except error:
+        rejected = error.kind == NetErrorKind.invalid_argument()
+    assert_true(rejected)
 
 
 def main() raises:

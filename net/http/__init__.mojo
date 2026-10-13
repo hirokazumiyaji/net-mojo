@@ -24,7 +24,13 @@ from .middleware import (
     TimeoutHandler,
     apply_middleware,
 )
-from .request import HttpVersion, Request, RequestBody, split_path_query
+from .request import (
+    HttpVersion,
+    Request,
+    RequestBody,
+    RequestBodyReceiver,
+    split_path_query,
+)
 from .response import (
     ResponseSender,
     ResponseWriter,
