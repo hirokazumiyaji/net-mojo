@@ -2385,5 +2385,55 @@ def test_http2_bootstrap_advertises_configured_max_header_list_size() raises:
     assert_equal(parsed.parsed.settings[1].value, UInt32(16384))
 
 
+def test_http2_priority_rejects_zero_stream_wrong_length_and_self_dependency() raises:
+    var payload: List[Byte] = [Byte(0), Byte(0), Byte(0), Byte(1), Byte(0)]
+    var zero = Http2FrameDispatcher(Http2PeerSettings().snapshot())
+    var zero_result = zero.accept(
+        FrameParseResult.complete(Byte(2), Byte(0), UInt32(0), 5), Span(payload)
+    )
+    assert_true(zero_result.is_error())
+    assert_equal(zero_result.value, UInt32(1))
+    var short = Http2FrameDispatcher(Http2PeerSettings().snapshot())
+    var short_result = short.accept(
+        FrameParseResult.complete(Byte(2), Byte(0), UInt32(1), 4),
+        Span(payload)[:4],
+    )
+    assert_true(short_result.is_error())
+    assert_equal(short_result.value, UInt32(6))
+    for frame_type in [Byte(1), Byte(2)]:
+        var dispatcher = Http2FrameDispatcher(Http2PeerSettings().snapshot())
+        var result = dispatcher.accept(
+            FrameParseResult.complete(frame_type, Byte(0x24), UInt32(1), 5),
+            Span(payload),
+        )
+        assert_true(result.is_error())
+        assert_equal(result.value, UInt32(1))
+
+    var padded = Http2FrameDispatcher(Http2PeerSettings().snapshot())
+    var padded_payload: List[Byte] = [0, 0x80, 0, 0, 1, 0]
+    var padded_result = padded.accept(
+        FrameParseResult.complete(Byte(1), Byte(0x2C), UInt32(1), 6),
+        Span(padded_payload),
+    )
+    assert_true(padded_result.is_error())
+    assert_equal(padded_result.value, UInt32(1))
+
+
+def test_http2_priority_allows_other_dependencies_and_idle_streams() raises:
+    var dispatcher = Http2FrameDispatcher(Http2PeerSettings().snapshot())
+    var payload: List[Byte] = [0x80, 0, 0, 1, 0]
+    var priority = dispatcher.accept(
+        FrameParseResult.complete(Byte(2), Byte(0), UInt32(3), 5),
+        Span(payload),
+    )
+    assert_true(priority.is_ignored())
+    var padded_payload: List[Byte] = [0, 0x80, 0, 0, 1, 0]
+    var headers = dispatcher.accept(
+        FrameParseResult.complete(Byte(1), Byte(0x2C), UInt32(3), 6),
+        Span(padded_payload),
+    )
+    assert_true(headers.is_ignored())
+
+
 def main() raises:
     TestSuite.discover_tests[__functions_in_module()]().run()
