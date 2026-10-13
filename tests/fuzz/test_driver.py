@@ -12,6 +12,13 @@ spec.loader.exec_module(driver)
 
 
 class MutationDriverTests(unittest.TestCase):
+    def test_serialized_xy_regression_is_replayed(self):
+        fixture = Path(__file__).parents[1] / "fuzz-regressions/hpack/serialized-xy.bin"
+        fields = fixture.read_bytes()
+        self.assertEqual(fields, struct.pack(">II", 1, 1) + b"xy")
+        for target in ("hpack", "hpack-mojo"):
+            self.assertIn(fields, driver.make_inputs(target, 227, 1))
+
     def test_seed_reproduces_exact_inputs(self):
         for target in ("http1", "authority", "http2-frames", "ip", "address", "hpack-mojo"):
             first = driver.make_inputs(target, 227, 100)

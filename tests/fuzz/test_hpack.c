@@ -1,6 +1,7 @@
 #include <assert.h>
 #include <stdint.h>
 #include <stddef.h>
+#include <stdio.h>
 #include "net/http/_http2/hpack_shim.h"
 static int successes;
 static int tracked_encode(net_hpack_deflater *wrapper, const uint8_t *fields,
@@ -14,7 +15,12 @@ static int tracked_encode(net_hpack_deflater *wrapper, const uint8_t *fields,
 #define net_hpack_encode tracked_encode
 #include "hpack.c"
 int main(void) {
-    uint8_t fields[] = {0,0,0,1,0,0,0,1,'x','y'};
+    uint8_t fields[10];
+    FILE *fixture = fopen("tests/fuzz-regressions/hpack/serialized-xy.bin", "rb");
+    assert(fixture != NULL);
+    assert(fread(fields, 1, sizeof(fields), fixture) == sizeof(fields));
+    assert(fgetc(fixture) == EOF);
+    assert(fclose(fixture) == 0);
     LLVMFuzzerTestOneInput(fields, sizeof(fields));
     assert(successes > 0);
     return 0;

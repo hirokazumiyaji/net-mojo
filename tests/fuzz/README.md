@@ -12,8 +12,10 @@ in the existing `sanitize` environment and the native HPACK target with
 libFuzzer, ASan and UBSan in `fuzz`. The separate build environments keep the
 native compiler sysroot out of Mojo linking. HPACK runs for 60
 seconds, with a 10 second per-input timeout, 2 GiB RSS limit and 8192 byte input
-limit. The native build also verifies that a valid serialized header reaches successful
-encoding, so fuzz-control choices cannot silently disable that path.
+limit. The native build also replays the tracked `x: y` regression fixture and verifies
+successful encoding, so fuzz-control choices cannot silently disable that path.
+The same fixture is checked for exact decoded contents by ordinary `hpack-test`
+and is seeded into both native and Mojo replay targets.
 The six Mojo targets replay seed prefixes and 10,000 seeded
 mutations each; their process timeout is 60 seconds. `fuzz-http1`,
 `fuzz-authority`, `fuzz-http2-frames`, `fuzz-ip`, `fuzz-address`,

@@ -31,7 +31,7 @@ SEEDS = {
     "hpack": [
         b"\x82\x86\x84", b"\x82\x86\x84\x41\x0fwww.example.com",
         b"\x20", b"\xff", b"\x40\x01x\x01y",
-        struct.pack(">II", 1, 1) + b"xy",
+        (Path(__file__).resolve().parents[1] / "tests/fuzz-regressions/hpack/serialized-xy.bin").read_bytes(),
         struct.pack(">II", 0xffffffff, 0xffffffff),
     ],
 }
