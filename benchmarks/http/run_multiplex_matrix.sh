@@ -475,15 +475,18 @@ run_h2load_cell() {
     fi
 
     local req_s success failed errored timedout
-    req_s="$(rg -o 'finished in [^,]+, ([0-9.]+) req/s' -r '$1' "$out" | head -1 || true)"
-    success="$(rg -o 'requests: .* ([0-9]+) succeeded' -r '$1' "$out" | head -1 || true)"
-    failed="$(rg -o 'requests: .* ([0-9]+) failed' -r '$1' "$out" | head -1 || true)"
-    errored="$(rg -o 'requests: .* ([0-9]+) errored' -r '$1' "$out" | head -1 || true)"
-    timedout="$(rg -o 'requests: .* ([0-9]+) timeout' -r '$1' "$out" | head -1 || true)"
+    # Portable parsing (no ripgrep): sed -E works on GNU and BSD.
+    req_s="$(sed -nE 's/.*finished in [^,]+, ([0-9.]+) req\/s.*/\1/p' "$out" | head -1 || true)"
+    success="$(sed -nE 's/.* ([0-9]+) succeeded.*/\1/p' "$out" | head -1 || true)"
+    failed="$(sed -nE 's/.* ([0-9]+) failed.*/\1/p' "$out" | head -1 || true)"
+    errored="$(sed -nE 's/.* ([0-9]+) errored.*/\1/p' "$out" | head -1 || true)"
+    timedout="$(sed -nE 's/.* ([0-9]+) timeout.*/\1/p' "$out" | head -1 || true)"
     local med_tok p95_tok p99_tok
-    med_tok="$(rg '^\s*request\s*:' "$out" | awk '{print $5}' | head -1 || true)"
-    p95_tok="$(rg '^\s*request\s*:' "$out" | awk '{print $6}' | head -1 || true)"
-    p99_tok="$(rg '^\s*request\s*:' "$out" | awk '{print $7}' | head -1 || true)"
+    local request_line
+    request_line="$(grep -E '^[[:space:]]*request[[:space:]]*:' "$out" | head -1 || true)"
+    med_tok="$(printf '%s\n' "$request_line" | awk '{print $5}')"
+    p95_tok="$(printf '%s\n' "$request_line" | awk '{print $6}')"
+    p99_tok="$(printf '%s\n' "$request_line" | awk '{print $7}')"
     local p50 p95 p99
     p50="$(to_us "${med_tok:-}")"
     p95="$(to_us "${p95_tok:-}")"
@@ -556,13 +559,14 @@ run_h3_cell() {
     fi
 
     local line req_s p50 p95 p99 ok failed
-    line="$(rg -N '^req_s=' "$out" | tail -1 || true)"
-    req_s="$(printf '%s' "$line" | rg -o 'req_s=([0-9.]+)' -r '$1' || true)"
-    p50="$(printf '%s' "$line" | rg -o 'p50_us=([0-9.]+)' -r '$1' || true)"
-    p95="$(printf '%s' "$line" | rg -o 'p95_us=([0-9.]+)' -r '$1' || true)"
-    p99="$(printf '%s' "$line" | rg -o 'p99_us=([0-9.]+)' -r '$1' || true)"
-    ok="$(printf '%s' "$line" | rg -o 'ok=([0-9]+)' -r '$1' || true)"
-    failed="$(printf '%s' "$line" | rg -o 'failed=([0-9]+)' -r '$1' || true)"
+    # Portable parsing (no ripgrep): grep/sed work on GNU and BSD.
+    line="$(grep -E '^req_s=' "$out" | tail -1 || true)"
+    req_s="$(printf '%s' "$line" | sed -nE 's/.*req_s=([0-9.]+).*/\1/p' || true)"
+    p50="$(printf '%s' "$line" | sed -nE 's/.*p50_us=([0-9.]+).*/\1/p' || true)"
+    p95="$(printf '%s' "$line" | sed -nE 's/.*p95_us=([0-9.]+).*/\1/p' || true)"
+    p99="$(printf '%s' "$line" | sed -nE 's/.*p99_us=([0-9.]+).*/\1/p' || true)"
+    ok="$(printf '%s' "$line" | sed -nE 's/.*ok=([0-9]+).*/\1/p' || true)"
+    failed="$(printf '%s' "$line" | sed -nE 's/.*failed=([0-9]+).*/\1/p' || true)"
     local sample_line
     sample_line="$(tr '\n' ' ' <"$sample" | sed 's/ *$//')"
 
@@ -713,16 +717,16 @@ run_h2_special() {
                 trap - RETURN INT TERM
                 set -e
                 local loss_req loss_fail loss_success
-                loss_req="$(rg -o 'finished in [^,]+, ([0-9.]+) req/s' -r '$1' \
+                loss_req="$(sed -nE 's/.*finished in [^,]+, ([0-9.]+) req\/s.*/\1/p' \
                     "$OUT_DIR/special/h2_${label}_loss_h2load.out" | head -1 || true)"
-                loss_fail="$(rg -o 'requests: .* ([0-9]+) failed' -r '$1' \
+                loss_fail="$(sed -nE 's/.* ([0-9]+) failed.*/\1/p' \
                     "$OUT_DIR/special/h2_${label}_loss_h2load.out" | head -1 || true)"
-                loss_success="$(rg -o 'requests: .* ([0-9]+) succeeded' -r '$1' \
+                loss_success="$(sed -nE 's/.* ([0-9]+) succeeded.*/\1/p' \
                     "$OUT_DIR/special/h2_${label}_loss_h2load.out" | head -1 || true)"
                 local loss_errored loss_timeout
-                loss_errored="$(rg -o 'requests: .* ([0-9]+) errored' -r '$1' \
+                loss_errored="$(sed -nE 's/.* ([0-9]+) errored.*/\1/p' \
                     "$OUT_DIR/special/h2_${label}_loss_h2load.out" | head -1 || true)"
-                loss_timeout="$(rg -o 'requests: .* ([0-9]+) timeout' -r '$1' \
+                loss_timeout="$(sed -nE 's/.* ([0-9]+) timeout.*/\1/p' \
                     "$OUT_DIR/special/h2_${label}_loss_h2load.out" | head -1 || true)"
                 # A loss run that lost every request (req_s 0.00), reported
                 # failures, or exited nonzero is not a valid measurement.
@@ -765,7 +769,7 @@ run_h2_special() {
         h2load --alpn-list=h2 -c 8 -m 4 -t 1 -D 3s "${url}/fixed" \
             >"$OUT_DIR/special/h2_${label}_loss_baseline.out" 2>&1 || true
         local base_req
-        base_req="$(rg -o 'finished in [^,]+, ([0-9.]+) req/s' -r '$1' \
+        base_req="$(sed -nE 's/.*finished in [^,]+, ([0-9.]+) req\/s.*/\1/p' \
             "$OUT_DIR/special/h2_${label}_loss_baseline.out" | head -1 || true)"
         loss_detail="${loss_detail}; no-loss reference req_s=${base_req:-?} (3s)"
     fi

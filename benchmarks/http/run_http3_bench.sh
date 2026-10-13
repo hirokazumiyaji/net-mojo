@@ -62,7 +62,7 @@ sysctl -n machdep.cpu.brand_string 2>/dev/null || true
 echo "mojo: $(pixi run -e "$PIXI_ENV" mojo --version 2>/dev/null || echo unknown)"
 echo "aioquic: $("$PIXI_PYTHON" -c 'import aioquic; print(aioquic.__version__)')"
 echo "python: $PIXI_PYTHON"
-echo "quiche (provider Cargo.lock): $(rg -N '^name = \"quiche\"' -A1 net/quic/provider/Cargo.lock | rg -N 'version' | head -1 || echo pinned in Cargo.toml =0.29.3)"
+echo "quiche (provider Cargo.lock): $(grep -A1 '^name = \"quiche\"' net/quic/provider/Cargo.lock | grep 'version' | head -1 || echo pinned in Cargo.toml =0.29.3)"
 echo "procedure: warmup=${WARMUP_S}s measure=${MEASURE_S}s runs=${RUNS} clients=${CLIENTS} streams=[${STREAMS}] loss_pct=${LOSS_PCT} (label; not injected by harness)"
 echo
 
@@ -106,7 +106,7 @@ smoke_get() {
         cat "$OUT_DIR/smoke.err" >&2 || true
         return 1
     }
-    if ! rg -q 'ok=[1-9]' "$OUT_DIR/smoke.out"; then
+    if ! grep -qE 'ok=[1-9]' "$OUT_DIR/smoke.out"; then
         echo "smoke GET produced no successes: $(cat "$OUT_DIR/smoke.out")" >&2
         cat "$OUT_DIR/smoke.err" >&2 || true
         return 1
@@ -150,13 +150,14 @@ run_load() {
     fi
 
     local line req_s p50 p95 p99 ok failed
-    line="$(rg -N '^req_s=' "$out" | tail -1 || true)"
-    req_s="$(printf '%s' "$line" | rg -o '\breq_s=(\S+)' -r '$1' || true)"
-    p50="$(printf '%s' "$line" | rg -o '\bp50_us=(\S+)' -r '$1' || true)"
-    p95="$(printf '%s' "$line" | rg -o '\bp95_us=(\S+)' -r '$1' || true)"
-    p99="$(printf '%s' "$line" | rg -o '\bp99_us=(\S+)' -r '$1' || true)"
-    ok="$(printf '%s' "$line" | rg -o '\bok=(\S+)' -r '$1' || true)"
-    failed="$(printf '%s' "$line" | rg -o '\bfailed=(\S+)' -r '$1' || true)"
+    # Portable parsing (no ripgrep): grep/sed work on GNU and BSD.
+    line="$(grep -E '^req_s=' "$out" | tail -1 || true)"
+    req_s="$(printf '%s' "$line" | sed -nE 's/.*req_s=([^[:space:]]+).*/\1/p' || true)"
+    p50="$(printf '%s' "$line" | sed -nE 's/.*p50_us=([^[:space:]]+).*/\1/p' || true)"
+    p95="$(printf '%s' "$line" | sed -nE 's/.*p95_us=([^[:space:]]+).*/\1/p' || true)"
+    p99="$(printf '%s' "$line" | sed -nE 's/.*p99_us=([^[:space:]]+).*/\1/p' || true)"
+    ok="$(printf '%s' "$line" | sed -nE 's/.*ok=([^[:space:]]+).*/\1/p' || true)"
+    failed="$(printf '%s' "$line" | sed -nE 's/.*failed=([^[:space:]]+).*/\1/p' || true)"
 
     local sample_line
     sample_line="$(tr '\n' ' ' <"$sample" | sed 's/ *$//')"

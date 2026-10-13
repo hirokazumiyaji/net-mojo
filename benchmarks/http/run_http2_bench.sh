@@ -209,19 +209,22 @@ run_h2load() {
     fi
 
     local req_s success failed errored timedout
-    req_s="$(rg -o 'finished in [^,]+, ([0-9.]+) req/s' -r '$1' "$out" | head -1 || true)"
-    success="$(rg -o 'requests: .* ([0-9]+) succeeded' -r '$1' "$out" | head -1 || true)"
-    failed="$(rg -o 'requests: .* ([0-9]+) failed' -r '$1' "$out" | head -1 || true)"
-    errored="$(rg -o 'requests: .* ([0-9]+) errored' -r '$1' "$out" | head -1 || true)"
-    timedout="$(rg -o 'requests: .* ([0-9]+) timeout' -r '$1' "$out" | head -1 || true)"
+    # Portable parsing (no ripgrep): sed -E works on GNU and BSD.
+    req_s="$(sed -nE 's/.*finished in [^,]+, ([0-9.]+) req\/s.*/\1/p' "$out" | head -1 || true)"
+    success="$(sed -nE 's/.* ([0-9]+) succeeded.*/\1/p' "$out" | head -1 || true)"
+    failed="$(sed -nE 's/.* ([0-9]+) failed.*/\1/p' "$out" | head -1 || true)"
+    errored="$(sed -nE 's/.* ([0-9]+) errored.*/\1/p' "$out" | head -1 || true)"
+    timedout="$(sed -nE 's/.* ([0-9]+) timeout.*/\1/p' "$out" | head -1 || true)"
 
     # h2load request row: min max median p95 p99 mean sd +/-sd
     # Fields after splitting on whitespace: $1=request $2=: $3=min $4=max
     # $5=median $6=p95 $7=p99 ...
     local med_tok p95_tok p99_tok
-    med_tok="$(rg '^\s*request\s*:' "$out" | awk '{print $5}' | head -1 || true)"
-    p95_tok="$(rg '^\s*request\s*:' "$out" | awk '{print $6}' | head -1 || true)"
-    p99_tok="$(rg '^\s*request\s*:' "$out" | awk '{print $7}' | head -1 || true)"
+    local request_line
+    request_line="$(grep -E '^[[:space:]]*request[[:space:]]*:' "$out" | head -1 || true)"
+    med_tok="$(printf '%s\n' "$request_line" | awk '{print $5}')"
+    p95_tok="$(printf '%s\n' "$request_line" | awk '{print $6}')"
+    p99_tok="$(printf '%s\n' "$request_line" | awk '{print $7}')"
     local p50 p95 p99
     p50="$(to_us "${med_tok:-}")"
     p95="$(to_us "${p95_tok:-}")"
