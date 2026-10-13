@@ -53,8 +53,8 @@ connection-owned deflater. Because the scheduler is the only producer that
 advances the deflater, encode order equals wire order on the connection and the
 peer's single inflater stays in sync without storing pre-compressed blocks. The
 optional HPACK shim is loaded when the first request headers arrive. The
-session returns connection and stream receive credit after request DATA is
-copied into the bounded body buffer. Responses stay within current connection
+buffered session returns connection and stream receive credit after request
+DATA is copied into the bounded body buffer. Responses stay within current connection
 send credit and the peer's initial stream window; a response body that does not
 fit the shared budget at enqueue time is refused on that stream with
 RST_STREAM(REFUSED_STREAM) and sibling streams keep running.
@@ -84,6 +84,42 @@ closes under budget pressure is the aggregate request-body reservation across
 all concurrent streams: that budget is shared and the server cannot know which
 single stream to refuse, so the connection drops once the sum exceeds the
 remaining capacity budget.
+
+## Streaming request-session contract
+
+`Http2RequestSession` enables request streaming when `request_body_budget` is
+present. A successful request head produces `is_head()` with an owned `Request`
+whose body reader consumes a shared pipe. Buffered sessions keep `is_request()`
+completion and their fixed body deadline. Streaming sessions renew the body
+deadline only when a nonempty DATA payload is accepted; empty DATA does not
+extend it.
+
+Streaming sessions advertise `SETTINGS_INITIAL_WINDOW_SIZE` as
+`min(max_body_size, 65535)`. Before the peer acknowledges those SETTINGS, each
+admitted stream reserves the default 65535-byte receive window from the shared
+budget and accepts valid first-flight DATA within that credit. Insufficient
+reservation refuses the new stream without cancelling siblings. The ACK applies
+the signed window reduction to existing streams, preserving already queued
+bytes even when the resulting receive window is negative. Later streams reserve
+the configured window. Shrinking queue storage accounts for both allocations;
+when peak capacity is unavailable, consumption continues using the existing
+charged allocation until it can shrink or retire empty storage.
+
+DATA payload remains charged against connection and stream flow control until
+`flush_body_credit()` collects bytes consumed or discarded by the body reader.
+Padding credit returns immediately. Consumed WINDOW_UPDATE increments repay
+negative stream windows before enabling additional peer DATA. Remote completion
+keeps input state until consumed EOF; response completion removes send state
+independently. Terminal input refunds any remaining connection credit and
+removes the pipe's loop wakeup capability while preserving EOF and trailers.
+Admission counts the union of retained input and response streams.
+
+RST_STREAM, body expiry, connection failure and local shutdown cancel streaming
+input and wake detached readers. Cancellation refunds outstanding connection
+credit without issuing stream credit for a closed stream. Local stream resets
+also set `reset_stream_id` so the owner can cancel response work. Local shutdown
+cancels streaming input even when an earlier peer GOAWAY already marked the
+session draining; buffered input retains its existing shutdown grace behavior.
 
 ## Outbound frame encoding
 
@@ -265,7 +301,8 @@ whose initial send window is zero before later granting credit. Unit tests cover
 round-robin DATA scheduling, bounded payloads, header-once behavior, completion,
 credit exhaustion, resumption, and reset cancellation.
 
-Stream admission counts request streams until their response finishes. When the
+Buffered stream admission counts requests until their response finishes.
+Streaming admission also counts input retained until consumed EOF. When the
 local cap is reached, the server advances the client stream ID and sends
 `RST_STREAM(REFUSED_STREAM)` for that stream while keeping admitted streams and
 the connection usable. DATA that races with the refusal is ignored for that
@@ -273,8 +310,9 @@ closed stream.
 
 When shutdown begins, the server sends GOAWAY with the highest admitted peer
 stream ID and refuses later streams with `REFUSED_STREAM`. GOAWAY is queued
-behind existing connection output, and admitted requests keep the configured
-shutdown grace period to finish. At the grace deadline, remaining TCP
+behind existing connection output, and admitted buffered requests keep the
+configured shutdown grace period to finish. Streaming input is cancelled as
+described in the request-session contract above. At the grace deadline, remaining TCP
 connections are closed.
 
 ## Verification sequence
