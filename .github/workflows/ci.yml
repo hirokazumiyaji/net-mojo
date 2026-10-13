@@ -295,6 +295,8 @@ jobs:
         run: pixi run test-http-request-stream
       - name: Test HTTP/2 streaming request models
         run: pixi run test-http2-request-stream
+      - name: Test HTTP URL parser
+        run: pixi run test-http-url
       - name: Test HTTP parser
         run: pixi run test-http-parser
       - name: Test HTTP response
@@ -412,6 +414,8 @@ jobs:
         run: pixi run sanitize-http-control
       - name: Sanitize HTTP worker pool
         run: pixi run sanitize-http-pool
+      - name: Sanitize HTTP URL parser
+        run: pixi run sanitize-http-url
       - name: Sanitize HTTP parser
         run: pixi run sanitize-http-parser
       - name: Sanitize request body pipe

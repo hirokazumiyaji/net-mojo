@@ -15,6 +15,7 @@ from ._offload import HandlerJob, OffloadError, WorkerPool, WorkerPoolConfig
 
 from .switch import HijackedConn
 from ._hijack import HijackSender
+from .client_error import ClientError
 from .config import ServerConfig
 from .error import HttpError, _status_reason
 from .handler import Handler, HandlerFactory, DefaultHandlerFactory
