@@ -12,6 +12,8 @@ from net.http import (
 """
 
 from ._offload import HandlerJob, OffloadError, WorkerPool, WorkerPoolConfig
+
+from .switch import HijackedConn
 from .config import ServerConfig
 from .error import HttpError, _status_reason
 from .handler import Handler, HandlerFactory, DefaultHandlerFactory

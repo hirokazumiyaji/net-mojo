@@ -1125,3 +1125,22 @@ workers detach and retain the shared state until their jobs and destructors
 return. This bounds shutdown while preserving lifetime safety; it cannot stop
 arbitrary user code. See [http-offload.md](http-offload.md) for the full
 contract and `examples/http_offload.mojo` / `examples/http_sse.mojo` for usage.
+
+### Raw transport ownership
+
+`net.http.HijackedConn` owns one TCP or TLS transport and unread bytes from
+before the protocol switch. `read` and `try_read` consume these bytes before
+reading the socket; `buffered` borrows the unread suffix and `take_buffered`
+transfers it. The bytes belong to the switched protocol and must not be parsed
+as another HTTP request. `write` and `try_write` may return a partial count.
+The descriptor returned by `raw_fd` is borrowed. `close` consumes the connection;
+its owner also closes it when the value is destroyed.
+
+A TLS handoff retains the server's scratch allocation and outstanding read
+length. This permits a receiver to request fewer bytes without changing the
+pending OpenSSL read call. Newly decrypted surplus bytes remain buffered.
+A nonblocking TLS write retry must use the same content and length; a different
+length raises `invalid_state`. A timeout may require either readability or
+writability, so a raw-descriptor poller watches both. `shutdown_write` sends TLS
+close-notify before the TCP write-side shutdown and preserves the read side.
+It rejects shutdown while a TLS write retry remains outstanding.

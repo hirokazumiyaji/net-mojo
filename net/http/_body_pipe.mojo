@@ -6,10 +6,14 @@ The Arc allocation and consumer-owned trailer copies remain separate.
 
 from std.memory import ArcPointer
 
-from net._actor import PthreadMutex, signal_wakeup_fd
+from net._actor import (
+    PthreadMutex,
+    PthreadCond,
+    signal_wakeup_fd,
+    _COND_TIMED_OUT,
+)
 from net import Timeout
 from net.timeout import _Deadline
-from ._body_signal import _BodyCondition, _TIMED_OUT
 from net.error import NetError, NetErrorKind
 from ._buffer import SharedBufferBudget, _reserve_capacity
 from .headers import Headers
@@ -17,7 +21,7 @@ from .headers import Headers
 
 struct _BodyPipeState(Movable):
     var mutex: PthreadMutex
-    var condition: _BodyCondition
+    var condition: PthreadCond
     var loop_wakeup_fd: Int32
     var budget: SharedBufferBudget
     var limit: Int
@@ -37,7 +41,7 @@ struct _BodyPipeState(Movable):
         out self, limit: Int, var budget: SharedBufferBudget, wakeup_fd: Int32
     ):
         self.mutex = PthreadMutex._uninitialized()
-        self.condition = _BodyCondition()
+        self.condition = PthreadCond()
         self.loop_wakeup_fd = wakeup_fd
         self.budget = budget^
         self.limit = limit
@@ -282,7 +286,7 @@ struct _BodyPipe(Copyable):
             var result = state.condition.wait(state.mutex, deadline)
             if result != 0:
                 state.mutex.unlock()
-                if result == _TIMED_OUT:
+                if result == _COND_TIMED_OUT:
                     raise _body_error(
                         NetErrorKind.timeout(), "request body receive timed out"
                     )
