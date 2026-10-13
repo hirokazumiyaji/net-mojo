@@ -61,6 +61,13 @@ tests the conda package on every supported platform, uploads it to the
 prefix.dev channel named by the `PREFIX_CHANNEL` repository variable (using
 the `PREFIX_API_KEY` secret), and creates the GitHub Release.
 
+Build and test the conda package locally with `bash scripts/build_conda.sh`.
+Pull requests and manual Publish runs build packages without uploading to
+prefix.dev or creating a Release. GitHub Releases include conda packages and
+`net-<platform>.mojoc` artifacts for each supported target; rename the selected
+artifact to `net.mojoc` before using it on the import path. Both distribution
+formats require the exact Mojo compiler release that built them.
+
 ## Public API
 
 Import public types and functions from `net`:
