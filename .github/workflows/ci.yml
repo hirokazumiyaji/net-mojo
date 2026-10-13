@@ -220,6 +220,8 @@ jobs:
         run: pixi run test-http-body-decoder
       - name: Test HTTP/1 streaming request lifecycle
         run: pixi run test-http-request-stream
+      - name: Test HTTP/2 streaming request models
+        run: pixi run test-http2-request-stream
       - name: Test HTTP parser
         run: pixi run test-http-parser
       - name: Test HTTP response
@@ -323,6 +325,8 @@ jobs:
         run: pixi run sanitize-http-body-decoder
       - name: Sanitize HTTP/1 streaming request lifecycle
         run: pixi run sanitize-http-request-stream
+      - name: Sanitize HTTP/2 streaming request models
+        run: pixi run sanitize-http2-request-stream
       - name: Sanitize HTTP response
         run: pixi run sanitize-http-response
       - name: Sanitize HTTP router

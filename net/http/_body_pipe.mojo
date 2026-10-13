@@ -30,6 +30,7 @@ struct _BodyPipeState(Movable):
     var claimed: Bool
     var discarded: Bool
     var terminal_trailers: Headers
+    var retain_capacity: Bool
 
     def __init__(
         out self, limit: Int, var budget: SharedBufferBudget, wakeup_fd: Int32
@@ -48,6 +49,7 @@ struct _BodyPipeState(Movable):
         self.claimed = False
         self.discarded = False
         self.terminal_trailers = Headers()
+        self.retain_capacity = False
 
     def __deinit__(deinit self):
         _drop_body_bytes(Pointer(to=self))
@@ -85,6 +87,7 @@ struct _BodyPipe(Copyable):
         limit: Int,
         var budget: SharedBufferBudget,
         wakeup_fd: Int32 = -1,
+        reserve_capacity: Bool = False,
     ) raises NetError:
         if limit < 1:
             raise _body_error(
@@ -93,6 +96,14 @@ struct _BodyPipe(Copyable):
         self._state = ArcPointer(_BodyPipeState(limit, budget^, wakeup_fd))
         self._state[].mutex._initialize()
         self._state[].condition.initialize()
+        if reserve_capacity:
+            if not self._state[].budget.try_reserve(limit):
+                raise _body_error(
+                    NetErrorKind.invalid_state(),
+                    "receive window exceeds buffer budget",
+                )
+            self._state[].bytes.reserve(limit)
+            self._state[].retain_capacity = True
 
     def push[origin: ImmOrigin](self, data: Span[Byte, origin]) -> Bool:
         ref state = self._state[]
@@ -109,7 +120,9 @@ struct _BodyPipe(Copyable):
         if len(data) > state.limit - pending:
             state.mutex.unlock()
             return False
-        if state.head > 0 and state.head >= len(state.bytes) // 2:
+        if state.head > 0 and (
+            state.retain_capacity or state.head >= len(state.bytes) // 2
+        ):
             for i in range(pending):
                 state.bytes[i] = state.bytes[state.head + i]
             state.bytes.resize(pending, fill=0)
@@ -159,6 +172,8 @@ struct _BodyPipe(Copyable):
         _ = previous^
         trailers = Headers()
         state.finished = True
+        if state.head == len(state.bytes):
+            _drop_body_bytes(Pointer(to=state))
         state.condition.broadcast()
         state.mutex.unlock()
         return True
@@ -193,7 +208,11 @@ struct _BodyPipe(Copyable):
         state.head += count
         state.consumed += count
         if state.head == len(state.bytes):
-            _drop_body_bytes(Pointer(to=state))
+            if state.retain_capacity and not state.finished:
+                state.bytes.clear()
+                state.head = 0
+            else:
+                _drop_body_bytes(Pointer(to=state))
         signal_wakeup_fd(state.loop_wakeup_fd)
         state.mutex.unlock()
         return count
@@ -322,9 +341,9 @@ struct _BodyPipe(Copyable):
             state.mutex.unlock()
             return count
         var pending = len(state.bytes) - state.head
-        var length = pending if state.head >= len(state.bytes) // 2 else len(
+        var length = pending if state.retain_capacity or state.head >= len(
             state.bytes
-        )
+        ) // 2 else len(state.bytes)
         var room = (
             max(state.bytes.capacity(), state.budget.remaining()) - length
         )

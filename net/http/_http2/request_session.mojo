@@ -608,7 +608,7 @@ struct Http2RequestSession(Movable):
         frame: FrameParseResult,
         payload: Span[Byte, origin],
         mut output: List[Byte],
-    ) -> Http2RequestStreamResult:
+    ) raises -> Http2RequestStreamResult:
         var index = self._find_stream(frame.stream_id)
         var data = parse_data_frame(frame, payload)
         if not data.is_valid():
