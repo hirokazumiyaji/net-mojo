@@ -1,5 +1,7 @@
-"""Assembles completed HTTP/2 requests for one connection."""
+"""Dispatches HTTP/2 request heads or completed buffered requests."""
 
+from net.http._buffer import SharedBufferBudget
+from net.http._body_pipe import _BodyPipe
 from net import Timeout
 from std.collections import Set
 from net.http.request import HttpVersion, Request
@@ -75,6 +77,20 @@ struct Http2RequestSessionResult(Movable):
             ),
         )
 
+    @staticmethod
+    def head(
+        consumed: Int,
+        stream_id: UInt32,
+        var output: List[Byte],
+        var request: Request,
+    ) -> Self:
+        var result = Self.complete(consumed, stream_id, output^, request^)
+        result.kind = 4
+        return result^
+
+    def is_head(self) -> Bool:
+        return self.kind == 4
+
     def is_pending(self) -> Bool:
         return self.kind == 1
 
@@ -116,6 +132,10 @@ struct Http2RequestSession(Movable):
     var _send_window: Http2FlowWindow
     var _max_active_streams: Int
     var _max_body_size: Int
+    var _body_budget: Optional[SharedBufferBudget]
+    var _body_wakeup_fd: Int32
+    var _initial_receive_window: Int
+    var _settings_acknowledged: Bool
     var _max_headers_bytes: Int
     var _max_headers_count: Int
     var _max_trailer_bytes: Int
@@ -143,13 +163,22 @@ struct Http2RequestSession(Movable):
         max_control_frames_per_second: Int = 1000,
         max_resets_per_second: Int = 100,
         max_new_streams_per_second: Int = 10000,
+        var request_body_budget: Optional[SharedBufferBudget] = None,
+        body_wakeup_fd: Int32 = -1,
     ):
+        self._initial_receive_window = min(
+            max_body_size, 65535
+        ) if request_body_budget else 65535
+        self._settings_acknowledged = False
+        self._body_budget = request_body_budget^
+        self._body_wakeup_fd = body_wakeup_fd
         self._input = Http2ServerConnectionInput(
             max_concurrent_streams=max_active_streams,
             max_control_frames_per_second=max_control_frames_per_second,
             max_resets_per_second=max_resets_per_second,
             max_new_streams_per_second=max_new_streams_per_second,
             max_header_list_size=max_headers_bytes,
+            initial_receive_window=self._initial_receive_window,
         )
         self._decoder = None
         self._library_path = library_path^
@@ -180,19 +209,32 @@ struct Http2RequestSession(Movable):
         self._failed = (
             max_active_streams < 0
             or max_body_size < 0
+            or (self._body_budget and max_body_size == 0)
             or max_headers_bytes < 0
             or max_headers_count < 0
             or max_trailer_bytes < 0
             or max_trailer_count < 0
         )
 
+    def _fail(mut self):
+        self._failed = True
+        self._pending_headers_at = NO_DEADLINE
+        for i in range(len(self._streams)):
+            self._streams[i].body_at = NO_DEADLINE
+            self._streams[i].stream.cancel_input()
+
     def begin_shutdown(mut self, error_code: UInt32 = UInt32(0)) -> List[Byte]:
-        if self._draining:
-            return List[Byte]()
-        self._draining = True
-        var goaway = encode_goaway_frame(self._last_stream_id, error_code)
         var output = List[Byte]()
-        output.extend(Span(goaway.wire))
+        if not self._draining:
+            self._draining = True
+            var goaway = encode_goaway_frame(self._last_stream_id, error_code)
+            output.extend(Span(goaway.wire))
+        var index = 0
+        while index < len(self._streams):
+            if self._streams[index].stream.is_streaming():
+                self._cancel_stream_at(index, output)
+            else:
+                index += 1
         return output^
 
     def next_deadline(self) -> Int:
@@ -215,7 +257,7 @@ struct Http2RequestSession(Movable):
             self._pending_headers_at != NO_DEADLINE
             and now >= self._pending_headers_at
         ):
-            self._failed = True
+            self._fail()
             self._pending_headers_at = NO_DEADLINE
             return output^
 
@@ -228,7 +270,7 @@ struct Http2RequestSession(Movable):
             var stream_id = expired[i]
             if not self._append_reset(output, stream_id, UInt32(8)):
                 return output^
-            self._remove_stream(stream_id)
+            self._remove_stream(stream_id, output)
         return output^
 
     def _connection_error(
@@ -237,7 +279,7 @@ struct Http2RequestSession(Movable):
         var output: List[Byte],
         error_code: UInt32 = UInt32(1),
     ) -> Http2RequestSessionResult:
-        self._failed = True
+        self._fail()
         self._draining = True
         var goaway = encode_goaway_frame(self._last_stream_id, error_code)
         output.extend(Span(goaway.wire))
@@ -254,6 +296,7 @@ struct Http2RequestSession(Movable):
         while consumed < len(data):
             var input = self._input.consume(data[consumed:])
             consumed += input.consumed
+            self._apply_settings_ack()
             if input.is_error():
                 output.extend(Span(input.output))
                 return self._connection_error(consumed, output^, input.value)
@@ -273,12 +316,12 @@ struct Http2RequestSession(Movable):
                 # close-after-flush; leaving it false keeps the connection
                 # open until idle timeout with no further readable progress.
                 self._draining = True
-                self._failed = True
+                self._fail()
                 var goaway = encode_goaway_frame(
                     self._last_stream_id, UInt32(11)
                 )
                 if not goaway.is_complete():
-                    self._failed = True
+                    self._fail()
                     return Http2RequestSessionResult.error(consumed, output^)
                 output.extend(Span(goaway.wire))
                 return Http2RequestSessionResult.pending(consumed, output^)
@@ -329,10 +372,12 @@ struct Http2RequestSession(Movable):
                                 return Http2RequestSessionResult.error(
                                     consumed, output^
                                 )
-                            self._remove_stream(decoded.stream_id)
-                            continue
+                            self._remove_stream(decoded.stream_id, output)
+                            return Http2RequestSessionResult.pending(
+                                consumed, output^, decoded.stream_id
+                            )
                         if request_result.is_error():
-                            self._failed = True
+                            self._fail()
                             return Http2RequestSessionResult.error(
                                 consumed, output^
                             )
@@ -343,6 +388,28 @@ struct Http2RequestSession(Movable):
                                 return Http2RequestSessionResult.error(
                                     consumed, output^
                                 )
+                            continue
+                        var head_index = self._find_stream(decoded.stream_id)
+                        if (
+                            head_index >= 0
+                            and self._streams[head_index].stream.head_ready()
+                        ):
+                            if not self._streams[
+                                head_index
+                            ].stream.is_complete():
+                                self._streams[
+                                    head_index
+                                ].body_at = deadline_from_now(
+                                    self._body_deadline
+                                )
+                            var request = self._streams[
+                                head_index
+                            ].stream.take_head()
+                            return Http2RequestSessionResult.head(
+                                consumed, decoded.stream_id, output^, request^
+                            )
+                        if request_result.is_complete() and self._body_budget:
+                            self._streams[head_index].body_at = NO_DEADLINE
                             continue
                         if request_result.is_complete():
                             var request = self._take_request(decoded.stream_id)
@@ -378,12 +445,14 @@ struct Http2RequestSession(Movable):
                             return Http2RequestSessionResult.error(
                                 consumed, output^
                             )
-                        self._remove_stream(stream_id)
-                        continue
+                        self._remove_stream(stream_id, output)
+                        return Http2RequestSessionResult.pending(
+                            consumed, output^, stream_id
+                        )
                     elif decoded.is_flooded():
                         self._pending_headers_at = NO_DEADLINE
                         self._draining = True
-                        self._failed = True
+                        self._fail()
                         var goaway = encode_goaway_frame(
                             self._last_stream_id, UInt32(11)
                         )
@@ -396,7 +465,7 @@ struct Http2RequestSession(Movable):
                             consumed, output^
                         )
                     else:
-                        self._failed = True
+                        self._fail()
                         return Http2RequestSessionResult.error(
                             consumed, output^
                         )
@@ -415,7 +484,7 @@ struct Http2RequestSession(Movable):
                             return Http2RequestSessionResult.error(
                                 consumed, output^
                             )
-                        self._remove_stream(input.stream_id)
+                        self._remove_stream(input.stream_id, output)
                         return Http2RequestSessionResult.pending(
                             consumed, output^, input.stream_id
                         )
@@ -426,10 +495,12 @@ struct Http2RequestSession(Movable):
                             return Http2RequestSessionResult.error(
                                 consumed, output^
                             )
-                        self._remove_stream(input.stream_id)
-                        continue
+                        self._remove_stream(input.stream_id, output)
+                        return Http2RequestSessionResult.pending(
+                            consumed, output^, input.stream_id
+                        )
                     if request_result.is_error():
-                        self._failed = True
+                        self._fail()
                         return Http2RequestSessionResult.error(
                             consumed, output^
                         )
@@ -440,7 +511,18 @@ struct Http2RequestSession(Movable):
                             return Http2RequestSessionResult.error(
                                 consumed, output^
                             )
-                        self._remove_stream(input.stream_id)
+                        self._remove_stream(input.stream_id, output)
+                        return Http2RequestSessionResult.pending(
+                            consumed, output^, input.stream_id
+                        )
+                    if (
+                        request_result.is_pending()
+                        and self._find_stream(input.stream_id) < 0
+                    ):
+                        return Http2RequestSessionResult.pending(
+                            consumed, output^, input.stream_id
+                        )
+                    if request_result.is_complete() and self._body_budget:
                         continue
                     if request_result.is_complete():
                         var request = self._take_request(input.stream_id)
@@ -451,9 +533,9 @@ struct Http2RequestSession(Movable):
                 if input.stream_id > self._last_stream_id or (
                     input.stream_id & UInt32(1)
                 ) == UInt32(0):
-                    self._failed = True
+                    self._fail()
                     return Http2RequestSessionResult.error(consumed, output^)
-                self._remove_stream(input.stream_id)
+                self._remove_stream(input.stream_id, output)
                 if not self._reset_history_full():
                     self._peer_reset_streams.add(input.stream_id)
                 if self._reset_history_full():
@@ -500,7 +582,7 @@ struct Http2RequestSession(Movable):
                         if input.stream_id > self._last_stream_id or (
                             input.stream_id & UInt32(1)
                         ) == UInt32(0):
-                            self._failed = True
+                            self._fail()
                             return Http2RequestSessionResult.error(
                                 consumed, output^
                             )
@@ -512,7 +594,7 @@ struct Http2RequestSession(Movable):
                             return Http2RequestSessionResult.error(
                                 consumed, output^
                             )
-                        self._remove_stream(input.stream_id)
+                        self._remove_stream(input.stream_id, output)
                         return Http2RequestSessionResult.pending(
                             consumed, output^, input.stream_id
                         )
@@ -526,7 +608,7 @@ struct Http2RequestSession(Movable):
                             return Http2RequestSessionResult.error(
                                 consumed, output^
                             )
-                        self._remove_stream(input.stream_id)
+                        self._remove_stream(input.stream_id, output)
                         return Http2RequestSessionResult.pending(
                             consumed, output^, input.stream_id
                         )
@@ -575,10 +657,31 @@ struct Http2RequestSession(Movable):
             ):
                 return Http2RequestStreamResult.error()
             self._last_stream_id = decoded.stream_id
-            if len(self._send_streams) >= self._max_active_streams:
+            var active = len(self._send_streams)
+            for i in range(len(self._streams)):
+                if self._find_send_stream(self._streams[i].stream_id) < 0:
+                    active += 1
+            if active >= self._max_active_streams:
                 return Http2RequestStreamResult.refused()
-            var stream = Http2RequestStream(self._max_body_size)
-            var receive_window = Http2FlowWindow(65535, 65535)
+            var pipe: Optional[_BodyPipe] = None
+            if self._body_budget:
+                try:
+                    pipe = Optional(
+                        _BodyPipe(
+                            self._initial_receive_window if self._settings_acknowledged else 65535,
+                            self._body_budget.value().copy(),
+                            self._body_wakeup_fd,
+                            reserve_capacity=True,
+                        )
+                    )
+                except:
+                    return Http2RequestStreamResult.refused()
+            var stream = Http2RequestStream(self._max_body_size, pipe^)
+            var receive_window = Http2FlowWindow(
+                65535,
+                self._initial_receive_window if self._settings_acknowledged
+                or not self._body_budget else 65535,
+            )
             var entry = _Http2RequestEntry(
                 stream_id=decoded.stream_id,
                 stream=stream^,
@@ -613,19 +716,14 @@ struct Http2RequestSession(Movable):
         var data = parse_data_frame(frame, payload)
         if not data.is_valid():
             return Http2RequestStreamResult.error()
-        if index < 0:
+        if not self._receive_window.receive_data(frame.payload_length):
+            return Http2RequestStreamResult.error()
+        if index < 0 or self._streams[index].stream.is_complete():
             if (frame.stream_id & UInt32(1)) == UInt32(
                 1
             ) and frame.stream_id <= self._last_stream_id:
+                _ = self._receive_window.release_received(frame.payload_length)
                 if frame.payload_length > 0:
-                    if not self._receive_window.receive_data(
-                        frame.payload_length
-                    ):
-                        return Http2RequestStreamResult.error()
-                    if not self._receive_window.release_received(
-                        frame.payload_length
-                    ):
-                        return Http2RequestStreamResult.error()
                     _append_window_update(
                         output, UInt32(0), frame.payload_length
                     )
@@ -635,38 +733,93 @@ struct Http2RequestSession(Movable):
                     return Http2RequestStreamResult.peer_reset()
                 return Http2RequestStreamResult.closed()
             return Http2RequestStreamResult.error()
-        if not self._receive_window.receive_data(
-            frame.payload_length
-        ) or not self._streams[index].receive_window.receive_data(
+        if not self._streams[index].receive_window.receive_data(
             frame.payload_length
         ):
-            return Http2RequestStreamResult.error()
-        var received = self._streams[index].stream.receive_data(data, payload)
-        if received.is_too_large():
-            if not self._receive_window.release_received(frame.payload_length):
-                return Http2RequestStreamResult.error()
-            _append_window_update(output, UInt32(0), frame.payload_length)
-            return received^
-        if received.is_malformed():
+            _ = self._receive_window.release_received(frame.payload_length)
             if frame.payload_length > 0:
-                if not self._receive_window.release_received(
-                    frame.payload_length
-                ):
-                    return Http2RequestStreamResult.error()
                 _append_window_update(output, UInt32(0), frame.payload_length)
-            return received^
+            _ = self._append_reset(output, frame.stream_id, UInt32(3))
+            self._remove_stream(frame.stream_id, output)
+            return Http2RequestStreamResult.pending()
+        var received = self._streams[index].stream.receive_data(data, payload)
         if not received.is_pending() and not received.is_complete():
             return received^
-        if frame.payload_length > 0:
-            if not self._receive_window.release_received(
-                frame.payload_length
-            ) or not self._streams[index].receive_window.release_received(
-                frame.payload_length
-            ):
-                return Http2RequestStreamResult.error()
-            _append_window_update(output, UInt32(0), frame.payload_length)
-            _append_window_update(output, frame.stream_id, frame.payload_length)
+        var credit = frame.payload_length
+        if self._streams[index].stream.is_streaming():
+            credit -= data.data_length
+            if received.is_complete():
+                self._streams[index].body_at = NO_DEADLINE
+            elif data.data_length > 0:
+                self._streams[index].body_at = deadline_from_now(
+                    self._body_deadline
+                )
+        if credit > 0:
+            _ = self._receive_window.release_received(credit)
+            _ = self._streams[index].receive_window.release_received(credit)
+            _append_window_update(output, UInt32(0), credit)
+            _append_window_update(output, frame.stream_id, credit)
         return received^
+
+    def _apply_settings_ack(mut self):
+        if (
+            self._settings_acknowledged
+            or not self._input.settings_acknowledged()
+        ):
+            return
+        self._settings_acknowledged = True
+        if not self._body_budget:
+            return
+        var delta = self._initial_receive_window - 65535
+        for i in range(len(self._streams)):
+            self._streams[i].receive_window.adjust_initial_receive_window(delta)
+            self._streams[i].stream.body_pipe().set_limit(
+                self._initial_receive_window
+            )
+
+    def flush_body_credit(mut self) -> List[Byte]:
+        var output = List[Byte]()
+        var i = 0
+        while i < len(self._streams):
+            if not self._streams[i].stream.is_streaming():
+                i += 1
+                continue
+            var pipe = self._streams[i].stream.body_pipe()
+            var credit = pipe.take_consumed()
+            if credit > 0:
+                _ = self._receive_window.release_received(credit)
+                _ = self._streams[i].receive_window.release_received(credit)
+                _append_window_update(output, UInt32(0), credit)
+                if not self._streams[i].stream.is_complete():
+                    _append_window_update(
+                        output, self._streams[i].stream_id, credit
+                    )
+            if self._streams[i].stream.is_complete() and pipe.is_eof():
+                var remaining = self._streams[
+                    i
+                ].receive_window.pending_receive_credit()
+                if remaining > 0:
+                    _ = self._receive_window.release_received(remaining)
+                    _append_window_update(output, UInt32(0), remaining)
+                pipe._stop_loop_wakeup()
+                self._remove_stream_at(i)
+            else:
+                i += 1
+        return output^
+
+    def _cancel_stream_at(mut self, index: Int, mut output: List[Byte]):
+        var credit = self._streams[
+            index
+        ].receive_window.pending_receive_credit()
+        self._streams[index].stream.cancel_input()
+        if credit > 0:
+            _ = self._receive_window.release_received(credit)
+            _append_window_update(output, UInt32(0), credit)
+        self._remove_stream_at(index)
+
+    def __deinit__(deinit self):
+        for i in range(len(self._streams)):
+            self._streams[i].stream.cancel_input()
 
     def _find_stream(self, stream_id: UInt32) -> Int:
         for i in range(len(self._streams)):
@@ -723,15 +876,21 @@ struct Http2RequestSession(Movable):
             if index < len(self._send_streams):
                 self._send_streams[index] = last^
 
-    def reset_response(mut self, stream_id: UInt32):
+    def reset_response_credit_size(self, stream_id: UInt32) -> Int:
+        var index = self._find_stream(stream_id)
+        if index >= 0 and self._streams[index].receive_window.pending_receive_credit() > 0:
+            return 13
+        return 0
+
+    def reset_response(mut self, stream_id: UInt32, mut output: List[Byte]):
         _ = self._remember_local_reset(stream_id)
-        self._remove_stream(stream_id)
+        self._remove_stream(stream_id, output)
 
     def refuse_stream(
         mut self, stream_id: UInt32, error_code: UInt32
     ) -> List[Byte]:
-        self._remove_stream(stream_id)
         var output = List[Byte]()
+        self._remove_stream(stream_id, output)
         _ = self._append_reset(output, stream_id, error_code)
         return output^
 
@@ -745,10 +904,10 @@ struct Http2RequestSession(Movable):
         var entry = self._streams.pop(self._find_stream(stream_id))
         return entry^.take_request()
 
-    def _remove_stream(mut self, stream_id: UInt32):
+    def _remove_stream(mut self, stream_id: UInt32, mut output: List[Byte]):
         var index = self._find_stream(stream_id)
         if index >= 0:
-            self._remove_stream_at(index)
+            self._cancel_stream_at(index, output)
         var send_index = self._find_send_stream(stream_id)
         if send_index >= 0:
             var last = self._send_streams.pop()
@@ -760,7 +919,7 @@ struct Http2RequestSession(Movable):
     ) -> Bool:
         var reset = encode_rst_stream_frame(stream_id, code)
         if not reset.is_complete():
-            self._failed = True
+            self._fail()
             return False
         output.extend(Span(reset.wire))
         if not self._remember_local_reset(stream_id):
@@ -774,7 +933,7 @@ struct Http2RequestSession(Movable):
             if not self._reset_history_full():
                 self._locally_reset_streams.add(stream_id)
             if self._reset_history_full():
-                self._failed = True
+                self._fail()
         return not self._failed
 
     def _reset_history_full(self) -> Bool:

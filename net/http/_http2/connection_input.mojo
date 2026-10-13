@@ -156,6 +156,7 @@ struct Http2ServerConnectionInput(Movable):
     var _max_control_frames_per_second: Int
     var _max_resets_per_second: Int
     var _max_new_streams_per_second: Int
+    var _settings_acknowledged: Bool
 
     def __init__(
         out self,
@@ -165,9 +166,13 @@ struct Http2ServerConnectionInput(Movable):
         max_resets_per_second: Int = 100,
         max_new_streams_per_second: Int = 10000,
         max_header_list_size: Int = 32768,
+        initial_receive_window: Int = 65535,
     ):
         self._bootstrap = Http2ConnectionBootstrap(
-            max_frame_size, max_concurrent_streams, max_header_list_size
+            max_frame_size,
+            max_concurrent_streams,
+            max_header_list_size,
+            initial_receive_window,
         )
         self._reader = Http2FrameReader(max_frame_size)
         self._max_control_frames_per_second = max_control_frames_per_second
@@ -180,6 +185,10 @@ struct Http2ServerConnectionInput(Movable):
             max_new_streams_per_second,
         )
         self._failed = False
+        self._settings_acknowledged = False
+
+    def settings_acknowledged(self) -> Bool:
+        return self._settings_acknowledged
 
     def consume[
         origin: Origin
@@ -256,6 +265,8 @@ struct Http2ServerConnectionInput(Movable):
                 8, consumed, dispatched.stream_id, dispatched.value
             )
         if dispatched.is_ignored():
+            if read.frame_type == Byte(4) and (read.flags & Byte(1)) != Byte(0):
+                self._settings_acknowledged = True
             if read.frame_type == Byte(4) or read.frame_type == Byte(6):
                 return Http2ConnectionInputResult.ignored(consumed)
             if (

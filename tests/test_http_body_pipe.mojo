@@ -411,3 +411,48 @@ def test_empty_detached_receive_buffer_is_rejected() raises:
 
 def main() raises:
     TestSuite.discover_tests[__functions_in_module()]().run()
+
+
+def test_reserved_pipe_limit_reduction_respects_peak_budget() raises:
+    var budget = SharedBufferBudget(8)
+    var pipe = _BodyPipe(8, budget.copy(), reserve_capacity=True)
+    assert_true(pipe.push(String("abcdefgh").as_bytes()))
+    pipe.set_limit(2)
+    assert_equal(budget.used(), 8)
+    var buffer = Array[Byte, 4](fill=0)
+    assert_equal(pipe.pop(Span(buffer)), 4)
+    assert_equal(budget.used(), 8)
+    assert_equal(String(from_utf8_lossy=Span(buffer)), "abcd")
+    assert_equal(pipe.pop(Span(buffer)), 4)
+    assert_equal(String(from_utf8_lossy=Span(buffer)), "efgh")
+    assert_equal(budget.used(), 2)
+    assert_true(pipe.push(String("ij").as_bytes()))
+    pipe.push_eof()
+    assert_equal(pipe.pop(Span(buffer)), 2)
+    assert_equal(budget.used(), 0)
+
+
+def test_reserved_pipe_limit_reduction_reserves_overlap_allocation() raises:
+    var budget = SharedBufferBudget(16)
+    var pipe = _BodyPipe(8, budget.copy(), reserve_capacity=True)
+    assert_true(pipe.push(String("abcd").as_bytes()))
+    pipe.set_limit(2)
+    assert_equal(budget.used(), 4)
+    var buffer = Array[Byte, 2](fill=0)
+    assert_equal(pipe.pop(Span(buffer)), 2)
+    assert_equal(budget.used(), 2)
+    assert_equal(pipe.pop(Span(buffer)), 2)
+    pipe.cancel()
+    assert_equal(budget.used(), 0)
+
+
+def test_terminal_pipe_detaches_wakeup_without_cancelling_eof() raises:
+    var budget = SharedBufferBudget(8)
+    var pipe = _BodyPipe(2, budget.copy(), reserve_capacity=True)
+    pipe.push_eof()
+    pipe._state[].loop_wakeup_fd = Int32(123)
+    pipe._stop_loop_wakeup()
+    assert_equal(pipe._state[].loop_wakeup_fd, Int32(-1))
+    assert_true(pipe.is_eof())
+    assert_false(pipe.is_cancelled())
+    assert_equal(len(pipe.trailers()), 0)

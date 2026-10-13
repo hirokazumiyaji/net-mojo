@@ -406,13 +406,14 @@ struct Http2ResponseScheduler(Movable):
                             var rst = encode_rst_stream_frame(
                                 stream_id, UInt32(2)
                             )
-                            if not rst.is_complete() or len(rst.wire) > (
-                                max_output_bytes - len(output)
-                            ):
+                            if not rst.is_complete() or (
+                                len(rst.wire)
+                                + session.reset_response_credit_size(stream_id)
+                            ) > (max_output_bytes - len(output)):
                                 break
                             output.extend(Span(rst.wire))
                             failed.append(stream_id)
-                            session.reset_response(stream_id)
+                            session.reset_response(stream_id, output)
                             completed.append(stream_id)
                             released += (
                                 self._responses[index].reserved_header_bytes
@@ -452,13 +453,14 @@ struct Http2ResponseScheduler(Movable):
                                 var rst = encode_rst_stream_frame(
                                     stream_id, UInt32(2)
                                 )
-                                if not rst.is_complete() or len(rst.wire) > (
-                                    max_output_bytes - len(output)
-                                ):
+                                if not rst.is_complete() or (
+                                    len(rst.wire)
+                                    + session.reset_response_credit_size(stream_id)
+                                ) > (max_output_bytes - len(output)):
                                     break
                                 output.extend(Span(rst.wire))
                                 failed.append(stream_id)
-                                session.reset_response(stream_id)
+                                session.reset_response(stream_id, output)
                                 completed.append(stream_id)
                                 released += (
                                     self._responses[index].reserved_header_bytes
@@ -528,13 +530,14 @@ struct Http2ResponseScheduler(Movable):
                     )
                 if emit_result == _EMIT_RST:
                     var rst = encode_rst_stream_frame(stream_id, UInt32(2))
-                    if not rst.is_complete() or len(rst.wire) > (
-                        max_output_bytes - len(output)
-                    ):
+                    if not rst.is_complete() or (
+                        len(rst.wire)
+                        + session.reset_response_credit_size(stream_id)
+                    ) > (max_output_bytes - len(output)):
                         break
                     output.extend(Span(rst.wire))
                     failed.append(stream_id)
-                    session.reset_response(stream_id)
+                    session.reset_response(stream_id, output)
                     completed.append(stream_id)
                     released += (
                         self._responses[index].reserved_header_bytes
@@ -774,13 +777,14 @@ struct Http2ResponseScheduler(Movable):
                         # instead of deferring forever and starving
                         # queued sibling responses.
                         var rst = encode_rst_stream_frame(stream_id, UInt32(2))
-                        if not rst.is_complete() or len(rst.wire) > (
-                            max_output_bytes - len(output)
-                        ):
+                        if not rst.is_complete() or (
+                            len(rst.wire)
+                            + session.reset_response_credit_size(stream_id)
+                        ) > (max_output_bytes - len(output)):
                             break
                         output.extend(Span(rst.wire))
                         failed.append(stream_id)
-                        session.reset_response(stream_id)
+                        session.reset_response(stream_id, output)
                         completed.append(stream_id)
                         released += (
                             self._responses[index].reserved_header_bytes
@@ -811,13 +815,14 @@ struct Http2ResponseScheduler(Movable):
                     )
                 if trailer_encode.is_too_large():
                     var rst = encode_rst_stream_frame(stream_id, UInt32(2))
-                    if not rst.is_complete() or len(rst.wire) > (
-                        max_output_bytes - len(output)
-                    ):
+                    if not rst.is_complete() or (
+                        len(rst.wire)
+                        + session.reset_response_credit_size(stream_id)
+                    ) > (max_output_bytes - len(output)):
                         break
                     output.extend(Span(rst.wire))
                     failed.append(stream_id)
-                    session.reset_response(stream_id)
+                    session.reset_response(stream_id, output)
                     completed.append(stream_id)
                     released += (
                         self._responses[index].reserved_header_bytes

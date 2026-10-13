@@ -1,5 +1,7 @@
 from std.testing import assert_equal, assert_false, assert_true, TestSuite
 
+from net.error import NetErrorKind
+
 from net.http._http2.hpack import Http2HpackDeflater, Http2HpackInflater
 from net.http._http2.frame import FrameParseResult, parse_frame
 from net.http._http2.header_decoder import Http2HeaderDecoder
@@ -2779,6 +2781,102 @@ def test_http2_peer_reset_history_limit_drains_connection() raises:
     assert_true(session.is_failed())
     assert_true(session.is_draining())
     assert_equal(len(session._peer_reset_streams), 256)
+
+
+def test_http2_scheduler_streaming_reset_preserves_credit_and_batch_limit() raises:
+    var budget = SharedBufferBudget(8)
+    var session = Http2RequestSession(
+        "build/http2/libnet_hpack",
+        4,
+        4,
+        request_body_budget=Optional(budget.copy()),
+    )
+    _bootstrap_session(session)
+    var empty = List[Byte]()
+    var ack = List[Byte]()
+    _append_frame(ack, Byte(4), Byte(1), UInt32(0), Span(empty))
+    assert_true(session.consume(Span(ack)).is_pending())
+    var compressed: List[Byte] = [0x83, 0x87, 0x84, 0x01, 0x01, 0x78]
+    var opening1 = List[Byte]()
+    _append_frame(opening1, Byte(1), Byte(4), UInt32(1), Span(compressed))
+    var head1 = session.consume(Span(opening1))
+    assert_true(head1.is_head())
+    var request1 = head1^.take_request()
+    var reader1 = request1.body_reader()
+    var opening3 = List[Byte]()
+    _append_frame(opening3, Byte(1), Byte(4), UInt32(3), Span(compressed))
+    var head3 = session.consume(Span(opening3))
+    assert_true(head3.is_head())
+    var request3 = head3^.take_request()
+    var reader3 = request3.body_reader()
+    var payload: List[Byte] = [Byte(97), Byte(98), Byte(99), Byte(100)]
+    var input1 = List[Byte]()
+    _append_frame(input1, Byte(0), Byte(0), UInt32(1), Span(payload))
+    var received1 = session.consume(Span(input1))
+    assert_true(received1.is_pending())
+    assert_equal(len(received1.output), 0)
+    var partial = Array[Byte, 2](fill=0)
+    assert_equal(reader1.read(Span(partial)), 2)
+    assert_equal(session._receive_window.receive_window(), 65531)
+    assert_equal(budget.used(), 8)
+    assert_equal(session.reset_response_credit_size(UInt32(1)), 13)
+
+    var scheduler = Http2ResponseScheduler()
+    var deflater = _make_deflater()
+    assert_true(_enqueue_response(scheduler, UInt32(1), 200, List[Byte]()))
+    var tight = scheduler.drain(
+        session, deflater, "Thu, 01 Jan 1970 00:00:00 GMT", 16384, 13
+    )
+    assert_equal(len(tight.wire), 0)
+    assert_equal(len(tight.failed_streams), 0)
+    assert_equal(len(tight.completed_streams), 0)
+    assert_equal(scheduler.queued_count(), 1)
+    assert_equal(len(session._locally_reset_streams), 0)
+    assert_equal(session._receive_window.receive_window(), 65531)
+    assert_equal(session.reset_response_credit_size(UInt32(1)), 13)
+    assert_equal(budget.used(), 8)
+
+    var batch = scheduler.drain(
+        session, deflater, "Thu, 01 Jan 1970 00:00:00 GMT", 16384, 26
+    )
+    assert_equal(len(batch.wire), 26)
+    var reset = parse_frame(Span(batch.wire))
+    assert_true(reset.is_complete())
+    assert_equal(reset.frame_type, Byte(3))
+    assert_equal(reset.stream_id, UInt32(1))
+    var reset_fields = parse_rst_stream_frame(reset, Span(batch.wire)[9:13])
+    assert_true(reset_fields.is_valid())
+    assert_equal(reset_fields.error_code, UInt32(2))
+    var update = parse_frame(Span(batch.wire)[13:])
+    assert_true(update.is_complete())
+    assert_equal(update.frame_type, Byte(8))
+    assert_equal(update.stream_id, UInt32(0))
+    var fields = parse_window_update_frame(update, Span(batch.wire)[22:26])
+    assert_true(fields.is_valid())
+    assert_equal(fields.increment, UInt32(4))
+    assert_equal(scheduler.queued_count(), 0)
+    assert_equal(session._receive_window.receive_window(), 65535)
+    assert_equal(session.reset_response_credit_size(UInt32(1)), 0)
+    assert_true(UInt32(1) in session._locally_reset_streams)
+    assert_equal(budget.used(), 4)
+    var cancelled = False
+    try:
+        _ = reader1.read(Span(partial))
+    except error:
+        cancelled = error.kind == NetErrorKind.cancelled()
+    assert_true(cancelled)
+    var no_duplicate_credit = session.flush_body_credit()
+    assert_equal(len(no_duplicate_credit), 0)
+
+    var sibling = List[Byte]()
+    _append_frame(sibling, Byte(0), Byte(0), UInt32(3), Span(payload))
+    assert_true(session.consume(Span(sibling)).is_pending())
+    assert_false(session.is_failed())
+    var buffer = Array[Byte, 4](fill=0)
+    assert_equal(reader3.read(Span(buffer)), 4)
+    var sibling_credit = session.flush_body_credit()
+    assert_equal(len(sibling_credit), 26)
+    assert_equal(session._receive_window.receive_window(), 65535)
 
 
 def main() raises:

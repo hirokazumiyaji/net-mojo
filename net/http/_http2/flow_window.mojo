@@ -30,7 +30,7 @@ struct Http2FlowWindow(Movable):
         return True
 
     def receive_data(mut self, flow_bytes: Int) -> Bool:
-        if flow_bytes < 0 or flow_bytes > self._receive_window:
+        if flow_bytes < 0 or flow_bytes > max(0, self._receive_window):
             return False
         self._receive_window -= flow_bytes
         self._pending_receive_credit += flow_bytes
@@ -54,6 +54,9 @@ struct Http2FlowWindow(Movable):
         self._send_window += delta
         self._initial_send_window = value
         return True
+
+    def adjust_initial_receive_window(mut self, delta: Int):
+        self._receive_window += delta
 
     def send_window(self) -> Int:
         return self._send_window

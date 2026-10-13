@@ -204,8 +204,11 @@ struct Http2RequestStream(Movable):
         self.cancel_input()
 
     def cancel_input(self):
-        if self._body.is_streaming() and not self._body.pipe().is_eof():
-            self._body.pipe().cancel()
+        if self._body.is_streaming():
+            if self._body.pipe().is_eof():
+                self._body.pipe()._stop_loop_wakeup()
+            else:
+                self._body.pipe().cancel()
 
     def __deinit__(deinit self):
         if not self._ready:

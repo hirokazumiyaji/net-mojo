@@ -57,12 +57,45 @@ struct _BodyPipeState(Movable):
         self.mutex.destroy()
 
 
-# Keep owned-field replacement from moving the live native mutex.
+# Preserve the addresses of the live native synchronization objects.
 def _drop_body_bytes[origin: MutOrigin](state: Pointer[_BodyPipeState, origin]):
     var bytes_ptr = Pointer(to=state[].bytes)
     var bytes = bytes_ptr.unsafe_take_pointee()
     bytes_ptr.unsafe_write(List[Byte]())
     var capacity = bytes.capacity()
+    _ = bytes^
+    state[].head = 0
+    state[].budget.release(capacity)
+
+
+def _shrink_body_capacity[
+    origin: MutOrigin
+](state: Pointer[_BodyPipeState, origin]):
+    var pending = len(state[].bytes) - state[].head
+    var target = max(state[].limit, pending)
+    var capacity = state[].bytes.capacity()
+    if not state[].retain_capacity or capacity <= target:
+        return
+    if pending == 0:
+        var bytes_ptr = Pointer(to=state[].bytes)
+        var bytes = bytes_ptr.unsafe_take_pointee()
+        bytes_ptr.unsafe_write(List[Byte]())
+        _ = bytes^
+        state[].head = 0
+        state[].budget.release(capacity - target)
+        state[].bytes.reserve(target)
+        return
+    if pending > state[].limit and pending > capacity // 2:
+        return
+    if not state[].budget.try_reserve(target):
+        return
+    var replacement = List[Byte]()
+    replacement.reserve(target)
+    for i in range(pending):
+        replacement.append(state[].bytes[state[].head + i])
+    var bytes_ptr = Pointer(to=state[].bytes)
+    var bytes = bytes_ptr.unsafe_take_pointee()
+    bytes_ptr.unsafe_write(replacement^)
     _ = bytes^
     state[].head = 0
     state[].budget.release(capacity)
@@ -105,6 +138,13 @@ struct _BodyPipe(Copyable):
             self._state[].bytes.reserve(limit)
             self._state[].retain_capacity = True
 
+    def set_limit(self, limit: Int):
+        ref state = self._state[]
+        state.mutex.lock()
+        state.limit = limit
+        _shrink_body_capacity(Pointer(to=state))
+        state.mutex.unlock()
+
     def push[origin: ImmOrigin](self, data: Span[Byte, origin]) -> Bool:
         ref state = self._state[]
         state.mutex.lock()
@@ -117,7 +157,7 @@ struct _BodyPipe(Copyable):
             state.mutex.unlock()
             return True
         var pending = len(state.bytes) - state.head
-        if len(data) > state.limit - pending:
+        if len(data) > max(0, state.limit - pending):
             state.mutex.unlock()
             return False
         if state.head > 0 and (
@@ -213,6 +253,7 @@ struct _BodyPipe(Copyable):
                 state.head = 0
             else:
                 _drop_body_bytes(Pointer(to=state))
+        _shrink_body_capacity(Pointer(to=state))
         signal_wakeup_fd(state.loop_wakeup_fd)
         state.mutex.unlock()
         return count
