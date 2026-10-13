@@ -154,6 +154,7 @@ struct RequestBody[origin: ImmOrigin](Movable):
                 None,
                 "body reader cannot be detached",
             )
+        self._pipe.value().mark_reader_detached()
         self._detached = True
         return RequestBodyReceiver(self._pipe.value().copy())
 
