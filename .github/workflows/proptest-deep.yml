@@ -1,0 +1,50 @@
+name: Deep property tests
+
+on:
+  schedule:
+    - cron: "31 3 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  proptest:
+    name: Deep properties (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-14, ubuntu-24.04]
+    env:
+      PROPTEST_MAX_EXAMPLES: "5000"
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      - name: Install pixi
+        uses: prefix-dev/setup-pixi@f00437f565399d418b0acc85936d12c1fb668347
+        with:
+          frozen: true
+          environments: proptest proptest-http2
+      - name: Restore minimized examples
+        uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830
+        with:
+          path: .proptest-mojo/
+          key: ${{ runner.os }}-proptest-v1-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: ${{ runner.os }}-proptest-v1-
+      - name: Explore semantic properties
+        run: pixi run -e proptest test-prop
+      - name: Explore HPACK properties
+        if: ${{ !cancelled() }}
+        run: pixi run -e proptest-http2 test-prop-hpack
+      - name: Save minimized examples
+        if: ${{ !cancelled() }}
+        uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830
+        with:
+          path: .proptest-mojo/
+          key: ${{ runner.os }}-proptest-v1-${{ github.run_id }}-${{ github.run_attempt }}
