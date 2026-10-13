@@ -75,6 +75,24 @@ static int test_streaming_response_ffi(struct NetQuicServer *server) {
     return 0;
 }
 
+static int test_request_input_ffi(struct NetQuicServer *server) {
+    uint8_t body[16];
+    if (net_quic_next_request_head(server, body, sizeof(body)) != -1 ||
+        net_quic_set_request_streaming(server, 1) != 1 ||
+        net_quic_next_request_head(server, body, sizeof(body)) != 0 ||
+        net_quic_read_body(server, 1, body, sizeof(body)) != -2 ||
+        net_quic_read_body(server, 1, body, 0) != -3 ||
+        net_quic_consume_body(server, 1, 1) != -1 ||
+        net_quic_body_trailers(server, 1, body, sizeof(body)) != -1 ||
+        net_quic_release_body(server, 1, 0) != -1 ||
+        net_quic_release_body(server, 1, 2) != -1 ||
+        net_quic_set_request_streaming(server, 2) != -1 ||
+        net_quic_set_request_streaming(server, 0) != 1) {
+        return 12;
+    }
+    return 0;
+}
+
 int main(int argc, char **argv) {
     if (argc != 3 || strcmp(net_quic_version(), "0.29.3") != 0) {
         return 1;
@@ -89,6 +107,10 @@ int main(int argc, char **argv) {
     struct NetQuicServer *server = net_quic_create(config);
     if (server == NULL) {
         return 3;
+    }
+    int input_result = test_request_input_ffi(server);
+    if (input_result != 0) {
+        return input_result;
     }
     int stream_result = test_streaming_response_ffi(server);
     if (stream_result != 0) { return stream_result; }

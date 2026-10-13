@@ -46,6 +46,44 @@ and 16 MiB / 131,072 CRYPTO entries. Initial peer stream counts remain 100
 bidirectional and 3 unidirectional. These bounds do not cover all native send,
 recovery, TLS or allocator memory.
 
+## Provider request input streaming
+
+The provider keeps full-body buffering as its default. Direct provider users
+can call `QuicUDPEndpoint.set_request_streaming(True)` before the first
+connection, then use `try_next_request_head()` to receive a validated head
+without waiting for DATA or FIN. Head records use the same request ID and field
+encoding as buffered requests, with empty body and trailer fields.
+
+`read_body(id, output)` copies at most the caller's output capacity and returns
+`QuicBodyReadResult`. Its state is `data`, `would_block`, `eof`, or `cancelled`;
+only `data` has a positive count. A nonempty output span is required. Reads are
+bounded by the per-request limit on bytes copied but not yet consumed, allowing
+the total upload to exceed that limit as the application makes progress. The
+provider leaves additional DATA in quiche's bounded receive pool.
+
+DATA credit is held after the copy. The application calls
+`consume_body(id, count)` after consuming or discarding those bytes. This returns
+both QUIC stream and connection receive credit. HTTP framing and QPACK control
+bytes retain immediate credit. A count greater than the outstanding DATA debt
+is rejected without changing credit.
+
+`body_trailers(id)` becomes available after a read reports EOF. Initial headers,
+trailers, and input progress remain owned independently of the response route;
+sending response FIN does not retire input. Keep the input ID until queued body
+bytes have been consumed, then call `release_body(id)`. Releasing unfinished
+input discards its remaining receive side through STOP_SENDING while leaving
+response output available. `release_body(id, cancel=True)` cancels both sides.
+Reset, STOP_SENDING on active output, invalid trailers, body timeout, and
+connection teardown cancel input and refund retained metadata and DATA debt.
+The body timeout advances on DATA readiness, positive reads, and consumption.
+
+At the C boundary, `net_quic_read_body` returns positive byte counts, zero for
+EOF, -1 for would-block, -2 for cancellation, and -3 for invalid arguments.
+Head and trailer record functions return a negative required capacity when the
+output is too small and preserve the record for retry. Configuration,
+consumption, and release return 1 on success and -1 on rejection. The Mojo
+wrapper converts read statuses into the typed result above.
+
 ## Same-origin operation
 
 `examples/http3_hello.mojo` registers TCP HTTPS and UDP HTTP/3 on

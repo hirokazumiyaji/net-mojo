@@ -57,6 +57,19 @@ uint64_t net_quic_server_timeout_micros(
 void net_quic_server_on_timeout(struct NetQuicServer *server);
 int32_t net_quic_server_next_request(
     struct NetQuicServer *server, uint8_t *output, size_t output_capacity);
+int32_t net_quic_server_set_request_streaming(struct NetQuicServer *server, int32_t enabled);
+int32_t net_quic_server_next_request_head(struct NetQuicServer *server, uint8_t *output, size_t capacity);
+int64_t net_quic_server_read_body(struct NetQuicServer *server, uint64_t id, uint8_t *output, size_t capacity);
+int32_t net_quic_server_consume_body(struct NetQuicServer *server, uint64_t id, size_t bytes);
+int32_t net_quic_server_body_trailers(struct NetQuicServer *server, uint64_t id, uint8_t *output, size_t capacity);
+int32_t net_quic_server_release_body(struct NetQuicServer *server, uint64_t id, int32_t cancel);
+int32_t net_quic_set_request_streaming(struct NetQuicServer *server, int32_t enabled);
+int32_t net_quic_next_request_head(struct NetQuicServer *server, uint8_t *output, size_t capacity);
+int64_t net_quic_read_body(struct NetQuicServer *server, uint64_t id, uint8_t *output, size_t capacity);
+int32_t net_quic_consume_body(struct NetQuicServer *server, uint64_t id, size_t bytes);
+int32_t net_quic_body_trailers(struct NetQuicServer *server, uint64_t id, uint8_t *output, size_t capacity);
+int32_t net_quic_release_body(struct NetQuicServer *server, uint64_t id, int32_t cancel);
+
 int32_t net_quic_server_start_response(struct NetQuicServer *server, uint64_t request_id, uint32_t status, const uint8_t *headers, size_t length);
 int32_t net_quic_start_response(struct NetQuicServer *server, uint64_t request_id, uint32_t status, const uint8_t *headers, size_t length);
 int64_t net_quic_server_stream_capacity(struct NetQuicServer *server, uint64_t request_id);

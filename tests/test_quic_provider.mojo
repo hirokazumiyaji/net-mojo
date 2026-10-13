@@ -4,7 +4,7 @@ from std.time import perf_counter_ns
 from net._reactor import Reactor
 from net.address import SocketAddress
 from net.error import NetErrorKind
-from net.quic import QuicProvider, QuicUDPEndpoint, _send_at
+from net.quic import QuicProvider, QuicUDPEndpoint, QuicBodyReadState, _send_at
 from net.http import Handler, Request, ResponseWriter, Server, ServerConfig
 from net.timeout import Timeout
 from net.udp import dial_udp, listen_udp
@@ -285,8 +285,40 @@ def test_streaming_response_ffi_rejects_unknown_request() raises:
     assert_true(rejected)
 
 
+def test_request_input_ffi_unknown_and_typed_cancellation() raises:
+    var provider = QuicProvider("build/quic/libnet_quic_provider")
+    var config = provider.server_config(
+        "build/tls/test-cert.pem", "build/tls/test-key.pem"
+    )
+    var listener = listen_udp("127.0.0.1:0")
+    var endpoint = QuicUDPEndpoint(provider.server(config^), listener^)
+    endpoint.set_request_streaming(True)
+    var head = endpoint.try_next_request_head()
+    assert_true(head.id == 0)
+    var output = Array[Byte, 16](fill=0)
+    var result = endpoint.read_body(UInt64(1), Span[mut=True](output))
+    assert_true(result.state == QuicBodyReadState.cancelled())
+    assert_true(result.count == 0)
+    assert_false(endpoint.consume_body(UInt64(1), 1))
+    assert_false(endpoint.release_body(UInt64(1)))
+    var rejected = False
+    try:
+        _ = endpoint.body_trailers(UInt64(1))
+    except error:
+        rejected = error.kind == NetErrorKind.invalid_state()
+    assert_true(rejected)
+    var empty = List[Byte]()
+    rejected = False
+    try:
+        _ = endpoint.read_body(UInt64(1), Span[mut=True](empty))
+    except error:
+        rejected = error.kind == NetErrorKind.invalid_argument()
+    assert_true(rejected)
+
+
 def main() raises:
     test_streaming_response_ffi_rejects_unknown_request()
+    test_request_input_ffi_unknown_and_typed_cancellation()
     var provider = QuicProvider("build/quic/libnet_quic_provider")
     assert_true(provider.version() == "0.29.3")
     var config = provider.server_config(

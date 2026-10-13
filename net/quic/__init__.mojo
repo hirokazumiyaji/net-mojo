@@ -77,6 +77,33 @@ struct QuicSendDatagramResult(Copyable, Movable):
     var delay_ns: UInt64
 
 
+@fieldwise_init
+struct QuicBodyReadState(Copyable, Equatable):
+    var value: UInt8
+
+    @staticmethod
+    def data() -> Self:
+        return Self(value=0)
+
+    @staticmethod
+    def would_block() -> Self:
+        return Self(value=1)
+
+    @staticmethod
+    def eof() -> Self:
+        return Self(value=2)
+
+    @staticmethod
+    def cancelled() -> Self:
+        return Self(value=3)
+
+
+@fieldwise_init
+struct QuicBodyReadResult(Copyable, Movable):
+    var state: QuicBodyReadState
+    var count: Int
+
+
 struct QuicServer(Movable):
     var _library: OwnedDLHandle
     var _server: Pointer[Byte, MutUntrackedOrigin]
@@ -350,13 +377,96 @@ struct QuicServer(Movable):
 
     def next_request[
         origin: MutOrigin
-    ](mut self, output: Span[mut=True, Byte, origin]) raises NetError -> Int:
+    ](
+        mut self, output: Span[mut=True, Byte, origin], head_only: Bool = False
+    ) raises NetError -> Int:
+        if head_only:
+            return Int(
+                self._library.call["net_quic_next_request_head", c_int](
+                    self._server, output.unsafe_ptr(), c_size_t(len(output))
+                )
+            )
         return Int(
             self._library.call["net_quic_next_request", c_int](
                 self._server,
                 output.unsafe_ptr(),
                 c_size_t(len(output)),
             )
+        )
+
+    def set_request_streaming(mut self, enabled: Bool) raises NetError:
+        _require_ok(
+            self._library.call["net_quic_set_request_streaming", c_int](
+                self._server, c_int(enabled)
+            ),
+            "set HTTP/3 request streaming",
+            "request streaming must be configured before the first connection",
+        )
+
+    def read_body[
+        origin: MutOrigin
+    ](
+        mut self, request_id: UInt64, output: Span[mut=True, Byte, origin]
+    ) raises NetError -> QuicBodyReadResult:
+        var result = Int(
+            self._library.call["net_quic_read_body", Int64](
+                self._server,
+                request_id,
+                output.unsafe_ptr(),
+                c_size_t(len(output)),
+            )
+        )
+        if result > 0:
+            return QuicBodyReadResult(
+                state=QuicBodyReadState.data(), count=result
+            )
+        if result == 0:
+            return QuicBodyReadResult(state=QuicBodyReadState.eof(), count=0)
+        if result == -1:
+            return QuicBodyReadResult(
+                state=QuicBodyReadState.would_block(), count=0
+            )
+        if result == -2:
+            return QuicBodyReadResult(
+                state=QuicBodyReadState.cancelled(), count=0
+            )
+        raise NetError(
+            NetErrorKind.invalid_argument(),
+            "read HTTP/3 request body",
+            None,
+            "request body reads require a nonempty output buffer",
+        )
+
+    def consume_body(mut self, request_id: UInt64, count: Int) -> Bool:
+        return (
+            self._library.call["net_quic_consume_body", c_int](
+                self._server, request_id, c_size_t(count)
+            )
+            == 1
+        )
+
+    def body_trailers[
+        origin: MutOrigin
+    ](
+        mut self, request_id: UInt64, output: Span[mut=True, Byte, origin]
+    ) -> Int:
+        return Int(
+            self._library.call["net_quic_body_trailers", c_int](
+                self._server,
+                request_id,
+                output.unsafe_ptr(),
+                c_size_t(len(output)),
+            )
+        )
+
+    def release_body(
+        mut self, request_id: UInt64, cancel: Bool = False
+    ) -> Bool:
+        return (
+            self._library.call["net_quic_release_body", c_int](
+                self._server, request_id, c_int(cancel)
+            )
+            == 1
         )
 
     def respond[
@@ -761,15 +871,23 @@ struct QuicUDPEndpoint(Movable):
         self._server.on_timeout()
 
     def try_next_request(mut self) raises NetError -> QuicRequest:
+        return self._try_next_request(False)
+
+    def try_next_request_head(mut self) raises NetError -> QuicRequest:
+        return self._try_next_request(True)
+
+    def _try_next_request(
+        mut self, head_only: Bool
+    ) raises NetError -> QuicRequest:
         var length = self._server.next_request(
-            Span[mut=True](self._request_buffer)
+            Span[mut=True](self._request_buffer), head_only
         )
         if length < 0:
             var needed = -length
             if needed > len(self._request_buffer):
                 self._request_buffer = List[Byte](length=needed, fill=0)
                 length = self._server.next_request(
-                    Span[mut=True](self._request_buffer)
+                    Span[mut=True](self._request_buffer), head_only
                 )
         if length == 0:
             return QuicRequest(
@@ -812,6 +930,47 @@ struct QuicUDPEndpoint(Movable):
             capacity = 1_200_000
         if capacity > len(self._request_buffer):
             self._request_buffer = List[Byte](length=capacity, fill=0)
+
+    def set_request_streaming(mut self, enabled: Bool) raises NetError:
+        self._server.set_request_streaming(enabled)
+
+    def read_body[
+        origin: MutOrigin
+    ](
+        mut self, request_id: UInt64, output: Span[mut=True, Byte, origin]
+    ) raises NetError -> QuicBodyReadResult:
+        return self._server.read_body(request_id, output)
+
+    def consume_body(mut self, request_id: UInt64, count: Int) -> Bool:
+        return self._server.consume_body(request_id, count)
+
+    def body_trailers(
+        mut self, request_id: UInt64
+    ) raises NetError -> List[QuicRequestHeader]:
+        var length = self._server.body_trailers(
+            request_id, Span[mut=True](self._request_buffer)
+        )
+        if length < 0 and -length > len(self._request_buffer):
+            self._request_buffer = List[Byte](length=-length, fill=0)
+            length = self._server.body_trailers(
+                request_id, Span[mut=True](self._request_buffer)
+            )
+        if length < 0:
+            raise NetError(
+                NetErrorKind.invalid_state(),
+                "receive HTTP/3 request trailers",
+                None,
+                "trailers are available only after request EOF",
+            )
+        var offset = 0
+        return _read_request_fields(
+            Span(self._request_buffer)[0:length], offset
+        )
+
+    def release_body(
+        mut self, request_id: UInt64, cancel: Bool = False
+    ) -> Bool:
+        return self._server.release_body(request_id, cancel)
 
     def respond[
         headers_origin: Origin, body_origin: Origin, trailers_origin: Origin
@@ -890,6 +1049,20 @@ def _read_request_bytes[
     return value^
 
 
+def _read_request_fields[
+    origin: Origin
+](data: Span[Byte, origin], mut offset: Int) -> List[QuicRequestHeader]:
+    var count = Int(_read_request_u32(data, offset))
+    var fields = List[QuicRequestHeader]()
+    for _ in range(count):
+        var name = String(
+            from_utf8_lossy=Span(_read_request_bytes(data, offset))
+        )
+        var value = _read_request_bytes(data, offset)
+        fields.append(QuicRequestHeader(name=name^, value=value^))
+    return fields^
+
+
 def _decode_request_record[
     origin: Origin
 ](data: Span[Byte, origin]) -> QuicRequest:
@@ -902,22 +1075,8 @@ def _decode_request_record[
     var authority = String(
         from_utf8_lossy=Span(_read_request_bytes(data, offset))
     )
-    var header_count = Int(_read_request_u32(data, offset))
-    var headers = List[QuicRequestHeader]()
-    for _ in range(header_count):
-        var name = String(
-            from_utf8_lossy=Span(_read_request_bytes(data, offset))
-        )
-        var value = _read_request_bytes(data, offset)
-        headers.append(QuicRequestHeader(name=name^, value=value^))
-    var trailer_count = Int(_read_request_u32(data, offset))
-    var trailers = List[QuicRequestHeader]()
-    for _ in range(trailer_count):
-        var name = String(
-            from_utf8_lossy=Span(_read_request_bytes(data, offset))
-        )
-        var value = _read_request_bytes(data, offset)
-        trailers.append(QuicRequestHeader(name=name^, value=value^))
+    var headers = _read_request_fields(data, offset)
+    var trailers = _read_request_fields(data, offset)
     var body = _read_request_bytes(data, offset)
     return QuicRequest(
         id=id,

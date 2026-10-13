@@ -154,3 +154,22 @@ int32_t net_quic_cancel_response(struct NetQuicServer *server, uint64_t request_
 int32_t net_quic_poll_stream_events(struct NetQuicServer *server, uint64_t *ids, uint8_t *kinds, size_t capacity) {
     return net_quic_server_poll_stream_events(server, ids, kinds, capacity);
 }
+
+int32_t net_quic_set_request_streaming(struct NetQuicServer *server, int32_t enabled) {
+    return net_quic_server_set_request_streaming(server, enabled);
+}
+int32_t net_quic_next_request_head(struct NetQuicServer *server, uint8_t *output, size_t capacity) {
+    return net_quic_server_next_request_head(server, output, capacity);
+}
+int64_t net_quic_read_body(struct NetQuicServer *server, uint64_t id, uint8_t *output, size_t capacity) {
+    return net_quic_server_read_body(server, id, output, capacity);
+}
+int32_t net_quic_consume_body(struct NetQuicServer *server, uint64_t id, size_t bytes) {
+    return net_quic_server_consume_body(server, id, bytes);
+}
+int32_t net_quic_body_trailers(struct NetQuicServer *server, uint64_t id, uint8_t *output, size_t capacity) {
+    return net_quic_server_body_trailers(server, id, output, capacity);
+}
+int32_t net_quic_release_body(struct NetQuicServer *server, uint64_t id, int32_t cancel) {
+    return net_quic_server_release_body(server, id, cancel);
+}
