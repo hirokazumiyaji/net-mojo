@@ -40,6 +40,14 @@ struct Http2RequestStreamResult(Movable):
     def malformed() -> Self:
         return Self(kind=6)
 
+    @staticmethod
+    def closed() -> Self:
+        return Self(kind=7)
+
+    @staticmethod
+    def peer_reset() -> Self:
+        return Self(kind=8)
+
     def is_pending(self) -> Bool:
         return self.kind == 1
 
@@ -57,6 +65,12 @@ struct Http2RequestStreamResult(Movable):
 
     def is_malformed(self) -> Bool:
         return self.kind == 6
+
+    def is_closed(self) -> Bool:
+        return self.kind == 7
+
+    def is_peer_reset(self) -> Bool:
+        return self.kind == 8
 
 
 def _content_length_matches_body(request: Request, body_len: Int) -> Bool:

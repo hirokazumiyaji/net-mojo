@@ -253,7 +253,7 @@ struct Http2ResponseScheduler(Movable):
                             ):
                                 break
                             output.extend(Span(rst.wire))
-                            session.finish_response(stream_id)
+                            session.reset_response(stream_id)
                             completed.append(stream_id)
                             released += (
                                 self._responses[index].reserved_header_bytes
@@ -298,7 +298,7 @@ struct Http2ResponseScheduler(Movable):
                                 ):
                                     break
                                 output.extend(Span(rst.wire))
-                                session.finish_response(stream_id)
+                                session.reset_response(stream_id)
                                 completed.append(stream_id)
                                 released += (
                                     self._responses[index].reserved_header_bytes
@@ -362,7 +362,7 @@ struct Http2ResponseScheduler(Movable):
                     ):
                         break
                     output.extend(Span(rst.wire))
-                    session.finish_response(stream_id)
+                    session.reset_response(stream_id)
                     completed.append(stream_id)
                     released += (
                         self._responses[index].reserved_header_bytes
@@ -537,7 +537,7 @@ struct Http2ResponseScheduler(Movable):
                         ):
                             break
                         output.extend(Span(rst.wire))
-                        session.finish_response(stream_id)
+                        session.reset_response(stream_id)
                         completed.append(stream_id)
                         released += (
                             self._responses[index].reserved_header_bytes
@@ -571,7 +571,7 @@ struct Http2ResponseScheduler(Movable):
                     ):
                         break
                     output.extend(Span(rst.wire))
-                    session.finish_response(stream_id)
+                    session.reset_response(stream_id)
                     completed.append(stream_id)
                     released += (
                         self._responses[index].reserved_header_bytes

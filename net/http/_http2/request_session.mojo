@@ -1,6 +1,7 @@
 """Assembles completed HTTP/2 requests for one connection."""
 
 from net import Timeout
+from std.collections import Set
 from net.http.request import HttpVersion, Request
 from net.http._deadline import NO_DEADLINE, deadline_from_now
 
@@ -15,6 +16,8 @@ from .flow_window import Http2FlowWindow
 from .header_decoder import Http2HeaderDecodeResult, Http2HeaderDecoder
 from .request_stream import Http2RequestStream, Http2RequestStreamResult
 from .settings_state import Http2PeerSettingsSnapshot
+
+comptime _MAX_RESET_HISTORY = 256
 
 
 @fieldwise_init
@@ -121,6 +124,8 @@ struct Http2RequestSession(Movable):
     var _body_deadline: Timeout
     var _pending_headers_at: Int
     var _last_stream_id: UInt32
+    var _locally_reset_streams: Set[UInt32]
+    var _peer_reset_streams: Set[UInt32]
     var _draining: Bool
     var _failed: Bool
 
@@ -169,6 +174,8 @@ struct Http2RequestSession(Movable):
         self._body_deadline = body_deadline.copy()
         self._pending_headers_at = NO_DEADLINE
         self._last_stream_id = UInt32(0)
+        self._locally_reset_streams = Set[UInt32]()
+        self._peer_reset_streams = Set[UInt32]()
         self._draining = False
         self._failed = (
             max_active_streams < 0
@@ -179,11 +186,11 @@ struct Http2RequestSession(Movable):
             or max_trailer_count < 0
         )
 
-    def begin_shutdown(mut self) -> List[Byte]:
+    def begin_shutdown(mut self, error_code: UInt32 = UInt32(0)) -> List[Byte]:
         if self._draining:
             return List[Byte]()
         self._draining = True
-        var goaway = encode_goaway_frame(self._last_stream_id, UInt32(0))
+        var goaway = encode_goaway_frame(self._last_stream_id, error_code)
         var output = List[Byte]()
         output.extend(Span(goaway.wire))
         return output^
@@ -397,6 +404,21 @@ struct Http2RequestSession(Movable):
                     var request_result = self._receive_data(
                         frame, Span(input.payload), output
                     )
+                    if request_result.is_peer_reset():
+                        return self._connection_error(
+                            consumed, output^, UInt32(5)
+                        )
+                    if request_result.is_closed():
+                        if not self._append_reset(
+                            output, input.stream_id, UInt32(5)
+                        ):
+                            return Http2RequestSessionResult.error(
+                                consumed, output^
+                            )
+                        self._remove_stream(input.stream_id)
+                        return Http2RequestSessionResult.pending(
+                            consumed, output^, input.stream_id
+                        )
                     if request_result.is_malformed():
                         if not self._append_reset(
                             output, input.stream_id, UInt32(1)
@@ -432,6 +454,10 @@ struct Http2RequestSession(Movable):
                     self._failed = True
                     return Http2RequestSessionResult.error(consumed, output^)
                 self._remove_stream(input.stream_id)
+                if not self._reset_history_full():
+                    self._peer_reset_streams.add(input.stream_id)
+                if self._reset_history_full():
+                    return self._connection_error(consumed, output^, UInt32(11))
                 return Http2RequestSessionResult.pending(
                     consumed, output^, input.stream_id
                 )
@@ -591,8 +617,6 @@ struct Http2RequestSession(Movable):
             if (frame.stream_id & UInt32(1)) == UInt32(
                 1
             ) and frame.stream_id <= self._last_stream_id:
-                # DATA may already be in flight before the peer sees RST/END.
-                # Still account for connection flow control and return credit.
                 if frame.payload_length > 0:
                     if not self._receive_window.receive_data(
                         frame.payload_length
@@ -605,7 +629,11 @@ struct Http2RequestSession(Movable):
                     _append_window_update(
                         output, UInt32(0), frame.payload_length
                     )
-                return Http2RequestStreamResult.pending()
+                if self._is_locally_reset(frame.stream_id):
+                    return Http2RequestStreamResult.pending()
+                if frame.stream_id in self._peer_reset_streams:
+                    return Http2RequestStreamResult.peer_reset()
+                return Http2RequestStreamResult.closed()
             return Http2RequestStreamResult.error()
         if not self._receive_window.receive_data(
             frame.payload_length
@@ -695,14 +723,16 @@ struct Http2RequestSession(Movable):
             if index < len(self._send_streams):
                 self._send_streams[index] = last^
 
+    def reset_response(mut self, stream_id: UInt32):
+        _ = self._remember_local_reset(stream_id)
+        self._remove_stream(stream_id)
+
     def refuse_stream(
         mut self, stream_id: UInt32, error_code: UInt32
     ) -> List[Byte]:
         self._remove_stream(stream_id)
-        var reset = encode_rst_stream_frame(stream_id, error_code)
         var output = List[Byte]()
-        if reset.is_complete():
-            output.extend(Span(reset.wire))
+        _ = self._append_reset(output, stream_id, error_code)
         return output^
 
     def _find_send_stream(self, stream_id: UInt32) -> Int:
@@ -733,7 +763,28 @@ struct Http2RequestSession(Movable):
             self._failed = True
             return False
         output.extend(Span(reset.wire))
+        if not self._remember_local_reset(stream_id):
+            var goaway = self.begin_shutdown(UInt32(11))
+            output.extend(Span(goaway))
+            return False
         return True
+
+    def _remember_local_reset(mut self, stream_id: UInt32) -> Bool:
+        if stream_id not in self._locally_reset_streams:
+            if not self._reset_history_full():
+                self._locally_reset_streams.add(stream_id)
+            if self._reset_history_full():
+                self._failed = True
+        return not self._failed
+
+    def _reset_history_full(self) -> Bool:
+        return (
+            len(self._locally_reset_streams) + len(self._peer_reset_streams)
+            >= _MAX_RESET_HISTORY
+        )
+
+    def _is_locally_reset(self, stream_id: UInt32) -> Bool:
+        return stream_id in self._locally_reset_streams
 
     def _remove_stream_at(mut self, index: Int):
         var last = self._streams.pop()

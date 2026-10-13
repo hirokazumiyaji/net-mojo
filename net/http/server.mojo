@@ -1869,6 +1869,16 @@ struct Server(Movable):
         if batch.deflater_failed:
             self._close_conn(idx)
             return
+        if (
+            self._conns[idx].http2_session.value().is_failed()
+            and not self._conns[idx].http2_session.value().is_draining()
+        ):
+            var goaway = (
+                self._conns[idx]
+                .http2_session.value()
+                .begin_shutdown(UInt32(11))
+            )
+            batch.wire.extend(Span(goaway))
         if len(batch.wire) == 0:
             if self._conns[idx].http2_responses.queued_count() > 0:
                 # Still waiting for WINDOW_UPDATE credit; keep the write
