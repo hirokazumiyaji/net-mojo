@@ -4120,6 +4120,41 @@ mod tests {
     }
 
     #[test]
+    fn continue_peer_stop_cancels_target_without_interrupting_sibling() {
+        let (mut server, mut client, mut h3, local, remote) = request_timer_peer();
+        let target = completed_ready_request(&mut server, &mut client, &mut h3, local, remote);
+        let sibling = completed_ready_request(&mut server, &mut client, &mut h3, local, remote);
+        assert!(server.send_continue(target.id));
+        client
+            .stream_shutdown(
+                target.stream_id,
+                quiche::Shutdown::Read,
+                super::H3_REQUEST_CANCELLED,
+            )
+            .unwrap();
+        assert!(server.enqueue_response(sibling.id, 200, vec![], b"sibling".to_vec(), vec![]));
+        for _ in 0..32 {
+            pump_in_memory(
+                &mut client,
+                &mut server,
+                &mut [0; 65535],
+                local,
+                remote,
+                false,
+                false,
+            );
+        }
+        assert_eq!(
+            drain_ready_body(&mut client, &mut h3, sibling.stream_id),
+            (b"sibling".to_vec(), true)
+        );
+        assert!(!server.request_routes.contains_key(&target.id));
+        assert!(!server.send_continue(target.id));
+        assert_eq!(server.buffered_response_bytes, 0);
+        assert!(server.response_timeouts.is_empty());
+    }
+
+    #[test]
     fn continue_invalid_final_response_cancels_and_refunds_placeholder() {
         let (mut server, mut client, mut h3, local, remote) = request_timer_peer();
         let request = completed_ready_request(&mut server, &mut client, &mut h3, local, remote);
