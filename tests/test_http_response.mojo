@@ -1069,5 +1069,62 @@ def test_trailers_wire_capacity_exact_matches_measure() raises:
         assert_equal(wire[i], expected[i])
 
 
+def test_switch_wire_omits_http_body_framing() raises:
+    for status in [101, 200, 204, 205, 299]:
+        var writer = ResponseWriter(32)
+        writer.status = status
+        writer.headers.add(String("Connection"), String("Upgrade"))
+        writer.headers.add(String("Upgrade"), String("echo"))
+        var budget = BufferBudget(1024)
+        var wire = _encode_response_budgeted(
+            writer, False, "date", 100, 32768, budget, switching=True
+        )
+        var text = _bytes_to_string(Span(wire))
+        assert_true(text.startswith(String("HTTP/1.1 ") + String(status)))
+        if status == 101:
+            assert_true(text.startswith("HTTP/1.1 101 Switching Protocols\r\n"))
+        assert_true(text.endswith("\r\n\r\n"))
+        assert_true(text.find("Content-Length") < 0)
+        assert_true(text.find("Transfer-Encoding") < 0)
+        assert_true(text.find("Upgrade: echo\r\n") >= 0)
+        assert_equal(budget.used, wire.capacity())
+        var capacity = wire.capacity()
+        _ = wire^
+        budget.release(capacity)
+        assert_equal(budget.used, 0)
+
+
+def test_switch_wire_rejects_content_and_invalid_status_without_reserving() raises:
+    for scenario in range(7):
+        var writer = ResponseWriter(32)
+        writer.status = 101
+        if scenario == 0:
+            writer.write_string("body")
+        elif scenario == 1:
+            writer.add_trailer(String("X-Finish"), String("done"))
+        elif scenario == 2:
+            writer.headers.add(String("Content-Length"), String("0"))
+        elif scenario == 3:
+            writer.headers.add(String("Transfer-Encoding"), String("chunked"))
+        elif scenario == 4:
+            writer.status = 100
+        elif scenario == 5:
+            writer.status = 300
+        else:
+            writer.should_close = True
+        var budget = BufferBudget(1024)
+        assert_true(budget.try_reserve(7))
+        var rejected = False
+        try:
+            _ = _encode_response_budgeted(
+                writer, False, "date", 100, 32768, budget, switching=True
+            )
+        except e:
+            assert_equal(e.kind, NetErrorKind.invalid_argument())
+            rejected = True
+        assert_true(rejected)
+        assert_equal(budget.used, 7)
+
+
 def main() raises:
     TestSuite.discover_tests[__functions_in_module()]().run()

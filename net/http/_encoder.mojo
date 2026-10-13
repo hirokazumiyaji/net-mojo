@@ -274,10 +274,26 @@ def _render_response[
     max_bytes: Int,
     mut out: List[Byte],
     mut byte_count: Int,
+    switching: Bool = False,
 ) raises NetError:
     # Final responses are 2xx–5xx (and uncommon 6xx–9xx). 1xx is
     # intermediate only; Expect: 100-continue uses encode_100_continue().
-    if writer.status < 200 or writer.status > 999:
+    if switching:
+        if (
+            (writer.status != 101 and not (200 <= writer.status < 300))
+            or len(writer.body) != 0
+            or len(writer.trailers) != 0
+            or writer.should_close
+            or writer.headers._first_lower_index("content-length") >= 0
+            or writer.headers._first_lower_index("transfer-encoding") >= 0
+        ):
+            raise NetError(
+                NetErrorKind.invalid_argument(),
+                "encode switch response",
+                None,
+                "switch requires 101 or 2xx headers without content framing",
+            )
+    elif writer.status < 200 or writer.status > 999:
         raise NetError(
             NetErrorKind.invalid_argument(),
             "encode response",
@@ -303,7 +319,9 @@ def _render_response[
             None,
             "response headers too large",
         )
-    var send_body = has_body_for_status(writer.status, is_head)
+    var send_body = not switching and has_body_for_status(
+        writer.status, is_head
+    )
     # Trailers only reach the wire for responses that frame a body on
     # this request (RFC 9112 §7.1.2); HEAD / 1xx / 204 / 205 / 304
     # silently drop trailers. 205 still uses Content-Length: 0.
@@ -345,9 +363,9 @@ def _render_response[
     # 205 omits content bytes but frames Content-Length: 0 so keep-alive
     # clients can delimit the empty message body (RFC 9112 §6.3).
     var wire_length = -1
-    if has_body_for_status(writer.status, False):
+    if not switching and has_body_for_status(writer.status, False):
         wire_length = len(writer.body)
-    elif writer.status == 205:
+    elif not switching and writer.status == 205:
         wire_length = 0
     # Validate a caller-supplied Content-Length against the framed length.
     # For HEAD the framed length is the GET-equivalent body length.
@@ -529,11 +547,19 @@ def _measure_response(
     date: StringSlice,
     max_headers: Int,
     max_bytes: Int,
+    switching: Bool = False,
 ) raises NetError -> Int:
     var out = List[Byte]()
     var byte_count = 0
     _render_response[True](
-        writer, is_head, date, max_headers, max_bytes, out, byte_count
+        writer,
+        is_head,
+        date,
+        max_headers,
+        max_bytes,
+        out,
+        byte_count,
+        switching,
     )
     return byte_count
 
@@ -547,9 +573,10 @@ def _encode_response_budgeted[
     max_headers: Int,
     max_bytes: Int,
     mut budget: B,
+    switching: Bool = False,
 ) raises NetError -> List[Byte]:
     var capacity = _measure_response(
-        writer, is_head, date, max_headers, max_bytes
+        writer, is_head, date, max_headers, max_bytes, switching
     )
     if not budget.try_reserve(capacity):
         raise NetError(
@@ -562,7 +589,14 @@ def _encode_response_budgeted[
     var byte_count = 0
     try:
         _render_response[False](
-            writer, is_head, date, max_headers, max_bytes, out, byte_count
+            writer,
+            is_head,
+            date,
+            max_headers,
+            max_bytes,
+            out,
+            byte_count,
+            switching,
         )
     except e:
         _ = out^
