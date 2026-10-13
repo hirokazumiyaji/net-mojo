@@ -44,7 +44,7 @@ from net import SocketAddress, TCPConn, TCPListener, Timeout, listen_tcp
 from net._actor import WakeupChannel
 from net._reactor import Reactor, ReactorToken
 from net.error import NetError, NetErrorKind
-from net.quic import QuicUDPEndpoint
+from net.quic import QuicUDPEndpoint, QuicBodyReadState
 
 from ._buffer import SharedBufferBudget, _CapacityTicket, _reserve_capacity
 from ._body_decoder import _BodyDecoder
@@ -95,6 +95,7 @@ from ._parser import (
     _RequestScan,
     _scan_chunked,
     _scan_head,
+    _split_comma_tokens,
     parse_body,
     parse_head,
     _split_comma_tokens,
@@ -160,6 +161,20 @@ struct _Http2DetachedStream(Movable):
     def __deinit__(deinit self):
         if self.addr != 0:
             _cancel_detach_state(self.addr)
+
+
+@fieldwise_init
+struct _Http3RequestInput(Movable):
+    var request_id: UInt64
+    var pipe: _BodyPipe
+    var wire_eof: Bool
+    var eof_published: Bool
+    var trailers: Headers
+
+    def __deinit__(deinit self):
+        if not self.pipe.is_eof():
+            self.pipe.cancel()
+        self.pipe._stop_loop_wakeup()
 
 
 struct _Http3DetachedStream(Movable):
@@ -279,6 +294,8 @@ struct Server(Movable):
     var _http2_detached_ticket: _CapacityTicket
     var _http3_detached: List[_Http3DetachedStream]
     var _http3_detached_ticket: _CapacityTicket
+    var _http3_inputs: List[_Http3RequestInput]
+    var _http3_inputs_ticket: _CapacityTicket
     var _request_body_conns: List[Int]
 
     def __init__(out self, var config: ServerConfig) raises:
@@ -318,11 +335,15 @@ struct Server(Movable):
         self._http2_detached_ticket = _CapacityTicket(self._budget.copy())
         self._http3_detached = List[_Http3DetachedStream]()
         self._http3_detached_ticket = _CapacityTicket(self._budget.copy())
+        self._http3_inputs = List[_Http3RequestInput]()
+        self._http3_inputs_ticket = _CapacityTicket(self._budget.copy())
         self._request_body_conns = List[Int]()
         while len(self._slot_map) <= wtoken.slot:
             self._slot_map.append(-1)
 
     def __deinit__(deinit self):
+        self._http3_inputs = List[_Http3RequestInput]()
+        self._http3_inputs_ticket.release()
         self._http3_detached = List[_Http3DetachedStream]()
         self._http3_detached_ticket.release()
         self._finish_control()
@@ -406,6 +427,9 @@ struct Server(Movable):
             self.config.quic_send_crypto_bytes,
             self.config.quic_send_crypto_slots,
         )
+        endpoint.set_request_streaming(
+            self.config.enable_request_body_streaming
+        )
         endpoint.set_request_limits(
             self.config.max_body_bytes,
             self.config.max_headers_bytes,
@@ -471,7 +495,9 @@ struct Server(Movable):
                 self.control._drain()
                 break
         self._drive_quic()
+        self._process_http3_inputs()
         self._dispatch_quic_requests(handler)
+        self._process_http3_inputs()
         self._process_http3_detached(now)
         self._finish_quic_shutdown_if_due(now)
         self._flush_quic()
@@ -816,6 +842,8 @@ struct Server(Movable):
             if self._quic_endpoint:
                 self._http3_detached = List[_Http3DetachedStream]()
                 self._http3_detached_ticket.release()
+                self._http3_inputs = List[_Http3RequestInput]()
+                self._http3_inputs_ticket.release()
                 self._quic_endpoint.value().close_connections()
                 self._flush_quic()
                 self._quic_close_at = now + _QUIC_CLOSE_DRAIN_NS
@@ -967,6 +995,8 @@ struct Server(Movable):
             self._listener_paused = False
 
     def _drop_quic_endpoint(mut self):
+        self._http3_inputs = List[_Http3RequestInput]()
+        self._http3_inputs_ticket.release()
         self._http3_detached = List[_Http3DetachedStream]()
         self._http3_detached_ticket.release()
         if self._quic_endpoint:
@@ -1006,7 +1036,11 @@ struct Server(Movable):
             return
         var processed = 0
         while processed < self.config.max_requests_per_tick:
-            var quic_request = self._quic_endpoint.value().try_next_request()
+            var quic_request = (
+                self._quic_endpoint.value()
+                .try_next_request_head() if self.config.enable_request_body_streaming else self._quic_endpoint.value()
+                .try_next_request()
+            )
             if quic_request.id == 0:
                 break
             var request_id = quic_request.id
@@ -1047,8 +1081,40 @@ struct Server(Movable):
                             name^, Span(quic_request.trailers[i].value)
                         )
                     request.body = quic_request.take_body()
+                    var dispatch = True
+                    var expectations = request.headers.get_all("Expect")
+                    for expectation in expectations:
+                        var tokens = _split_comma_tokens(expectation)
+                        if len(tokens) == 0:
+                            dispatch = False
+                        for token in tokens:
+                            if token.lower() != "100-continue":
+                                dispatch = False
+                    if not dispatch:
+                        response.status = 417
+                    if dispatch and self.config.enable_request_body_streaming:
+                        try:
+                            var pipe = _BodyPipe(
+                                self.config.max_body_bytes,
+                                self._budget.copy(),
+                                self._wakeup_channel.write_fd(),
+                                reserve_capacity=True,
+                            )
+                            if not self._register_http3_input(request_id, pipe):
+                                dispatch = False
+                            else:
+                                request._body_pipe = pipe.copy()
+                                response._set_request_body_pipe(
+                                    Optional(pipe.copy())
+                                )
+                                self._process_http3_inputs()
+                        except:
+                            dispatch = False
+                        if not dispatch:
+                            response.status = 503
                     try:
-                        handler.handle(request^, response)
+                        if dispatch:
+                            handler.handle(request^, response)
                     except e:
                         _ = e
                         response._cancel_detach()
@@ -1061,6 +1127,17 @@ struct Server(Movable):
                     response.body.clear()
                     response.trailers.clear()
                 self._budget.release(body_size)
+            if self.config.enable_request_body_streaming:
+                var position = self._find_http3_input(request_id)
+                if (
+                    position < 0
+                    or not self._http3_inputs[
+                        position
+                    ].pipe.has_detached_reader()
+                ):
+                    _ = self._quic_endpoint.value().release_body(request_id)
+                    if position >= 0:
+                        self._remove_http3_input(position)
             if response.is_detached() and response._detach_state_addr != 0:
                 var addr = response._detach_state_addr
                 response._detach_state_addr = 0
@@ -1193,6 +1270,114 @@ struct Server(Movable):
             except e:
                 _ = e
             processed += 1
+
+    def _find_http3_input(self, request_id: UInt64) -> Int:
+        for i in range(len(self._http3_inputs)):
+            if self._http3_inputs[i].request_id == request_id:
+                return i
+        return -1
+
+    def _register_http3_input(
+        mut self, request_id: UInt64, pipe: _BodyPipe
+    ) -> Bool:
+        var reservation = 0
+        if not _reserve_capacity(
+            self._http3_inputs,
+            self._budget,
+            len(self._http3_inputs) + 1,
+            reservation,
+        ):
+            return False
+        self._http3_inputs_ticket.amount = (
+            self._http3_inputs.capacity() * size_of[_Http3RequestInput]()
+        )
+        self._http3_inputs.append(
+            _Http3RequestInput(request_id, pipe.copy(), False, False, Headers())
+        )
+        return True
+
+    def _remove_http3_input(mut self, position: Int):
+        var last = self._http3_inputs.pop()
+        if position < len(self._http3_inputs):
+            self._http3_inputs[position] = last^
+        if len(self._http3_inputs) == 0:
+            self._http3_inputs = List[_Http3RequestInput]()
+            self._http3_inputs_ticket.release()
+
+    def _process_http3_inputs(mut self) raises NetError:
+        if not self._quic_endpoint:
+            return
+        var scratch = Array[Byte, 4096](fill=0)
+        var index = 0
+        while index < len(self._http3_inputs):
+            var id = self._http3_inputs[index].request_id
+            var pipe = self._http3_inputs[index].pipe.copy()
+            var consumed = pipe.take_consumed()
+            if consumed > 0 and not self._quic_endpoint.value().consume_body(
+                id, consumed
+            ):
+                pipe.cancel()
+            if pipe.is_cancelled():
+                _ = self._quic_endpoint.value().release_body(id, True)
+                self._cancel_http3_detached(id, UInt64(0x10C))
+                self._remove_http3_input(index)
+                continue
+            if self._http3_inputs[index].wire_eof:
+                var probe = self._quic_endpoint.value().read_body(
+                    id, Span[mut=True](scratch)[:0]
+                )
+                if probe.state == QuicBodyReadState.cancelled():
+                    pipe.cancel()
+                    self._cancel_http3_detached(id, UInt64(0x10C))
+                    self._remove_http3_input(index)
+                    continue
+            if not self._http3_inputs[index].wire_eof:
+                var capacity = min(len(scratch), pipe.writable_bytes())
+                var result = self._quic_endpoint.value().read_body(
+                    id, Span[mut=True](scratch)[:capacity]
+                )
+                if result.state == QuicBodyReadState.cancelled():
+                    pipe.cancel()
+                    self._cancel_http3_detached(id, UInt64(0x10C))
+                    self._remove_http3_input(index)
+                    continue
+                if result.state == QuicBodyReadState.data():
+                    if not pipe.push(Span(scratch)[: result.count]):
+                        pipe.cancel()
+                    var discarded = pipe.take_consumed()
+                    if discarded > 0:
+                        _ = self._quic_endpoint.value().consume_body(
+                            id, discarded
+                        )
+                elif result.state == QuicBodyReadState.eof():
+                    var fields = self._quic_endpoint.value().body_trailers(id)
+                    for i in range(len(fields)):
+                        self._http3_inputs[index].trailers.add_bytes(
+                            fields[i].name.copy(), Span(fields[i].value)
+                        )
+                    self._http3_inputs[index].wire_eof = True
+            if (
+                self._http3_inputs[index].wire_eof
+                and not self._http3_inputs[index].eof_published
+            ):
+                try:
+                    self._http3_inputs[index].eof_published = pipe._try_push_eof(
+                        self._http3_inputs[index].trailers
+                    )
+                except:
+                    pipe.cancel()
+                    _ = self._quic_endpoint.value().release_body(id, True)
+                    self._cancel_http3_detached(id, UInt64(0x102))
+                    self._remove_http3_input(index)
+                    continue
+            if pipe.is_eof():
+                consumed = pipe.take_consumed()
+                if consumed > 0:
+                    _ = self._quic_endpoint.value().consume_body(id, consumed)
+                _ = self._quic_endpoint.value().release_body(id)
+                self._remove_http3_input(index)
+                continue
+            index += 1
 
     def _find_http3_detached(self, request_id: UInt64) -> Int:
         for i in range(len(self._http3_detached)):
@@ -3783,6 +3968,7 @@ struct Server(Movable):
 
     def _process_detached_messages(mut self, now: Int) raises NetError:
         self._process_http2_detached(now)
+        self._process_http3_inputs()
         self._process_http3_detached(now)
         self._flush_quic()
         if len(self._detached_conns) == 0:

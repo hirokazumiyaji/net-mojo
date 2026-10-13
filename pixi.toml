@@ -235,6 +235,10 @@ http3-detach-test = { cmd = "python3 scripts/test_http3_detach.py", depends-on =
   "tls-build",
   "quic-build",
 ] }
+http3-request-stream-test = { cmd = "python3 scripts/test_http3_request_stream.py", depends-on = [
+  "tls-build",
+  "quic-build",
+] }
 http3-client-test = { cmd = "python3 scripts/test_http3_server.py", depends-on = [
   "tls-build",
   "quic-build",

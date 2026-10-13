@@ -6,7 +6,7 @@
 send, and provider timers from its event loop. `QuicServer` is a Rust provider
 behind the optional C ABI artifact. It owns QUIC connections and delegates HTTP/3
 framing, QPACK, stream flow control, and transport recovery to quiche 0.29.3.
-The provider returns a completed request record to Mojo; the HTTP server maps it
+The provider returns a request record to Mojo; the HTTP server maps it
 to the shared `Request`, invokes the same synchronous `Handler` used by HTTP/1.1
 and HTTP/2. Buffered responses and detached producer messages remain bound to
 the originating request ID.
@@ -21,8 +21,8 @@ timeouts are exposed as microseconds and advanced by the server loop.
 The adapter requires `:method`, `:scheme`, `:authority`, and `:path`, validates
 pseudo-header ordering and uniqueness, and maps them to `Request` fields. Regular
 headers and trailers remain separate. CONNECT, extended CONNECT, connection-
-specific fields, and invalid `TE` values are rejected. A request body is fully
-buffered before the shared handler runs.
+specific fields, and invalid `TE` values are rejected. By default a request body
+is fully buffered before the shared handler runs.
 
 Current limits are 100 request header fields and 32 KiB for the combined
 request header sections, 1 MiB for each decoded body, and 64 MiB for request
@@ -56,7 +56,8 @@ encoding as buffered requests, with empty body and trailer fields.
 
 `read_body(id, output)` copies at most the caller's output capacity and returns
 `QuicBodyReadResult`. Its state is `data`, `would_block`, `eof`, or `cancelled`;
-only `data` has a positive count. A nonempty output span is required. Reads are
+only `data` has a positive count. A zero-length span with valid backing storage
+probes EOF or cancellation without consuming DATA. Reads are
 bounded by the per-request limit on bytes copied but not yet consumed, allowing
 the total upload to exceed that limit as the application makes progress. The
 provider leaves additional DATA in quiche's bounded receive pool.
@@ -83,6 +84,25 @@ Head and trailer record functions return a negative required capacity when the
 output is too small and preserve the record for retry. Configuration,
 consumption, and release return 1 on success and -1 on rejection. The Mojo
 wrapper converts read statuses into the typed result above.
+
+## Server request input streaming
+
+Set `ServerConfig.enable_request_body_streaming = True` before constructing the
+server. The handler runs after validated initial headers, with empty `req.body`
+and a bounded body reader. `req.detach_body()` transfers the receiver to a worker
+independently of response output. Response FIN does not end an accepted upload;
+a detached receiver can continue reading DATA and trailers afterward.
+
+The server reserves body queue capacity from `max_total_buffer_bytes`, copies at
+most 4 KiB per input per turn, and returns native receive credit only after the
+reader consumes or discards those bytes. A full queue pauses DATA copying while
+still observing EOF, resets, and body deadlines. Unclaimed input is discarded
+when the handler returns. Invalid trailers or an exhausted trailer budget cancel
+that stream while sibling requests continue.
+
+Shutdown refuses new requests and lets accepted input finish during the grace
+period. Expiry cancels unfinished receivers. Run the independent client cases
+with `pixi run -e tls-http3 http3-request-stream-test`.
 
 ## Same-origin operation
 
