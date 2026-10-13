@@ -1,4 +1,4 @@
-"""Fairly schedules queued HTTP/2 response bodies across streams.
+"""Fairly schedules buffered and streaming HTTP/2 response bodies across streams.
 
 HEADERS are HPACK-encoded lazily, at the moment the scheduler is about to
 emit them. Encoding and wire emission happen atomically in the same drain
@@ -8,6 +8,14 @@ dynamic table. Trailers are hand-encoded as literal never-indexed (no
 dynamic table insertion) by the enqueue site and emitted as a separate
 HEADERS block with END_STREAM after the body.
 """
+
+from std.sys import size_of
+
+from net.http._buffer import (
+    SharedBufferBudget,
+    _CapacityTicket,
+    _reserve_capacity,
+)
 
 from .control_frames import encode_rst_stream_frame
 from .frame_encoder import encode_frame
@@ -23,6 +31,22 @@ from .response_headers import (
 comptime _EMIT_OK: Int = 0
 comptime _EMIT_DEFLATER_FAILED: Int = 1
 comptime _EMIT_RST: Int = 2
+
+
+@fieldwise_init
+struct _Http2BodyChunk(Movable):
+    var body: List[Byte]
+    var ticket: _CapacityTicket
+
+    def __deinit__(deinit self):
+        _ = self.body^
+        self.ticket.release()
+
+
+@fieldwise_init
+struct Http2ConsumedBytes(Copyable, Movable):
+    var stream_id: UInt32
+    var amount: Int
 
 
 @fieldwise_init
@@ -44,6 +68,18 @@ struct _PendingHttp2Response(Movable):
     var trailers_offset: Int
     var trailers_sent: Bool
     var cancelled: Bool
+    var streaming: Bool
+    var end_stream_queued: Bool
+    var body_ticket: _CapacityTicket
+    var chunks: List[_Http2BodyChunk]
+    var chunk_head: Int
+    var chunks_ticket: _CapacityTicket
+
+    def __deinit__(deinit self):
+        _ = self.body^
+        self.body_ticket.release()
+        _ = self.chunks^
+        self.chunks_ticket.release()
 
 
 @fieldwise_init
@@ -52,6 +88,7 @@ struct Http2ScheduledOutput(Movable):
     var completed_streams: List[UInt32]
     var released_bytes: Int
     var deflater_failed: Bool
+    var consumed_bytes: List[Http2ConsumedBytes]
 
 
 @fieldwise_init
@@ -110,8 +147,100 @@ struct Http2ResponseScheduler(Movable):
             trailers_offset=0,
             trailers_sent=False,
             cancelled=False,
+            streaming=False,
+            end_stream_queued=True,
+            body_ticket=_CapacityTicket(),
+            chunks=List[_Http2BodyChunk](),
+            chunk_head=0,
+            chunks_ticket=_CapacityTicket(),
         )
         self._responses.append(response^)
+        return True
+
+    def enqueue_streaming(
+        mut self,
+        stream_id: UInt32,
+        var header_fields: List[Byte],
+        header_field_count: Int,
+        max_header_list_size: Int,
+        max_header_fields: Int,
+        compressed_capacity: Int,
+        var budget: Optional[SharedBufferBudget] = None,
+    ) -> Bool:
+        if not self.enqueue(
+            stream_id,
+            header_fields^,
+            header_field_count,
+            max_header_list_size,
+            max_header_fields,
+            compressed_capacity,
+            List[Byte](),
+        ):
+            return False
+        var index = self._find(stream_id)
+        self._responses[index].streaming = True
+        self._responses[index].end_stream_queued = False
+        self._responses[index].chunks_ticket = _CapacityTicket(budget^)
+        return True
+
+    def push_body(
+        mut self,
+        stream_id: UInt32,
+        var body: List[Byte],
+        var ticket: _CapacityTicket = _CapacityTicket(),
+    ) -> Bool:
+        var index = self._find(stream_id)
+        if index < 0:
+            return False
+        if (
+            not self._responses[index].streaming
+            or self._responses[index].end_stream_queued
+            or self._responses[index].cancelled
+        ):
+            return False
+        if len(body) == 0:
+            return True
+        self._compact_chunks(index)
+        var budget = self._responses[index].chunks_ticket.budget.copy()
+        if budget:
+            if ticket.amount == 0:
+                ticket = _CapacityTicket(budget.copy())
+                if not ticket._try_reserve(body.capacity()):
+                    return False
+            var reservation = 0
+            if not _reserve_capacity(
+                self._responses[index].chunks,
+                budget.value(),
+                len(self._responses[index].chunks) + 1,
+                reservation,
+            ):
+                return False
+        self._responses[index].chunks.append(_Http2BodyChunk(body^, ticket^))
+        self._responses[index].chunks_ticket.amount = (
+            self._responses[index].chunks.capacity()
+            * size_of[_Http2BodyChunk]()
+        )
+        return True
+
+    def finish(
+        mut self,
+        stream_id: UInt32,
+        var trailers: List[Byte] = List[Byte](),
+        trailer_field_count: Int = 0,
+    ) -> Bool:
+        var index = self._find(stream_id)
+        if index < 0:
+            return False
+        if (
+            not self._responses[index].streaming
+            or self._responses[index].end_stream_queued
+            or self._responses[index].cancelled
+        ):
+            return False
+        self._responses[index].reserved_trailer_bytes = len(trailers)
+        self._responses[index].trailers = trailers^
+        self._responses[index].trailer_field_count = trailer_field_count
+        self._responses[index].end_stream_queued = True
         return True
 
     def queued_count(self) -> Int:
@@ -158,6 +287,10 @@ struct Http2ResponseScheduler(Movable):
         self._responses[index].trailers = List[Byte]()
         self._responses[index].trailers_offset = 0
         self._responses[index].reserved_trailer_bytes = 0
+        self._responses[index].chunks = List[_Http2BodyChunk]()
+        self._responses[index].chunks_ticket.release()
+        self._responses[index].chunk_head = 0
+        self._responses[index].body_ticket.release()
         self._responses[index].cancelled = True
         return Http2PeerResetResult(
             released_bytes=body_bytes + trailer_bytes, kept_headers=True
@@ -180,11 +313,13 @@ struct Http2ResponseScheduler(Movable):
         var output = List[Byte]()
         var completed = List[UInt32]()
         var released = 0
+        var consumed = List[Http2ConsumedBytes]()
         if max_frame_size < 1 or max_output_bytes < 9:
             return Http2ScheduledOutput(
                 wire=output^,
                 completed_streams=completed^,
                 released_bytes=0,
+                consumed_bytes=consumed^,
                 deflater_failed=False,
             )
 
@@ -222,6 +357,7 @@ struct Http2ResponseScheduler(Movable):
                         wire=output^,
                         completed_streams=completed^,
                         released_bytes=released,
+                        consumed_bytes=consumed^,
                         deflater_failed=True,
                     )
                 if hpack_bound > self._responses[index].compressed_capacity:
@@ -318,6 +454,10 @@ struct Http2ResponseScheduler(Movable):
                         self._responses[
                             index
                         ].header_field_count = minimal.field_count
+                        self._responses[index].end_stream_queued = True
+                        self._responses[index].chunks = List[_Http2BodyChunk]()
+                        self._responses[index].chunks_ticket.release()
+                        self._responses[index].chunk_head = 0
                         self._responses[index].body = List[Byte]()
                         self._responses[index].body_offset = 0
                         # The minimal 500 belongs to a different response
@@ -337,7 +477,10 @@ struct Http2ResponseScheduler(Movable):
                         continue
                     break
                 var end_on_headers = (
-                    len(self._responses[index].body) == 0
+                    self._responses[index].end_stream_queued
+                    and len(self._responses[index].body) == 0
+                    and len(self._responses[index].chunks)
+                    == self._responses[index].chunk_head
                     and len(self._responses[index].trailers) == 0
                 )
                 var emit_result = self._encode_and_emit_headers(
@@ -353,6 +496,7 @@ struct Http2ResponseScheduler(Movable):
                         wire=output^,
                         completed_streams=completed^,
                         released_bytes=released,
+                        consumed_bytes=consumed^,
                         deflater_failed=True,
                     )
                 if emit_result == _EMIT_RST:
@@ -388,7 +532,10 @@ struct Http2ResponseScheduler(Movable):
                 # _encode_and_emit_headers may have cleared body and trailers
                 # to make the HEADERS frame close the stream.
                 var effective_end = (
-                    len(self._responses[index].body) == 0
+                    self._responses[index].end_stream_queued
+                    and len(self._responses[index].body) == 0
+                    and len(self._responses[index].chunks)
+                    == self._responses[index].chunk_head
                     and len(self._responses[index].trailers) == 0
                 )
                 if effective_end and not self._responses[index].cancelled:
@@ -416,6 +563,29 @@ struct Http2ResponseScheduler(Movable):
                 self._remove(index)
                 continue
 
+            if (
+                self._responses[index].streaming
+                and len(self._responses[index].body) == 0
+                and len(self._responses[index].chunks)
+                > self._responses[index].chunk_head
+            ):
+                var chunk_ptr = Pointer(
+                    to=self._responses[index].chunks[
+                        self._responses[index].chunk_head
+                    ]
+                )
+                var chunk = chunk_ptr.unsafe_take_pointee()
+                chunk_ptr.unsafe_write(
+                    _Http2BodyChunk(List[Byte](), _CapacityTicket())
+                )
+                self._responses[index].chunk_head += 1
+                self._responses[index].body = chunk.body^
+                chunk.body = List[Byte]()
+                self._responses[index].body_ticket = chunk.ticket^
+                chunk.ticket = _CapacityTicket()
+                _ = chunk^
+                self._responses[index].body_offset = 0
+
             var body_done = self._responses[index].body_offset == len(
                 self._responses[index].body
             )
@@ -437,8 +607,12 @@ struct Http2ResponseScheduler(Movable):
                     remaining_body,
                     min(max_frame_size, min(credit, output_room)),
                 )
-                var end_stream = payload_length == remaining_body and (
-                    len(self._responses[index].trailers) == 0
+                var end_stream = (
+                    self._responses[index].end_stream_queued
+                    and payload_length == remaining_body
+                    and len(self._responses[index].chunks)
+                    == self._responses[index].chunk_head
+                    and len(self._responses[index].trailers) == 0
                 )
                 var flags = Byte(1) if end_stream else Byte(0)
                 var frame = encode_frame(
@@ -463,6 +637,14 @@ struct Http2ResponseScheduler(Movable):
                     continue
                 output.extend(Span(frame.wire))
                 self._responses[index].body_offset += payload_length
+                if self._responses[index].streaming:
+                    self._record_consumed(consumed, stream_id, payload_length)
+                    if self._responses[index].body_offset == len(
+                        self._responses[index].body
+                    ):
+                        self._responses[index].body = List[Byte]()
+                        self._responses[index].body_offset = 0
+                        self._responses[index].body_ticket.release()
                 skipped = 0
                 if end_stream:
                     session.finish_response(stream_id)
@@ -480,6 +662,36 @@ struct Http2ResponseScheduler(Movable):
                 if not body_done or len(self._responses[index].trailers) == 0:
                     if len(self._responses) > 0:
                         self._next_index = (index + 1) % len(self._responses)
+                    continue
+
+            if body_done and self._responses[index].streaming:
+                if (
+                    len(self._responses[index].chunks)
+                    > self._responses[index].chunk_head
+                ):
+                    self._next_index = (index + 1) % len(self._responses)
+                    continue
+                if not self._responses[index].end_stream_queued:
+                    self._next_index = (index + 1) % len(self._responses)
+                    skipped += 1
+                    if skipped >= len(self._responses):
+                        break
+                    continue
+                if len(self._responses[index].trailers) == 0:
+                    var end = encode_frame(
+                        Byte(0),
+                        Byte(1),
+                        stream_id,
+                        Span(List[Byte]()),
+                        max_frame_size,
+                    )
+                    if len(end.wire) > max_output_bytes - len(output):
+                        break
+                    output.extend(Span(end.wire))
+                    session.finish_response(stream_id)
+                    completed.append(stream_id)
+                    self._remove(index)
+                    skipped = 0
                     continue
 
             if body_done and len(self._responses[index].trailers) > 0:
@@ -510,6 +722,7 @@ struct Http2ResponseScheduler(Movable):
                         wire=output^,
                         completed_streams=completed^,
                         released_bytes=released,
+                        consumed_bytes=consumed^,
                         deflater_failed=True,
                     )
                 # Gate on the worst-case wire bound BEFORE calling the
@@ -562,6 +775,7 @@ struct Http2ResponseScheduler(Movable):
                         wire=output^,
                         completed_streams=completed^,
                         released_bytes=released,
+                        consumed_bytes=consumed^,
                         deflater_failed=True,
                     )
                 if trailer_encode.is_too_large():
@@ -608,6 +822,7 @@ struct Http2ResponseScheduler(Movable):
                         wire=output^,
                         completed_streams=completed^,
                         released_bytes=released,
+                        consumed_bytes=consumed^,
                         deflater_failed=True,
                     )
                 _ = trailer_count
@@ -629,6 +844,7 @@ struct Http2ResponseScheduler(Movable):
             wire=output^,
             completed_streams=completed^,
             released_bytes=released,
+            consumed_bytes=consumed^,
             deflater_failed=False,
         )
 
@@ -678,6 +894,10 @@ struct Http2ResponseScheduler(Movable):
             # Preserve the server's original reservation so release() refunds
             # the full budget it charged; the fallback is strictly smaller.
             effective_end_on_headers = True
+            self._responses[index].end_stream_queued = True
+            self._responses[index].chunks = List[_Http2BodyChunk]()
+            self._responses[index].chunks_ticket.release()
+            self._responses[index].chunk_head = 0
             self._responses[index].body = List[Byte]()
             self._responses[index].body_offset = 0
             self._responses[index].trailers = List[Byte]()
@@ -702,6 +922,35 @@ struct Http2ResponseScheduler(Movable):
             return _EMIT_DEFLATER_FAILED
         output.extend(Span(frames.wire))
         return _EMIT_OK
+
+    def _compact_chunks(mut self, index: Int):
+        var head = self._responses[index].chunk_head
+        var count = len(self._responses[index].chunks)
+        if head == 0 or head * 2 < count:
+            return
+        var remaining = count - head
+        for i in range(remaining):
+            var source = Pointer(to=self._responses[index].chunks[head + i])
+            var chunk = source.unsafe_take_pointee()
+            source.unsafe_write(
+                _Http2BodyChunk(List[Byte](), _CapacityTicket())
+            )
+            self._responses[index].chunks[i] = chunk^
+        while len(self._responses[index].chunks) > remaining:
+            _ = self._responses[index].chunks.pop()
+        self._responses[index].chunk_head = 0
+
+    def _record_consumed(
+        self,
+        mut consumed: List[Http2ConsumedBytes],
+        stream_id: UInt32,
+        amount: Int,
+    ):
+        for i in range(len(consumed)):
+            if consumed[i].stream_id == stream_id:
+                consumed[i].amount += amount
+                return
+        consumed.append(Http2ConsumedBytes(stream_id, amount))
 
     def _find(self, stream_id: UInt32) -> Int:
         for i in range(len(self._responses)):
