@@ -13,7 +13,7 @@ from net.error import NetError, NetErrorKind
 
 from ._buffer import _CapacityBudget
 from .error import _status_reason
-from .headers import _trailer_forbidden
+from .headers import Headers, _trailer_forbidden
 from .response import ResponseWriter, has_body_for_status
 
 
@@ -952,12 +952,37 @@ def _encode_chunk_budgeted[
 
 def _encode_chunk_end_budgeted[
     B: _CapacityBudget
-](mut budget: B) raises NetError -> List[Byte]:
-    if not budget.try_reserve(5):
+](
+    mut budget: B,
+    trailers: Headers = Headers(),
+    max_headers: Int = 64,
+    max_bytes: Int = 16384,
+) raises NetError -> List[Byte]:
+    var capacity = 5
+    for i in range(len(trailers)):
+        capacity += (
+            trailers._names[i].byte_length() + trailers.value_byte_length(i) + 4
+        )
+    if len(trailers) > max_headers or capacity - 5 > max_bytes:
+        raise NetError(
+            NetErrorKind.invalid_argument(),
+            "encode chunk end",
+            None,
+            "response trailers exceed header limits",
+        )
+    if not budget.try_reserve(capacity):
         raise NetError(
             NetErrorKind.invalid_argument(),
             "encode chunk end",
             None,
             "stream wire capacity exceeds budget",
         )
-    return encode_chunk_end()
+    var out = List[Byte](capacity=capacity)
+    out.extend("0\r\n".as_bytes())
+    for i in range(len(trailers)):
+        out.extend(trailers._names[i].as_bytes())
+        out.extend(": ".as_bytes())
+        out.extend(trailers._value_bytes_span(i))
+        out.extend("\r\n".as_bytes())
+    out.extend("\r\n".as_bytes())
+    return out^

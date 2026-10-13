@@ -8,6 +8,7 @@ from net._sys.common import EINTR
 from net.error import NetErrorKind
 from net.http._connection import H1_ERROR_CAPACITY
 from net.http._buffer import SharedBufferBudget
+from net.http._encoder import _encode_chunk_end_budgeted
 from net.http import (
     Handler,
     Headers,
@@ -25,6 +26,7 @@ from net.http._detach import (
     MSG_KIND_RESPOND,
     MSG_KIND_START,
     _create_detach_state,
+    _cancel_detach_state,
     _DetachTarget,
     _detach_state,
     _DetachedBatch,
@@ -2009,6 +2011,192 @@ def test_finish_follows_accepted_chunks_without_array_growth() raises:
     assert_equal(_status_of(response), 200)
     assert_equal(_body_of(response), "1\r\na\r\n1\r\nb\r\n0\r\n\r\n")
     assert_equal(server._budget.used(), H1_ERROR_CAPACITY)
+    client.close()
+
+
+def test_finish_trailers_follow_chunks_on_wire() raises:
+    var server = Server(ServerConfig.default())
+    server.add_listener(listen_tcp("127.0.0.1:0"))
+    var handler = _MailboxHandler()
+    var client = dial_tcp(
+        String("127.0.0.1:") + String(server.local_address().port),
+        Timeout.seconds(1),
+    )
+    client.write_all(
+        "GET / HTTP/1.1\r\nHost: x\r\n\r\n".as_bytes(), Timeout.seconds(1)
+    )
+    _wait_mailbox_handler(server, handler)
+    var sender = ResponseSender(handler.addr)
+    sender.start()
+    assert_true(sender.send("a".as_bytes()))
+    var trailers = Headers()
+    trailers.add("Digest", "test")
+    sender.finish(trailers=trailers^)
+    _ = sender^
+    var response = _tick_and_read_chunked(server, handler, client)
+    assert_equal(_body_of(response), "1\r\na\r\n0\r\nDigest: test\r\n\r\n")
+    assert_equal(server._budget.used(), H1_ERROR_CAPACITY)
+    client.close()
+
+
+def test_finish_rejects_forbidden_trailers_before_terminal_mutation() raises:
+    var addr = _create_detach_state(slot=0, generation=1)
+    var sender = ResponseSender(addr)
+    sender.start()
+    var trailers = Headers()
+    trailers.add("Content-Length", "0")
+    var rejected = False
+    try:
+        sender.finish(trailers=trailers^)
+    except:
+        rejected = True
+    assert_true(rejected)
+    assert_false(_detach_state(addr)[].finished)
+    assert_true(sender.send("a".as_bytes()))
+    sender.finish()
+    _release_detach_state(addr, from_sender=False)
+
+
+def test_terminal_trailers_budget_transfers_to_batch_and_releases() raises:
+    var budget = SharedBufferBudget(65536)
+    var addr = _create_detach_state(slot=0, generation=1, budget=budget.copy())
+    var sender = ResponseSender(addr)
+    sender.start()
+    var initial = _take_batch(_detach_state(addr))
+    _ = initial^
+    var before = budget.used()
+    var trailers = Headers()
+    trailers.add("Digest", "test")
+    sender.finish(trailers=trailers^)
+    assert_true(budget.used() > before)
+    var batch = _take_batch(_detach_state(addr))
+    assert_equal(batch.trailers.get_first("Digest").value(), "test")
+    assert_equal(len(_detach_state(addr)[].terminal_trailers), 0)
+    _ = batch^
+    assert_equal(budget.used(), before)
+    _release_detach_state(addr, from_sender=False)
+    _ = sender^
+    assert_equal(budget.used(), 0)
+
+
+def test_finish_trailer_budget_rejection_allows_empty_finish() raises:
+    var budget = SharedBufferBudget(65536)
+    var addr = _create_detach_state(slot=0, generation=1, budget=budget.copy())
+    var sender = ResponseSender(addr)
+    sender.start()
+    var initial = _take_batch(_detach_state(addr))
+    _ = initial^
+    var remaining = 65536 - budget.used()
+    assert_true(budget.try_reserve(remaining))
+    var trailers = Headers()
+    trailers.add("Digest", "test")
+    var rejected = False
+    try:
+        sender.finish(trailers=trailers^)
+    except:
+        rejected = True
+    assert_true(rejected)
+    assert_false(_detach_state(addr)[].finished)
+    sender.finish()
+    budget.release(remaining)
+    _release_detach_state(addr, from_sender=False)
+    _ = sender^
+    assert_equal(budget.used(), 0)
+
+
+def test_cancel_refunds_terminal_trailers_while_sender_remains_alive() raises:
+    var budget = SharedBufferBudget(65536)
+    var addr = _create_detach_state(slot=0, generation=1, budget=budget.copy())
+    var sender = ResponseSender(addr)
+    sender.start()
+    var initial = _take_batch(_detach_state(addr))
+    _ = initial^
+    var before = budget.used()
+    var trailers = Headers()
+    trailers.add("Digest", "test")
+    sender.finish(trailers=trailers^)
+    assert_true(budget.used() > before)
+    _cancel_detach_state(addr)
+    assert_true(sender.is_cancelled())
+    assert_equal(budget.used(), before)
+    _ = sender^
+    assert_equal(budget.used(), 0)
+
+
+def test_terminal_chunk_framing_does_not_consume_header_byte_limit() raises:
+    var budget = SharedBufferBudget(65536)
+    var empty = _encode_chunk_end_budgeted(budget, max_bytes=0)
+    assert_equal(len(empty), 5)
+    budget.release(empty.capacity())
+    var trailers = Headers()
+    trailers.add("X", "y")
+    var wire = _encode_chunk_end_budgeted(budget, trailers, max_bytes=6)
+    assert_equal(len(wire), 11)
+    budget.release(wire.capacity())
+    assert_equal(budget.used(), 0)
+
+
+def test_streaming_trailers_share_initial_response_header_limits() raises:
+    for count_limit in [True, False]:
+        var config = ServerConfig.default()
+        if count_limit:
+            config.max_response_headers_count = 1
+        else:
+            config.max_response_headers_bytes = 6
+        var server = Server(config^)
+        server.add_listener(listen_tcp("127.0.0.1:0"))
+        var handler = _MailboxHandler()
+        var client = dial_tcp(
+            String("127.0.0.1:") + String(server.local_address().port),
+            Timeout.seconds(1),
+        )
+        client.write_all(
+            "GET / HTTP/1.1\r\nHost: x\r\n\r\n".as_bytes(), Timeout.seconds(1)
+        )
+        _wait_mailbox_handler(server, handler)
+        var sender = ResponseSender(handler.addr)
+        var headers = Headers()
+        headers.add("X", "y")
+        sender.start(headers=headers^)
+        var trailers = Headers()
+        trailers.add("Z", "y")
+        sender.finish(trailers=trailers^)
+        for _ in range(20):
+            _ = server.tick(handler)
+            if sender.is_cancelled():
+                break
+        assert_true(sender.is_cancelled())
+        client.close()
+
+
+def test_streaming_trailer_limits_include_headers_added_after_start() raises:
+    var config = ServerConfig.default()
+    config.max_response_headers_count = 1
+    var server = Server(config^)
+    server.add_listener(listen_tcp("127.0.0.1:0"))
+    var handler = _MailboxHandler()
+    var client = dial_tcp(
+        String("127.0.0.1:") + String(server.local_address().port),
+        Timeout.seconds(1),
+    )
+    client.write_all(
+        "GET / HTTP/1.1\r\nHost: x\r\n\r\n".as_bytes(), Timeout.seconds(1)
+    )
+    _wait_mailbox_handler(server, handler)
+    var sender = ResponseSender(handler.addr)
+    sender.start()
+    var state = _detach_state(handler.addr)
+    state[].mutex.lock()
+    state[].messages[0].headers.add("Alt-Svc", "test")
+    state[].mutex.unlock()
+    var trailers = Headers()
+    trailers.add("Z", "y")
+    sender.finish(trailers=trailers^)
+    for _ in range(20):
+        _ = server.tick(handler)
+        if sender.is_cancelled():
+            break
+    assert_true(sender.is_cancelled())
     client.close()
 
 

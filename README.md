@@ -282,7 +282,9 @@ struct SseHandler(Handler):
   standard Content-Length response asynchronously.
 - **Streaming response**: `sender.start(status, headers)` begins chunked
   streaming, `sender.send(chunk)` pushes chunks, and `sender.finish()`
-  completes the stream.
+  completes the stream. Pass `sender.finish(trailers=trailers)` to send
+  validated trailing headers after the final body chunk. Framing and routing
+  headers are rejected, and trailer storage counts against the server budget.
 - **Cancellation**: `sender.send(...)` returns `False` immediately upon
   client disconnect, deadline expiry, or shutdown.
 - **Thread safety**: Background threads never touch socket descriptors

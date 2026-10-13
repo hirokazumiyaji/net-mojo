@@ -2456,6 +2456,7 @@ struct Server(Movable):
             s_ptr[].array_ticket.release()
             s_ptr[].queued_bytes = 0
             s_ptr[].terminal_kind = MSG_KIND_NONE
+            s_ptr[].terminal_trailers = Headers()
             s_ptr[].mutex.unlock()
 
     def _cleanup_detached_state(mut self, idx: Int):
@@ -2576,7 +2577,7 @@ struct Server(Movable):
                 == _DetachTarget.http1(idx, self._conns[idx].token.generation)
             ):
                 if batch.terminal_kind == MSG_KIND_FINISH:
-                    self._handle_detached_finish(idx)
+                    self._handle_detached_finish(idx, batch.trailers)
                 else:
                     self._handle_detached_abort(idx)
 
@@ -2714,6 +2715,15 @@ struct Server(Movable):
             self._fail_detached(idx, is_head, rw)
             return
 
+        self._conns[idx].stream_header_count = len(rw.headers)
+        self._conns[idx].stream_header_bytes = 0
+        for i in range(len(rw.headers)):
+            self._conns[idx].stream_header_bytes += (
+                rw.headers._names[i].byte_length()
+                + rw.headers.value_byte_length(i)
+                + 4
+            )
+
         self._conns[idx].state = STATE_STREAMING
         self._conns[idx].stream_finished = False
         self._conns[idx].stream_has_body = (
@@ -2766,7 +2776,11 @@ struct Server(Movable):
             self.config.stream_idle_timeout
         )
 
-    def _handle_detached_finish(mut self, idx: Int) raises NetError:
+    def _handle_detached_finish(
+        mut self,
+        idx: Int,
+        trailers: Headers,
+    ) raises NetError:
         if not self._conns[idx].active:
             return
         if self._conns[idx].state != STATE_STREAMING:
@@ -2779,7 +2793,14 @@ struct Server(Movable):
 
         var wire: List[Byte]
         try:
-            wire = _encode_chunk_end_budgeted(self._budget)
+            wire = _encode_chunk_end_budgeted(
+                self._budget,
+                trailers,
+                self.config.max_response_headers_count
+                - self._conns[idx].stream_header_count,
+                self.config.max_response_headers_bytes
+                - self._conns[idx].stream_header_bytes,
+            )
         except e:
             _ = e
             self._handle_detached_abort(idx)

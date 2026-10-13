@@ -55,6 +55,8 @@ struct HttpConnection(Movable):
     var read_eof: Bool
     var stream_finished: Bool
     var stream_has_body: Bool
+    var stream_header_count: Int
+    var stream_header_bytes: Int
     var header_at: Int
     var body_at: Int
     var write_at: Int
@@ -116,6 +118,8 @@ struct HttpConnection(Movable):
         self.read_eof = False
         self.stream_finished = False
         self.stream_has_body = False
+        self.stream_header_count = 0
+        self.stream_header_bytes = 0
         self._no_deadline = no_deadline
         self.header_at = no_deadline
         self.body_at = no_deadline
@@ -457,6 +461,8 @@ struct HttpConnection(Movable):
         self.is_head = False
         self.stream_finished = False
         self.stream_has_body = False
+        self.stream_header_count = 0
+        self.stream_header_bytes = 0
         self.tls = None
         self.http2_session = None
         self.http2_deflater = None

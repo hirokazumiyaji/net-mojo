@@ -30,7 +30,7 @@ from net.http._buffer import (
     _CapacityTicket,
     _reserve_capacity,
 )
-from net.http.headers import Headers
+from net.http.headers import Headers, _trailer_forbidden
 
 
 comptime MSG_KIND_NONE: UInt8 = 0
@@ -162,6 +162,7 @@ struct _DetachedBatch(Movable):
     var messages: List[DetachMessage]
     var ticket: _CapacityTicket
     var terminal_kind: UInt8
+    var trailers: Headers
     var target: _DetachTarget
 
     def __deinit__(deinit self):
@@ -189,6 +190,7 @@ struct _SharedDetachState:
     var budget: Optional[SharedBufferBudget]
     var array_ticket: _CapacityTicket
     var terminal_kind: UInt8
+    var terminal_trailers: Headers
     var state_ticket: _CapacityTicket
 
     def __init__(
@@ -216,6 +218,7 @@ struct _SharedDetachState:
         self.budget = budget^
         self.array_ticket = _CapacityTicket(self.budget.copy())
         self.terminal_kind = MSG_KIND_NONE
+        self.terminal_trailers = Headers()
         self.state_ticket = state_ticket^
 
     def __deinit__(deinit self):
@@ -259,11 +262,20 @@ def _take_batch(
     var ticket = ticket_ptr.unsafe_take_pointee()
     ticket_ptr.unsafe_write(_CapacityTicket(state[].budget.copy()))
     var terminal_kind = state[].terminal_kind
+    var trailers_ptr = Pointer(to=state[].terminal_trailers)
+    var trailers = trailers_ptr.unsafe_take_pointee()
+    trailers_ptr.unsafe_write(Headers())
     var target = state[].target.copy()
     state[].queued_bytes = 0
     state[].terminal_kind = MSG_KIND_NONE
     state[].mutex.unlock()
-    return _DetachedBatch(messages^, ticket^, terminal_kind, target^)
+    return _DetachedBatch(
+        messages^,
+        ticket^,
+        terminal_kind,
+        trailers^,
+        target^,
+    )
 
 
 def _create_detach_state(
@@ -333,6 +345,7 @@ def _cancel_detach_state(addr: Int):
     var state = _detach_state(addr)
     state[].mutex.lock()
     state[].cancelled = True
+    state[].terminal_trailers = Headers()
     state[].mutex.unlock()
     _release_detach_state(addr, from_sender=False)
 
@@ -596,8 +609,16 @@ struct ResponseSender(Movable):
             )
         return True
 
-    def finish(mut self) raises NetError:
-        """Finishes the streaming response."""
+    def finish(mut self, var trailers: Headers = Headers()) raises NetError:
+        """Finishes the streaming response with optional trailers."""
+        for i in range(len(trailers)):
+            if _trailer_forbidden(trailers.name_at(i)):
+                raise NetError(
+                    NetErrorKind.invalid_argument(),
+                    "finish",
+                    None,
+                    "trailer modifies framing, routing, or payload processing",
+                )
         if self._addr == 0:
             raise _inactive_error("finish")
         var s_ptr = _detach_state(self._addr)
@@ -614,6 +635,15 @@ struct ResponseSender(Movable):
                 None,
                 "streaming response not started or already finished",
             )
+        if not trailers._adopt_capacity_budget(s_ptr[].budget.copy()):
+            s_ptr[].mutex.unlock()
+            raise NetError(
+                NetErrorKind.invalid_argument(),
+                "finish",
+                None,
+                "trailer capacity exceeds budget",
+            )
+        s_ptr[].terminal_trailers = trailers^
         s_ptr[].finished = True
         s_ptr[].terminal_kind = MSG_KIND_FINISH
         _unlock_and_wake(s_ptr)
