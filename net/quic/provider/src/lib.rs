@@ -2724,10 +2724,11 @@ impl QuicServer {
                 let has_trailers = !response.trailers.is_empty();
                 if !response.headers_sent {
                     let fin = !response.streaming && response.body.is_empty() && !has_trailers;
-                    match http3.send_response(
+                    match http3.send_response_with_priority(
                         &mut connection.transport,
                         stream_id,
                         &response.headers,
+                        &quiche::h3::Priority::new(3, response.streaming),
                         fin,
                     ) {
                         Ok(()) => {
@@ -3417,6 +3418,42 @@ mod tests {
                 .any(|event| *event == (request.id, 1))
         );
         assert_eq!(server.buffered_response_bytes, 0);
+    }
+
+    #[test]
+    fn streaming_response_headers_interleave_before_a_large_body_drains() {
+        let (mut server, mut client, mut h3, local, remote) = request_timer_peer();
+        let first = completed_ready_request(&mut server, &mut client, &mut h3, local, remote);
+        let second = completed_ready_request(&mut server, &mut client, &mut h3, local, remote);
+        assert!(server.start_response(first.id, 200, vec![]));
+        assert!(server.start_response(second.id, 200, vec![]));
+        server.drive_responses().unwrap();
+        let body = vec![b'a'; 32768];
+        assert!(server.send_stream_body(first.id, &body, false) > 0);
+        let _ = server.send_stream_body(second.id, &body, false);
+        flush_server_to_client(&mut client, &mut server, &mut [0; 65535], remote);
+        let mut headers = Vec::new();
+        let mut received = 0;
+        loop {
+            match h3.poll(&mut client) {
+                Ok((id, quiche::h3::Event::Headers { .. })) => headers.push(id),
+                Ok((id, quiche::h3::Event::Data)) => {
+                    while let Ok(length) = h3.recv_body(&mut client, id, &mut [0; 4096]) {
+                        received += length;
+                        if length == 0 {
+                            break;
+                        }
+                    }
+                }
+                Ok(_) => (),
+                Err(quiche::h3::Error::Done) => break,
+                Err(error) => panic!("response poll failed: {error:?}"),
+            }
+        }
+        assert!(received < body.len());
+        assert_eq!(headers.len(), 2);
+        assert!(headers.contains(&first.stream_id));
+        assert!(headers.contains(&second.stream_id));
     }
 
     #[test]
