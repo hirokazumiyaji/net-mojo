@@ -129,12 +129,16 @@ def main() raises:
     server.serve(listen_tcp("127.0.0.1:8080"), handler)
 ```
 
-### HTTP/1 request body streaming
+### Request body streaming
 
 Set `config.enable_request_body_streaming = True` before constructing `Server`.
 A streaming request has an empty `req.body`; its `body_reader().read(buffer)`
 returns decoded bytes, zero at EOF, or `NetErrorKind.timeout()` when more input
 is needed. The loop thread's read never blocks.
+This interface applies to HTTP/1 Content-Length/chunked input and HTTP/2/HTTP/3
+DATA. In streaming mode `max_body_bytes` bounds queued input, so a consumer can
+process uploads larger than the queue. `total_buffer_budget` still bounds shared
+Mojo queues; the QUIC provider also maintains its native receive pool limits.
 
 For a worker, use `var endpoints = writer.detach_with_body(req)` and transfer
 `endpoints^` into its owned context. `endpoints.receiver.receive(buffer, timeout)`
@@ -142,11 +146,20 @@ waits for input; `endpoints.sender` completes or streams the response.
 `receiver.trailers()` becomes available after consumed EOF. Disconnects,
 input deadlines and expired shutdown grace wake the receiver with
 `NetErrorKind.cancelled()`.
+`req.detach_body()` also transfers a receiver independently of response output.
+An owned receiver keeps accepted input alive after a synchronous response FIN;
+completed trailers remain available until the receiver is dropped.
 
 Call `body_reader().discard()` to drain an unwanted body before reusing the
-connection. A synchronous response with an incomplete, undiscarded body closes
-the connection. Streaming input progress renews `body_deadline`; response
+connection. An HTTP/1 synchronous response with an incomplete, undiscarded body
+and no owned receiver closes the connection. HTTP/2 and HTTP/3 discard unclaimed
+input while preserving response output. Streaming input progress renews `body_deadline`; response
 and shutdown deadlines still apply.
+
+Valid `Expect: 100-continue` receives informational headers before the handler
+runs when input is incomplete. Unsupported expectations receive 417 without
+handler dispatch. Accepted input can finish during graceful shutdown; grace
+expiry cancels unfinished receivers.
 
 Constraints (see `docs/design/http-server.md` for the full contract):
 

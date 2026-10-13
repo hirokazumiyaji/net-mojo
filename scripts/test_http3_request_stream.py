@@ -5,15 +5,31 @@ import subprocess
 from pathlib import Path
 
 import pylsqpack
-from aioquic.h3.connection import FrameType, encode_frame
+from aioquic.h3.connection import FrameType, HeadersState, encode_frame
+from aioquic.h3.events import HeadersReceived
 from aioquic.asyncio import connect
 from aioquic.quic.configuration import QuicConfiguration
-from test_http3_detach import Http3ClientProtocol
+from test_http3_detach import Http3ClientProtocol, ResponseConnection
 
 ROOT = Path(__file__).resolve().parents[1]
 
 
+class InformationalConnection(ResponseConnection):
+    def _handle_request_or_push_frame(self, frame_type, frame_data, stream, stream_ended):
+        events = super()._handle_request_or_push_frame(frame_type, frame_data, stream, stream_ended)
+        for event in events:
+            if isinstance(event, HeadersReceived) and (b":status", b"100") in event.headers:
+                assert not event.stream_ended
+                # Keep informational sections separate from final response headers.
+                stream.headers_recv_state = HeadersState.INITIAL
+        return events
+
+
 class Client(Http3ClientProtocol):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.http = InformationalConnection(self._quic)
+
     def begin(self, path, upload=False, headers=()):
         stream = self._quic.get_next_available_stream_id()
         response = {"future": self._loop.create_future(), "headers": [], "body": bytearray()}
