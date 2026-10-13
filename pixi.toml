@@ -40,6 +40,7 @@ test-http-router = "mojo run --Werror -I . tests/test_http_router.mojo"
 test-http-middleware = "mojo run --Werror -I . tests/test_http_middleware.mojo"
 test-http-server = "mojo run --Werror -I . tests/test_http_server.mojo"
 test-http2 = "mojo run --Werror -I . tests/test_http2.mojo"
+test-http-hijack-actor = "mojo run --Werror -I . tests/test_http_hijack_actor.mojo"
 test-http-hijacked-conn = "mojo run --Werror -I . tests/test_http_hijacked_conn.mojo"
 test-http-detach = "mojo run --Werror -I . tests/test_http_detach.mojo"
 test-http-offload = "mojo run --Werror -I . tests/test_http_offload.mojo"
@@ -65,6 +66,7 @@ sanitize-http-server = { cmd = "bash scripts/run_sanitized.sh tests/test_http_se
 sanitize-http2 = { cmd = "bash scripts/run_sanitized.sh tests/test_http2.mojo", default-environment = "sanitize", depends-on = [
   { task = "hpack-test", environment = "http2" },
 ] }
+sanitize-http-hijack-actor = { cmd = "bash scripts/run_sanitized.sh tests/test_http_hijack_actor.mojo", default-environment = "sanitize" }
 sanitize-http-hijacked-conn = { cmd = "bash scripts/run_sanitized.sh tests/test_http_hijacked_conn.mojo", default-environment = "sanitize" }
 sanitize-http-detach = { cmd = "bash scripts/run_sanitized.sh tests/test_http_detach.mojo", default-environment = "sanitize" }
 sanitize-http-offload = { cmd = "bash scripts/run_sanitized.sh tests/test_http_offload.mojo", default-environment = "sanitize" }
@@ -89,6 +91,7 @@ sanitize = { depends-on = [
   { task = "sanitize-http-middleware", environment = "sanitize" },
   { task = "sanitize-http-server", environment = "sanitize" },
   { task = "sanitize-http2", environment = "sanitize" },
+  { task = "sanitize-http-hijack-actor", environment = "sanitize" },
   { task = "sanitize-http-hijacked-conn", environment = "sanitize" },
   { task = "sanitize-http-detach", environment = "sanitize" },
   { task = "sanitize-http-offload", environment = "sanitize" },
@@ -116,6 +119,7 @@ test = { depends-on = [
   "test-http-middleware",
   "test-http-server",
   "test-http2",
+  "test-http-hijack-actor",
   "test-http-hijacked-conn",
   "test-http-detach",
   "test-http-offload",

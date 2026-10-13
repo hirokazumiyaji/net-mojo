@@ -1144,3 +1144,11 @@ length raises `invalid_state`. A timeout may require either readability or
 writability, so a raw-descriptor poller watches both. `shutdown_write` sends TLS
 close-notify before the TCP write-side shutdown and preserves the read side.
 It rejects shutdown while a TLS write retry remains outstanding.
+
+`HijackSender.take_connection` consumes a worker endpoint and blocks on a
+condition until the HTTP loop publishes the connection after output flush,
+or cancels the switch. Calling it on the HTTP loop thread prevents completion.
+Cancellation returns `NetError(closed)`. Dropping or aborting an incomplete
+sender wakes the loop; dropping an unclaimed completed sender closes its raw
+transport. Each handoff has two references, held by the loop and worker;
+its response-wire and state-allocation budget tickets return on cleanup.
