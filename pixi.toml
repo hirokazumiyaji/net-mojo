@@ -291,6 +291,9 @@ test-prop-http1-parser = "mojo run --Werror -I . tests/prop/test_prop_http1_pars
 test-prop-http1-chunked = "mojo run --Werror -I . tests/prop/test_prop_http1_chunked.mojo"
 test-prop = { depends-on = ["test-prop-http1-parser", "test-prop-http1-chunked", "test-prop-ip", "test-prop-address", "test-prop-timeout", "test-prop-mailbox"] }
 
+[feature.proptest-http2.tasks]
+test-prop-hpack = { cmd = "mojo run --Werror -I . tests/prop/test_prop_hpack.mojo", depends-on = ["hpack-test"] }
+
 [feature.mojo-1-1.dependencies]
 mojo = ">=1.1.0,<1.2"
 
@@ -301,6 +304,7 @@ compiler-rt = "==23.1.2"
 [environments]
 default = ["mojo-1-1"]
 proptest = ["proptest", "mojo-1-1"]
+proptest-http2 = ["proptest", "proptest-http2", "http2", "mojo-1-1"]
 sanitize = ["sanitize", "mojo-1-1"]
 fuzz = ["fuzz", "sanitize", "mojo-1-1"]
 conformance = ["conformance", "tls", "http2", "mojo-1-1"]

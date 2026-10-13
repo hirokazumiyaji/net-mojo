@@ -32,9 +32,11 @@ jobs:
         uses: prefix-dev/setup-pixi@f00437f565399d418b0acc85936d12c1fb668347
         with:
           frozen: true
-          environments: proptest
+          environments: proptest proptest-http2
       - name: Test semantic properties
         run: pixi run -e proptest test-prop
+      - name: Test HPACK properties
+        run: pixi run -e proptest-http2 test-prop-hpack
 
   fuzz:
     name: Fuzz smoke (${{ matrix.os }})
