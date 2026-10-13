@@ -32,6 +32,7 @@ test-http-control = "mojo run --Werror -I . tests/test_http_control.mojo"
 test-http-api = "mojo run --Werror -I . tests/test_http_api.mojo"
 test-http-parser = "mojo run --Werror -I . tests/test_http_parser.mojo"
 test-http-response = "mojo run --Werror -I . tests/test_http_response.mojo"
+test-http-router = "mojo run --Werror -I . tests/test_http_router.mojo"
 test-http-server = "mojo run --Werror -I . tests/test_http_server.mojo"
 test-http2 = "mojo run --Werror -I . tests/test_http2.mojo"
 test-http-detach = "mojo run --Werror -I . tests/test_http_detach.mojo"
@@ -84,6 +85,7 @@ test = { depends-on = [
   "test-http-pool",
   "test-http-parser",
   "test-http-response",
+  "test-http-router",
   "test-http-server",
   "test-http2",
   "test-http-detach",
