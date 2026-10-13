@@ -1,7 +1,7 @@
 from std.testing import assert_equal, assert_false, assert_true, TestSuite
 from std.ffi import c_int, external_call
 from std.memory import OwnedPointer
-from std.time import sleep
+from std.time import perf_counter_ns, sleep
 
 from net import TCPConn, Timeout, dial_tcp, listen_tcp
 from net.error import NetErrorKind
@@ -499,8 +499,9 @@ def test_one_budget_byte_pauses_input_until_refund() raises:
     assert_true(server._budget.try_reserve(held))
     var wire = String("a") * 512
     client.write_all(wire.as_bytes(), Timeout.seconds(1))
-    for _ in range(3):
-        _ = server.tick(handler, Timeout.nanoseconds(0))
+    var expires = perf_counter_ns() + 1_000_000_000
+    while server._conns[0].wants_read() and perf_counter_ns() < expires:
+        _ = server.tick(handler, Timeout.nanoseconds(1_000_000))
     assert_false(server._conns[0].wants_read())
     server._budget.release(held)
     var body = _receive_body(server, handler)
