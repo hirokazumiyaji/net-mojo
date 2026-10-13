@@ -53,6 +53,14 @@ with the version source of truth in `pixi.toml`. Changes are recorded in
 `net` that does not start with an underscore; anything under `net/_sys/`
 or starting with `_` is internal and may change without a version bump.
 
+To release, set the same version in `pixi.toml` and
+`conda.recipe/recipe.yaml`, move the CHANGELOG entries under
+`## [X.Y.Z] - YYYY-MM-DD`, optionally add `docs/releases/vX.Y.Z.md`, and push
+the tag `vX.Y.Z`. The Publish workflow checks that these agree, builds and
+tests the conda package on every supported platform, uploads it to the
+prefix.dev channel named by the `PREFIX_CHANNEL` repository variable (using
+the `PREFIX_API_KEY` secret), and creates the GitHub Release.
+
 ## Public API
 
 Import public types and functions from `net`:

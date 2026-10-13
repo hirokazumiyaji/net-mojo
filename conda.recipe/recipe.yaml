@@ -1,0 +1,39 @@
+context:
+  name: net-mojo
+  version: "0.1.0"
+
+package:
+  name: ${{ name }}
+  version: ${{ version }}
+
+source:
+  path: ..
+
+build:
+  number: 0
+  script:
+    - mkdir -p ${{ PREFIX }}/lib/mojo
+    - mojo precompile net -o ${{ PREFIX }}/lib/mojo/net.mojoc
+
+requirements:
+  build:
+    - mojo-compiler =1.1.0
+  host:
+    - mojo-compiler =1.1.0
+  run:
+    # Precompiled artifacts only load in the compiler release that built them.
+    - ${{ pin_compatible('mojo-compiler', upper_bound='x.x.x') }}
+
+tests:
+  - script:
+      - mojo run --Werror tests/package_smoke.mojo
+    files:
+      source:
+        - tests/package_smoke.mojo
+
+about:
+  homepage: https://github.com/hirokazumiyaji/net-mojo
+  repository: https://github.com/hirokazumiyaji/net-mojo
+  license: MIT
+  license_file: LICENSE
+  summary: Synchronous TCP, UDP, Unix socket and HTTP server networking for Mojo

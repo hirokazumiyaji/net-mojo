@@ -37,6 +37,9 @@ underscore (see README "Versioning and compatibility"). Anything under
 
 ### Added
 
+- Publish conda packages for linux-64, linux-aarch64 and osx-arm64 to
+  prefix.dev and create a GitHub Release when a `v*.*.*` tag is pushed
+  (`.github/workflows/publish.yml`, `conda.recipe/recipe.yaml`).
 - HTTP/1.1 response trailers via `ResponseWriter.add_trailer(name, value)`:
   the buffered encoder switches to `Transfer-Encoding: chunked`, advertises
   the names in `Trailer:`, and emits the trailer section after the body
