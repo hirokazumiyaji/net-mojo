@@ -236,6 +236,24 @@ Construct the chain before serving. Middleware callbacks own their captures
 under the same contract as route callbacks. Errors propagate through `next`;
 use `try`/`except` when cleanup must also run after an error.
 
+### Handler middleware
+
+`LoggingHandler[Inner, Sink]` owns an inner handler and an injected `LogSink`.
+`StdoutLogSink` prints method, raw path, status and elapsed nanoseconds;
+custom sinks can retain owned records. For example, wrap a mux with
+`LoggingHandler[ServeMux](mux^, StdoutLogSink())`.
+Escaping errors are logged as 500 and rethrown. Detached responses are
+logged when the synchronous handler returns, before their eventual completion.
+
+`RecoverHandler[Inner](inner^)` replaces a failed buffered response with
+500, discarding its partial body, headers and trailers. Errors after detach
+propagate to the server for cancellation.
+`TimeoutHandler[Inner](inner^, timeout)` checks a monotonic deadline before
+and after a synchronous call, replacing an expired successful response with
+503. It cannot interrupt blocking work; inner errors propagate and detached
+responses are unsupported. Replacement responses obey the writer's body
+limit and shared buffer budget.
+
 Optional provider pins live in `pixi.toml` (`openssl`, `libnghttp2`) and
 `net/quic/provider/Cargo.toml` (quiche). After bumping a pin, refresh
 `pixi.lock` / the provider `Cargo.lock`, rebuild the `tls-http2` /

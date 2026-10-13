@@ -18,10 +18,12 @@ from net.http import (
     Handler,
     Request,
     ResponseWriter,
+    RecoverHandler,
     Server,
     ServerConfig,
     ServerControl,
     ServeMux,
+    TimeoutHandler,
 )
 from tests.support import (
     _content_length_of,
@@ -1940,6 +1942,53 @@ def test_serve_mux_head_falls_back_and_omits_wire_body() raises:
     assert_equal(_status_of(wire), 200)
     assert_equal(_content_length_of(wire), 12)
     assert_equal(len(wire), _header_end(wire))
+    assert_equal(server.active_connections(), 0)
+    assert_equal(server._budget.used(), 0)
+    client.close()
+
+
+def test_recover_mux_keeps_connection_after_buffered_error() raises:
+    var server = Server(ServerConfig.default())
+    server.add_listener(listen_tcp("127.0.0.1:0"))
+    var mux = ServeMux()
+    mux.handle_handler("GET /raise", _HeadErrorHandler())
+    mux.handle_handler("GET /alive", _HeadErrorHandler())
+    var handler = RecoverHandler[ServeMux](mux^)
+    var client = dial_tcp(
+        String("127.0.0.1:") + String(server.local_address().port),
+        Timeout.seconds(2),
+    )
+    var failed = _exchange(
+        server, handler, client, "GET /raise HTTP/1.1\r\nHost: x\r\n\r\n"
+    )
+    assert_equal(_status_of(failed), 500)
+    _assert_body(failed, "500 Internal Server Error")
+    assert_equal(server.active_connections(), 1)
+    var alive = _exchange(
+        server, handler, client, "GET /alive HTTP/1.1\r\nHost: x\r\n\r\n"
+    )
+    assert_equal(_status_of(alive), 200)
+    _assert_body(alive, "alive")
+    assert_equal(server.active_connections(), 0)
+    assert_equal(server._budget.used(), 0)
+    client.close()
+
+
+def test_timeout_mux_rejects_detach_and_server_releases_state() raises:
+    var server = Server(ServerConfig.default())
+    server.add_listener(listen_tcp("127.0.0.1:0"))
+    var mux = ServeMux()
+    mux.handle_handler("GET /abort", _HeadErrorHandler())
+    var handler = TimeoutHandler[ServeMux](mux^, Timeout.seconds(1))
+    var client = dial_tcp(
+        String("127.0.0.1:") + String(server.local_address().port),
+        Timeout.seconds(2),
+    )
+    var wire = _exchange(
+        server, handler, client, "GET /abort HTTP/1.1\r\nHost: x\r\n\r\n"
+    )
+    assert_equal(_status_of(wire), 500)
+    _assert_body(wire, "500 Internal Server Error")
     assert_equal(server.active_connections(), 0)
     assert_equal(server._budget.used(), 0)
     client.close()

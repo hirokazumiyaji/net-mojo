@@ -465,6 +465,24 @@ def apply_middleware(
     var final: RouteHandler, var layers: List[MiddlewareFn]
 ) -> RouteHandler
 
+trait LogSink(Movable):
+    def record(
+        mut self, method: StringSlice, path: StringSlice, status: Int, elapsed_ns: Int
+    )
+
+struct LoggingHandler[
+    Inner: Handler & Deinitable, Sink: LogSink & Deinitable = StdoutLogSink
+](Handler):
+    var inner: Self.Inner
+    var sink: Self.Sink
+
+struct RecoverHandler[Inner: Handler & Deinitable](Handler):
+    var inner: Self.Inner
+
+struct TimeoutHandler[Inner: Handler & Deinitable](Handler):
+    var inner: Self.Inner
+    var timeout: Timeout
+
 # net/http/error.mojo
 struct HttpError(Copyable, Movable, Writable):
     var status: Int
@@ -676,6 +694,19 @@ callback は `next.handle(req, writer)` を呼んで後続へ進むか、呼ば�
 後続が例外を返すと、その例外は呼び出し元の middleware に伝わる。
 `next.handle` の後の処理を例外時にも実行する場合は callback が `try`/`except` を使う。
 合成自体は応答 status と body を変更せず、前後処理と短絡処理を callback が決める。
+
+### Handler を包む middleware
+
+`LoggingHandler` は内側の handler と `LogSink` を所有し、同期呼び出しの完了時に method、raw path、status、経過 nanosecond を記録する。
+`StdoutLogSink` はこれらを標準出力へ出し、利用者は同じ trait を満たす出力先を注入できる。
+内側から例外が出た場合は 500 を記録して同じ例外を返す。
+detach した応答は同期 handler の復帰時に記録するため、後で sender が設定する status はこの記録に含まれない。
+
+`RecoverHandler` は buffered handler の例外を 500 応答へ変換し、途中まで作った body、headers、trailers の storage と予算予約を解放する。
+detach 後の例外は server に返し、応答 owner に sender の取消を任せる。
+`TimeoutHandler` は同期呼び出しの前後で monotonic deadline を調べ、正常に戻った時点で期限を過ぎていれば途中の応答を 503 に置き換える。
+実行中の blocking work を中断する機能は持たず、内側の例外はそのまま返し、detach を行った場合は `invalid_state` を返す。
+500 と 503 の置換応答も writer の body 上限と共有予算に従う。
 
 ### エラー契約
 

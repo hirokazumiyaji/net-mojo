@@ -5,6 +5,8 @@ from net.http import (
     Headers,
     HttpVersion,
     MiddlewareFn,
+    LoggingHandler,
+    RecoverHandler,
     Request,
     ServerPool,
     ResponseSender,
@@ -12,6 +14,8 @@ from net.http import (
     RouteHandler,
     ServerConfig,
     ServeMux,
+    StdoutLogSink,
+    TimeoutHandler,
     apply_middleware,
     has_body_for_status,
 )
@@ -92,11 +96,15 @@ def _check_http_router() raises:
         "GET /hello/{name}",
         apply_middleware(RouteHandler(_packaged_route), layers^),
     )
+    comptime RecoveredMux = RecoverHandler[ServeMux]
+    comptime LoggedMux = LoggingHandler[RecoveredMux]
+    var logged = LoggedMux(RecoveredMux(mux^), StdoutLogSink())
+    var handler = TimeoutHandler[LoggedMux](logged^, Timeout.seconds(1))
     var req = Request(
         "GET", "/hello/package", "/hello/package", "", HttpVersion.http11()
     )
     var writer = ResponseWriter(1024)
-    mux.handle(req, writer)
+    handler.handle(req, writer)
     if (
         writer.status != 200
         or String(from_utf8_lossy=Span(writer.body)) != "package"
