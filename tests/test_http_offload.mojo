@@ -631,6 +631,63 @@ def test_invalid_config_and_inactive_sender_report_error() raises:
     assert_equal(len(gate.destroyed), 1)
 
 
+def test_writer_offload_accepts_and_full_pool_completes_503() raises:
+    var gate = _JobGate()
+    gate.mutex._initialize()
+    for queue_limit in [1, 0]:
+        var pool = WorkerPool(
+            WorkerPoolConfig(workers=1, queue_limit=queue_limit)
+        )
+        var writer = ResponseWriter(1024)
+        assert_equal(
+            writer.offload(pool, _RecordJob(_gate_address(gate), queue_limit)),
+            queue_limit == 1,
+        )
+        assert_true(writer.is_detached())
+        var addr = writer._detach_state_addr
+        pool.shutdown()
+        _assert_response(addr, 200 if queue_limit == 1 else 503)
+        writer._cancel_detach()
+    assert_equal(len(gate.destroyed), 2)
+
+
+def test_writer_offload_failed_detach_releases_job_without_submission() raises:
+    var gate = _JobGate()
+    gate.mutex._initialize()
+    var pool = WorkerPool(WorkerPoolConfig(workers=1))
+    var writer = ResponseWriter(1024)
+    writer._set_mailbox_budget(SharedBufferBudget(0))
+    var rejected = False
+    try:
+        _ = writer.offload(pool, _RecordJob(_gate_address(gate), 8))
+    except:
+        rejected = True
+    pool.shutdown()
+    assert_true(rejected)
+    assert_false(writer.is_detached())
+    assert_equal(len(gate.order), 0)
+    assert_equal(len(gate.destroyed), 1)
+
+
+def test_writer_offload_already_detached_releases_unsubmitted_job() raises:
+    var gate = _JobGate()
+    gate.mutex._initialize()
+    var pool = WorkerPool(WorkerPoolConfig(workers=1))
+    var writer = ResponseWriter(1024)
+    var sender = writer.detach()
+    var rejected = False
+    try:
+        _ = writer.offload(pool, _RecordJob(_gate_address(gate), 8))
+    except error:
+        rejected = error.kind == NetErrorKind.invalid_state()
+    sender.abort()
+    pool.shutdown()
+    writer._cancel_detach()
+    assert_true(rejected)
+    assert_equal(len(gate.order), 0)
+    assert_equal(len(gate.destroyed), 1)
+
+
 @fieldwise_init
 struct _HTTPJob(HandlerJob):
     var gate_addr: Int
@@ -671,8 +728,8 @@ struct _OffloadHTTPHandler(Handler):
             var pool = Pointer[Byte, MutUntrackedOrigin](
                 unsafe_from_address=self.pool_addr
             ).unsafe_bitcast[WorkerPool]()
-            _ = pool[].submit(
-                writer.detach(), _HTTPJob(self.gate_addr, req.body.copy())
+            _ = writer.offload(
+                pool[], _HTTPJob(self.gate_addr, req.body.copy())
             )
             self.submitted += 1
         else:

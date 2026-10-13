@@ -1104,3 +1104,24 @@ shutdown grace 中も受信を続けるが、猶予や本文期限の満了は r
 
 `tests/test_http_request_stream.mojo` は、ヘッダーだけでの dispatch、固定長と chunked、トレーラー、discard と pipeline、未読本文の切断を検証する。
 期限更新、100-continue、受信途中の EOF・shutdown と、32 バイトのキューを使う 16 KiB の pthread 受信も同じテストで確認する。
+
+## Heavy handler offload
+
+Handlers remain synchronous on the event loop. `ResponseWriter.offload(pool,
+job)` transfers a detached response and an owned `HandlerJob` to the reusable
+`WorkerPool`; it does not give the job socket or reactor ownership. Copy
+buffered request values into jobs before returning from the handler. The
+pool's queue count limit is separate from Server buffer budgets and does not
+bound memory retained by user jobs.
+
+A full or closed pool completes the detached sender with 503 and
+`Retry-After: 1`, returning `False`. Accepted jobs return `True`. A failed
+detach releases the unsubmitted job. The response sender's existing ownership
+rules handle errors after detach, so handlers need no private rollback call.
+
+Shut down Server before the pool. Pool shutdown stops admission, waits within
+its own grace, then cancels outstanding response capabilities. Unfinished
+workers detach and retain the shared state until their jobs and destructors
+return. This bounds shutdown while preserving lifetime safety; it cannot stop
+arbitrary user code. See [http-offload.md](http-offload.md) for the full
+contract and `examples/http_offload.mojo` / `examples/http_sse.mojo` for usage.

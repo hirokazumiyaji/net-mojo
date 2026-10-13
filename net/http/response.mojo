@@ -22,6 +22,7 @@ from ._detach import (
     _create_detach_state,
 )
 from ._buffer import SharedBufferBudget, _reserve_capacity
+from ._offload import HandlerJob, OffloadError, WorkerPool
 from .headers import Headers, _trailer_forbidden
 from .request import Request, RequestBodyReceiver
 from ._body_pipe import _BodyPipe
@@ -186,6 +187,13 @@ struct ResponseWriter(Movable, Sized):
         self._detach_state_addr = addr
         self._detached = True
         return ResponseSender(addr)
+
+    def offload[
+        J: HandlerJob
+    ](mut self, mut pool: WorkerPool, var job: J) raises OffloadError -> Bool:
+        """Transfers this response and an owned job to a bounded worker pool."""
+        var sender = self.detach()
+        return pool.submit(sender^, job^)
 
     def __len__(self) -> Int:
         return len(self.body)

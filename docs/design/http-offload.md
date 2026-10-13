@@ -4,6 +4,9 @@
 A handler detaches its response and transfers the resulting `ResponseSender`
 and an owned `HandlerJob` to `pool.submit(sender, job)`.
 The connection actor retains socket and reactor ownership.
+`writer.offload(pool, job)` combines detach and submit. Failed detach destroys
+the unsubmitted job; errors after detach follow sender ownership and abort
+rules. No caller needs private detach rollback.
 
 ## Admission and ownership
 
