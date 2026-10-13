@@ -456,10 +456,9 @@ struct Http2RequestSession(Movable):
                         # Closed streams: ignore stream errors, including
                         # increment=0, so a late update cannot tear down
                         # the connection (RFC 9113 §5.1 closed).
-                        if (
-                            input.stream_id > self._last_stream_id
-                            or (input.stream_id & UInt32(1)) == UInt32(0)
-                        ):
+                        if input.stream_id > self._last_stream_id or (
+                            input.stream_id & UInt32(1)
+                        ) == UInt32(0):
                             self._failed = True
                             return Http2RequestSessionResult.error(
                                 consumed, output^
