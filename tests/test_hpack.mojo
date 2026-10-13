@@ -2353,7 +2353,7 @@ def test_http2_data_after_local_reset_returns_connection_credit_without_reset() 
     _ = session.refuse_stream(UInt32(1), UInt32(7))
     var retained = session.buffered_request_bytes()
     var body: List[Byte] = [Byte(ord("x"))]
-    for i in range(2):
+    for _ in range(2):
         var late = List[Byte]()
         _append_frame(late, Byte(0), Byte(0), UInt32(1), Span(body))
         var result = session.consume(Span(late))
