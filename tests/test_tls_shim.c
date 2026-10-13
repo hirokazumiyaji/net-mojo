@@ -10,6 +10,8 @@
 #include "net/tls/shim.h"
 
 void *net_tls_context_server(const char *, const char *, const char *);
+void *net_tls_context_client(const char *, const char *, unsigned int);
+void *net_tls_connection_new_client(void *, int, const char *, const char *);
 void net_tls_context_free(void *);
 void *net_tls_connection_new(void *, int);
 void net_tls_connection_free(void *);
@@ -22,6 +24,58 @@ int net_tls_shutdown(void *);
 
 static int is_would_block(int result) {
     return result == NET_TLS_WANT_READ || result == NET_TLS_WANT_WRITE;
+}
+
+static void test_client_owned_context(const char *certificate, const char *key,
+                                      const char *hostname) {
+    assert(net_tls_context_client(certificate, "h2", 0) == NULL);
+    assert(net_tls_context_client(certificate, "http/1.1", 2) == NULL);
+    void *client_context = net_tls_context_client(certificate, "http/1.1", 0);
+    void *server_context = net_tls_context_server(certificate, key, "http/1.1");
+    assert(client_context != NULL && server_context != NULL);
+    int fds[2];
+    assert(socketpair(AF_UNIX, SOCK_STREAM, 0, fds) == 0);
+    for (int i = 0; i < 2; i++) {
+        int flags = fcntl(fds[i], F_GETFL, 0);
+        assert(flags >= 0);
+        assert(fcntl(fds[i], F_SETFL, flags | O_NONBLOCK) == 0);
+    }
+    void *server = net_tls_connection_new(server_context, fds[0]);
+    void *client = net_tls_connection_new_client(client_context, fds[1],
+                                                "other.example.", hostname);
+    assert(server != NULL && client != NULL);
+    net_tls_context_free(server_context);
+    net_tls_context_free(client_context);
+    int client_ready = 0;
+    int server_ready = 0;
+    for (int i = 0; i < 32 && (!client_ready || !server_ready); i++) {
+        if (!client_ready) {
+            int result = net_tls_handshake(client);
+            assert(result == 1 || is_would_block(result));
+            client_ready = result == 1;
+        }
+        if (!server_ready) {
+            int result = net_tls_handshake(server);
+            assert(result == 1 || is_would_block(result));
+            server_ready = result == 1;
+        }
+    }
+    assert(client_ready && server_ready);
+    unsigned char selected[16];
+    assert(net_tls_selected_alpn(client, selected, sizeof(selected)) == 8);
+    assert(memcmp(selected, "http/1.1", 8) == 0);
+    const unsigned char ping[] = "ping";
+    assert(net_tls_write(client, ping, sizeof(ping) - 1) == 4);
+    unsigned char received[16];
+    assert(net_tls_read(server, received, sizeof(received)) == 4);
+    assert(memcmp(received, ping, 4) == 0);
+    assert(net_tls_write(server, ping, sizeof(ping) - 1) == 4);
+    assert(net_tls_read(client, received, sizeof(received)) == 4);
+    assert(memcmp(received, ping, 4) == 0);
+    net_tls_connection_free(client);
+    net_tls_connection_free(server);
+    close(fds[0]);
+    close(fds[1]);
 }
 
 int main(int argc, char **argv) {
@@ -118,6 +172,8 @@ int main(int argc, char **argv) {
     net_tls_context_free(server_context);
     close(fds[0]);
     close(fds[1]);
+    test_client_owned_context(argv[1], argv[2], "localhost");
+    test_client_owned_context(argv[1], argv[2], "localhost.");
     puts("TLS shim roundtrip succeeded");
     return 0;
 }

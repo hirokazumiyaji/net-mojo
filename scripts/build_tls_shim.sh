@@ -36,6 +36,12 @@ openssl req -quiet -x509 -newkey rsa:2048 -nodes -days 1 \
     -subj /CN=localhost \
     -addext subjectAltName=DNS:localhost
 
+openssl req -quiet -x509 -newkey rsa:2048 -nodes -days 1 \
+    -keyout build/tls/client-ip-key.pem \
+    -out build/tls/client-ip-cert.pem \
+    -subj /CN=localhost \
+    -addext subjectAltName=DNS:localhost,IP:127.0.0.1,IP:::1
+
 openssl genpkey -quiet -algorithm RSA -pkeyopt rsa_keygen_bits:2048 \
     -out build/tls/wrong-key.pem
 

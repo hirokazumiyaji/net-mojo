@@ -119,5 +119,26 @@ def test_tls_context_duplicate_survives_original_owner_drop() raises:
     client.close()
 
 
+def test_tls_client_context_verification_configuration() raises:
+    var _ = TLSContext.client(
+        "build/tls/libnet_tls", "build/tls/test-cert.pem", "http/1.1"
+    )
+    var _ = TLSContext.client("build/tls/libnet_tls", None, "http/1.1")
+    var rejected = False
+    try:
+        var _ = TLSContext.client(
+            "build/tls/libnet_tls", "build/tls/missing-ca.pem", "http/1.1"
+        )
+    except:
+        rejected = True
+    assert_true(rejected)
+    rejected = False
+    try:
+        var _ = TLSContext.client("build/tls/libnet_tls", None, "h2")
+    except:
+        rejected = True
+    assert_true(rejected)
+
+
 def main() raises:
     TestSuite.discover_tests[__functions_in_module()]().run()

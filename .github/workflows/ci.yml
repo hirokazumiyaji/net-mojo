@@ -254,14 +254,7 @@ jobs:
       - name: Verify formatting
         run: git diff --exit-code
       - name: Verify test tasks mirror pixi
-        run: |
-          diff -u \
-            <(awk '/^\[feature\./ {exit} /^test-[a-z0-9-]+/ {sub(/ .*/, ""); print}' pixi.toml | sort -u) \
-            <(awk '$1 == "run:" && $2 == "pixi" && $3 == "run" && $4 ~ /^test-/ {print $4}' .github/workflows/ci.yml | sort -u)
-          for t in $(awk '/^\[feature\./ {exit} /^test-[a-z0-9-]+/ {sub(/ .*/, ""); print}' pixi.toml | sort -u); do
-            [ "$t" = "test-package" ] && continue
-            grep -q "\"$t\"," pixi.toml || { echo "$t missing from 'test' aggregate"; exit 1; }
-          done
+        run: python3 scripts/check_ci_tasks.py test
       # Individual test steps match `pixi run test` in pixi.toml for step-level triage.
       - name: Test core
         run: pixi run test-core
@@ -390,13 +383,7 @@ jobs:
         with:
           frozen: true
       - name: Verify sanitize tasks mirror pixi
-        run: |
-          diff -u \
-            <(grep -oE '^sanitize-[a-z0-9-]+' pixi.toml | sort -u) \
-            <(awk '$1 == "run:" && $2 == "pixi" && $3 == "run" && $4 ~ /^sanitize-/ {print $4}' .github/workflows/ci.yml | sort -u)
-          for t in $(grep -oE '^sanitize-[a-z0-9-]+' pixi.toml | sort -u); do
-            grep -q "\"$t\"," pixi.toml || { echo "$t missing from 'sanitize' aggregate"; exit 1; }
-          done
+        run: python3 scripts/check_ci_tasks.py sanitize
       # Individual sanitize steps match `pixi run sanitize` in pixi.toml for step-level triage.
       - name: Sanitize system bindings
         run: pixi run sanitize-sys

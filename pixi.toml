@@ -342,6 +342,8 @@ tls-build = "bash scripts/build_tls_shim.sh"
 tls-test = { cmd = "mojo run --Werror -I . tests/test_tls.mojo", depends-on = [
   "tls-build",
 ] }
+test-https-client = { cmd = "mojo run --Werror -I . tests/test_https_client.mojo", depends-on = ["tls-build"] }
+https-client-interop-test = { cmd = "python3 scripts/test_https_client.py", depends-on = ["tls-build"] }
 https-state-test = { cmd = "mojo run --Werror -I . tests/test_https_server.mojo", depends-on = [
   "tls-build",
 ] }
@@ -364,6 +366,8 @@ tls-suite = { depends-on = [
   "http-hijack-tls-interop",
   "http-hijacked-tls-test",
   "tls-test",
+  "test-https-client",
+  "https-client-interop-test",
   "https-state-test",
   "https-client-test",
   "https-body-stream-test",

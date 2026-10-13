@@ -1,8 +1,11 @@
 """Synchronous HTTP/1.1 client with per-origin connection leases."""
 
+from net import TCPConn
+from net.error import _timeout_error
 from net.address import _resolve_parsed
 from net._sys.common import SOCK_STREAM
 from net.tcp import _dial_tcp_candidates
+from net.tls import TLSContext
 from net.timeout import _Deadline
 from .client_error import ClientError
 from .client_config import ClientConfig
@@ -24,6 +27,7 @@ struct Client(Movable):
     var _config: ClientConfig
     var _pool: _ClientPool
     var _parser_config: ServerConfig
+    var _tls_context: Optional[TLSContext]
 
     def __init__(out self, var config: ClientConfig) raises ClientError:
         config._validate()
@@ -41,6 +45,7 @@ struct Client(Movable):
         self._parser_config = parser_config^
         self._pool = _ClientPool(config)
         self._config = config^
+        self._tls_context = None
 
     def do(mut self, var request: ClientRequest) raises ClientError -> Response:
         var timeout = self._config.request_timeout.copy()
@@ -57,10 +62,8 @@ struct Client(Movable):
             raise ClientError(
                 ClientError.TIMEOUT, "HTTP request deadline expired"
             )
-        if url.scheme == "https":
-            raise ClientError(
-                ClientError.TLS, "HTTPS client transport is not enabled"
-            )
+        if url.scheme == "https" and not self._config.tls:
+            raise ClientError(ClientError.TLS, "HTTPS requires ClientTLSConfig")
         var head = encode_request_head(
             request.method,
             url.target,
@@ -75,22 +78,37 @@ struct Client(Movable):
             var connect_deadline = _phase_deadline(
                 deadline, self._config.connect_timeout
             )
+            var socket: TCPConn
             try:
                 var addresses = _resolve_parsed(
                     url.host.copy(), url.port, SOCK_STREAM
                 )
                 if connect_deadline.expired():
-                    lease.finish(False)
-                else:
-                    lease.connection = _ClientConnection(
-                        _dial_tcp_candidates(addresses^, connect_deadline)
-                    )
+                    raise _timeout_error("HTTP connect")
+                socket = _dial_tcp_candidates(addresses^, connect_deadline)
             except error:
                 raise _client_transport(ClientError.DIAL, error^)
-            if not lease.active:
-                raise ClientError(
-                    ClientError.TIMEOUT, "HTTP connect deadline expired"
-                )
+            if url.scheme == "https":
+                try:
+                    if not self._tls_context:
+                        self._tls_context = TLSContext.client(
+                            self._config.tls.value().library_path.copy(),
+                            self._config.tls.value().ca_bundle_path.copy(),
+                            self._config.tls.value().alpn.copy(),
+                            self._config.tls.value().insecure_skip_verify,
+                        )
+                    lease.connection = _ClientConnection(
+                        self._tls_context.value().connect(
+                            socket^,
+                            url.host.copy(),
+                            self._config.tls.value().sni_override.copy(),
+                        )
+                    )
+                except error:
+                    raise _client_transport(ClientError.TLS, error^)
+                lease.connection.value().handshake(connect_deadline)
+            else:
+                lease.connection = _ClientConnection(socket^)
         lease.connection.value().write_all(Span(head), deadline)
         lease.connection.value().write_all(Span(request.body.bytes), deadline)
         var header_deadline = _phase_deadline(
@@ -151,6 +169,7 @@ struct Client(Movable):
 
     def close(mut self):
         self._pool.close()
+        self._tls_context = None
 
     def __deinit__(deinit self):
         self._pool.close()

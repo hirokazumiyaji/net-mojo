@@ -16,6 +16,7 @@ from net.http import (
     Response,
 )
 from net.http._parser import parse_one
+from net.tls import TLSContext
 
 
 struct _FixtureState(Movable):
@@ -122,6 +123,7 @@ struct _Fixture(Movable):
                 c_ulong(self.handle),
                 Optional[Pointer[Byte, MutUntrackedOrigin]](None),
             )
+        _ = self.state^
 
 
 def test_client_fixed_keepalive_and_post() raises:
@@ -391,12 +393,18 @@ struct _LoopFixture(Movable):
     var joined: Bool
     var url: String
 
-    def __init__(out self) raises:
+    def __init__(out self, var tls: Optional[TLSContext] = None) raises:
         var config = ServerConfig.default()
         config.shutdown_grace = Timeout.seconds(1)
         var server = Server(config^)
-        server.add_listener(listen_tcp("127.0.0.1:0"))
-        self.url = String("http://") + String(server.local_address())
+        var listener = listen_tcp("127.0.0.1:0")
+        var port = listener.local_address().port
+        if tls:
+            server.add_tls_listener(listener^, tls.take())
+            self.url = String("https://localhost:") + String(port)
+        else:
+            server.add_listener(listener^)
+            self.url = String("http://127.0.0.1:") + String(port)
         self.control = server.control.copy()
         self.state = ArcPointer(_LoopState(server^))
         self.handle = 0
@@ -428,6 +436,7 @@ struct _LoopFixture(Movable):
                 c_ulong(self.handle),
                 Optional[Pointer[Byte, MutUntrackedOrigin]](None),
             )
+        _ = self.state^
 
 
 def test_client_32_live_responses_and_idle_cap_against_server() raises:
