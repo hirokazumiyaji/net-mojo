@@ -17,6 +17,8 @@ mkdir -p "$CARGO_HOME/bin"
 ln -sf "$(command -v rustup)" "$CARGO_HOME/bin/rustup"
 printf 'paths = ["%s"]\n' "$task_quiche_source" > "$CARGO_HOME/config.toml"
 rustup toolchain install nightly-2026-10-01 --profile minimal
+task_quic_cargo=$(rustup which --toolchain nightly-2026-10-01 cargo)
+export PATH="$(dirname "$task_quic_cargo"):$PATH"
 rustup run nightly-2026-10-01 cargo install --locked --version 0.13.2 \
     --root "$PWD/build/fuzz/quic-tools" cargo-fuzz
 export PATH="$PWD/build/fuzz/quic-tools/bin:$PATH"
