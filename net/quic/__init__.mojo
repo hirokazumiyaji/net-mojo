@@ -434,7 +434,7 @@ struct QuicServer(Movable):
             NetErrorKind.invalid_argument(),
             "read HTTP/3 request body",
             None,
-            "request body reads require a nonempty output buffer",
+            "request body reads require valid output storage",
         )
 
     def consume_body(mut self, request_id: UInt64, count: Int) -> Bool:
