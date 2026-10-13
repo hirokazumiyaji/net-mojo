@@ -15,6 +15,7 @@ sysroot_linux-64 = "==2.34"
 sysroot_linux-aarch64 = "==2.34"
 
 [tasks]
+fuzz-parser-build = { cmd = "bash scripts/build_fuzz_parser.sh", default-environment = "sanitize" }
 format = "mojo format net tests examples benchmarks"
 test-core = "mojo run --Werror -I . tests/test_core.mojo"
 test-ip = "mojo run --Werror -I . tests/test_ip.mojo"
@@ -243,7 +244,8 @@ pkg-config = "*"
 python = ">=3.11,<3.15"
 
 [feature.fuzz.tasks]
-fuzz-build = "bash scripts/build_fuzz.sh"
+fuzz-native-build = "bash scripts/build_fuzz.sh"
+fuzz-build = { depends-on = ["fuzz-native-build", { task = "fuzz-parser-build", environment = "sanitize" }] }
 fuzz-http1 = { cmd = "python3 scripts/run_fuzz.py http1", depends-on = ["fuzz-build"] }
 fuzz-authority = { cmd = "python3 scripts/run_fuzz.py authority", depends-on = ["fuzz-build"] }
 fuzz-hpack = { cmd = "python3 scripts/run_fuzz.py hpack", depends-on = ["fuzz-build"] }

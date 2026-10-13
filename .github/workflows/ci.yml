@@ -35,9 +35,10 @@ jobs:
           import tomllib
           from pathlib import Path
           tasks = tomllib.loads(Path("pixi.toml").read_text())["feature"]["fuzz"]["tasks"]
-          expected = {"fuzz-build", "fuzz-http1", "fuzz-authority", "fuzz-hpack", "fuzz-smoke", "fuzz-driver-test"}
+          expected = {"fuzz-build", "fuzz-native-build", "fuzz-http1", "fuzz-authority", "fuzz-hpack", "fuzz-smoke", "fuzz-driver-test"}
           assert set(tasks) == expected, set(tasks) ^ expected
           assert tasks["fuzz-smoke"]["depends-on"] == ["fuzz-build"]
+          assert {"task": "fuzz-parser-build", "environment": "sanitize"} in tasks["fuzz-build"]["depends-on"]
           PYTHON
       - name: Test mutation and replay driver
         run: pixi run -e fuzz fuzz-driver-test

@@ -6,7 +6,9 @@ HTTP/2 frame, IP/address and QUIC targets, nightly corpus evolution, minimizatio
 and h2spec conformance follow in separate PRs.
 
 Run `pixi run -e fuzz fuzz-smoke`. It compiles the Mojo replay target with ASan
-and the native HPACK target with libFuzzer, ASan and UBSan. HPACK runs for 60
+in the existing `sanitize` environment and the native HPACK target with
+libFuzzer, ASan and UBSan in `fuzz`. The separate build environments keep the
+native compiler sysroot out of Mojo linking. HPACK runs for 60
 seconds, with a 10 second per-input timeout, 2 GiB RSS limit and 8192 byte input
 limit. The native build also verifies that a valid serialized header reaches successful
 encoding, so fuzz-control choices cannot silently disable that path.
