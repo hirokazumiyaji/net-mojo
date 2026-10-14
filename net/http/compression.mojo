@@ -82,11 +82,24 @@ def _gzip_headers(
         if name.lower() == "content-length":
             continue
         var value = headers.value_bytes_at(i)
-        if name.lower() == "etag" and len(value) > 0 and value[0] == Byte(34):
+        var tag_start = 0
+        if name.lower() == "etag":
+            while tag_start < len(value) and (
+                value[tag_start] == Byte(32) or value[tag_start] == Byte(9)
+            ):
+                tag_start += 1
+        if (
+            name.lower() == "etag"
+            and tag_start < len(value)
+            and value[tag_start] == Byte(34)
+        ):
             var weak = List[Byte](capacity=len(value) + 2)
+            for j in range(tag_start):
+                weak.append(value[j])
             weak.append(Byte(87))
             weak.append(Byte(47))
-            weak.extend(value^)
+            for j in range(tag_start, len(value)):
+                weak.append(value[j])
             result.add_bytes(name^, Span(weak))
         else:
             result.add_bytes(name^, Span(value))

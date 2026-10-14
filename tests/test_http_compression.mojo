@@ -332,14 +332,17 @@ def test_compression_does_not_hide_oversized_source() raises:
 
 
 def test_gzip_weakens_strong_etag_and_preserves_weak_etag() raises:
-    for tag in ['"source"', 'W/"source"']:
-        var inner = _body_handler()
-        inner.headers.add("ETag", tag)
-        var app = _gzip(inner^)
-        var req = _request()
-        var writer = ResponseWriter(16384)
-        app.handle(req, writer)
-        assert_equal(writer.headers.get_first("ETag").value(), 'W/"source"')
+    for prefix in ["", " ", "\t", " \t"]:
+        for tag in ['"source"', 'W/"source"']:
+            var inner = _body_handler()
+            inner.headers.add("ETag", prefix + tag)
+            var app = _gzip(inner^)
+            var req = _request()
+            var writer = ResponseWriter(16384)
+            app.handle(req, writer)
+            assert_equal(
+                writer.headers.get_first("ETag").value(), prefix + 'W/"source"'
+            )
 
 
 def main() raises:
