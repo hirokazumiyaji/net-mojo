@@ -3916,6 +3916,7 @@ struct Server(Movable):
         self._remove_detached_conn(idx)
         self._conns[idx].stream_finished = False
         self._conns[idx].stream_known_length = -1
+        self._conns[idx].stream_pending_body = 0
         self._conns[idx].stream_has_body = False
         self._conns[idx].detach_at = NO_DEADLINE
         self._conns[idx].requests_served += 1
@@ -4135,6 +4136,12 @@ struct Server(Movable):
             self._conns[idx].sent_100 = True
             return
         if was_streaming:
+            if self._conns[idx].stream_pending_body > 0:
+                _consume_detach_bytes(
+                    self._conns[idx].detach_state_addr,
+                    self._conns[idx].stream_pending_body,
+                )
+                self._conns[idx].stream_pending_body = 0
             if not self._conns[idx].stream_finished:
                 self._conns[idx].write_at = NO_DEADLINE
                 self._conns[idx].detach_at = deadline_from_now(
@@ -4300,7 +4307,7 @@ struct Server(Movable):
                 elif msg.kind == MSG_KIND_START:
                     self._handle_detached_start(idx, msg)
                 elif msg.kind == MSG_KIND_CHUNK:
-                    self._handle_detached_chunk(idx, msg)
+                    self._handle_detached_chunk(idx, msg, batch.retains_credit)
                 else:
                     self._handle_detached_abort(idx)
                     break
@@ -4506,7 +4513,7 @@ struct Server(Movable):
         )
 
     def _handle_detached_chunk(
-        mut self, idx: Int, mut msg: DetachMessage
+        mut self, idx: Int, mut msg: DetachMessage, retains_credit: Bool
     ) raises NetError:
         if not self._conns[idx].active:
             return
@@ -4517,8 +4524,13 @@ struct Server(Movable):
         if len(msg.body) == 0:
             return
         if not self._conns[idx].stream_has_body:
+            if retains_credit:
+                _consume_detach_bytes(
+                    self._conns[idx].detach_state_addr, len(msg.body)
+                )
             return
 
+        var body_length = len(msg.body)
         var wire: List[Byte]
         try:
             if self._conns[idx].stream_known_length >= 0:
@@ -4535,6 +4547,8 @@ struct Server(Movable):
             self._close_conn(idx)
             return
 
+        if retains_credit:
+            self._conns[idx].stream_pending_body += body_length
         self._conns[idx].write_at = deadline_from_now(
             self.config.write_deadline
         )

@@ -295,10 +295,51 @@ def test_try_send_preserves_h1_response_during_queue_pressure() raises:
     assert_false(sender.is_cancelled())
     var first = _take_batch(_detach_state(writer._detach_state_addr))
     assert_equal(len(first.messages), 2)
+    assert_false(sender.try_send("cd".as_bytes()))
+    _consume_detach_bytes(writer._detach_state_addr, 2)
     assert_true(sender.try_send("cd".as_bytes()))
     sender.finish()
     assert_false(sender.is_cancelled())
     _release_detach_state(writer._detach_state_addr, from_sender=False)
+
+
+def test_try_send_h1_credit_waits_until_pending_socket_output_drains() raises:
+    var config = ServerConfig.default()
+    config.max_bytes_per_tick = 128
+    config.stream_queue_limit = 1024
+    var server = Server(config^)
+    server.add_listener(listen_tcp("127.0.0.1:0"))
+    var box = 0
+    var handler = _DeferredHandler(
+        Pointer(to=box).unsafe_origin_cast[MutUntrackedOrigin]()
+    )
+    var client = dial_tcp(
+        "127.0.0.1:" + String(server.local_address().port), Timeout.seconds(2)
+    )
+    client.write_all(
+        "GET /stream HTTP/1.1\r\nHost: localhost\r\n\r\n".as_bytes(),
+        Timeout.seconds(2),
+    )
+    _tick_until_detached(server, handler, handler.sender_box)
+    server.config.max_bytes_per_tick = 1
+    var sender = ResponseSender(box)
+    var chunk = List[Byte](length=1024, fill=Byte(97))
+    sender.start(200, _length_headers(2048))
+    assert_true(sender.try_send(Span(chunk)))
+    assert_false(sender.try_send(Span(chunk)))
+    _ = server.tick(handler, Timeout.milliseconds(0))
+    assert_false(sender.try_send(Span(chunk)))
+    assert_false(sender.is_cancelled())
+    for _ in range(1300):
+        _ = server.tick(handler, Timeout.milliseconds(0))
+    assert_true(sender.try_send(Span(chunk)))
+    sender.finish()
+    for _ in range(1300):
+        _ = server.tick(handler, Timeout.milliseconds(0))
+    var response = _tick_and_read(server, handler, client)
+    assert_equal(_content_length_of(response), 2048)
+    assert_equal(_body_of(response).byte_length(), 2048)
+    client.close()
 
 
 def main() raises:

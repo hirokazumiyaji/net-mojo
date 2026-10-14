@@ -168,6 +168,7 @@ struct _DetachedBatch(Movable):
     var terminal_kind: UInt8
     var trailers: Headers
     var target: _DetachTarget
+    var retains_credit: Bool
 
     def __deinit__(deinit self):
         _ = self.messages^
@@ -190,6 +191,7 @@ struct _SharedDetachState:
     var finished: Bool
     var queue_limit: Int
     var queued_bytes: Int
+    var retains_credit: Bool
     var expected_bytes: Int
     var admitted_bytes: Int
     var is_head: Bool
@@ -222,6 +224,7 @@ struct _SharedDetachState:
         self.finished = False
         self.queue_limit = queue_limit
         self.queued_bytes = 0
+        self.retains_credit = False
         self.expected_bytes = -1
         self.admitted_bytes = 0
         self.is_head = is_head
@@ -277,7 +280,8 @@ def _take_batch(
     var trailers = trailers_ptr.unsafe_take_pointee()
     trailers_ptr.unsafe_write(Headers())
     var target = state[].target.copy()
-    if state[].target.protocol == _DETACH_HTTP1:
+    var retains_credit = state[].retains_credit
+    if state[].target.protocol == _DETACH_HTTP1 and not retains_credit:
         state[].queued_bytes = 0
     state[].terminal_kind = MSG_KIND_NONE
     state[].mutex.unlock()
@@ -287,6 +291,7 @@ def _take_batch(
         terminal_kind,
         trailers^,
         target^,
+        retains_credit,
     )
 
 
@@ -646,6 +651,8 @@ struct ResponseSender(Movable):
                 None,
                 "body exceeds Content-Length",
             )
+        if not abort_on_full:
+            s_ptr[].retains_credit = True
         if s_ptr[].queued_bytes + len(data) > s_ptr[].queue_limit:
             if not abort_on_full or s_ptr[].target.protocol != _DETACH_HTTP1:
                 s_ptr[].mutex.unlock()
