@@ -1,7 +1,7 @@
 from std.os import getenv
 from std.time import perf_counter_ns
 
-from net import Timeout
+from net import Poller, Timeout
 from net.http import Handler, Request, ResponseWriter, Server, ServerConfig
 from net.quic import QuicProvider, QuicUDPEndpoint
 from net.udp import listen_udp
@@ -57,7 +57,11 @@ def main() raises:
     )
     var handler = _ReceiveBudgetHandler()
     print("READY " + address)
-    var end = Int(perf_counter_ns()) + 1_000_000_000
+    var completion = Poller()
+    completion.add(0)
+    var end = Int(perf_counter_ns()) + 10_000_000_000
     while Int(perf_counter_ns()) < end:
+        if completion.wait(Timeout.nanoseconds(0)) > 0:
+            break
         _ = server.tick(handler, Timeout.milliseconds(10))
     print("HANDLED", handler.requests)

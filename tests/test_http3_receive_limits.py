@@ -4,6 +4,7 @@ import asyncio
 import os
 import ssl
 import subprocess
+import time
 
 from aioquic.asyncio import connect
 from aioquic.asyncio.protocol import QuicConnectionProtocol
@@ -12,6 +13,9 @@ from aioquic.h3.events import DataReceived, HeadersReceived
 from aioquic.quic.configuration import QuicConfiguration
 from aioquic.quic.events import ConnectionTerminated, HandshakeCompleted
 from aioquic.quic.packet import QuicProtocolVersion
+
+
+OPERATION_TIMEOUT = 5
 
 
 class PoolProtocol(QuicConnectionProtocol):
@@ -64,9 +68,9 @@ async def check(address, mode):
                     return
                 raise AssertionError("zero send CRYPTO slots should refuse Initial")
             if mode in ("send_request_bytes", "send_request_slots"):
-                await asyncio.wait_for(client.wait_connected(), 0.8)
+                await asyncio.wait_for(client.wait_connected(), OPERATION_TIMEOUT)
                 client.get()
-            assert await asyncio.wait_for(client.closed, 0.8) == 0x1
+            assert await asyncio.wait_for(client.closed, OPERATION_TIMEOUT) == 0x1
             return
         if mode in ("crypto_bytes", "crypto_slots"):
             try:
@@ -77,15 +81,15 @@ async def check(address, mode):
             raise AssertionError("CRYPTO capacity should reject Initial")
         if mode in ("control_slots", "control_bytes"):
             expected = {"control_slots": 0x1, "control_bytes": 0x1}[mode]
-            actual = await asyncio.wait_for(client.closed, 0.8)
+            actual = await asyncio.wait_for(client.closed, OPERATION_TIMEOUT)
             assert actual == expected, (mode, actual, expected)
             return
-        await asyncio.wait_for(client.wait_connected(), 0.8)
+        await asyncio.wait_for(client.wait_connected(), OPERATION_TIMEOUT)
         client.get()
         if mode == "default":
-            assert await asyncio.wait_for(client.response, 0.8) == (b"200", b"alive")
+            assert await asyncio.wait_for(client.response, OPERATION_TIMEOUT) == (b"200", b"alive")
         else:
-            assert await asyncio.wait_for(client.closed, 0.8) == 0x1
+            assert await asyncio.wait_for(client.closed, OPERATION_TIMEOUT) == 0x1
 
 
 def main():
@@ -96,14 +100,17 @@ def main():
         env = dict(os.environ)
         env["HTTP3_RECEIVE_POOL"] = mode
         process = subprocess.Popen(["mojo", "run", "--Werror", "-I", ".",
-                                    "tests/http3_receive_budget_fixture.mojo"], stdout=subprocess.PIPE,
+                                    "tests/http3_receive_budget_fixture.mojo"], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                                    stderr=subprocess.PIPE, text=True, env=env)
         try:
             ready = process.stdout.readline().strip()
             assert ready.startswith("READY "), (mode, ready, process.stderr.read())
             assert process.poll() is None, (mode, "fixture exited before readiness was observed")
+            # Client scheduling must not consume the fixture's serving lifetime.
+            if mode == "send_request_bytes":
+                time.sleep(1.1)
             asyncio.run(check(ready.removeprefix("READY "), mode))
-            out, err = process.communicate(timeout=3)
+            out, err = process.communicate(input="done\n", timeout=3)
             assert process.returncode == 0, (mode, out, err)
             assert out.strip() == ("HANDLED 1" if mode in ("default", "send_request_bytes") else "HANDLED 0"), (mode, out)
             print(f"HTTP native pool={mode}: pass")
