@@ -64,6 +64,7 @@ test-http-known-length = "mojo run --Werror -I . tests/test_http_known_length.mo
 test-http-detach = "mojo run --Werror -I . tests/test_http_detach.mojo"
 test-http-offload = "mojo run --Werror -I . tests/test_http_offload.mojo"
 test-http-compression-config = "mojo run --Werror -I . tests/test_http_compression_config.mojo"
+test-http-compression-pass-through = "mojo run --Werror -I . tests/test_http_compression_pass_through.mojo"
 test-actor = "mojo run --Werror -I . tests/test_actor.mojo"
 sanitize-sys = { cmd = "bash scripts/run_sanitized.sh tests/test_sys.mojo", default-environment = "sanitize" }
 sanitize-tcp = { cmd = "bash scripts/run_sanitized.sh tests/test_tcp.mojo", default-environment = "sanitize" }
@@ -190,6 +191,7 @@ test = { depends-on = [
   "test-http-fileserver-wire",
   "test-http-offload",
   "test-http-compression-config",
+  "test-http-compression-pass-through",
   "test-actor",
 ] }
 example-tcp = "mojo run --Werror -I . examples/tcp_echo.mojo"
@@ -485,7 +487,13 @@ python = ">=3.10,<3.15"
 [feature.compression.tasks]
 compression-build = "bash scripts/build_zlib_shim.sh"
 test-gzip-provider = { cmd = "mojo run --Werror -I . tests/test_gzip_provider.mojo", depends-on = ["compression-build"] }
-compression-suite = { depends-on = ["test-gzip-provider", "test-http-compression-config"] }
+test-http-compression = { cmd = "mojo run --Werror -I . tests/test_http_compression.mojo", depends-on = ["compression-build"] }
+compression-suite = { depends-on = ["test-gzip-provider", "test-http-compression-config", "test-http-compression"] }
+
+[feature.http3.tasks.gzip-wire-test]
+cmd = "python3 scripts/test_http_compression.py"
+default-environment = "http-stream-sse"
+depends-on = [{ task = "tls-build", environment = "http-stream-sse" }, { task = "hpack-test", environment = "http-stream-sse" }, { task = "quic-build", environment = "http-stream-sse" }, { task = "compression-build", environment = "compression" }]
 
 [feature.mojo-1-1.dependencies]
 mojo = ">=1.1.0,<1.2"

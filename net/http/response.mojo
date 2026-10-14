@@ -164,6 +164,15 @@ struct ResponseWriter(Movable, Sized):
             self._body_budget.value().release(self._body_capacity_reserved)
         self._body_capacity_reserved = 0
 
+    def _swap_body(mut self, var body: List[Byte], var ticket: _CapacityTicket):
+        self._drop_body()
+        self.body = body^
+        if self._body_budget:
+            self._body_capacity_reserved = ticket.amount
+            ticket.amount = 0
+        else:
+            ticket.release()
+
     def _representation_length(self, is_head: Bool) -> Int:
         if is_head and len(self.body) == 0:
             var declared = _declared_content_length(self.headers)
