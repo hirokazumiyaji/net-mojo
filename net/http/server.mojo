@@ -820,13 +820,10 @@ struct Server(Movable):
             if mark == NO_DEADLINE or mark > now:
                 self._arm_deadline(idx)
                 continue
-            if (
-                self._conns[idx].state == STATE_TLS_SHUTDOWN
-                or (
-                    self._conns[idx].body_decoder
-                    and self._conns[idx].body_at != NO_DEADLINE
-                    and now >= self._conns[idx].body_at
-                )
+            if self._conns[idx].state == STATE_TLS_SHUTDOWN or (
+                self._conns[idx].body_decoder
+                and self._conns[idx].body_at != NO_DEADLINE
+                and now >= self._conns[idx].body_at
             ):
                 self._close_conn(idx)
                 continue
