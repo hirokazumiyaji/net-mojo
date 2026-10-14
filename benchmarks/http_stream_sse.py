@@ -174,7 +174,7 @@ async def run(tcp_port, udp_port):
         await asyncio.wait_for(client.begin("/shutdown").future, 10)
 
 
-async def main():
+async def run_benchmark():
     binary = ROOT / "build/http_stream_sse"
     subprocess.run(["mojo", "build", "--Werror", "-I", ".", "benchmarks/http_stream_sse.mojo", "-o", str(binary)], cwd=ROOT, check=True)
     with subprocess.Popen([str(binary)], cwd=ROOT, stdout=subprocess.PIPE, text=True) as server:
@@ -189,6 +189,29 @@ async def main():
             if server.poll() is None:
                 server.kill()
                 server.wait()
+
+
+async def main():
+    loop = asyncio.get_running_loop()
+    failure = loop.create_future()
+    previous_handler = loop.get_exception_handler()
+
+    def callback_failed(loop, context):
+        if not failure.done():
+            failure.set_result(context)
+
+    loop.set_exception_handler(callback_failed)
+    benchmark = asyncio.create_task(run_benchmark())
+    try:
+        await asyncio.wait((benchmark, failure), return_when=asyncio.FIRST_COMPLETED)
+        if failure.done():
+            context = failure.result()
+            raise context.get("exception") or RuntimeError(context["message"])
+        await benchmark
+    finally:
+        benchmark.cancel()
+        await asyncio.gather(benchmark, return_exceptions=True)
+        loop.set_exception_handler(previous_handler)
 
 
 if __name__ == "__main__":
