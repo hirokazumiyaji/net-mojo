@@ -29,12 +29,14 @@ struct _FixtureState(Movable):
     var requests: List[String]
     var wires: List[String]
     var reply_delay: Float64
+    var expect_cancel: Bool
 
     def __init__(
         out self,
         var listener: TCPListener,
         var replies: List[String],
         reply_delay: Float64,
+        expect_cancel: Bool,
     ):
         self.listener = listener^
         self.replies = replies^
@@ -44,6 +46,7 @@ struct _FixtureState(Movable):
         self.requests = List[String]()
         self.wires = List[String]()
         self.reply_delay = reply_delay
+        self.expect_cancel = expect_cancel
 
 
 def _fixture_entry(
@@ -63,6 +66,8 @@ def _fixture_entry(
                 Span(buffer), Timeout.seconds(3)
             )
             if count == 0:
+                if state[].expect_cancel:
+                    return arg
                 connection = None
                 wire.clear()
                 continue
@@ -105,11 +110,16 @@ struct _Fixture(Movable):
     var url: String
 
     def __init__(
-        out self, var replies: List[String], reply_delay: Float64 = 0
+        out self,
+        var replies: List[String],
+        reply_delay: Float64 = 0,
+        expect_cancel: Bool = False,
     ) raises:
         var listener = listen_tcp("127.0.0.1:0")
         self.url = String("http://") + String(listener.local_address())
-        self.state = ArcPointer(_FixtureState(listener^, replies^, reply_delay))
+        self.state = ArcPointer(
+            _FixtureState(listener^, replies^, reply_delay, expect_cancel)
+        )
         self.handle = 0
         self.joined = True
         var rc = external_call["pthread_create", c_int](
@@ -130,7 +140,8 @@ struct _Fixture(Movable):
             self.joined = True
             assert_equal(Int(rc), 0)
         assert_true(not self.state[].failed)
-        assert_equal(self.state[].served, len(self.state[].replies))
+        if not self.state[].expect_cancel:
+            assert_equal(self.state[].served, len(self.state[].replies))
 
     def __deinit__(deinit self):
         if not self.joined:

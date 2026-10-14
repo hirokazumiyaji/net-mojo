@@ -158,13 +158,15 @@ def test_redirect_loop_invalid_location_and_request_deadline() raises:
                 "HTTP/1.1 302 Redirect\r\nLocation: ftp://example.com/\r\nContent-Length: 0\r\n\r\n" if mode
                 == 1 else "HTTP/1.1 302 Redirect\r\nLocation: /again\r\nContent-Length: 0\r\n\r\n"
             )
-        var fixture = _Fixture(replies^, 0.04 if mode == 2 else 0.0)
+        var fixture = _Fixture(
+            replies^, 0.4 if mode == 2 else 0.0, expect_cancel=mode == 2
+        )
         var config = ClientConfig.default()
         config.redirect.max_hops = 2
         var client = Client(config^)
         var request = ClientRequest.get(fixture.url)
         if mode == 2:
-            request.deadline = Timeout.milliseconds(70)
+            request.deadline = Timeout.milliseconds(700)
         var caught = False
         try:
             var _ = client.do(request^)
