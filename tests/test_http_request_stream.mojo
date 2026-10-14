@@ -5,6 +5,7 @@ from std.time import sleep
 
 from net import TCPConn, Timeout, dial_tcp, listen_tcp
 from net.error import NetErrorKind
+from net.http._deadline import now_ns
 from net.http import (
     Handler,
     Headers,
@@ -678,7 +679,7 @@ def test_discarded_body_completion_restores_header_deadline() raises:
 def test_discarded_incomplete_body_gets_shutdown_grace() raises:
     var config = ServerConfig.default()
     config.enable_request_body_streaming = True
-    config.shutdown_grace = Timeout.milliseconds(100)
+    config.shutdown_grace = Timeout.seconds(30)
     config.body_deadline = Timeout.seconds(1)
     var server = Server(config^)
     var client = _connect(server)
@@ -692,7 +693,6 @@ def test_discarded_incomplete_body_gets_shutdown_grace() raises:
     assert_equal(_status_of(_tick_and_read(server, handler, client)), 200)
     server.request_shutdown()
     _ = server.tick(handler, Timeout.nanoseconds(0))
-    sleep(0.02)
     _ = server.tick(handler, Timeout.nanoseconds(0))
     assert_equal(server.active_connections(), 1)
     client.write_all(String("body").as_bytes(), Timeout.seconds(1))
@@ -701,7 +701,7 @@ def test_discarded_incomplete_body_gets_shutdown_grace() raises:
         if len(server._request_body_conns) == 0:
             break
     assert_equal(len(server._request_body_conns), 0)
-    sleep(0.11)
+    server._shutdown_at = now_ns() - 1
     _ = server.tick(handler, Timeout.nanoseconds(0))
     assert_equal(server.active_connections(), 0)
     client.close()
@@ -731,7 +731,7 @@ def test_complete_unread_body_does_not_pin_idle_connection_budget() raises:
 def test_streaming_progress_renews_body_deadline() raises:
     var config = ServerConfig.default()
     config.enable_request_body_streaming = True
-    config.body_deadline = Timeout.milliseconds(30)
+    config.body_deadline = Timeout.seconds(30)
     var server = Server(config^)
     var client = _connect(server)
     var handler = _BodyHandler()
@@ -744,6 +744,7 @@ def test_streaming_progress_renews_body_deadline() raises:
     _wait_for_handler(server, handler)
     var buffer = Array[Byte, 1](fill=0)
     for byte in String("body").as_bytes():
+        var previous_deadline = server._conns[0].body_at
         var one = Array[Byte, 1](fill=byte)
         client.write_all(Span(one), Timeout.seconds(1))
         var received = False
@@ -759,7 +760,7 @@ def test_streaming_progress_renews_body_deadline() raises:
                 if error.kind != NetErrorKind.timeout():
                     raise error^
         assert_true(received)
-        sleep(0.015)
+        assert_true(server._conns[0].body_at > previous_deadline)
         _ = server.tick(handler, Timeout.nanoseconds(0))
         assert_equal(server.active_connections(), 1)
     assert_true(handler.endpoints.value().receiver.is_eof())
