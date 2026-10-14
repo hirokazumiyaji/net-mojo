@@ -89,8 +89,9 @@ wrapper converts read statuses into the typed result above.
 
 Set `ServerConfig.enable_request_body_streaming = True` before constructing the
 server. The handler runs after validated initial headers, with empty `req.body`
-and a bounded body reader. `req.detach_body()` transfers the receiver to a worker
-independently of response output. Response FIN does not end an accepted upload;
+and a bounded body reader. Use `var reader = req.body_reader()` followed by
+`reader.detach()` to transfer the receiver to a worker independently of response
+output. Response FIN does not end an accepted upload;
 a detached receiver can continue reading DATA and trailers afterward.
 `Expect: 100-continue` queues informational headers before the handler runs when
 input is incomplete. Completed input needs no informational response. Unsupported

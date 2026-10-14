@@ -146,7 +146,8 @@ waits for input; `endpoints.sender` completes or streams the response.
 `receiver.trailers()` becomes available after consumed EOF. Disconnects,
 input deadlines and expired shutdown grace wake the receiver with
 `NetErrorKind.cancelled()`.
-`req.detach_body()` also transfers a receiver independently of response output.
+Use `var reader = req.body_reader()` followed by `reader.detach()` to transfer
+a receiver independently of response output.
 An owned receiver keeps accepted input alive after a synchronous response FIN;
 completed trailers remain available until the receiver is dropped.
 
