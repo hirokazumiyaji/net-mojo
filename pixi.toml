@@ -40,7 +40,7 @@ test-http-router = "mojo run --Werror -I . tests/test_http_router.mojo"
 test-http-middleware = "mojo run --Werror -I . tests/test_http_middleware.mojo"
 test-http-server = "mojo run --Werror -I . tests/test_http_server.mojo"
 test-http2 = "mojo run --Werror -I . tests/test_http2.mojo"
-http-hijack-fixture-build = "mkdir -p build && mojo build --Werror -I . tests/http_hijack_fixture.mojo -o build/http_hijack_fixture"
+http-hijack-fixture-build = "mkdir -p build && mojo build --Werror -I . -Xlinker -ldl tests/http_hijack_fixture.mojo -o build/http_hijack_fixture"
 http-hijack-interop = { cmd = "python3 tests/test_hijack_interop.py", depends-on = ["http-hijack-fixture-build"] }
 test-http-connect = "mojo run --Werror -I . tests/test_http_connect.mojo"
 test-http-hijack = "mojo run --Werror -I . tests/test_http_hijack.mojo"
