@@ -1,8 +1,18 @@
 [workspace]
 channels = ["https://conda.modular.com/max", "conda-forge"]
 name = "net-mojo"
-platforms = ["osx-arm64", "linux-64", "linux-aarch64"]
+platforms = [
+  "osx-arm64",
+  { name = "linux-64-glibc-2-34", platform = "linux-64", glibc = "2.34" },
+  { name = "linux-aarch64-glibc-2-34", platform = "linux-aarch64", glibc = "2.34" },
+]
 version = "0.1.0"
+
+[target.linux-64.dependencies]
+sysroot_linux-64 = "==2.34"
+
+[target.linux-aarch64.dependencies]
+sysroot_linux-aarch64 = "==2.34"
 
 [tasks]
 format = "mojo format net tests examples benchmarks"
