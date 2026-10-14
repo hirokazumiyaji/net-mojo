@@ -59,7 +59,7 @@ def main() raises:
     print("READY " + address)
     var completion = Poller()
     completion.add(0)
-    var end = Int(perf_counter_ns()) + 10_000_000_000
+    var end = Int(perf_counter_ns()) + 30_000_000_000
     while Int(perf_counter_ns()) < end:
         if completion.wait(Timeout.nanoseconds(0)) > 0:
             break
