@@ -846,7 +846,14 @@ struct Server(Movable):
                 ):
                     self._close_conn(idx)
                     continue
-                var expired = self._conns[idx].http2_session.value().expire(now)
+                var expired_stream_ids = List[UInt32]()
+                var expired = (
+                    self._conns[idx]
+                    .http2_session.value()
+                    .expire(now, expired_stream_ids)
+                )
+                for stream_id in expired_stream_ids:
+                    self._reset_http2_response(idx, stream_id)
                 if len(expired) > 0:
                     if not self._conns[idx].append_pending(
                         expired^, self._budget
@@ -1874,7 +1881,14 @@ struct Server(Movable):
             return
         if self._conns[idx].protocol == PROTOCOL_HTTP2:
             if self._conns[idx].http2_session:
-                var expired = self._conns[idx].http2_session.value().expire(now)
+                var expired_stream_ids = List[UInt32]()
+                var expired = (
+                    self._conns[idx]
+                    .http2_session.value()
+                    .expire(now, expired_stream_ids)
+                )
+                for stream_id in expired_stream_ids:
+                    self._reset_http2_response(idx, stream_id)
                 if len(expired) > 0:
                     if not self._conns[idx].append_pending(
                         expired^, self._budget
@@ -2092,14 +2106,7 @@ struct Server(Movable):
             if result.consumed > 0:
                 self._consume_receive(idx, result.consumed)
             if result.reset_stream_id != UInt32(0):
-                self._drop_http2_detached(idx, result.reset_stream_id)
-                var reset_result = self._conns[
-                    idx
-                ].http2_responses.on_peer_reset(result.reset_stream_id)
-                self._budget.release(reset_result.released_bytes)
-                self._conns[
-                    idx
-                ].http2_response_bytes_reserved -= reset_result.released_bytes
+                self._reset_http2_response(idx, result.reset_stream_id)
             var request_body_bytes = 0
             if result.is_request():
                 request_body_bytes = len(result.request.body)
@@ -2983,6 +2990,12 @@ struct Server(Movable):
             self._conns[idx].buffered_len() + count,
             self._conns[idx].reserved,
         )
+
+    def _reset_http2_response(mut self, idx: Int, stream_id: UInt32):
+        self._drop_http2_detached(idx, stream_id)
+        var result = self._conns[idx].http2_responses.on_peer_reset(stream_id)
+        self._budget.release(result.released_bytes)
+        self._conns[idx].http2_response_bytes_reserved -= result.released_bytes
 
     def _consume_receive(mut self, idx: Int, count: Int):
         var old_capacity = self._conns[idx].buf.capacity()

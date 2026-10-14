@@ -1496,7 +1496,9 @@ def test_http2_failed_session_ignores_header_and_body_deadlines() raises:
         assert_true(session.consume(Span(malformed)).is_error())
         assert_true(session.is_failed())
         assert_equal(session.next_deadline(), NO_DEADLINE)
-        assert_equal(len(session.expire(deadline)), 0)
+        var expired_stream_ids = List[UInt32]()
+        assert_equal(len(session.expire(deadline, expired_stream_ids)), 0)
+        assert_equal(len(expired_stream_ids), 0)
         assert_equal(session.next_deadline(), NO_DEADLINE)
 
 
@@ -2884,3 +2886,92 @@ def test_http2_scheduler_streaming_reset_preserves_credit_and_batch_limit() rais
 
 def main() raises:
     TestSuite.discover_tests[__functions_in_module()]().run()
+
+
+def _check_http2_body_expiry_response_work(started: Bool) raises:
+    from net import Timeout
+
+    var budget = SharedBufferBudget(4)
+    var session = Http2RequestSession(
+        "build/http2/libnet_hpack",
+        4,
+        4,
+        body_deadline=Timeout.seconds(1),
+        request_body_budget=Optional(budget.copy()),
+    )
+    _bootstrap_session(session)
+    var empty = List[Byte]()
+    var ack = List[Byte]()
+    _append_frame(ack, Byte(4), Byte(1), UInt32(0), Span(empty))
+    assert_true(session.consume(Span(ack)).is_pending())
+    var zero_window: List[Byte] = [0, 4, 0, 0, 0, 0]
+    var settings = List[Byte]()
+    _append_frame(settings, Byte(4), Byte(0), UInt32(0), Span(zero_window))
+    assert_true(session.consume(Span(settings)).is_pending())
+    var compressed: List[Byte] = [0x83, 0x87, 0x84, 0x01, 0x01, 0x78]
+    var opening = List[Byte]()
+    _append_frame(opening, Byte(1), Byte(4), UInt32(1), Span(compressed))
+    var head = session.consume(Span(opening))
+    assert_true(head.is_head())
+    var request = head^.take_request()
+    var reader = request.body_reader()
+    var bytes: List[Byte] = [Byte(97), Byte(98)]
+    var data = List[Byte]()
+    _append_frame(data, Byte(0), Byte(0), UInt32(1), Span(bytes))
+    assert_true(session.consume(Span(data)).is_pending())
+    assert_equal(session._receive_window.receive_window(), 65533)
+    var scheduler = Http2ResponseScheduler()
+    var deflater = _make_deflater()
+    var body: List[Byte] = [Byte(97), Byte(98), Byte(99), Byte(100)]
+    assert_true(_enqueue_response(scheduler, UInt32(1), 200, body^))
+    if started:
+        var first = scheduler.drain(
+            session, deflater, "Thu, 01 Jan 1970 00:00:00 GMT", 16384, 2048
+        )
+        var headers = parse_frame(Span(first.wire))
+        assert_true(headers.is_complete())
+        assert_equal(headers.frame_type, Byte(1))
+        assert_equal(headers.stream_id, UInt32(1))
+        assert_equal(len(first.wire), headers.consumed)
+        assert_equal(scheduler.queued_count(), 1)
+
+    var expired_stream_ids = List[UInt32]()
+    var expired = session.expire(session.next_deadline(), expired_stream_ids)
+    assert_equal(len(expired_stream_ids), 1)
+    assert_equal(expired_stream_ids[0], UInt32(1))
+    assert_equal(len(expired), 26)
+    var reset = parse_frame(Span(expired))
+    assert_true(reset.is_complete())
+    assert_equal(reset.frame_type, Byte(3))
+    assert_equal(reset.stream_id, UInt32(1))
+    var reset_fields = parse_rst_stream_frame(reset, Span(expired)[9:13])
+    assert_true(reset_fields.is_valid())
+    assert_equal(reset_fields.error_code, UInt32(8))
+    var update = parse_frame(Span(expired)[13:])
+    assert_true(update.is_complete())
+    assert_equal(update.frame_type, Byte(8))
+    assert_equal(update.stream_id, UInt32(0))
+    var credit = parse_window_update_frame(update, Span(expired)[22:26])
+    assert_true(credit.is_valid())
+    assert_equal(credit.increment, UInt32(2))
+    assert_equal(session._receive_window.receive_window(), 65535)
+    assert_equal(budget.used(), 0)
+    for stream_id in expired_stream_ids:
+        var cancellation = scheduler.on_peer_reset(stream_id)
+        assert_true(cancellation.released_bytes > 0)
+        assert_equal(cancellation.kept_headers, started)
+    var after = scheduler.drain(
+        session, deflater, "Thu, 01 Jan 1970 00:00:00 GMT", 16384, 2048
+    )
+    assert_equal(len(after.wire), 0)
+    assert_equal(scheduler.queued_count(), 0)
+    assert_equal(session.next_deadline(), NO_DEADLINE)
+    _ = reader.detach()
+
+
+def test_http2_body_expiry_cancels_queued_response() raises:
+    _check_http2_body_expiry_response_work(False)
+
+
+def test_http2_body_expiry_cancels_started_response() raises:
+    _check_http2_body_expiry_response_work(True)

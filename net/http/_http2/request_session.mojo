@@ -249,7 +249,9 @@ struct Http2RequestSession(Movable):
                 best = body_at
         return best
 
-    def expire(mut self, now: Int) -> List[Byte]:
+    def expire(
+        mut self, now: Int, mut expired_stream_ids: List[UInt32]
+    ) -> List[Byte]:
         var output = List[Byte]()
         if self._failed:
             return output^
@@ -271,6 +273,7 @@ struct Http2RequestSession(Movable):
             if not self._append_reset(output, stream_id, UInt32(8)):
                 return output^
             self._remove_stream(stream_id, output)
+            expired_stream_ids.append(stream_id)
         return output^
 
     def _connection_error(
