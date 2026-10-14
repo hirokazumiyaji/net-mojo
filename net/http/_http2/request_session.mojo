@@ -470,6 +470,9 @@ struct Http2RequestSession(Movable):
                             consumed, output^
                         )
                 elif input.frame_type == Byte(0):
+                    var was_locally_reset = self._is_locally_reset(
+                        input.stream_id
+                    )
                     var request_result = self._receive_data(
                         frame, Span(input.payload), output
                     )
@@ -517,6 +520,7 @@ struct Http2RequestSession(Movable):
                         )
                     if (
                         request_result.is_pending()
+                        and not was_locally_reset
                         and self._find_stream(input.stream_id) < 0
                     ):
                         return Http2RequestSessionResult.pending(
@@ -878,7 +882,10 @@ struct Http2RequestSession(Movable):
 
     def reset_response_credit_size(self, stream_id: UInt32) -> Int:
         var index = self._find_stream(stream_id)
-        if index >= 0 and self._streams[index].receive_window.pending_receive_credit() > 0:
+        if (
+            index >= 0
+            and self._streams[index].receive_window.pending_receive_credit() > 0
+        ):
             return 13
         return 0
 

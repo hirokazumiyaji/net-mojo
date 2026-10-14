@@ -455,7 +455,9 @@ struct Http2ResponseScheduler(Movable):
                                 )
                                 if not rst.is_complete() or (
                                     len(rst.wire)
-                                    + session.reset_response_credit_size(stream_id)
+                                    + session.reset_response_credit_size(
+                                        stream_id
+                                    )
                                 ) > (max_output_bytes - len(output)):
                                     break
                                 output.extend(Span(rst.wire))
