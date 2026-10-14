@@ -6902,14 +6902,10 @@ mod tests {
     #[test]
     fn nat_rebinding_continues_or_cleans_cid_routes() {
         let mut server = super::QuicServer::new(stress_server_config()).unwrap();
-        // Keep idle short so the timeout path finishes quickly when migration fails.
-        server.idle_timeout = Duration::from_millis(150);
-        server.config.set_max_idle_timeout(150);
         let local = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 4433);
         let original_remote = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 54323);
         let rebound_remote = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 54324);
         let mut client_config = stress_client_config();
-        client_config.set_max_idle_timeout(150);
         let client_scid = [0x73; 16];
         let mut client = quiche::connect(
             Some("localhost"),
@@ -6932,6 +6928,13 @@ mod tests {
         assert_eq!(server.connections.len(), 1);
         let route_count_before = server.routes.len();
         assert!(route_count_before > 0);
+
+        // Apply the short cleanup deadline after the handshake survives CI scheduling.
+        server.idle_timeout = Duration::from_millis(150);
+        let connection_keys: Vec<_> = server.connections.keys().cloned().collect();
+        for key in connection_keys {
+            server.refresh_idle_timeout(&key);
+        }
 
         // Mid-connection NAT rebinding: same CIDs, new observed UDP source address.
         let mut continued = false;
