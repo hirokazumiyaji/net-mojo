@@ -24,7 +24,7 @@ v0.2 は要求された機能と品質の確認後に扱う。
 | [236](https://github.com/hirokazumiyaji/net-mojo/issues/236) | WebSocket | [312](https://github.com/hirokazumiyaji/net-mojo/pull/312)–[316](https://github.com/hirokazumiyaji/net-mojo/pull/316) | 実装、レビュー、ローカル検証済み。公開済み、修正後の CI 待ち。 |
 | [237](https://github.com/hirokazumiyaji/net-mojo/issues/237) | FileServer と metadata | [317](https://github.com/hirokazumiyaji/net-mojo/pull/317)–[320](https://github.com/hirokazumiyaji/net-mojo/pull/320) | 実装、レビュー、ローカル検証済み。公開済み、修正後の CI 待ち。 |
 | [238](https://github.com/hirokazumiyaji/net-mojo/issues/238) | optional gzip | [321](https://github.com/hirokazumiyaji/net-mojo/pull/321)、[322](https://github.com/hirokazumiyaji/net-mojo/pull/322)、[323](https://github.com/hirokazumiyaji/net-mojo/pull/323)、[324](https://github.com/hirokazumiyaji/net-mojo/pull/324) | 実装、レビュー、ローカル検証済み。公開済み、最新 CI 待ち。 |
-| [239](https://github.com/hirokazumiyaji/net-mojo/issues/239) | 受け入れ証拠の索引 | 本書 | 文書レビューと公開待ち。 |
+| [239](https://github.com/hirokazumiyaji/net-mojo/issues/239) | 受け入れ証拠の索引 | 本書 | 各受け入れ条件と確認済みの証拠を記録する。 |
 
 FileServer と gzip の共通検証は [325](https://github.com/hirokazumiyaji/net-mojo/pull/325) に対応する。
 各 PR 本文に、その変更の対象 head、検証内容と結果を記録する。
