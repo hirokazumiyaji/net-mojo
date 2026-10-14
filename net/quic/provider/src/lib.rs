@@ -6901,6 +6901,15 @@ mod tests {
 
     #[test]
     fn nat_rebinding_continues_or_cleans_cid_routes() {
+        exercise_nat_rebinding(false);
+    }
+
+    #[test]
+    fn ignored_nat_rebinding_packets_clean_cid_routes() {
+        exercise_nat_rebinding(true);
+    }
+
+    fn exercise_nat_rebinding(drop_rebound_packets: bool) {
         let mut server = super::QuicServer::new(stress_server_config()).unwrap();
         let local = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 4433);
         let original_remote = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 54323);
@@ -6929,12 +6938,15 @@ mod tests {
         let route_count_before = server.routes.len();
         assert!(route_count_before > 0);
 
-        // Apply the short cleanup deadline after the handshake survives CI scheduling.
+        // Keep the migration cleanup deadline from expiring during the handshake.
         server.idle_timeout = Duration::from_millis(150);
-        let connection_keys: Vec<_> = server.connections.keys().cloned().collect();
-        for key in connection_keys {
-            server.refresh_idle_timeout(&key);
-        }
+        let connection_key = server.connections.keys().next().unwrap().clone();
+        server
+            .connections
+            .get_mut(&connection_key)
+            .unwrap()
+            .idle_deadline_at = Some(Instant::now() + server.idle_timeout);
+        server.refresh_idle_timeout(&connection_key);
 
         // Mid-connection NAT rebinding: same CIDs, new observed UDP source address.
         let mut continued = false;
@@ -6956,8 +6968,10 @@ mod tests {
         for _ in 0..48 {
             drive_timeouts(&mut client, &mut server);
             let datagrams = collect_client_datagrams(&mut client, &mut packet);
-            for datagram in &datagrams {
-                deliver_client_datagram(&mut server, datagram, local, rebound_remote);
+            if !drop_rebound_packets {
+                for datagram in &datagrams {
+                    deliver_client_datagram(&mut server, datagram, local, rebound_remote);
+                }
             }
             // Only rebound-directed return traffic is usable. Packets still
             // addressed to the obsolete address are dropped (as a real NAT

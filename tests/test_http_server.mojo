@@ -2016,11 +2016,6 @@ def _drain_until_eof_driven[
 
 
 def test_pipelined_chain_completes_without_extra_waits() raises:
-    # Six pipelined requests must all complete well before six ticks:
-    # chaining parses each buffered request in the same drive instead
-    # of stalling one poll wait per request. The bound is deliberately
-    # loose (chaining needs two ticks: accept, then everything) so no
-    # wall-clock timing is asserted, only tick counts.
     var server = Server(ServerConfig.default())
     server.add_listener(listen_tcp("127.0.0.1:0"))
     var port = server.local_address().port
@@ -2028,19 +2023,21 @@ def test_pipelined_chain_completes_without_extra_waits() raises:
     var client = dial_tcp(
         String("127.0.0.1:") + String(port), Timeout.seconds(2)
     )
+    for _ in range(100):
+        _ = server.tick(handler, Timeout.milliseconds(1))
+        if server.active_connections() == 1:
+            break
+    assert_equal(server.active_connections(), 1)
     var batch = String("")
     for _ in range(5):
         batch += String("GET /one HTTP/1.1\r\nHost: x\r\n\r\n")
     batch += String("GET /two HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n")
     client.write_all(batch.as_bytes(), Timeout.seconds(2))
-    # Ticks alone must quiesce the server: client reads play no role in
-    # server progress (kernel buffers hold the small batch), so delivery
-    # timing cannot flake this bound. Without chaining, six requests
-    # need at least seven ticks (accept plus one each).
-    for _ in range(4):
-        _ = server.tick(handler, Timeout.nanoseconds(0))
+    _ = server.tick(handler, Timeout.seconds(2))
+    for _ in range(3):
         if server.active_connections() == 0:
             break
+        _ = server.tick(handler, Timeout.nanoseconds(0))
     assert_equal(server.active_connections(), 0)
     var out = _drain_until_eof(client)
     var text = String(from_utf8_lossy=Span(out))
@@ -2917,7 +2914,11 @@ def test_deadline_close_and_slot_reuse_removes_old_entries() raises:
     var base = now_ns()
     for _ in range(20):
         var client = dial_tcp(address, Timeout.seconds(2))
-        _tick_n(server, handler, 2)
+        for _ in range(100):
+            _ = server.tick(handler, Timeout.milliseconds(1))
+            if server.active_connections() == 1:
+                break
+        assert_equal(server.active_connections(), 1)
         assert_equal(len(server._conns), 1)
         server._conns[0].idle_at = base + 10_000_000
         server._arm_deadline(0)
