@@ -13,10 +13,14 @@ from net.http.websocket import (
 struct _MemoryState:
     var outgoing: List[Byte]
     var closed: Bool
+    var write_timeout_ns: UInt64
+    var read_wait_ns: UInt64
 
     def __init__(out self):
         self.outgoing = List[Byte]()
         self.closed = False
+        self.write_timeout_ns = 0
+        self.read_wait_ns = 0
 
 
 struct _MemoryStream(DuplexStream):
@@ -25,7 +29,7 @@ struct _MemoryStream(DuplexStream):
     var offset: Int
     var require_closing_pong: Bool
     var read_delay_ns: UInt64
-    var write_delay_ns: UInt64
+    var fail_writes: Bool
 
     def __init__(out self, var incoming: List[Byte]):
         self.incoming = incoming^
@@ -33,7 +37,7 @@ struct _MemoryStream(DuplexStream):
         self.offset = 0
         self.require_closing_pong = False
         self.read_delay_ns = 0
-        self.write_delay_ns = 0
+        self.fail_writes = False
 
     def read[
         o: MutOrigin
@@ -47,6 +51,7 @@ struct _MemoryStream(DuplexStream):
                     .timeout(), "memory read", None, "read deadline elapsed"
                 )
             sleep(Float64(self.read_delay_ns) / 1_000_000_000)
+            self.state[].read_wait_ns += self.read_delay_ns
         if self.offset == len(self.incoming):
             raise NetError(
                 .timeout(), "memory read", None, "no available bytes"
@@ -60,13 +65,11 @@ struct _MemoryStream(DuplexStream):
     def write[
         o: ImmOrigin
     ](mut self, buffer: Span[Byte, o], timeout: Timeout) raises NetError -> Int:
-        if self.write_delay_ns > 0:
-            if timeout._value < self.write_delay_ns:
-                sleep(Float64(timeout._value) / 1_000_000_000)
-                raise NetError(
-                    .timeout(), "memory write", None, "write deadline elapsed"
-                )
-            sleep(Float64(self.write_delay_ns) / 1_000_000_000)
+        self.state[].write_timeout_ns = timeout._value
+        if self.fail_writes:
+            raise NetError(
+                .timeout(), "memory write", None, "injected write timeout"
+            )
         var count = min(2, len(buffer))
         self.state[].outgoing.extend(buffer[0:count])
         return count
@@ -495,7 +498,6 @@ def test_control_frames_share_message_operation_deadline() raises:
     assert_true(ws.is_closed())
 
 
-from std.time import perf_counter_ns
 from net.http.switch import HijackedConn
 from net.http._websocket_conn import _HijackedWebSocketStream
 
@@ -534,8 +536,8 @@ def test_peer_close_releases_tcp_while_metadata_remains_owned() raises:
 def test_automatic_control_writes_share_read_budget() raises:
     for scenario in range(4):
         var config = WebSocketConfig.default()
-        config.read_deadline = Timeout.nanoseconds(10_000_000)
-        config.write_deadline = Timeout.nanoseconds(500_000_000)
+        config.read_deadline = Timeout.nanoseconds(1_000_000_000)
+        config.write_deadline = Timeout.nanoseconds(5_000_000_000)
         if scenario == 3:
             config.ping_interval = Timeout.nanoseconds(1)
         var wire: List[Byte] = [137, 129, 0, 0, 0, 0, 120]
@@ -544,15 +546,23 @@ def test_automatic_control_writes_share_read_budget() raises:
         elif scenario == 2:
             wire = [193, 128]
         var ws = _make_configured_ws(wire^, config)
-        ws._stream.value().write_delay_ns = 50_000_000
-        var started = perf_counter_ns()
+        ws._stream.value().read_delay_ns = 5_000_000
+        ws._stream.value().fail_writes = True
+        var state = ws._stream.value().state.copy()
         var expired = False
         try:
             _ = ws.read_message()
         except err:
             expired = err.is_timeout()
         assert_true(expired or scenario == 2)
-        assert_true(perf_counter_ns() - started < 70_000_000)
+        assert_true(state[].write_timeout_ns > 0)
+        if scenario != 3:
+            assert_true(state[].read_wait_ns > 0)
+        assert_true(
+            state[].write_timeout_ns
+            <= config.read_deadline._value - state[].read_wait_ns
+        )
+        assert_true(ws.is_closed())
 
 
 struct _FailingWriteStream(DuplexStream):

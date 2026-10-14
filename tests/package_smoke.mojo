@@ -176,7 +176,7 @@ def _check_file_server() raises:
     var handler = FileServer(FileSystem.dir("."), config^)
     var settings = ServerConfig.default()
     var bytes = _to_bytes(
-        "HEAD /README.md HTTP/1.1\r\nHost: example.com\r\n\r\n"
+        "HEAD /tests/package_smoke.mojo HTTP/1.1\r\nHost: example.com\r\n\r\n"
     )
     var parsed = parse_one(Span(bytes), settings)
     if not parsed.is_complete():
