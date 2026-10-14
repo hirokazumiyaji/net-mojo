@@ -192,8 +192,8 @@ Constraints (see `docs/design/http-server.md` for the full contract):
 - Request bodies are buffered by default, up to `max_body_bytes` (1 MiB).
   With `enable_request_body_streaming = True`, HTTP/1 handlers run after the
   headers arrive and use `req.body_reader()` to read decoded bytes. The limit
-  then bounds queued body bytes; socket reads pause until the consumer drains
-  them. HTTP/2 and HTTP/3 retain buffered request bodies in this slice.
+  then bounds queued body bytes; each protocol pauses input until the consumer drains
+  them. HTTP/2 and HTTP/3 use the same streaming body interface.
 - Response trailers: `writer.add_trailer(name, value)` queues a trailer
   on a buffered HTTP/1.1 response. The encoder switches to
   `Transfer-Encoding: chunked`, advertises the names in `Trailer:`, and
@@ -348,7 +348,14 @@ struct SseHandler(Handler):
   completes the stream. Pass `sender.finish(trailers=trailers)` to send
   validated trailing headers after the final body chunk. Framing and routing
   headers are rejected, and trailer storage counts against the server budget.
-  HTTP/1.1 uses chunked encoding; HTTP/2 and HTTP/3 use DATA frames.
+  HTTP/1.1 uses chunked encoding by default; HTTP/2 and HTTP/3 use DATA frames.
+  A unique, valid `Content-Length` selects known-length streaming on every
+  protocol. `send` counts admitted bytes and `finish` rejects a short body;
+  excess bytes abort the response. `try_send` returns `False` on queue pressure
+  without consuming a chunk; check `is_cancelled()` before retrying.
+  Known-length responses cannot carry trailers.
+  HEAD can advertise a representation length with an empty buffered body and
+  `Content-Length`, without allocating the GET body.
 - **Backpressure**: On HTTP/2 and HTTP/3, `sender.send(...)` returns `False`
   when its bounded queue is full. Retain the chunk and retry after the loop
   drains output. `sender.is_cancelled()` distinguishes terminal cancellation.
@@ -578,7 +585,7 @@ Run the whole test suite with `pixi run test` (and memory sanitizers with
 analogous `test-core`, `test-ip`, `test-address`, `test-sys`, `test-udp`,
 `test-unix`, `test-poll`, `test-reactor`, `test-http-api`, `test-http-parser`,
 `test-http-response`, `test-http-server`, `test-http2`, `test-http-detach`,
-`test-http-offload`, `test-http-hijack`, `test-http-connect`, and
+`test-http-known-length`, `test-http-offload`, `test-http-hijack`, `test-http-connect`, and
 `test-actor` tasks.
 The default Pixi environment uses Mojo 1.1.
 Run the bounded client benchmark with `pixi run benchmark-http-client`. Run other benchmarks with `pixi run benchmark-ip`, `pixi run benchmark-loopback`, `pixi run benchmark-http-parse`, `pixi run benchmark-http-server`, and `pixi run benchmark-http-stream`.

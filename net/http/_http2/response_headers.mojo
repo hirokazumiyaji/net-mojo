@@ -1,6 +1,11 @@
 """HTTP/2 response field validation and shared response adaptation."""
 
-from net.http.headers import Headers, _parse_decimal, _trailer_forbidden
+from net.http.headers import (
+    Headers,
+    _parse_decimal,
+    _trailer_forbidden,
+    _declared_content_length,
+)
 from net.http.response import ResponseWriter, has_body_for_status
 
 from .request_headers import _is_connection_specific
@@ -87,11 +92,20 @@ def encode_http2_response_headers(
     var send_body = has_body_for_status(writer.status, is_head)
     var wire_length = -1
     if not streaming and has_body_for_status(writer.status, False):
-        wire_length = len(writer.body)
+        wire_length = writer._representation_length(is_head)
 
     var declared_lengths = writer.headers.get_all("content-length")
-    if streaming and len(declared_lengths) > 0:
-        return Http2ResponseHeadersResult.error()
+    if streaming:
+        wire_length = _declared_content_length(writer.headers)
+        if (
+            wire_length == -2
+            or (
+                wire_length >= 0
+                and (writer.status == 204 or writer.status == 304)
+            )
+            or (writer.status == 205 and wire_length > 0)
+        ):
+            return Http2ResponseHeadersResult.error()
     if wire_length >= 0:
         for i in range(len(declared_lengths)):
             if not _content_length_matches(declared_lengths[i], wire_length):

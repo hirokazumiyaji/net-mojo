@@ -2612,19 +2612,19 @@ def test_streaming_lifecycle_validation() raises:
     _release_detach_state(writer._detach_state_addr, from_sender=False)
 
 
-def test_streaming_rejects_content_length() raises:
-    var writer = ResponseWriter(1024)
-    var sender = writer.detach()
-    var h = Headers()
-    h.add(String("Content-Length"), String("42"))
-    var rejected = False
-    try:
-        sender.start(200, h^)
-    except e:
-        if e.kind == NetErrorKind.invalid_argument():
-            rejected = True
-    assert_true(rejected)
-    _release_detach_state(writer._detach_state_addr, from_sender=False)
+def test_streaming_rejects_invalid_content_length() raises:
+    for value in ["", "-1", "x", "9223372036854775808"]:
+        var writer = ResponseWriter(1024)
+        var sender = writer.detach()
+        var h = Headers()
+        h.add("Content-Length", String(value))
+        var rejected = False
+        try:
+            sender.start(200, h^)
+        except e:
+            rejected = e.kind == NetErrorKind.invalid_argument()
+        _release_detach_state(writer._detach_state_addr, from_sender=False)
+        assert_true(rejected)
 
 
 def test_streaming_queue_limit_exceeded() raises:

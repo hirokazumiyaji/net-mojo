@@ -13,7 +13,12 @@ from net.error import NetError, NetErrorKind
 
 from ._buffer import _CapacityBudget
 from .error import _status_reason
-from .headers import Headers, _parse_decimal, _trailer_forbidden
+from .headers import (
+    Headers,
+    _parse_decimal,
+    _trailer_forbidden,
+    _declared_content_length,
+)
 from .client_error import ClientError
 from ._parser import _is_token, _trim_ows
 from ._authority import _host_is_valid
@@ -368,7 +373,7 @@ def _render_response[
     # clients can delimit the empty message body (RFC 9112 §6.3).
     var wire_length = -1
     if not switching and has_body_for_status(writer.status, False):
-        wire_length = len(writer.body)
+        wire_length = writer._representation_length(is_head)
     elif not switching and writer.status == 205:
         wire_length = 0
     # Validate a caller-supplied Content-Length against the framed length.
@@ -765,12 +770,17 @@ def _render_chunked_start[
             None,
             "response headers too large",
         )
-    if writer.headers._first_lower_index("content-length") >= 0:
+    var declared = _declared_content_length(writer.headers)
+    if (
+        declared == -2
+        or (declared >= 0 and (writer.status == 204 or writer.status == 304))
+        or (writer.status == 205 and declared > 0)
+    ):
         raise NetError(
             NetErrorKind.invalid_argument(),
-            "encode chunked start",
+            "encode stream start",
             None,
-            "Content-Length is not permitted with chunked Transfer-Encoding",
+            "invalid streaming Content-Length",
         )
     if writer.headers._first_lower_index("transfer-encoding") >= 0:
         raise NetError(
@@ -782,7 +792,7 @@ def _render_chunked_start[
 
     # 1xx / 204 / 304 omit Transfer-Encoding. 205 also omits chunked
     # framing but emits Content-Length: 0 so the empty body is delimited.
-    var emit_transfer_encoding = True
+    var emit_transfer_encoding = declared < 0
     var emit_zero_content_length = False
     if (
         (writer.status >= 100 and writer.status <= 199)
@@ -804,6 +814,11 @@ def _render_chunked_start[
         byte_count,
     )
     for i in range(len(writer.headers)):
+        if (
+            writer.status == 205
+            and writer.headers._lower_names[i] == "content-length"
+        ):
+            continue
         var value_bytes = writer.headers._value_bytes_span(i)
         var name_bytes = writer.headers._names[i].as_bytes()
         for k in range(len(name_bytes)):
@@ -883,15 +898,15 @@ def encode_chunked_start(
     max_headers: Int,
     max_bytes: Int,
 ) raises NetError -> List[Byte]:
-    """Renders the status line and headers for a chunked response.
+    """Renders the status line and headers for a streaming response.
 
     Framing rules:
     - Status must be a 3-digit code (100-999).
-    - Content-Length is prohibited with chunked transfer coding (RFC 9112 §6.1).
+    - A validated Content-Length selects fixed-length framing; otherwise use chunked.
     - Transfer-Encoding header is managed by this encoder; caller-supplied is rejected.
     - Status 1xx, 204, 304 omit Transfer-Encoding: chunked.
     - Status 205 omits chunked coding and emits Content-Length: 0 instead.
-    - HEAD advertises Transfer-Encoding: chunked (if status allows body) but omits chunk bodies.
+    - HEAD advertises the selected framing but omits body bytes.
     """
     var capacity = _measure_chunked_start(
         writer, is_head, date, max_headers, max_bytes

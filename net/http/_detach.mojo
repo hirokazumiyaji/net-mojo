@@ -30,7 +30,11 @@ from net.http._buffer import (
     _CapacityTicket,
     _reserve_capacity,
 )
-from net.http.headers import Headers, _trailer_forbidden
+from net.http.headers import (
+    Headers,
+    _trailer_forbidden,
+    _declared_content_length,
+)
 
 
 comptime MSG_KIND_NONE: UInt8 = 0
@@ -186,6 +190,9 @@ struct _SharedDetachState:
     var finished: Bool
     var queue_limit: Int
     var queued_bytes: Int
+    var expected_bytes: Int
+    var admitted_bytes: Int
+    var is_head: Bool
     var messages: List[DetachMessage]
     var budget: Optional[SharedBufferBudget]
     var array_ticket: _CapacityTicket
@@ -203,6 +210,7 @@ struct _SharedDetachState:
         var budget: Optional[SharedBufferBudget] = None,
         protocol: UInt8 = _DETACH_HTTP1,
         stream_id: UInt64 = 0,
+        is_head: Bool = False,
     ):
         self.mutex = PthreadMutex._uninitialized()
         self.ref_count = 2  # 1 for connection actor, 1 for ResponseSender
@@ -214,6 +222,9 @@ struct _SharedDetachState:
         self.finished = False
         self.queue_limit = queue_limit
         self.queued_bytes = 0
+        self.expected_bytes = -1
+        self.admitted_bytes = 0
+        self.is_head = is_head
         self.messages = List[DetachMessage]()
         self.budget = budget^
         self.array_ticket = _CapacityTicket(self.budget.copy())
@@ -287,6 +298,7 @@ def _create_detach_state(
     var budget: Optional[SharedBufferBudget] = None,
     protocol: UInt8 = _DETACH_HTTP1,
     stream_id: UInt64 = 0,
+    is_head: Bool = False,
 ) raises NetError -> Int:
     """Allocates a new heap _SharedDetachState and returns its integer address.
     """
@@ -324,6 +336,7 @@ def _create_detach_state(
             budget=budget^,
             protocol=protocol,
             stream_id=stream_id,
+            is_head=is_head,
         )
     )
     s_ptr[].mutex._initialize()
@@ -526,15 +539,23 @@ struct ResponseSender(Movable):
         status: Int = 200,
         var headers: Headers = Headers(),
     ) raises NetError:
-        """Starts response streaming by sending the HTTP status and headers."""
+        """Starts streaming; Content-Length requires exactly that many admitted bytes.
+
+        HEAD sends no bytes. Known-length responses cannot carry trailers.
+        """
         if self._addr == 0:
             raise _inactive_error("start")
-        if headers.get_first("Content-Length"):
+        var declared = _declared_content_length(headers)
+        if (
+            declared == -2
+            or (declared >= 0 and (status == 204 or status == 304))
+            or (status == 205 and declared > 0)
+        ):
             raise NetError(
                 NetErrorKind.invalid_argument(),
                 "start",
                 None,
-                "Content-Length is not permitted with chunked streaming",
+                "invalid streaming Content-Length",
             )
         var s_ptr = _detach_state(self._addr)
         s_ptr[].mutex.lock()
@@ -552,6 +573,9 @@ struct ResponseSender(Movable):
                 "response already started or finished",
             )
         s_ptr[].started = True
+        s_ptr[].expected_bytes = (
+            0 if declared >= 0 and s_ptr[].is_head else declared
+        )
         var admitted = headers._adopt_capacity_budget(s_ptr[].budget.copy())
         if admitted:
             admitted = _append_message(
@@ -574,7 +598,23 @@ struct ResponseSender(Movable):
     def send[
         origin: ImmOrigin
     ](mut self, data: Span[Byte, origin]) raises NetError -> Bool:
-        """Enqueues a body chunk for response streaming."""
+        """Enqueues a chunk; queue saturation aborts HTTP/1 responses."""
+        return self._send(data, True)
+
+    def try_send[
+        origin: ImmOrigin
+    ](mut self, data: Span[Byte, origin]) raises NetError -> Bool:
+        """Returns False without consuming data when the stream queue is full.
+
+        A cancelled response also returns False; inspect is_cancelled before retrying.
+        """
+        return self._send(data, False)
+
+    def _send[
+        origin: ImmOrigin
+    ](
+        mut self, data: Span[Byte, origin], abort_on_full: Bool
+    ) raises NetError -> Bool:
         if self._addr == 0:
             raise _inactive_error("send")
         if len(data) == 0:
@@ -592,8 +632,22 @@ struct ResponseSender(Movable):
                 None,
                 "streaming response not started or already finished",
             )
+        if (
+            s_ptr[].expected_bytes >= 0
+            and len(data) > s_ptr[].expected_bytes - s_ptr[].admitted_bytes
+        ):
+            s_ptr[].cancelled = True
+            s_ptr[].finished = True
+            s_ptr[].terminal_kind = MSG_KIND_ABORT
+            _unlock_and_wake(s_ptr)
+            raise NetError(
+                NetErrorKind.invalid_argument(),
+                "send",
+                None,
+                "body exceeds Content-Length",
+            )
         if s_ptr[].queued_bytes + len(data) > s_ptr[].queue_limit:
-            if s_ptr[].target.protocol != _DETACH_HTTP1:
+            if not abort_on_full or s_ptr[].target.protocol != _DETACH_HTTP1:
                 s_ptr[].mutex.unlock()
                 return False
             s_ptr[].cancelled = True
@@ -620,6 +674,7 @@ struct ResponseSender(Movable):
             s_ptr[].terminal_kind = MSG_KIND_ABORT
         if admitted:
             s_ptr[].queued_bytes += len(data)
+            s_ptr[].admitted_bytes += len(data)
         _unlock_and_wake(s_ptr)
         if not admitted:
             raise NetError(
@@ -656,6 +711,26 @@ struct ResponseSender(Movable):
                 None,
                 "streaming response not started or already finished",
             )
+        if s_ptr[].expected_bytes >= 0:
+            if len(trailers) > 0:
+                s_ptr[].mutex.unlock()
+                raise NetError(
+                    NetErrorKind.invalid_argument(),
+                    "finish",
+                    None,
+                    "trailers require unknown-length streaming",
+                )
+            if s_ptr[].admitted_bytes != s_ptr[].expected_bytes:
+                s_ptr[].cancelled = True
+                s_ptr[].finished = True
+                s_ptr[].terminal_kind = MSG_KIND_ABORT
+                _unlock_and_wake(s_ptr)
+                raise NetError(
+                    NetErrorKind.invalid_argument(),
+                    "finish",
+                    None,
+                    "body does not match Content-Length",
+                )
         if not trailers._adopt_capacity_budget(s_ptr[].budget.copy()):
             s_ptr[].mutex.unlock()
             raise NetError(

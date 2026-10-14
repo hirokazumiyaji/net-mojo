@@ -878,7 +878,7 @@ handler をイベントループ上でブロックさせると全接続が停止
   - `ResponseSender` の `start(status, headers)`、`send(data)`、`finish()`、`abort()` 実装。
   - HTTP/1.1 chunked encoding（`encode_chunked_start`, `encode_chunk`, `encode_chunk_end`）。ゼロアロケーション hex 長さエンコード（`_append_hex`）。
   - RFC 9112 / RFC 9110 フレーミング規則の厳格な準拠：
-    - `start()` での `Content-Length` 指定拒否（`invalid_argument`）。
+    - `start()` の有効な `Content-Length` は既知長の送信を選択する。受理した本文バイト数を照合し、過剰・不足時は応答を中止する。
     - 1xx, 204, 205, 304 での `Transfer-Encoding: chunked` およびボディチャンク除外。
     - HEAD 要求における `Transfer-Encoding: chunked` ヘッダー出力とボディチャンク・終端チャンク省略。
     - 長さ 0 の `send()` の no-op（終端と誤認される 0 チャンク送出の防止）。
@@ -887,7 +887,7 @@ handler をイベントループ上でブロックさせると全接続が停止
   - `ServerConfig.stream_idle_timeout`（デフォルト 300 秒）によるストリームアイドルタイムアウト管理。
   - `STATE_STREAMING` 中のタイムアウト・abort 時における即時接続クローズ（ヘッダー送出後の不正な 500/503 送出による HTTP フレーミング破壊の防止）。
   - `STATE_STREAMING` 中の早期切断（EOF）検知とワーカーへの `cancelled = True` 伝播。
-  - `tests/test_http_detach.mojo` に Phase C 契約テストを追加（start -> send x 3 -> finish の chunked 復元、keep-alive 継続、Content-Length 指定エラー、queue_limit 超過時の中断、HEAD/204 でのチャンク省略、早期切断時のキャンセル）。
+  - `tests/test_http_detach.mojo` に Phase C 契約テストを追加（start -> send x 3 -> finish の chunked 復元、keep-alive 継続、不正 Content-Length 指定エラー、queue_limit 超過時の中断、HEAD/204 でのチャンク省略、早期切断時のキャンセル）。
 - **Phase D**: キャンセルと停止（実装完了）。
   - `ResponseSender.send(...) -> Bool` のキャンセル時戻り値を仕様（`docs/design/http-server.md` 表記）通り `False` に統一し、例外送出を解消（生成ワーカーでの自然なループ脱出を実現）。
   - サーバーイベントループ（`_process_detached_messages`）での世代（generation）不一致時の安全な処理（再利用先のアクティブ接続を巻き添えクローズせず、古い状態のみを安全に破棄）。
@@ -913,7 +913,7 @@ handler をイベントループ上でブロックさせると全接続が停止
 | `ResponseWriter.detach()` | `mut self -> ResponseSender` raises NetError | ハンドラ内で 1 回だけ呼び出し可能。呼び出し後は `ResponseWriter` への書き込みはエラーとなり、ハンドラ復帰後も接続は閉じず「切り離し待ち」状態に移行する。二重呼び出しは `invalid_state` エラー。 |
 | `ResponseSender` | `Movable` | 単一所有権（コピー不可、移動可能）。Mojo ランタイム管理外のスレッド（FFI 経由で生成した pthread 等）へ安全に移動可能。デストラクタで未送信 drop を検知した場合は自動的に `abort` をキューイングする。 |
 | `ResponseSender.respond` | `mut self, status: Int, var headers: Headers, var body: List[Byte]) raises NetError` | 遅延応答。Content-Length 付きの通常応答を 1 回で送信する。すでに `start()` や `respond()` が呼ばれている場合、またはキャンセル済みの場合はエラー。 |
-| `ResponseSender.start` | `mut self, status: Int = 200, var headers: Headers = Headers()) raises NetError` | レスポンスストリーミングを開始する。HTTP/1.1 では `Transfer-Encoding: chunked` ヘッダーを自動付与してステータス行とヘッダーを送信する（`Content-Length` を明示指定した場合は `invalid_argument` エラー）。 |
+| `ResponseSender.start` | `mut self, status: Int = 200, var headers: Headers = Headers()) raises NetError` | レスポンスストリーミングを開始する。有効な `Content-Length` があれば既知長で送信する。指定がなければ HTTP/1.1 は chunked、HTTP/2・HTTP/3 は長さ未指定の DATA で送信する。既知長では本文の過不足を拒否し、trailer を禁止する。 |
 | `ResponseSender.send` | `mut self, bytes: Span[Byte, _]) -> Bool` | ストリームのチャンク（body 断片）を送信する。HTTP/1.1 では 1 回の呼び出しを 1 つの chunk としてエンコードする。クライアント切断、タイムアウト、シャットダウンによりキャンセルされている場合は例外を送出せず `False` を返す。送信成功時は `True`。長さ 0 のバイト列は no-op（終端 chunk との混同を防ぐ）。 |
 | `ResponseSender.finish` | `mut self) raises NetError` | ストリームを正常終了する（HTTP/1.1 では `0\r\n\r\n` を送出）。その後、keep-alive の規則に従って次要求の受信へ進むか接続をクローズする。 |
 | `ResponseSender.abort` | `mut self)` | ストリームまたは遅延応答を中断し、接続を直ちにクローズする。例外は送出しない。 |
@@ -1172,3 +1172,20 @@ shutdown grace and write deadline. Abort, peer hangup, send failure, handler err
 server destruction or an expired flush deadline cancels the handoff. After transfer,
 server shutdown, deadlines and connection admission limits no longer own the raw
 transport; the receiver supplies its own I/O timeouts and close responsibility.
+
+
+### 既知長ストリーミングと HEAD の表現長
+
+`ResponseSender.start` に単一の有効な `Content-Length` を渡すと、HTTP/1.1 は chunked 符号化を使わず、宣言した長さで本文を区切る。
+HTTP/2・HTTP/3 も同じ長さをヘッダーに載せる。
+送信側は mailbox が受理した本文だけを数え、宣言長を超える `send` と不足した `finish` で応答を中止する。
+既知長の応答では trailer を使えない。
+HEAD は宣言した GET 相当の長さを保持し、本文の受理を必要としない。
+
+buffered HEAD では、本文が空なら caller の `Content-Length` を表現の長さとして使える。
+このため大きなファイルも本文を読み込まず HEAD に応答できる。
+GET と本文がある buffered 応答の長さ照合は従来と同じである。
+
+`try_send` は送信キューが満杯なら本文を受理せず `False` を返す。
+利用者は `is_cancelled()` を確認して再試行する。
+従来の `send` は HTTP/1 のキュー超過時に応答を中止する。

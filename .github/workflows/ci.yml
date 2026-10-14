@@ -334,6 +334,9 @@ jobs:
         run: pixi run example-http-upgrade-echo
       - name: Run CONNECT tunnel example
         run: pixi run example-http-connect
+
+      - name: Test known-length HTTP streaming
+        run: pixi run test-http-known-length
       - name: Test HTTP detach
         run: pixi run test-http-detach
       - name: Test HTTP offload
@@ -452,6 +455,9 @@ jobs:
         run: pixi run sanitize-http-websocket-fragments
       - name: Sanitize HTTP/1 connection switching
         run: pixi run sanitize-http-hijack
+
+      - name: Sanitize known-length HTTP streaming
+        run: pixi run sanitize-http-known-length
       - name: Sanitize HTTP detach
         run: pixi run sanitize-http-detach
       - name: Sanitize HTTP offload

@@ -31,7 +31,7 @@ from ._hijack import (
     _cancel_hijack_state,
     _release_hijack_state,
 )
-from .headers import Headers, _trailer_forbidden
+from .headers import Headers, _trailer_forbidden, _declared_content_length
 from .request import Request, RequestBodyReceiver
 from ._body_pipe import _BodyPipe
 
@@ -74,6 +74,7 @@ struct ResponseWriter(Movable, Sized):
     var _mailbox_budget: Optional[SharedBufferBudget]
     var _body_capacity_reserved: Int
     var _request_body_pipe: Optional[_BodyPipe]
+    var _is_head: Bool
 
     def __init__(
         out self,
@@ -82,6 +83,7 @@ struct ResponseWriter(Movable, Sized):
         generation: UInt64 = 0,
         wakeup_fd: Int32 = -1,
         queue_limit: Int = 1048576,
+        is_head: Bool = False,
     ):
         self.status = 200
         self.headers = Headers()
@@ -103,6 +105,7 @@ struct ResponseWriter(Movable, Sized):
         self._mailbox_budget = None
         self._body_capacity_reserved = 0
         self._request_body_pipe = None
+        self._is_head = is_head
 
     def __init__(out self, *, deinit move: Self):
         self.status = move.status
@@ -122,6 +125,7 @@ struct ResponseWriter(Movable, Sized):
         self._mailbox_budget = move._mailbox_budget^
         self._body_capacity_reserved = move._body_capacity_reserved
         self._request_body_pipe = move._request_body_pipe^
+        self._is_head = move._is_head
 
     def __deinit__(deinit self):
         self._cancel_hijack()
@@ -159,6 +163,13 @@ struct ResponseWriter(Movable, Sized):
         if self._body_budget:
             self._body_budget.value().release(self._body_capacity_reserved)
         self._body_capacity_reserved = 0
+
+    def _representation_length(self, is_head: Bool) -> Int:
+        if is_head and len(self.body) == 0:
+            var declared = _declared_content_length(self.headers)
+            if declared >= 0:
+                return declared
+        return len(self.body)
 
     def _set_detach_target(mut self, var target: _DetachTarget):
         self._target = target^
@@ -351,6 +362,7 @@ struct ResponseWriter(Movable, Sized):
             wakeup_fd=self._wakeup_fd,
             queue_limit=self._queue_limit,
             budget=self._mailbox_budget.copy(),
+            is_head=self._is_head,
         )
         self._detach_state_addr = addr
         self._detached = True

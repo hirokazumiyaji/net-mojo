@@ -110,7 +110,12 @@ from ._parser import (
 )
 from .config import ServerConfig
 from .handler import Handler
-from .headers import Headers, _check_value_bytes, _trailer_forbidden
+from .headers import (
+    Headers,
+    _check_value_bytes,
+    _trailer_forbidden,
+    _declared_content_length,
+)
 from .response import (
     ResponseWriter,
     _HijackContext,
@@ -1081,6 +1086,7 @@ struct Server(Movable):
                 self.config.max_response_body,
                 wakeup_fd=self._wakeup_channel.write_fd(),
                 queue_limit=self.config.stream_queue_limit,
+                is_head=is_head,
             )
             response._set_mailbox_budget(self._budget.copy())
             response._set_detach_target(_DetachTarget.http3(request_id))
@@ -1206,7 +1212,7 @@ struct Server(Movable):
                 response.body.clear()
             var wire_length = -1
             if has_body_for_status(response.status, False):
-                wire_length = len(response.body)
+                wire_length = response._representation_length(is_head)
             if wire_length >= 0:
                 var declared_lengths = response.headers.get_all(
                     "content-length"
@@ -1525,7 +1531,13 @@ struct Server(Movable):
         var wire_length = -1
         if not streaming and has_body_for_status(status, False):
             wire_length = len(msg.body)
-        var valid = status >= 200 and status <= 599
+            if self._http3_detached[position].is_head and len(msg.body) == 0:
+                var declared = _declared_content_length(msg.headers)
+                if declared >= 0:
+                    wire_length = declared
+        elif streaming:
+            wire_length = _declared_content_length(msg.headers)
+        var valid = status >= 200 and status <= 599 and wire_length != -2
         if not streaming:
             valid = valid and len(msg.body) <= self.config.max_response_body
         var count = len(msg.headers) - msg.headers.count("content-length")
@@ -1544,11 +1556,8 @@ struct Server(Movable):
             ):
                 valid = False
             if msg.headers._lower_names[i] == "content-length":
-                if streaming or (
-                    wire_length >= 0
-                    and not _content_length_matches(
-                        msg.headers.value_at(i), wire_length
-                    )
+                if wire_length >= 0 and not _content_length_matches(
+                    msg.headers.value_at(i), wire_length
                 ):
                     valid = False
                 continue
@@ -2546,6 +2555,7 @@ struct Server(Movable):
             generation=self._conns[idx].token.generation,
             wakeup_fd=self._wakeup_channel.write_fd(),
             queue_limit=self.config.stream_queue_limit,
+            is_head=is_head,
         )
         writer._set_detach_target(
             _DetachTarget.http2(
@@ -3734,6 +3744,7 @@ struct Server(Movable):
             generation=self._conns[idx].token.generation,
             wakeup_fd=self._wakeup_channel.write_fd(),
             queue_limit=self.config.stream_queue_limit,
+            is_head=is_head,
         )
         writer._set_body_budget(self._budget.copy())
         writer._set_request_body_pipe(req._body_pipe.copy())
@@ -3904,6 +3915,7 @@ struct Server(Movable):
         self._cleanup_detached_state(idx)
         self._remove_detached_conn(idx)
         self._conns[idx].stream_finished = False
+        self._conns[idx].stream_known_length = -1
         self._conns[idx].stream_has_body = False
         self._conns[idx].detach_at = NO_DEADLINE
         self._conns[idx].requests_served += 1
@@ -4472,6 +4484,9 @@ struct Server(Movable):
 
         self._conns[idx].state = STATE_STREAMING
         self._conns[idx].stream_finished = False
+        self._conns[idx].stream_known_length = _declared_content_length(
+            rw.headers
+        )
         self._conns[idx].stream_has_body = (
             not is_head
         ) and has_body_for_status(msg.status, False)
@@ -4506,7 +4521,12 @@ struct Server(Movable):
 
         var wire: List[Byte]
         try:
-            wire = _encode_chunk_budgeted(Span(msg.body), self._budget)
+            if self._conns[idx].stream_known_length >= 0:
+                wire = msg.body^
+                msg.body = List[Byte]()
+                msg.body_ticket.amount = 0
+            else:
+                wire = _encode_chunk_budgeted(Span(msg.body), self._budget)
         except e:
             _ = e
             self._handle_detached_abort(idx)
@@ -4535,6 +4555,9 @@ struct Server(Movable):
             return
         self._conns[idx].stream_finished = True
         if not self._conns[idx].stream_has_body:
+            return
+
+        if self._conns[idx].stream_known_length >= 0:
             return
 
         var wire: List[Byte]

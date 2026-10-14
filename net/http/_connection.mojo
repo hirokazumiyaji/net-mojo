@@ -61,6 +61,7 @@ struct HttpConnection(Movable):
     var peer_hangup: Bool
     var stream_finished: Bool
     var stream_has_body: Bool
+    var stream_known_length: Int
     var stream_header_count: Int
     var stream_header_bytes: Int
     var header_at: Int
@@ -131,6 +132,7 @@ struct HttpConnection(Movable):
         self.peer_hangup = False
         self.stream_finished = False
         self.stream_has_body = False
+        self.stream_known_length = -1
         self.stream_header_count = 0
         self.stream_header_bytes = 0
         self._no_deadline = no_deadline
@@ -520,6 +522,7 @@ struct HttpConnection(Movable):
         self.is_connect = False
         self.stream_finished = False
         self.stream_has_body = False
+        self.stream_known_length = -1
         self.stream_header_count = 0
         self.stream_header_bytes = 0
         self.tls = None

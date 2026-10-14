@@ -58,7 +58,7 @@ def test_stream_wire_denial_and_validation_leave_foreign_reservation() raises:
     for invalid in range(4):
         var writer = ResponseWriter(32)
         if invalid == 0:
-            writer.headers.add(String("Content-Length"), String("0"))
+            writer.headers.add(String("Content-Length"), String("bad"))
         elif invalid == 1:
             writer.headers.add(String("Transfer-Encoding"), String("chunked"))
         elif invalid == 2:
@@ -841,10 +841,7 @@ def test_empty_presence_and_content_length_errors_preserve_validation_order() ra
                 writer.headers.clear()
                 writer.headers.add(String("Content-Length"), String(""))
                 writer.headers.add(String("Transfer-Encoding"), String(""))
-                expected = String(
-                    "Content-Length is not permitted with chunked"
-                    " Transfer-Encoding"
-                )
+                expected = String("invalid streaming Content-Length")
         var budget = BufferBudget(4096)
         assert_true(budget.try_reserve(5))
         var rejected = False
