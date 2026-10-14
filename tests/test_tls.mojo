@@ -81,7 +81,9 @@ def test_http2_tls_shutdown_deadline_closes_before_session_expiry() raises:
         String("127.0.0.1:") + String(server.local_address().port),
         Timeout.seconds(2),
     )
-    server._accept_pending(now_ns())
+    var expires = now_ns() + 2_000_000_000
+    while server.active_connections() == 0 and now_ns() < expires:
+        server._accept_pending(now_ns())
     assert_equal(server.active_connections(), 1)
     assert_true(Bool(server._conns[0].tls))
     server._conns[0].http2_session = Http2RequestSession(
