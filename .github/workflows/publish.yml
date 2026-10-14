@@ -4,11 +4,12 @@ on:
   push:
     tags:
       - "v*.*.*"
-  # Pull requests and manual runs build and test the packages without uploading them.
   pull_request:
     paths:
       - conda.recipe/**
       - scripts/check_release_version.sh
+      - scripts/build_conda.sh
+      - scripts/test_release_version.py
       - .github/workflows/publish.yml
   workflow_dispatch:
 
@@ -38,30 +39,73 @@ jobs:
         if: startsWith(github.ref, 'refs/tags/')
         run: bash scripts/check_release_version.sh "$GITHUB_REF_NAME"
 
+      - name: Test release checks
+        run: python3 scripts/test_release_version.py
+
       - name: Build and test conda package
         uses: prefix-dev/rattler-build-action@1ca5f45832f419a46d1326ccc5861d7e14d67c44 # v0.2.39
         with:
           artifact-name: net-mojo-${{ matrix.platform }}
+          rattler-build-version: v0.74.0
+          recipe-path: conda.recipe/recipe.yaml
           build-args: >-
-            --recipe conda.recipe/recipe.yaml
             -c conda-forge
             -c https://conda.modular.com/max
 
-      - name: Upload package to prefix.dev
-        if: startsWith(github.ref, 'refs/tags/')
+      - name: Install pinned Mojo toolchain
+        uses: prefix-dev/setup-pixi@f00437f565399d418b0acc85936d12c1fb668347
+        with:
+          frozen: true
+
+      - name: Build precompiled release artifact
+        run: |
+          pixi run package
+          pixi run test-package
+          mkdir -p dist
+          cp build/net.mojoc "dist/net-${{ matrix.platform }}.mojoc"
+
+      - name: Upload precompiled artifact
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: net-mojo-precompiled-${{ matrix.platform }}
+          path: dist/*.mojoc
+          if-no-files-found: error
+
+  prefix-publish:
+    name: Publish conda packages
+    needs: package
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Download conda packages
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          pattern: net-mojo-*
+          path: dist
+          merge-multiple: true
+
+      - name: Install rattler-build
+        uses: prefix-dev/rattler-build-action@1ca5f45832f419a46d1326ccc5861d7e14d67c44 # v0.2.39
+        with:
+          rattler-build-version: v0.74.0
+          setup-only: true
+          upload-artifact: false
+
+      - name: Upload packages to prefix.dev
         env:
           PREFIX_CHANNEL: ${{ vars.PREFIX_CHANNEL }}
           PREFIX_API_KEY: ${{ secrets.PREFIX_API_KEY }}
         run: |
           test -n "$PREFIX_CHANNEL"
           test -n "$PREFIX_API_KEY"
-          packages="$(find output -type f -name '*.conda' -print)"
-          test -n "$packages"
-          find output -type f -name '*.conda' -exec rattler-build upload prefix --channel "$PREFIX_CHANNEL" {} +
+          shopt -s globstar nullglob
+          packages=(dist/**/*.conda)
+          test "${#packages[@]}" -eq 3
+          rattler-build upload prefix --channel "$PREFIX_CHANNEL" "${packages[@]}"
 
   github-release:
     name: GitHub Release
-    needs: package
+    needs: prefix-publish
     if: startsWith(github.ref, 'refs/tags/')
     runs-on: ubuntu-24.04
     permissions:
@@ -92,4 +136,6 @@ jobs:
         with:
           body_path: ${{ steps.notes.outputs.path }}
           generate_release_notes: ${{ steps.notes.outputs.path == '' }}
-          files: dist/**/*.conda
+          files: |
+            dist/**/*.conda
+            dist/*.mojoc
