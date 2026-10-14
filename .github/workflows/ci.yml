@@ -236,6 +236,8 @@ jobs:
         run: pixi run test-http-middleware
       - name: Test HTTP server
         run: pixi run test-http-server
+      - name: Test hijacked HTTP transport
+        run: pixi run test-http-hijacked-conn
       - name: Run HTTP router example
         run: pixi run example-http-router
       - name: Build HPACK shim for HTTP/2 session tests
@@ -341,6 +343,8 @@ jobs:
         run: pixi run sanitize-http-middleware
       - name: Sanitize HTTP server
         run: pixi run sanitize-http-server
+      - name: Sanitize hijacked HTTP transport
+        run: pixi run sanitize-http-hijacked-conn
       - name: Sanitize HTTP/2 frame parser
         run: pixi run sanitize-http2
       - name: Sanitize HTTP detach
