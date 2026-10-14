@@ -77,8 +77,10 @@ def negotiate_encoding(
     var best_quality = 0
     var best_position = len(entries)
     var best: Optional[String] = None
-    for coding in supported:
-        var supported_coding = coding.lower()
+    for index in range(len(supported) + 1):
+        var supported_coding = String("identity")
+        if index < len(supported):
+            supported_coding = supported[index].lower()
         var specific_quality = -1
         var specific_position = len(entries)
         var wildcard_quality = -1
@@ -109,6 +111,8 @@ def negotiate_encoding(
             elif quality > wildcard_quality:
                 wildcard_quality = quality
                 wildcard_position = position
+        if supported_coding == "identity" and specific_quality < 0:
+            continue
         var quality = specific_quality
         var position = specific_position
         if quality < 0:
@@ -119,5 +123,8 @@ def negotiate_encoding(
         ):
             best_quality = quality
             best_position = position
-            best = supported_coding^
+            if supported_coding == "identity":
+                best = None
+            else:
+                best = supported_coding^
     return best^

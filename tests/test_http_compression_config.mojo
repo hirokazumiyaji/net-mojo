@@ -48,6 +48,17 @@ def test_supported_quality_and_header_tie_order() raises:
     )
 
 
+def test_explicit_identity_quality_and_order_are_respected() raises:
+    assert_false(Bool(_choose("identity;q=1, gzip;q=0.1")))
+    assert_false(Bool(_choose("gzip;q=0.1, IDENTITY;q=0.9")))
+    assert_false(Bool(_choose("identity;q=0.5, gzip;q=0.5")))
+    assert_equal(_choose("gzip;q=0.5, identity;q=0.5").value(), "gzip")
+    assert_equal(_choose("identity;q=0, gzip;q=0.1").value(), "gzip")
+    assert_equal(_choose("gzip;q=0.1").value(), "gzip")
+    assert_false(Bool(_choose("identity;q=1, *;q=0.1")))
+    assert_equal(_choose("identity;q=NaN, gzip;q=0.1").value(), "gzip")
+
+
 def test_default_configuration_and_validation() raises:
     var config = CompressionConfig.default()
     assert_equal(config.level, 5)
