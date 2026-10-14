@@ -141,6 +141,8 @@ jobs:
           frozen: true
       - name: Test HTTP/3 provider and integration
         run: pixi run -e tls-http3 quic-suite
+      - name: Test streaming HTTP/3 request input
+        run: pixi run -e tls-http3 http3-request-stream-test
       - name: Test detached HTTP/3 responses
         run: pixi run -e tls-http3 http3-detach-test
       - name: Test independent HTTP/3 client
