@@ -25,7 +25,6 @@ struct _State(Movable):
     var checksum: Int
     var done: Bool
     var cancelled: Bool
-    var paired: Bool
     var failed: Bool
     var premature_trailers: Bool
     var trailer: String
@@ -37,7 +36,6 @@ struct _State(Movable):
         self.checksum = 0
         self.done = False
         self.cancelled = False
-        self.paired = False
         self.failed = False
         self.premature_trailers = False
         self.trailer = String()
@@ -113,7 +111,6 @@ def _consume(
     except error:
         state[].mutex.lock()
         state[].cancelled = error.kind == NetErrorKind.cancelled()
-        state[].paired = work[].endpoints.sender.is_cancelled()
         state[].failed = not state[].cancelled
         state[].done = True
         state[].mutex.unlock()
@@ -249,7 +246,7 @@ struct _StreamingHandler(Handler):
                 + ","
                 + String(Int(state.cancelled))
                 + ","
-                + String(Int(state.paired))
+                + String(Int(work.endpoints.sender.is_cancelled()))
                 + ","
                 + String(Int(state.premature_trailers))
                 + ","
@@ -326,7 +323,8 @@ def main() raises:
             0,
         )
     handler.threads.clear()
-    ref terminal = handler.work[len(handler.work) - 1][].state[]
+    ref terminal_work = handler.work[len(handler.work) - 1][]
+    ref terminal = terminal_work.state[]
     assert_true(terminal.done)
     assert_true(terminal.cancelled)
-    assert_true(terminal.paired)
+    assert_true(terminal_work.endpoints.sender.is_cancelled())
