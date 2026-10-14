@@ -13,7 +13,7 @@ from test_http_fileserver import Fixture, H1Client, H2Client, H3Client
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--protocols", nargs="+", default=["h1", "h2", "h3"])
+    parser.add_argument("--protocols", nargs="+", choices=["h1", "h2", "h3"], default=["h1", "h2", "h3"])
     args = parser.parse_args()
     binary = Path("build/http_fileserver_compression_fixture")
     binary.parent.mkdir(parents=True, exist_ok=True)
@@ -33,6 +33,10 @@ def main():
             client = H3Client(fixture.port) if protocol == "h3" else H2Client(fixture.port) if protocol == "h2" else H1Client(fixture.port, False)
             try:
                 plain = client.request("GET", "/small.txt")
+                assert plain.status == 200
+                assert not plain.values("content-encoding")
+                assert bytes(plain.body) == small
+                assert plain.values("content-length") == [str(len(small))]
                 compressed = client.request("GET", "/small.txt", (("Accept-Encoding", "gzip"),))
                 assert compressed.status == 200
                 assert compressed.values("content-encoding") == ["gzip"]
@@ -40,7 +44,8 @@ def main():
                 assert gzip.decompress(compressed.body) == small
                 assert compressed.values("etag") == plain.values("etag")
                 assert compressed.values("etag")[0].startswith('W/"')
-                assert "accept-encoding" in ",".join(compressed.values("vary")).lower()
+                vary = {token.strip().lower() for value in compressed.values("vary") for token in value.split(",")}
+                assert "accept-encoding" in vary
                 selected = client.request("GET", "/small.txt", (("Accept-Encoding", "gzip"), ("Range", "bytes=2-8")))
                 assert selected.status == 206
                 assert not selected.values("content-encoding")
