@@ -1502,7 +1502,7 @@ def test_http2_failed_session_ignores_header_and_body_deadlines() raises:
         assert_equal(session.next_deadline(), NO_DEADLINE)
 
 
-def test_http2_streaming_headers_omit_unknown_content_length() raises:
+def test_http2_streaming_headers_omit_unknown_and_preserve_declared_length() raises:
     var writer = ResponseWriter(64)
     var fields = encode_http2_response_headers(
         writer, False, "Thu, 01 Jan 1970 00:00:00 GMT", 4096, 32, streaming=True
@@ -1514,7 +1514,15 @@ def test_http2_streaming_headers_omit_unknown_content_length() raises:
     var declared = encode_http2_response_headers(
         writer, False, "Thu, 01 Jan 1970 00:00:00 GMT", 4096, 32, streaming=True
     )
-    assert_true(declared.is_error())
+    assert_true(declared.is_valid())
+    assert_equal(declared.field_count, fields.field_count + 1)
+    var known_raw = String(from_utf8_lossy=Span(declared.fields))
+    assert_true(known_raw.find("content-length") >= 0)
+    writer.headers.add("Content-Length", "1")
+    var conflicting = encode_http2_response_headers(
+        writer, False, "Thu, 01 Jan 1970 00:00:00 GMT", 4096, 32, streaming=True
+    )
+    assert_true(conflicting.is_error())
 
 
 def _enqueue_streaming(
