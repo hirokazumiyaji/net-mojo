@@ -949,9 +949,12 @@ def test_http2_request_session_resets_only_stream_for_oversized_body() raises:
     _append_frame(wire, Byte(0), Byte(1), UInt32(3), Span(next_body))
 
     var result = session.consume(Span(wire))
-    assert_true(result.is_request())
-    assert_equal(result.stream_id, UInt32(3))
-    assert_equal(result.request.body[0], Byte(4))
+    assert_true(result.is_pending())
+    assert_equal(result.reset_stream_id, UInt32(1))
+    var sibling = session.consume(Span(wire)[result.consumed :])
+    assert_true(sibling.is_request())
+    assert_equal(sibling.stream_id, UInt32(3))
+    assert_equal(sibling.request.body[0], Byte(4))
     var output_offset = 0
     var reset_found = False
     var connection_credit_found = False
