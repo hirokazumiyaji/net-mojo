@@ -136,17 +136,9 @@ struct TLSContext(Movable):
             "create TLS client context",
             "OpenSSL could not load the trust store or ALPN configuration",
         )
-        return Self(library_path^, library^, context)
-
-    def __init__(
-        out self,
-        var library_path: String,
-        var library: OwnedDLHandle,
-        context: Pointer[Byte, MutUntrackedOrigin],
-    ):
-        self._library_path = library_path^
-        self._library = library^
-        self._context = context
+        return Self(
+            library_path=library_path^, library=library^, context=context
+        )
 
     def __init__(
         out self,
