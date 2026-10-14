@@ -168,15 +168,49 @@ async def verify(request):
     return compressed
 
 
+async def verify_stream(request):
+    compressed = []
+    for path, size in (("/stream", 4096), ("/stream-known", 4096), ("/stream-trailers", 4096), ("/stream-known-trailers", 4096), ("/stream-tiny", 4), ("/stream-random", 4096)):
+        headers, body = await request(path)
+        fields = dict(headers)
+        assert fields[b":status"] == b"200", headers
+        assert fields[b"content-encoding"] == b"gzip", headers
+        assert b"content-length" not in fields, headers
+        assert fields[b"etag"] == b'W/"source"', headers
+        expected = b"A" * size
+        if path == "/stream-random":
+            state, expected = 123456789, bytearray()
+            for _ in range(size):
+                state = (state * 6364136223846793005 + 1) & ((1 << 64) - 1)
+                expected.append(state >> 56)
+        assert gzip.decompress(body) == expected, path
+        if path.endswith("trailers"):
+            assert fields[b"x-digest"] == b"ok", headers
+        compressed.append(body)
+    for path, method, encoding, size in (("/stream", "GET", "gzip;q=0", 4096), ("/stream-known-small", "GET", "gzip", 4), ("/stream-disabled", "GET", "gzip", 4096), ("/stream.gz", "GET", "gzip", 4096), ("/stream-known", "HEAD", "gzip", 0)):
+        headers, body = await request(path, method, encoding)
+        fields = dict(headers)
+        assert b"content-encoding" not in fields, headers
+        assert body == b"A" * size, path
+        assert fields[b"etag"] == b'"source"', headers
+        if method == "HEAD":
+            assert fields[b"content-length"] == b"4096", headers
+    return compressed
+
+
 async def run(tcp, udp):
     h1 = await verify(lambda *args: h1_request(tcp, *args))
+    stream1 = await verify_stream(lambda *args: h1_request(tcp, *args))
     h2 = await verify(lambda *args: h2_request(tcp, *args))
+    stream2 = await verify_stream(lambda *args: h2_request(tcp, *args))
     config = QuicConfiguration(is_client=True, alpn_protocols=["h3"], verify_mode=ssl.CERT_NONE)
     async with connect("127.0.0.1", udp, configuration=config, create_protocol=H3Client) as client:
         h3 = await verify(client.request)
+        stream3 = await verify_stream(client.request)
+        assert stream1 == stream2 == stream3, "streaming protocols produced different gzip bytes"
         assert h1 == h2 == h3, "protocols produced different gzip bytes"
         await client.request("/shutdown")
-    print("PASS gzip HTTP/1.1, HTTP/2, HTTP/3: 36 wire cases and identical gzip bytes", flush=True)
+    print("PASS gzip HTTP/1.1, HTTP/2, HTTP/3: 69 wire cases including streaming retry and identical gzip bytes", flush=True)
 
 
 def main():
@@ -186,7 +220,7 @@ def main():
     try:
         ready = server.stdout.readline().split()
         assert ready[0] == "READY", ready
-        asyncio.run(run(int(ready[1].rsplit(":", 1)[1]), int(ready[2].rsplit(":", 1)[1])))
+        asyncio.run(asyncio.wait_for(run(int(ready[1].rsplit(":", 1)[1]), int(ready[2].rsplit(":", 1)[1])), 60))
         assert server.wait(timeout=10) == 0
     finally:
         if server.poll() is None:

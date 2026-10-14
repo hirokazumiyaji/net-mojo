@@ -31,6 +31,7 @@ from .fileserver import (
 from .compression import (
     CompressionConfig,
     CompressionHandler,
+    CompressingSender,
     negotiate_encoding,
 )
 from .config import ServerConfig

@@ -488,7 +488,8 @@ python = ">=3.10,<3.15"
 compression-build = "bash scripts/build_zlib_shim.sh"
 test-gzip-provider = { cmd = "mojo run --Werror -I . tests/test_gzip_provider.mojo", depends-on = ["compression-build"] }
 test-http-compression = { cmd = "mojo run --Werror -I . tests/test_http_compression.mojo", depends-on = ["compression-build"] }
-compression-suite = { depends-on = ["test-gzip-provider", "test-http-compression-config", "test-http-compression"] }
+test-http-compression-stream = { cmd = "mojo run --Werror -I . tests/test_http_compression_stream.mojo", depends-on = ["compression-build"] }
+compression-suite = { depends-on = ["test-gzip-provider", "test-http-compression-config", "test-http-compression", "test-http-compression-stream"] }
 
 [feature.http3.tasks.gzip-wire-test]
 cmd = "python3 scripts/test_http_compression.py"

@@ -31,6 +31,9 @@ from ._hijack import (
     _cancel_hijack_state,
     _release_hijack_state,
 )
+from ._compression_config import CompressionConfig
+from ._compression_common import _accepts_gzip
+from ._compression_sender import CompressingSender
 from .headers import Headers, _trailer_forbidden, _declared_content_length
 from .request import Request, RequestBodyReceiver
 from ._body_pipe import _BodyPipe
@@ -376,6 +379,24 @@ struct ResponseWriter(Movable, Sized):
         self._detach_state_addr = addr
         self._detached = True
         return ResponseSender(addr)
+
+    def detach_compressed(
+        mut self,
+        req: Request,
+        var cfg: CompressionConfig,
+        var provider_library_path: Optional[String] = None,
+    ) raises NetError -> CompressingSender:
+        """Detaches with an owned request snapshot for optional streaming gzip.
+        """
+        cfg.validate()
+        return CompressingSender(
+            self.detach(),
+            cfg^,
+            provider_library_path^,
+            req.path.copy(),
+            req.method == "HEAD",
+            _accepts_gzip(req.headers),
+        )
 
     def offload[
         J: HandlerJob
