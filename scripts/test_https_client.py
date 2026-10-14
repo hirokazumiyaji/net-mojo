@@ -68,7 +68,7 @@ def case(*, host="localhost", ca="test-cert.pem", sni="-", insecure=False,
 
 
 def main():
-    subprocess.run(["mojo", "build", "--Werror", "-I", ".",
+    subprocess.run(["mojo", "build", "--Werror", "-I", ".", "-Xlinker", "-ldl",
                     "tests/https_client_probe.mojo", "-o", str(BINARY)], cwd=ROOT, check=True)
     case()
     case(host="localhost.")
