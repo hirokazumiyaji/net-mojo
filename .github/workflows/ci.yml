@@ -181,6 +181,8 @@ jobs:
         run: pixi run -e tls-http2 http-app-contract-test
       - name: Test HTTP/1.1 and HTTP/2 router contract
         run: pixi run -e tls-http2 http-router-h2-test
+      - name: Test static files over HTTP/1.1 and HTTP/2
+        run: pixi run -e tls-http2 http-fileserver-h2-test
       - name: Test HTTP/2 integration gaps
         run: pixi run -e tls-http2 http2-integration-test
       - name: Test shared-listener HTTP worker pool
@@ -220,6 +222,8 @@ jobs:
         run: pixi run -e tls-http3 http-pool-quic-integration-test
       - name: Test HTTP/3 router contract
         run: pixi run -e tls-http3 http-router-h3-test
+      - name: Test static files over HTTP/3
+        run: pixi run -e tls-http3 http-fileserver-h3-test
       - name: Test HTTP same-origin fallback
         run: pixi run -e tls-http3 http-same-origin-test
       - name: Test packaged HTTP/3 provider
@@ -339,12 +343,18 @@ jobs:
 
       - name: Test static file HTTP metadata
         run: pixi run test-http-file-metadata
+      - name: Test HTTP static files
+        run: pixi run test-http-fileserver
+      - name: Test static-file client EOF handling
+        run: pixi run test-http-fileserver-driver
+      - name: Test static-file transfer and memory bound
+        run: pixi run test-http-fileserver-wire
       - name: Test known-length HTTP streaming
         run: pixi run test-http-known-length
+      - name: Test HTTP worker offload
+        run: pixi run test-http-offload
       - name: Test HTTP detach
         run: pixi run test-http-detach
-      - name: Test HTTP offload
-        run: pixi run test-http-offload
       - name: Test actor primitives
         run: pixi run test-actor
       - name: Run HTTP client example
@@ -464,9 +474,13 @@ jobs:
 
       - name: Sanitize static file HTTP metadata
         run: pixi run sanitize-http-file-metadata
+      - name: Sanitize HTTP static files
+        run: pixi run sanitize-http-fileserver
+      - name: Sanitize static-file transfer and memory bound
+        run: pixi run sanitize-http-fileserver-wire
       - name: Sanitize known-length HTTP streaming
         run: pixi run sanitize-http-known-length
+      - name: Sanitize HTTP worker offload
+        run: pixi run sanitize-http-offload
       - name: Sanitize HTTP detach
         run: pixi run sanitize-http-detach
-      - name: Sanitize HTTP offload
-        run: pixi run sanitize-http-offload

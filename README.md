@@ -235,8 +235,7 @@ Constraints (see `docs/design/http-server.md` for the full contract):
   `switch_protocols()`. The receiving worker uses `HijackSender.take_connection()`;
   unread bytes are retained by `HijackedConn`. HTTP/2 and HTTP/3 do not support
   connection takeover.
-- No client, no HTTP/1.0, no multipart helpers,
-  no body compression, no static file serving.
+- No HTTP/1.0, no multipart helpers, no body compression.
 
 ### Method and path routing
 
@@ -266,10 +265,32 @@ Paths and captures retain their raw percent spelling.
 Register routes before serving. `ServeMux()` permits at most 1024 routes;
 each pattern is bounded to 1024 bytes, 32 segments and 16 named captures.
 `ServeMux.param` returns an owned `Optional[String]` during the selected
-handler call. Register concrete stateful handlers with `handle_handler`;
+handler call. Register concrete stateful handlers with `handle` or `handle_handler`;
 callbacks passed to `handle` must own their captures, using `{var value}`
 or `{var value^}`. Captured views require their backing storage to outlive
 the mux. Each mux and its handlers belong to one event loop.
+
+### Static files
+
+`FileServer` serves confined regular files through the same handler API:
+
+```mojo
+from net.http import ServeMux, file_server
+
+var mux = ServeMux()
+mux.handle("GET /static/{path...}", file_server("./public"))
+```
+
+Files include MIME types, weak ETags, Last-Modified, conditional GET/HEAD and
+single byte ranges. Directory indexes default to `index.html`; listing and
+symlink traversal are disabled. `FileServerConfig` controls indexes, listing,
+cache policy, file limits and its bounded worker pool. Large files stream from
+owned descriptors with at most 64 KiB read scratch space. The default maximum
+file size is 1 GiB. `serve_file(req, writer, fs, path)` serves an explicit path.
+
+Run `pixi run example-http-fileserver ./public` and visit `/static/`.
+See the [static file contract](docs/design/http-fileserver.md) for confinement,
+redirects, validators, resource limits and protocol validation.
 
 ### Function middleware
 

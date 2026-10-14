@@ -7,6 +7,9 @@ from net.http import (
     ClientRequest,
     ClientTLSConfig,
     RedirectPolicy,
+    FileServer,
+    FileServerConfig,
+    FileSystem,
     Headers,
     HttpVersion,
     MiddlewareFn,
@@ -166,6 +169,28 @@ def _check_http_client() raises:
     client.close()
 
 
+def _check_file_server() raises:
+    var config = FileServerConfig()
+    if config.max_in_memory_body != 65536:
+        raise Error("packaged FileServerConfig mismatch")
+    var handler = FileServer(FileSystem.dir("."), config^)
+    var settings = ServerConfig.default()
+    var bytes = _to_bytes(
+        "HEAD /README.md HTTP/1.1\r\nHost: example.com\r\n\r\n"
+    )
+    var parsed = parse_one(Span(bytes), settings)
+    if not parsed.is_complete():
+        raise Error("packaged file request failed")
+    var writer = ResponseWriter(0, is_head=True)
+    handler.handle(parsed.request, writer)
+    if (
+        writer.status != 200
+        or len(writer.body) != 0
+        or not writer.headers.get_first("Content-Length")
+    ):
+        raise Error("packaged FileServer HEAD mismatch")
+
+
 def main() raises:
     var listener = listen_tcp("127.0.0.1:0")
     var client = dial_tcp(String(listener.local_address()), Timeout.seconds(1))
@@ -195,6 +220,8 @@ def main() raises:
     _check_http_pool()
     print("packaged net.http pool succeeded")
 
+    _check_file_server()
+    print("packaged FileServer succeeded")
     _check_http_router()
     print("packaged net.http router succeeded")
 

@@ -382,6 +382,11 @@ struct ServeMux(Handler, Movable):
     ](mut self, pattern: StringSlice, var callback: F) raises NetError:
         self.register(pattern, RouteHandler(callback^))
 
+    def handle[
+        H: Handler & Deinitable
+    ](mut self, pattern: StringSlice, var handler: H) raises NetError:
+        self.handle_handler(pattern, handler^)
+
     def handle_handler[
         H: Handler & Deinitable
     ](mut self, pattern: StringSlice, var handler: H) raises NetError:

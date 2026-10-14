@@ -20,6 +20,14 @@ from .client_config import ClientConfig, ClientTLSConfig, RedirectPolicy
 from .client_request import ClientRequest, ClientRequestBody
 from .client_response import Response, ResponseBody
 from .client_error import ClientError
+from ._filesystem import FileSystem
+from .fileserver import (
+    FileETagMode,
+    FileServer,
+    FileServerConfig,
+    file_server,
+    serve_file,
+)
 from .config import ServerConfig
 from .error import HttpError, _status_reason
 from .handler import Handler, HandlerFactory, DefaultHandlerFactory

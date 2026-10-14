@@ -40,6 +40,9 @@ test-http-client = "mojo run --Werror -I . tests/test_http_client.mojo"
 test-http-url = "mojo run --Werror -I . tests/test_http_url.mojo"
 test-http-parser = "mojo run --Werror -I . tests/test_http_parser.mojo"
 test-http-response = "mojo run --Werror -I . tests/test_http_response.mojo"
+test-http-fileserver-driver = "python3 tests/test_http_fileserver_driver.py"
+test-http-fileserver-wire = "python3 scripts/test_http_fileserver.py"
+test-http-fileserver = "mojo run --Werror -I . tests/test_http_fileserver.mojo"
 test-http-filesystem = "mojo run --Werror -I . tests/test_http_filesystem.mojo"
 test-http-router = "mojo run --Werror -I . tests/test_http_router.mojo"
 test-http-middleware = "mojo run --Werror -I . tests/test_http_middleware.mojo"
@@ -80,6 +83,8 @@ sanitize-http-client = { cmd = "bash scripts/run_sanitized.sh tests/test_http_cl
 sanitize-http-url = { cmd = "bash scripts/run_sanitized.sh tests/test_http_url.mojo", default-environment = "sanitize" }
 sanitize-http-parser = { cmd = "bash scripts/run_sanitized.sh tests/test_http_parser.mojo", default-environment = "sanitize" }
 sanitize-http-response = { cmd = "bash scripts/run_sanitized.sh tests/test_http_response.mojo", default-environment = "sanitize" }
+sanitize-http-fileserver-wire = { cmd = "python3 scripts/test_http_fileserver.py --sanitize", default-environment = "sanitize" }
+sanitize-http-fileserver = { cmd = "bash scripts/run_sanitized.sh tests/test_http_fileserver.mojo", default-environment = "sanitize" }
 sanitize-http-filesystem = { cmd = "bash scripts/run_sanitized.sh tests/test_http_filesystem.mojo", default-environment = "sanitize" }
 sanitize-http-router = { cmd = "bash scripts/run_sanitized.sh tests/test_http_router.mojo", default-environment = "sanitize" }
 sanitize-http-middleware = { cmd = "bash scripts/run_sanitized.sh tests/test_http_middleware.mojo", default-environment = "sanitize" }
@@ -133,6 +138,8 @@ sanitize = { depends-on = [
   { task = "sanitize-http-detach", environment = "sanitize" },
   { task = "sanitize-http-known-length", environment = "sanitize" },
   { task = "sanitize-http-file-metadata", environment = "sanitize" },
+  { task = "sanitize-http-fileserver", environment = "sanitize" },
+  { task = "sanitize-http-fileserver-wire", environment = "sanitize" },
   { task = "sanitize-http-offload", environment = "sanitize" },
 ] }
 test = { depends-on = [
@@ -177,6 +184,9 @@ test = { depends-on = [
   "test-http-detach",
   "test-http-known-length",
   "test-http-file-metadata",
+  "test-http-fileserver",
+  "test-http-fileserver-driver",
+  "test-http-fileserver-wire",
   "test-http-offload",
   "test-actor",
 ] }
@@ -185,6 +195,7 @@ example-udp = "mojo run --Werror -I . examples/udp_echo.mojo"
 example-unix = "mojo run --Werror -I . examples/unix_echo.mojo"
 example-http-client = "mojo run --Werror -I . examples/http_client.mojo"
 example-http-hello = "mojo run --Werror -I . examples/http_hello.mojo"
+example-http-fileserver = "mojo run --Werror -I . examples/http_fileserver.mojo"
 example-http-router = "mojo run --Werror -I . examples/http_router.mojo"
 example-http-json = "mojo run --Werror -I . examples/http_json.mojo"
 dogfood-build = "mkdir -p build && mojo build --Werror -I . examples/http_dogfood.mojo -o build/http-dogfood"
@@ -249,6 +260,7 @@ python = ">=3.10,<3.15"
 h2 = "==4.4.1"
 
 [feature.http2.tasks]
+http-fileserver-h2-test = { cmd = "python3 scripts/test_http_fileserver.py --protocols h1 h2 --tls", depends-on = ["tls-build", "hpack-test"] }
 http-router-h2-test = { cmd = "python3 scripts/test_http_router_h2.py", depends-on = ["tls-build", "hpack-test"] }
 hpack-test = "bash scripts/build_hpack_shim.sh"
 hpack-mojo-test = { cmd = "mojo run --Werror -I . tests/test_hpack.mojo", depends-on = [
@@ -305,6 +317,7 @@ aioquic = "==1.3.0"
 [feature.http3.tasks]
 fuzz-quic-build = { cmd = "bash scripts/build_fuzz_quic.sh", depends-on = ["tls-build"] }
 fuzz-quic-recv = { cmd = "python3 scripts/run_fuzz_quic.py", depends-on = ["fuzz-quic-build"] }
+http-fileserver-h3-test = { cmd = "python3 scripts/test_http_fileserver.py --protocols h3", depends-on = ["tls-build", "quic-build"] }
 http-router-h3-test = { cmd = "python3 scripts/test_http_router_h3.py", depends-on = ["tls-build", "quic-build"] }
 quic-build = "bash scripts/build_quic_provider.sh"
 quic-test = { cmd = "build/quic/test_quic_provider build/tls/test-cert.pem build/tls/test-key.pem", depends-on = [
