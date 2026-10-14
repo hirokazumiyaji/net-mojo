@@ -46,6 +46,8 @@ test-http-connect = "mojo run --Werror -I . tests/test_http_connect.mojo"
 test-http-hijack = "mojo run --Werror -I . tests/test_http_hijack.mojo"
 test-http-hijack-actor = "mojo run --Werror -I . tests/test_http_hijack_actor.mojo"
 test-http-hijacked-conn = "mojo run --Werror -I . tests/test_http_hijacked_conn.mojo"
+test-http-handshake = "mojo run --Werror -I . tests/test_http_handshake.mojo"
+test-http-websocket-fragments = "mojo run --Werror -I . tests/test_http_websocket_fragments.mojo"
 test-http-detach = "mojo run --Werror -I . tests/test_http_detach.mojo"
 test-http-offload = "mojo run --Werror -I . tests/test_http_offload.mojo"
 test-actor = "mojo run --Werror -I . tests/test_actor.mojo"
@@ -73,6 +75,8 @@ sanitize-http2 = { cmd = "bash scripts/run_sanitized.sh tests/test_http2.mojo", 
 sanitize-http-hijack = { cmd = "bash scripts/run_sanitized.sh tests/test_http_hijack.mojo", default-environment = "sanitize" }
 sanitize-http-hijack-actor = { cmd = "bash scripts/run_sanitized.sh tests/test_http_hijack_actor.mojo", default-environment = "sanitize" }
 sanitize-http-hijacked-conn = { cmd = "bash scripts/run_sanitized.sh tests/test_http_hijacked_conn.mojo", default-environment = "sanitize" }
+sanitize-http-handshake = { cmd = "bash scripts/run_sanitized.sh tests/test_http_handshake.mojo", default-environment = "sanitize" }
+sanitize-http-websocket-fragments = { cmd = "bash scripts/run_sanitized.sh tests/test_http_websocket_fragments.mojo", default-environment = "sanitize" }
 sanitize-http-detach = { cmd = "bash scripts/run_sanitized.sh tests/test_http_detach.mojo", default-environment = "sanitize" }
 sanitize-http-offload = { cmd = "bash scripts/run_sanitized.sh tests/test_http_offload.mojo", default-environment = "sanitize" }
 # Note: pixi runs depends-on tasks concurrently. To avoid high memory from parallel ASan runs, invoke individual tasks sequentially.
@@ -99,6 +103,8 @@ sanitize = { depends-on = [
   { task = "sanitize-http-hijack", environment = "sanitize" },
   { task = "sanitize-http-hijack-actor", environment = "sanitize" },
   { task = "sanitize-http-hijacked-conn", environment = "sanitize" },
+  { task = "sanitize-http-handshake", environment = "sanitize" },
+  { task = "sanitize-http-websocket-fragments", environment = "sanitize" },
   { task = "sanitize-http-detach", environment = "sanitize" },
   { task = "sanitize-http-offload", environment = "sanitize" },
 ] }
@@ -132,6 +138,8 @@ test = { depends-on = [
   "test-http-hijack",
   "test-http-hijack-actor",
   "test-http-hijacked-conn",
+  "test-http-handshake",
+  "test-http-websocket-fragments",
   "test-http-detach",
   "test-http-offload",
   "test-actor",
