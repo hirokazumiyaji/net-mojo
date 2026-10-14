@@ -300,6 +300,8 @@ jobs:
         run: pixi run test-http-parser
       - name: Test HTTP response
         run: pixi run test-http-response
+      - name: Test confined HTTP filesystem
+        run: pixi run test-http-filesystem
       - name: Test HTTP route patterns
         run: pixi run test-http-router
       - name: Test HTTP middleware
@@ -435,6 +437,8 @@ jobs:
         run: pixi run sanitize-http2-request-stream
       - name: Sanitize HTTP response
         run: pixi run sanitize-http-response
+      - name: Sanitize confined HTTP filesystem
+        run: pixi run sanitize-http-filesystem
       - name: Sanitize HTTP router
         run: pixi run sanitize-http-router
       - name: Sanitize HTTP middleware

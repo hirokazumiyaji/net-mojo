@@ -40,6 +40,7 @@ test-http-client = "mojo run --Werror -I . tests/test_http_client.mojo"
 test-http-url = "mojo run --Werror -I . tests/test_http_url.mojo"
 test-http-parser = "mojo run --Werror -I . tests/test_http_parser.mojo"
 test-http-response = "mojo run --Werror -I . tests/test_http_response.mojo"
+test-http-filesystem = "mojo run --Werror -I . tests/test_http_filesystem.mojo"
 test-http-router = "mojo run --Werror -I . tests/test_http_router.mojo"
 test-http-middleware = "mojo run --Werror -I . tests/test_http_middleware.mojo"
 test-http-server = "mojo run --Werror -I . tests/test_http_server.mojo"
@@ -78,6 +79,7 @@ sanitize-http-client = { cmd = "bash scripts/run_sanitized.sh tests/test_http_cl
 sanitize-http-url = { cmd = "bash scripts/run_sanitized.sh tests/test_http_url.mojo", default-environment = "sanitize" }
 sanitize-http-parser = { cmd = "bash scripts/run_sanitized.sh tests/test_http_parser.mojo", default-environment = "sanitize" }
 sanitize-http-response = { cmd = "bash scripts/run_sanitized.sh tests/test_http_response.mojo", default-environment = "sanitize" }
+sanitize-http-filesystem = { cmd = "bash scripts/run_sanitized.sh tests/test_http_filesystem.mojo", default-environment = "sanitize" }
 sanitize-http-router = { cmd = "bash scripts/run_sanitized.sh tests/test_http_router.mojo", default-environment = "sanitize" }
 sanitize-http-middleware = { cmd = "bash scripts/run_sanitized.sh tests/test_http_middleware.mojo", default-environment = "sanitize" }
 sanitize-http-server = { cmd = "bash scripts/run_sanitized.sh tests/test_http_server.mojo", default-environment = "sanitize" }
@@ -115,6 +117,7 @@ sanitize = { depends-on = [
   { task = "sanitize-http2-request-stream", environment = "sanitize" },
   { task = "sanitize-http-body-pipe", environment = "sanitize" },
   { task = "sanitize-http-response", environment = "sanitize" },
+  { task = "sanitize-http-filesystem", environment = "sanitize" },
   { task = "sanitize-http-router", environment = "sanitize" },
   { task = "sanitize-http-middleware", environment = "sanitize" },
   { task = "sanitize-http-server", environment = "sanitize" },
@@ -152,6 +155,7 @@ test = { depends-on = [
   "test-http2-request-stream",
   "test-http-body-pipe",
   "test-http-response",
+  "test-http-filesystem",
   "test-http-router",
   "test-http-middleware",
   "test-http-server",
