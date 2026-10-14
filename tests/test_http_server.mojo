@@ -1742,7 +1742,10 @@ def test_writer_workspace_returns_on_success_handler_and_encoder_errors() raises
     var handler = _WorkspaceHandler()
     var waiting = dial_tcp(address, Timeout.seconds(1))
     waiting.write_all("GET /".as_bytes(), Timeout.seconds(1))
-    _tick_n(server, handler, 2)
+    for _ in range(100):
+        _ = server.tick(handler, Timeout.milliseconds(1))
+        if server._budget.used() == 5 + H1_ERROR_CAPACITY:
+            break
     assert_equal(server._budget.used(), 5 + H1_ERROR_CAPACITY)
     for action in range(4):
         handler.action = action
