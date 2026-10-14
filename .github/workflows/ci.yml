@@ -247,6 +247,10 @@ jobs:
         run: pixi run -e tls-http3 http-router-h3-test
       - name: Test static files over HTTP/3
         run: pixi run -e tls-http3 http-fileserver-h3-test
+      - name: Test gzip responses across HTTP protocols
+        run: pixi run -e http-stream-sse gzip-wire-test
+      - name: Test static files with optional gzip across HTTP protocols
+        run: pixi run -e http-stream-sse http-fileserver-compression-test
       - name: Test HTTP same-origin fallback
         run: pixi run -e tls-http3 http-same-origin-test
       - name: Test packaged HTTP/3 provider
@@ -368,6 +372,8 @@ jobs:
         run: pixi run test-http-file-metadata
       - name: Test HTTP static files
         run: pixi run test-http-fileserver
+      - name: Test static-file compression measurement driver
+        run: pixi run test-http-fileserver-compression-driver
       - name: Test static-file client EOF handling
         run: pixi run test-http-fileserver-driver
       - name: Test static-file transfer and memory bound

@@ -41,6 +41,7 @@ test-http-url = "mojo run --Werror -I . tests/test_http_url.mojo"
 test-http-parser = "mojo run --Werror -I . tests/test_http_parser.mojo"
 test-http-response = "mojo run --Werror -I . tests/test_http_response.mojo"
 test-http-fileserver-driver = "python3 tests/test_http_fileserver_driver.py"
+test-http-fileserver-compression-driver = "python3 tests/test_http_fileserver_compression_driver.py"
 test-http-fileserver-wire = "python3 scripts/test_http_fileserver.py"
 test-http-fileserver = "mojo run --Werror -I . tests/test_http_fileserver.mojo"
 test-http-filesystem = "mojo run --Werror -I . tests/test_http_filesystem.mojo"
@@ -188,6 +189,7 @@ test = { depends-on = [
   "test-http-file-metadata",
   "test-http-fileserver",
   "test-http-fileserver-driver",
+  "test-http-fileserver-compression-driver",
   "test-http-fileserver-wire",
   "test-http-offload",
   "test-http-compression-config",
@@ -494,6 +496,11 @@ compression-suite = { depends-on = ["test-gzip-provider", "test-http-compression
 
 [feature.http3.tasks.gzip-wire-test]
 cmd = "python3 scripts/test_http_compression.py"
+default-environment = "http-stream-sse"
+depends-on = [{ task = "tls-build", environment = "http-stream-sse" }, { task = "hpack-test", environment = "http-stream-sse" }, { task = "quic-build", environment = "http-stream-sse" }, { task = "compression-build", environment = "compression" }]
+
+[feature.http3.tasks.http-fileserver-compression-test]
+cmd = "python3 scripts/test_http_fileserver_compression.py"
 default-environment = "http-stream-sse"
 depends-on = [{ task = "tls-build", environment = "http-stream-sse" }, { task = "hpack-test", environment = "http-stream-sse" }, { task = "quic-build", environment = "http-stream-sse" }, { task = "compression-build", environment = "compression" }]
 
