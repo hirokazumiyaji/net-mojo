@@ -97,3 +97,24 @@ Docker is required. Linux uses host networking; Docker Desktop on macOS uses
 CI runs independent WS/WSS and ASan on all three supported platforms and Docker
 conformance on Linux x64/ARM64, using pinned amd64 image emulation on ARM64.
 Hosted macOS runners lack the Docker daemon needed by the upstream suite.
+
+
+## Shared parser replay targets
+
+The #227 shared deterministic replay harness exposes `websocket-frames` and
+`websocket-utf8`. Standard masked frame vectors and UTF-8 text form bounded
+seeds. Whole-frame and byte-at-a-time decoding must agree on rejection codes,
+completion, opcode/FIN and payload; whole and byte-at-a-time UTF-8 validation
+must agree on validity and completion. Replay batches retain length-prefixed
+inputs, each capped at 8192 bytes. Ordinary protocol rejection is expected.
+
+```sh
+pixi run -e websocket fuzz-websocket-frames --iterations 10000 --seed 236
+pixi run -e websocket fuzz-websocket-utf8 --iterations 10000 --seed 236
+python3 scripts/run_fuzz.py websocket-frames --replay build/fuzz/websocket-frames-seed-236.bin
+python3 scripts/run_fuzz_nightly.py websocket-utf8 --seconds 5 --iterations 1000 --seed 236
+```
+
+Both targets use the existing shared runner and ASan parser binary. Their
+retained batches also work with the shared input reducer after the #227
+harness is composed.

@@ -190,6 +190,9 @@ websocket-fixture-build = "mkdir -p build && mojo build --Werror -I . tests/webs
 websocket-interop = { cmd = "python3 tests/test_http_websocket_interop.py", depends-on = ["websocket-fixture-build"] }
 websocket-tls-interop = { cmd = "python3 tests/test_http_websocket_interop.py --tls", depends-on = ["websocket-fixture-build", "tls-build"] }
 benchmark-websocket-echo = { cmd = "python3 benchmarks/websocket_echo/run.py", depends-on = ["websocket-fixture-build"] }
+fuzz-websocket-frames = { cmd = "python3 scripts/run_fuzz.py websocket-frames", depends-on = [{ task = "fuzz-parser-build", environment = "sanitize" }] }
+fuzz-websocket-utf8 = { cmd = "python3 scripts/run_fuzz.py websocket-utf8", depends-on = [{ task = "fuzz-parser-build", environment = "sanitize" }] }
+fuzz-websocket-driver-test = "python3 tests/fuzz/test_driver.py"
 websocket-report-test = "python3 tests/test_websocket_autobahn.py"
 autobahn-ws = { cmd = "python3 tests/websocket_autobahn.py", depends-on = ["websocket-fixture-build", "websocket-report-test"] }
 websocket-interop-sanitize = { cmd = "python3 tests/test_http_websocket_interop.py --binary build/sanitize/websocket_fixture && python3 tests/test_http_websocket_interop.py --tls --binary build/sanitize/websocket_fixture", depends-on = ["tls-build", { task = "websocket-fixture-sanitize-build", environment = "sanitize" }], default-environment = "tls-websocket" }

@@ -40,6 +40,12 @@ jobs:
         run: pixi run -e tls-websocket websocket-interop
       - name: Check WebSocket measurement harness
         run: pixi run -e websocket benchmark-websocket-echo --iterations 3
+      - name: Replay bounded WebSocket frames
+        run: pixi run -e websocket fuzz-websocket-frames --iterations 1000
+      - name: Replay bounded streaming UTF-8
+        run: pixi run -e websocket fuzz-websocket-utf8 --iterations 1000
+      - name: Verify deterministic WebSocket replay metadata
+        run: pixi run -e websocket fuzz-websocket-driver-test
       - name: Test verified secure WebSocket client
         run: pixi run -e tls-websocket websocket-tls-interop
       - name: Test sanitized WS and WSS interoperability

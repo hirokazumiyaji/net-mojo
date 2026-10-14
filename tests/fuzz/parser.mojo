@@ -13,6 +13,13 @@ from net.http._http2.frame_reader import Http2FrameReader
 from net.http._http2.hpack import Http2HpackDeflater, Http2HpackInflater
 
 
+from net.http._websocket_frame import (
+    _FrameDecoder,
+    _UTF8Validator,
+    _WebSocketFrame,
+)
+
+
 comptime MAX_INPUT = 8192
 
 
@@ -96,6 +103,70 @@ def fuzz_address(target: StringSlice, text: StringSlice) raises:
             raise error
 
 
+@fieldwise_init
+struct _WebSocketOutcome(Movable):
+    var frame: Optional[_WebSocketFrame]
+    var code: UInt16
+
+
+def _decode_websocket[
+    o: ImmOrigin
+](data: Span[Byte, o], chunk: Int) raises -> _WebSocketOutcome:
+    var decoder = _FrameDecoder(MAX_INPUT)
+    var offset = 0
+    while offset < len(data) and not decoder.complete():
+        var end = min(offset + chunk, len(data))
+        var consumed: Int
+        try:
+            consumed = decoder.feed(data[offset:end])
+        except error:
+            return _WebSocketOutcome(None, error.code)
+        assert_true(consumed > 0 and consumed <= end - offset)
+        offset += consumed
+    var frame: Optional[_WebSocketFrame] = None
+    if decoder.complete():
+        try:
+            frame = decoder.take_frame()
+        except error:
+            return _WebSocketOutcome(None, error.code)
+    return _WebSocketOutcome(frame^, 0)
+
+
+def fuzz_websocket_frames[o: ImmOrigin](data: Span[Byte, o]) raises:
+    var whole = _decode_websocket(data, max(1, len(data)))
+    var split = _decode_websocket(data, 1)
+    assert_equal(whole.code, split.code)
+    assert_true(
+        whole.code == 0
+        or whole.code == 1002
+        or whole.code == 1007
+        or whole.code == 1009
+    )
+    assert_equal(Bool(whole.frame), Bool(split.frame))
+    if whole.frame:
+        assert_equal(whole.frame.value().opcode, split.frame.value().opcode)
+        assert_equal(whole.frame.value().fin, split.frame.value().fin)
+        assert_equal(
+            len(whole.frame.value().payload), len(split.frame.value().payload)
+        )
+        assert_true(len(whole.frame.value().payload) <= MAX_INPUT)
+        for i in range(len(whole.frame.value().payload)):
+            assert_equal(
+                whole.frame.value().payload[i], split.frame.value().payload[i]
+            )
+
+
+def fuzz_websocket_utf8[o: ImmOrigin](data: Span[Byte, o]) raises:
+    var whole = _UTF8Validator()
+    var valid = whole.feed(data)
+    var split = _UTF8Validator()
+    var split_valid = True
+    for i in range(len(data)):
+        split_valid = split.feed(data[i : i + 1]) and split_valid
+    assert_equal(valid, split_valid)
+    assert_equal(whole.complete(), split.complete())
+
+
 def main() raises:
     var target = getenv("NET_FUZZ_TARGET")
     if (
@@ -105,6 +176,8 @@ def main() raises:
         and target != "ip"
         and target != "address"
         and target != "hpack-mojo"
+        and target != "websocket-frames"
+        and target != "websocket-utf8"
     ):
         raise Error("unknown NET_FUZZ_TARGET")
     var config = ServerConfig.default()
@@ -124,6 +197,10 @@ def main() raises:
             _ = parse_one(data, config)
         elif target == "http2-frames":
             fuzz_frames(data)
+        elif target == "websocket-frames":
+            fuzz_websocket_frames(data)
+        elif target == "websocket-utf8":
+            fuzz_websocket_utf8(data)
         elif target == "hpack-mojo":
             fuzz_hpack(data)
         else:

@@ -35,7 +35,7 @@ SEEDS = {
         struct.pack(">II", 0xffffffff, 0xffffffff),
     ],
 }
-REPLAY_TARGETS = ("http1", "authority", "http2-frames", "ip", "address", "hpack-mojo")
+REPLAY_TARGETS = ("http1", "authority", "http2-frames", "ip", "address", "hpack-mojo", "websocket-frames", "websocket-utf8")
 SEEDS["http2-frames"] = [
     b"", bytes.fromhex("000000040000000000"),
     bytes.fromhex("000003000100000001") + b"abc",
@@ -59,6 +59,21 @@ SEEDS["address"] = [
 SEEDS["hpack-mojo"] = list(SEEDS["hpack"]) + [
     bytes.fromhex("828684418cf1e3c2e5f23a6ba0ab90f4ff"),
     struct.pack(">II", 7, 3) + b":status200",
+]
+
+SEEDS["websocket-frames"] = [
+    b"", bytes.fromhex("818537fa213d7f9f4d5158"),
+    bytes.fromhex("82840000000000010203"),
+    bytes.fromhex("89840000000070696e67"),
+    bytes.fromhex("88820000000003e8"),
+    bytes.fromhex("01810000000061"), bytes.fromhex("80810000000062"),
+    bytes.fromhex("81fe007e00000000") + b"x" * 126,
+]
+SEEDS["websocket-utf8"] = [
+    b"", b"Hello", "日本語 😀".encode(),
+    bytes.fromhex("f09f9880"), bytes.fromhex("f09f"),
+    bytes.fromhex("c080"), bytes.fromhex("eda080"),
+    bytes.fromhex("f4908080"), bytes.fromhex("efbfbd"),
 ]
 
 

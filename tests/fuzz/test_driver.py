@@ -1,4 +1,8 @@
 import importlib.util
+import contextlib
+import io
+import json
+import sys
 from pathlib import Path
 import random
 import struct
@@ -9,6 +13,8 @@ import unittest
 spec = importlib.util.spec_from_file_location("run_fuzz", Path(__file__).parents[2] / "scripts/run_fuzz.py")
 driver = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(driver)
+sys.path.insert(0, str(Path(__file__).parents[2] / "scripts"))
+import run_fuzz_nightly as nightly
 
 
 class MutationDriverTests(unittest.TestCase):
@@ -20,12 +26,27 @@ class MutationDriverTests(unittest.TestCase):
             self.assertIn(fields, driver.make_inputs(target, 227, 1))
 
     def test_seed_reproduces_exact_inputs(self):
-        for target in ("http1", "authority", "http2-frames", "ip", "address", "hpack-mojo"):
+        for target in ("http1", "authority", "http2-frames", "ip", "address", "hpack-mojo", "websocket-frames", "websocket-utf8"):
             first = driver.make_inputs(target, 227, 100)
             self.assertEqual(first, driver.make_inputs(target, 227, 100))
             self.assertNotEqual(first, driver.make_inputs(target, 228, 100))
             self.assertTrue(all(len(data) <= driver.MAX_INPUT for data in first))
             self.assertTrue(set(driver.SEEDS[target]).issubset(first))
+
+    @unittest.skipUnless(Path("build/fuzz/parser").exists(), "build fuzz targets first")
+    def test_websocket_nightly_retains_exact_seed_metadata(self):
+        for target in ("websocket-frames", "websocket-utf8"):
+            with self.subTest(target=target), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                with contextlib.redirect_stdout(io.StringIO()):
+                    rounds = nightly.run_repeated(target, root, 0.01, 3, 236)
+                self.assertGreaterEqual(rounds, 1)
+                state = json.loads((root / f"{target}-nightly.json").read_text())
+                self.assertEqual(state["target"], target)
+                self.assertEqual(state["seed"], 236 + rounds - 1)
+                expected = root / "expected.bin"
+                driver.write_batch(expected, driver.make_inputs(target, state["seed"], 3))
+                self.assertEqual(expected.read_bytes(), Path(state["batch"]).read_bytes())
 
     def test_mutation_preserves_size_bound_for_full_seed(self):
         rng = random.Random(227)

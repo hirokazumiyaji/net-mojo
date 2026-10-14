@@ -27,7 +27,7 @@ jobs:
       fail-fast: false
       matrix:
         os: [ubuntu-24.04, ubuntu-24.04-arm]
-        target: [http1, authority, http2-frames, ip, address, hpack-mojo, hpack]
+        target: [http1, authority, http2-frames, ip, address, hpack-mojo, hpack, websocket-frames, websocket-utf8]
     steps:
       - name: Check out repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
