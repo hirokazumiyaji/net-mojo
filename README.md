@@ -721,3 +721,5 @@ hostname は OS の同期 `getaddrinfo` で解決されます。
 Unix socket の path は library が削除しません。
 全 descriptor を close した後の削除は利用側が行います。
 詳細な設計理由は [docs/design/net-package.md](docs/design/net-package.md) を参照してください。
+
+実装と受け入れ状況は [実用化ロードマップと証拠](docs/design/roadmap-evidence.md) を参照してください。
