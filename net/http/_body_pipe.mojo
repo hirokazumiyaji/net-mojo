@@ -40,15 +40,20 @@ struct _BodyPipeState(Movable):
         self.discarded = False
         self.terminal_trailers = Headers()
 
-    def drop_bytes(mut self):
-        var capacity = self.bytes.capacity()
-        self.bytes = List[Byte]()
-        self.head = 0
-        self.budget.release(capacity)
-
     def __deinit__(deinit self):
-        self.drop_bytes()
+        _drop_body_bytes(Pointer(to=self))
         self.mutex.destroy()
+
+
+# Keep owned-field replacement from moving the live native mutex.
+def _drop_body_bytes[origin: MutOrigin](state: Pointer[_BodyPipeState, origin]):
+    var bytes_ptr = Pointer(to=state[].bytes)
+    var bytes = bytes_ptr.unsafe_take_pointee()
+    bytes_ptr.unsafe_write(List[Byte]())
+    var capacity = bytes.capacity()
+    _ = bytes^
+    state[].head = 0
+    state[].budget.release(capacity)
 
 
 def _body_error(kind: NetErrorKind, message: String) -> NetError:
@@ -121,7 +126,10 @@ struct _BodyPipe(Copyable):
                 NetErrorKind.invalid_argument(),
                 "body trailers exceed buffer budget",
             )
-        state.terminal_trailers = trailers^
+        var trailers_ptr = Pointer(to=state.terminal_trailers)
+        var previous = trailers_ptr.unsafe_take_pointee()
+        trailers_ptr.unsafe_write(trailers^)
+        _ = previous^
         state.finished = True
         state.mutex.unlock()
 
@@ -155,7 +163,7 @@ struct _BodyPipe(Copyable):
         state.head += count
         state.consumed += count
         if state.head == len(state.bytes):
-            state.drop_bytes()
+            _drop_body_bytes(Pointer(to=state))
         state.mutex.unlock()
         return count
 
@@ -230,15 +238,18 @@ struct _BodyPipe(Copyable):
                 NetErrorKind.cancelled(), "request body cancelled"
             )
         state.consumed += len(state.bytes) - state.head
-        state.drop_bytes()
+        _drop_body_bytes(Pointer(to=state))
         state.discarded = True
         state.mutex.unlock()
 
     def cancel(self):
         ref state = self._state[]
         state.mutex.lock()
-        state.drop_bytes()
-        state.terminal_trailers = Headers()
+        _drop_body_bytes(Pointer(to=state))
+        var trailers_ptr = Pointer(to=state.terminal_trailers)
+        var trailers = trailers_ptr.unsafe_take_pointee()
+        trailers_ptr.unsafe_write(Headers())
+        _ = trailers^
         state.cancelled = True
         state.mutex.unlock()
 

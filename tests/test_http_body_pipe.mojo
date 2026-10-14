@@ -215,7 +215,7 @@ def _produce_pipe(
     return arg
 
 
-def test_cross_thread_producer_and_consumer() raises:
+def _exercise_cross_thread_producer_and_consumer() raises:
     var budget = SharedBufferBudget(128)
     var pipe = _BodyPipe(32, budget.copy())
     var context = _PipeProducerContext(pipe.copy(), False)
@@ -254,6 +254,11 @@ def test_cross_thread_producer_and_consumer() raises:
     assert_equal(total, 512)
     assert_equal(pipe.take_consumed(), 512)
     assert_equal(budget.used(), 0)
+
+
+def test_cross_thread_producer_and_consumer() raises:
+    for _ in range(16):
+        _exercise_cross_thread_producer_and_consumer()
 
 
 def main() raises:
