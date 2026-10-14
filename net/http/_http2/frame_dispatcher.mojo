@@ -43,9 +43,9 @@ struct Http2DispatchResult(Movable):
         )
 
     @staticmethod
-    def error() -> Self:
+    def error(error_code: UInt32 = UInt32(1)) -> Self:
         return Self(
-            kind=6, stream_id=UInt32(0), value=UInt32(0), output=List[Byte]()
+            kind=6, stream_id=UInt32(0), value=error_code, output=List[Byte]()
         )
 
     @staticmethod
@@ -177,6 +177,13 @@ struct Http2FrameDispatcher(Movable):
             if (frame.stream_id & UInt32(1)) == UInt32(0):
                 self._failed = True
                 return Http2DispatchResult.error()
+            if (frame.flags & Byte(0x20)) != Byte(0):
+                var offset = 1 if (frame.flags & Byte(8)) != Byte(0) else 0
+                if len(payload) >= offset + 5 and _depends_on_self(
+                    frame.stream_id, payload[offset:]
+                ):
+                    self._failed = True
+                    return Http2DispatchResult.error()
             if frame.stream_id > self._last_headers_stream_id:
                 if self._new_stream_exceeded(now_ns()):
                     return self._flood()
@@ -187,7 +194,7 @@ struct Http2FrameDispatcher(Movable):
             var settings = parse_settings_frame(frame, payload)
             if settings.is_error():
                 self._failed = True
-                return Http2DispatchResult.error()
+                return Http2DispatchResult.error(settings.error_code)
             if self._control_exceeded():
                 return self._flood()
             if settings.is_ack():
@@ -197,7 +204,7 @@ struct Http2FrameDispatcher(Movable):
             )
             if applied.is_error():
                 self._failed = True
-                return Http2DispatchResult.error()
+                return Http2DispatchResult.error(applied.error_code)
             var ack_wire: List[Byte] = [
                 Byte(0),
                 Byte(0),
@@ -215,7 +222,9 @@ struct Http2FrameDispatcher(Movable):
             var ping = parse_ping_frame(frame, payload)
             if ping.is_error():
                 self._failed = True
-                return Http2DispatchResult.error()
+                return Http2DispatchResult.error(
+                    UInt32(6) if frame.payload_length != 8 else UInt32(1)
+                )
             if self._control_exceeded():
                 return self._flood()
             if ping.is_ack():
@@ -231,7 +240,9 @@ struct Http2FrameDispatcher(Movable):
             var update = parse_window_update_frame(frame, payload)
             if update.is_error():
                 self._failed = True
-                return Http2DispatchResult.error()
+                return Http2DispatchResult.error(
+                    UInt32(6) if frame.payload_length != 4 else UInt32(1)
+                )
             if self._control_exceeded():
                 return self._flood()
             return Http2DispatchResult.event(
@@ -242,7 +253,9 @@ struct Http2FrameDispatcher(Movable):
             var reset = parse_rst_stream_frame(frame, payload)
             if reset.is_error():
                 self._failed = True
-                return Http2DispatchResult.error()
+                return Http2DispatchResult.error(
+                    UInt32(6) if frame.payload_length != 4 else UInt32(1)
+                )
             if self._reset_exceeded():
                 return self._flood()
             return Http2DispatchResult.event(
@@ -253,12 +266,23 @@ struct Http2FrameDispatcher(Movable):
             var goaway = parse_goaway_frame(frame, payload)
             if goaway.is_error():
                 self._failed = True
-                return Http2DispatchResult.error()
+                return Http2DispatchResult.error(
+                    UInt32(6) if frame.payload_length < 8 else UInt32(1)
+                )
             return Http2DispatchResult.event(
                 5, goaway.last_stream_id, goaway.error_code
             )
 
         if frame.frame_type == Byte(2):
+            if frame.stream_id == UInt32(0):
+                self._failed = True
+                return Http2DispatchResult.error()
+            if frame.payload_length != 5:
+                self._failed = True
+                return Http2DispatchResult.error(UInt32(6))
+            if _depends_on_self(frame.stream_id, payload):
+                self._failed = True
+                return Http2DispatchResult.error()
             if self._control_exceeded():
                 return self._flood()
             return Http2DispatchResult.ignored()
@@ -279,3 +303,15 @@ struct Http2FrameDispatcher(Movable):
 
     def is_failed(self) -> Bool:
         return self._failed
+
+
+def _depends_on_self[
+    origin: Origin
+](stream_id: UInt32, priority: Span[Byte, origin]) -> Bool:
+    var dependency = (
+        (UInt32(priority[0]) << 24)
+        | (UInt32(priority[1]) << 16)
+        | (UInt32(priority[2]) << 8)
+        | UInt32(priority[3])
+    ) & UInt32(0x7FFFFFFF)
+    return dependency == stream_id

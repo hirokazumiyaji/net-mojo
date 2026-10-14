@@ -10,7 +10,7 @@ from std.testing import (
 from net.error import NetErrorKind
 from net import dial_tcp, listen_tcp, listen_udp
 from net.timeout import Timeout, _Deadline
-from tests.support import _count_open_fds, _socket_pair
+from tests.support import _count_open_fds, _socket_pair, _join_thread
 from net._sys.readiness import (
     _decode_gen_low,
     _decode_slot,
@@ -19,6 +19,8 @@ from net._sys.readiness import (
     _verify_readiness_abi,
 )
 from net._sys.common import (
+    _online_cpu_count,
+    _strerror_text,
     AF_INET,
     EAGAIN,
     EINPROGRESS,
@@ -309,6 +311,52 @@ def test_event_queue_fd_leak() raises:
         _ = queue.raw_fd()
     var after = _count_open_fds()
     assert_equal(before, after)
+
+
+def test_online_cpu_count_is_positive() raises:
+    assert_true(_online_cpu_count() >= 1)
+
+
+@fieldwise_init
+struct _ErrorTextContext(Movable):
+    var error_number: Int32
+    var expected: String
+    var mismatched: Bool
+
+
+def _error_text_entry(
+    arg: Pointer[Byte, MutUntrackedOrigin]
+) -> Pointer[Byte, MutUntrackedOrigin]:
+    var context = arg.unsafe_bitcast[_ErrorTextContext]()
+    for _ in range(10_000):
+        if _strerror_text(context[].error_number) != context[].expected:
+            context[].mismatched = True
+            break
+    return arg
+
+
+def test_concurrent_unknown_error_messages_keep_their_own_errno() raises:
+    var contexts = List[_ErrorTextContext]()
+    for value in range(4):
+        var error_number = Int32(100_000_000 + value * 111_111_111)
+        contexts.append(
+            _ErrorTextContext(error_number, _strerror_text(error_number), False)
+        )
+    var threads = List[UInt64]()
+    for i in range(len(contexts)):
+        var thread: UInt64 = 0
+        var result = external_call["pthread_create", c_int](
+            Pointer(to=thread),
+            Optional[Pointer[Byte, MutUntrackedOrigin]](None),
+            _error_text_entry,
+            Pointer(to=contexts[i]).unsafe_bitcast[Byte](),
+        )
+        assert_equal(Int(result), 0)
+        threads.append(thread)
+    for thread in threads:
+        _join_thread(thread)
+    for i in range(len(contexts)):
+        assert_false(contexts[i].mismatched)
 
 
 def main() raises:

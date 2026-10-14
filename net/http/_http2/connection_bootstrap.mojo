@@ -11,18 +11,27 @@ struct Http2BootstrapConsumeResult(Movable):
     var kind: UInt8
     var consumed: Int
     var output: List[Byte]
+    var error_code: UInt32
 
     @staticmethod
     def need_more(consumed: Int, var output: List[Byte]) -> Self:
-        return Self(kind=1, consumed=consumed, output=output^)
+        return Self(
+            kind=1, consumed=consumed, output=output^, error_code=UInt32(0)
+        )
 
     @staticmethod
     def ready(consumed: Int, var output: List[Byte]) -> Self:
-        return Self(kind=2, consumed=consumed, output=output^)
+        return Self(
+            kind=2, consumed=consumed, output=output^, error_code=UInt32(0)
+        )
 
     @staticmethod
-    def error(consumed: Int) -> Self:
-        return Self(kind=3, consumed=consumed, output=List[Byte]())
+    def error(
+        consumed: Int, var output: List[Byte], error_code: UInt32 = UInt32(1)
+    ) -> Self:
+        return Self(
+            kind=3, consumed=consumed, output=output^, error_code=error_code
+        )
 
     def is_need_more(self) -> Bool:
         return self.kind == 1
@@ -48,10 +57,11 @@ struct Http2ConnectionBootstrap(Movable):
         max_frame_size: Int = 16384,
         max_concurrent_streams: Int = 100,
         max_header_list_size: Int = 32768,
+        initial_receive_window: Int = 65535,
     ):
         self._max_frame_size = max_frame_size
         self._protocol = Http2ServerBootstrap(
-            max_concurrent_streams, max_header_list_size
+            max_concurrent_streams, max_header_list_size, initial_receive_window
         )
         self._preface = List[Byte]()
         self._frame = List[Byte]()
@@ -63,7 +73,7 @@ struct Http2ConnectionBootstrap(Movable):
         origin: Origin
     ](mut self, data: Span[Byte, origin]) -> Http2BootstrapConsumeResult:
         if self._failed or self._ready:
-            return Http2BootstrapConsumeResult.error(0)
+            return Http2BootstrapConsumeResult.error(0, List[Byte]())
 
         var output = List[Byte]()
         var consumed = 0
@@ -73,7 +83,7 @@ struct Http2ConnectionBootstrap(Movable):
             var result = parse_client_preface(Span(self._preface))
             if result.is_error():
                 self._failed = True
-                return Http2BootstrapConsumeResult.error(consumed)
+                return Http2BootstrapConsumeResult.error(consumed, output^)
             if result.is_complete():
                 self._preface_complete = True
                 _ = self._protocol.consume_client_preface(Span(self._preface))
@@ -81,7 +91,7 @@ struct Http2ConnectionBootstrap(Movable):
                 var settings = self._protocol.server_settings()
                 if not settings.is_complete():
                     self._failed = True
-                    return Http2BootstrapConsumeResult.error(consumed)
+                    return Http2BootstrapConsumeResult.error(consumed, output^)
                 output.extend(Span(settings.wire))
 
         while consumed < len(data):
@@ -90,7 +100,9 @@ struct Http2ConnectionBootstrap(Movable):
             var frame = parse_frame(Span(self._frame), self._max_frame_size)
             if frame.is_error():
                 self._failed = True
-                return Http2BootstrapConsumeResult.error(consumed)
+                return Http2BootstrapConsumeResult.error(
+                    consumed, output^, frame.error_code
+                )
             if not frame.is_complete():
                 continue
 
@@ -100,7 +112,9 @@ struct Http2ConnectionBootstrap(Movable):
             self._frame.clear()
             if not ack.is_complete():
                 self._failed = True
-                return Http2BootstrapConsumeResult.error(consumed)
+                return Http2BootstrapConsumeResult.error(
+                    consumed, output^, ack.error_code
+                )
             output.extend(Span(ack.wire))
             self._ready = True
             return Http2BootstrapConsumeResult.ready(consumed, output^)

@@ -120,6 +120,10 @@ int32_t net_quic_next_request(
     return net_quic_server_next_request(server, output, output_capacity);
 }
 
+int32_t net_quic_send_continue(struct NetQuicServer *server, uint64_t id) {
+    return net_quic_server_send_continue(server, id);
+}
+
 int32_t net_quic_respond(
     struct NetQuicServer *server, uint64_t request_id, uint32_t status,
     const uint8_t *headers, size_t headers_length,
@@ -128,4 +132,48 @@ int32_t net_quic_respond(
     return net_quic_server_respond(server, request_id, status, headers,
                                    headers_length, body, body_length,
                                    trailers, trailers_length);
+}
+
+int32_t net_quic_start_response(struct NetQuicServer *server, uint64_t request_id, uint32_t status, const uint8_t *headers, size_t length) {
+    return net_quic_server_start_response(server, request_id, status, headers, length);
+}
+
+int64_t net_quic_stream_capacity(struct NetQuicServer *server, uint64_t request_id) {
+    return net_quic_server_stream_capacity(server, request_id);
+}
+
+int64_t net_quic_send_stream_body(struct NetQuicServer *server, uint64_t request_id, const uint8_t *body, size_t length, int32_t fin) {
+    return net_quic_server_send_stream_body(server, request_id, body, length, fin);
+}
+
+int32_t net_quic_add_stream_trailers(struct NetQuicServer *server, uint64_t request_id, const uint8_t *trailers, size_t length) {
+    return net_quic_server_add_stream_trailers(server, request_id, trailers, length);
+}
+
+int32_t net_quic_cancel_response(struct NetQuicServer *server, uint64_t request_id,
+                                 uint64_t error_code) {
+    return net_quic_server_cancel_response(server, request_id, error_code);
+}
+
+int32_t net_quic_poll_stream_events(struct NetQuicServer *server, uint64_t *ids, uint8_t *kinds, size_t capacity) {
+    return net_quic_server_poll_stream_events(server, ids, kinds, capacity);
+}
+
+int32_t net_quic_set_request_streaming(struct NetQuicServer *server, int32_t enabled) {
+    return net_quic_server_set_request_streaming(server, enabled);
+}
+int32_t net_quic_next_request_head(struct NetQuicServer *server, uint8_t *output, size_t capacity) {
+    return net_quic_server_next_request_head(server, output, capacity);
+}
+int64_t net_quic_read_body(struct NetQuicServer *server, uint64_t id, uint8_t *output, size_t capacity) {
+    return net_quic_server_read_body(server, id, output, capacity);
+}
+int32_t net_quic_consume_body(struct NetQuicServer *server, uint64_t id, size_t bytes) {
+    return net_quic_server_consume_body(server, id, bytes);
+}
+int32_t net_quic_body_trailers(struct NetQuicServer *server, uint64_t id, uint8_t *output, size_t capacity) {
+    return net_quic_server_body_trailers(server, id, output, capacity);
+}
+int32_t net_quic_release_body(struct NetQuicServer *server, uint64_t id, int32_t cancel) {
+    return net_quic_server_release_body(server, id, cancel);
 }

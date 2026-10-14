@@ -22,6 +22,7 @@ from typing import Dict, List, Optional, Tuple
 from h2.config import H2Configuration
 from h2.connection import H2Connection
 from h2.errors import ErrorCodes
+from h2.settings import SettingCodes
 from h2.events import (
     ConnectionTerminated,
     DataReceived,
@@ -238,6 +239,191 @@ class H2Peer:
 
 
 # --- Test cases ---
+
+
+def case_detached_deferred_and_streaming(port: int) -> None:
+    peer = H2Peer(port, raise_conn_window=1 << 20)
+    try:
+        deferred = peer.open_request("GET", "/deferred")
+        sibling = peer.open_request("GET", "/sibling")
+        sibling_rec = peer.wait_stream(sibling, time.perf_counter() + TIMEOUT_S)
+        _assert(bytes(sibling_rec["body"]) == b"sibling ok", "deferred blocked sibling")
+        deferred_rec = peer.wait_stream(deferred, time.perf_counter() + TIMEOUT_S)
+        _assert(deferred_rec["status"] == 201, f"deferred status {deferred_rec}")
+        _assert(bytes(deferred_rec["body"]) == b"deferred ok", "deferred body mismatch")
+        expected = b"".join(bytes([97 + index % 26]) * 4096 for index in range(40))
+        for path in ("/detached-stream", "/detached-trailers"):
+            stream = peer.open_request("GET", path)
+            rec = peer.wait_stream(stream, time.perf_counter() + TIMEOUT_S)
+            _assert(rec["status"] == 200, f"streaming status {rec}")
+            _assert(bytes(rec["body"]) == expected, "streaming chunk order mismatch")
+            _assert(b"content-length" not in rec["headers"], "streaming declared length")
+            if path.endswith("trailers"):
+                _assert(rec["trailers"].get(b"x-digest") == [b"done"], "streaming trailer missing")
+    finally:
+        peer.close()
+
+
+def case_detached_head_body_suppression(port: int) -> None:
+    peer = H2Peer(port, raise_conn_window=1 << 20)
+    try:
+        for path in ("/deferred", "/detached-stream", "/detached-trailers"):
+            stream = peer.open_request("HEAD", path)
+            rec = peer.wait_stream(stream, time.perf_counter() + TIMEOUT_S)
+            _assert(rec["status"] in (200, 201), f"HEAD response {rec}")
+            _assert(not rec["body"] and not rec["trailers"], "HEAD emitted response payload")
+        sibling = peer.open_request("GET", "/sibling")
+        rec = peer.wait_stream(sibling, time.perf_counter() + TIMEOUT_S)
+        _assert(bytes(rec["body"]) == b"sibling ok", "HEAD cancellation closed sibling")
+    finally:
+        peer.close()
+
+
+def case_detached_head_waits_for_finish(port: int) -> None:
+    peer = H2Peer(port, raise_conn_window=1 << 20)
+    try:
+        idle = peer.open_request("HEAD", "/idle-detached")
+        peer.wait_response_only(idle, time.perf_counter() + TIMEOUT_S)
+        deadline = time.perf_counter() + 0.1
+        while time.perf_counter() < deadline:
+            peer.pump(deadline)
+        _assert(not peer._streams[idle]["ended"], "HEAD streaming ended before producer finish")
+        expired = peer.wait_stream(idle, time.perf_counter() + TIMEOUT_S)
+        _assert(expired["reset"] == int(ErrorCodes.CANCEL), f"HEAD detach timeout {expired}")
+        sibling = peer.open_request("GET", "/sibling")
+        rec = peer.wait_stream(sibling, time.perf_counter() + TIMEOUT_S)
+        _assert(bytes(rec["body"]) == b"sibling ok", "HEAD timeout closed sibling")
+    finally:
+        peer.close()
+
+
+def case_detached_timeout_preserves_sibling(port: int) -> None:
+    peer = H2Peer(port, raise_conn_window=1 << 20)
+    try:
+        idle = peer.open_request("GET", "/idle-detached")
+        peer.wait_response_only(idle, time.perf_counter() + TIMEOUT_S)
+        sibling = peer.open_request("GET", "/sibling")
+        rec = peer.wait_stream(sibling, time.perf_counter() + TIMEOUT_S)
+        _assert(bytes(rec["body"]) == b"sibling ok", "idle detach blocked sibling")
+        expired = peer.wait_stream(idle, time.perf_counter() + TIMEOUT_S)
+        _assert(expired["reset"] == int(ErrorCodes.CANCEL), f"detach timeout {expired}")
+        after = peer.open_request("GET", "/sibling")
+        rec = peer.wait_stream(after, time.perf_counter() + TIMEOUT_S)
+        _assert(bytes(rec["body"]) == b"sibling ok", "detach timeout closed connection")
+    finally:
+        peer.close()
+
+
+def case_detached_backpressure_and_reset(port: int) -> None:
+    peer = H2Peer(port, raise_conn_window=1 << 20)
+    try:
+        held = peer.open_request("GET", "/detached-hold", withhold=True)
+        peer.wait_response_only(held, time.perf_counter() + TIMEOUT_S)
+        deadline = time.perf_counter() + 0.3
+        while time.perf_counter() < deadline:
+            peer.pump(deadline)
+        _assert(len(peer._record(held)["body"]) == 65535, "held stream exceeded flow credit")
+        count = peer.open_request("GET", "/queue-count")
+        rec = peer.wait_stream(count, time.perf_counter() + TIMEOUT_S)
+        _assert(int(bytes(rec["body"])) > 0, "flow blocking never backpressured sender")
+        baseline_id = peer.open_request("GET", "/cancel-count")
+        baseline = int(bytes(peer.wait_stream(baseline_id, time.perf_counter() + TIMEOUT_S)["body"]))
+        peer._conn.reset_stream(held, error_code=int(ErrorCodes.CANCEL))
+        peer._flush()
+        deadline = time.perf_counter() + TIMEOUT_S
+        while time.perf_counter() < deadline:
+            count = peer.open_request("GET", "/cancel-count")
+            rec = peer.wait_stream(count, deadline)
+            if int(bytes(rec["body"])) > baseline:
+                break
+        else:
+            raise RuntimeError("peer reset did not cancel detached sender")
+        sibling = peer.open_request("GET", "/sibling")
+        rec = peer.wait_stream(sibling, time.perf_counter() + TIMEOUT_S)
+        _assert(bytes(rec["body"]) == b"sibling ok", "peer reset closed sibling connection")
+    finally:
+        peer.close()
+
+
+def case_detached_stream_admission_occupancy(port: int) -> None:
+    peer = H2Peer(port, raise_conn_window=1 << 20)
+    try:
+        occupied = [peer.open_request("GET", "/idle-detached") for _ in range(4)]
+        for stream in occupied:
+            peer.wait_response_only(stream, time.perf_counter() + TIMEOUT_S)
+        peer._conn.remote_settings[SettingCodes.MAX_CONCURRENT_STREAMS] = 100
+        peer._conn.remote_settings.acknowledge()
+        refused = peer.open_request("GET", "/sibling")
+        rec = peer.wait_stream(refused, time.perf_counter() + TIMEOUT_S)
+        _assert(rec["reset"] == int(ErrorCodes.REFUSED_STREAM), f"detach did not retain admission {rec}")
+        peer._conn.reset_stream(occupied[0], error_code=int(ErrorCodes.CANCEL))
+        peer._flush()
+        replacement = peer.open_request("GET", "/sibling")
+        rec = peer.wait_stream(replacement, time.perf_counter() + TIMEOUT_S)
+        _assert(bytes(rec["body"]) == b"sibling ok", "reset did not refund stream admission")
+    finally:
+        peer.close()
+
+
+def case_detached_scheduler_fallback_cancels_sender(port: int) -> None:
+    peer = H2Peer(port, raise_conn_window=1 << 20)
+    try:
+        peer._conn.update_settings({SettingCodes.MAX_HEADER_LIST_SIZE: 131072})
+        peer._flush()
+        baseline_id = peer.open_request("GET", "/fallback-cancel-count")
+        baseline = int(bytes(peer.wait_stream(baseline_id, time.perf_counter() + TIMEOUT_S)["body"]))
+        stream = peer.open_request("GET", "/detached-oversized")
+        rec = peer.wait_stream(stream, time.perf_counter() + TIMEOUT_S)
+        _assert(rec["status"] == 500, f"scheduler fallback {rec}")
+        count = peer.open_request("GET", "/fallback-cancel-count")
+        rec = peer.wait_stream(count, time.perf_counter() + TIMEOUT_S)
+        _assert(int(bytes(rec["body"])) > baseline, "scheduler fallback left sender active")
+        sibling = peer.open_request("GET", "/sibling")
+        rec = peer.wait_stream(sibling, time.perf_counter() + TIMEOUT_S)
+        _assert(bytes(rec["body"]) == b"sibling ok", "scheduler fallback closed sibling")
+    finally:
+        peer.close()
+
+
+def case_detached_trailers_use_updated_peer_limit(port: int) -> None:
+    peer = H2Peer(port, raise_conn_window=1 << 20)
+    try:
+        peer._conn.update_settings({SettingCodes.MAX_HEADER_LIST_SIZE: 128})
+        peer._flush()
+        stream = peer.open_request("GET", "/detached-changing-trailers")
+        peer.wait_response_only(stream, time.perf_counter() + TIMEOUT_S)
+        peer._conn.update_settings({SettingCodes.MAX_HEADER_LIST_SIZE: 8192})
+        peer._flush()
+        release = peer.open_request("GET", "/release-trailers")
+        peer.wait_stream(release, time.perf_counter() + TIMEOUT_S)
+        rec = peer.wait_stream(stream, time.perf_counter() + TIMEOUT_S)
+        _assert(rec["reset"] is None, f"updated trailer limit ignored {rec}")
+        _assert(rec["trailers"].get(b"x-meta") == [b"x" * 256], "updated-limit trailer missing")
+    finally:
+        peer.close()
+
+
+def case_detached_continuous_progress_refreshes_write_deadline(port: int) -> None:
+    peer = H2Peer(port, raise_conn_window=1 << 26)
+    try:
+        peer._conn.update_settings({SettingCodes.INITIAL_WINDOW_SIZE: 1 << 26})
+        peer._flush()
+        stream = peer.open_request("GET", "/detached-continuous")
+        peer.wait_response_only(stream, time.perf_counter() + TIMEOUT_S)
+        deadline = time.perf_counter() + 0.3
+        while time.perf_counter() < deadline and peer.terminated is None:
+            peer.pump(deadline)
+        _assert(peer.terminated is None, f"progressing stream terminated code={peer.terminated}, bytes={len(peer._record(stream)["body"])}")
+        _assert(len(peer._record(stream)["body"]) > 65536, "continuous stream did not make progress")
+        finish = peer.open_request("GET", "/finish-continuous")
+        peer.wait_stream(finish, time.perf_counter() + TIMEOUT_S)
+        rec = peer.wait_stream(stream, time.perf_counter() + TIMEOUT_S)
+        _assert(rec["reset"] is None, "progressing stream reset during finish")
+        sibling = peer.open_request("GET", "/sibling")
+        rec = peer.wait_stream(sibling, time.perf_counter() + TIMEOUT_S)
+        _assert(bytes(rec["body"]) == b"sibling ok", "progressing stream closed sibling")
+    finally:
+        peer.close()
 
 
 def case_large_request_body(port: int) -> None:
@@ -967,7 +1153,31 @@ def _shutdown(port: int) -> None:
         peer.close()
 
 
+def case_connection_protocol_error_goaway(port: int) -> None:
+    peer = H2Peer(port)
+    try:
+        def frame(kind: int, flags: int, payload: bytes) -> bytes:
+            return (len(payload).to_bytes(3, "big") + bytes([kind, flags])
+                    + (1).to_bytes(4, "big") + payload)
+        peer.send_raw(frame(1, 1, b"\x82") + frame(2, 0, bytes(5)))
+        peer.wait_terminated(time.perf_counter() + TIMEOUT_S)
+        _assert(peer.terminated == int(ErrorCodes.PROTOCOL_ERROR),
+                f"expected PROTOCOL_ERROR GOAWAY, got {peer.terminated!r}")
+    finally:
+        peer.close()
+
+
 def _run_cases(port: int) -> None:
+    case_connection_protocol_error_goaway(port)
+    case_detached_deferred_and_streaming(port)
+    case_detached_head_body_suppression(port)
+    case_detached_head_waits_for_finish(port)
+    case_detached_timeout_preserves_sibling(port)
+    case_detached_backpressure_and_reset(port)
+    case_detached_stream_admission_occupancy(port)
+    case_detached_scheduler_fallback_cancels_sender(port)
+    case_detached_trailers_use_updated_peer_limit(port)
+    case_detached_continuous_progress_refreshes_write_deadline(port)
     case_large_request_body(port)
     case_large_response_body(port)
     case_continuation_header_block(port)

@@ -1,3 +1,4 @@
+from net.http import Handler, Request, ResponseWriter
 from std.testing import assert_equal, assert_false, assert_true, TestSuite
 from net.http.request import HttpVersion
 
@@ -2156,7 +2157,9 @@ def test_http2_dispatcher_even_stream_id_is_protocol_error_before_rate_check() r
     assert_false(result.is_flood())
 
 
-def _stream_rate_bootstrap(mut session: Http2RequestSession) raises:
+def _stream_rate_bootstrap(
+    mut session: Http2RequestSession, acknowledge: Bool = True
+) raises:
     var wire = List[Byte]()
     var preface = "PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n".as_bytes()
     for i in range(len(preface)):
@@ -2166,6 +2169,9 @@ def _stream_rate_bootstrap(mut session: Http2RequestSession) raises:
     for i in range(len(settings)):
         wire.append(settings[i])
     assert_true(session.consume(Span(wire)).is_pending())
+    if acknowledge:
+        var ack = _frame(4, 1, 0, empty)
+        assert_true(session.consume(Span(ack)).is_pending())
 
 
 def test_http2_new_stream_flood_sends_goaway_and_isolates_sibling() raises:
@@ -2385,5 +2391,605 @@ def test_http2_bootstrap_advertises_configured_max_header_list_size() raises:
     assert_equal(parsed.parsed.settings[1].value, UInt32(16384))
 
 
+def test_http2_priority_rejects_zero_stream_wrong_length_and_self_dependency() raises:
+    var payload: List[Byte] = [Byte(0), Byte(0), Byte(0), Byte(1), Byte(0)]
+    var zero = Http2FrameDispatcher(Http2PeerSettings().snapshot())
+    var zero_result = zero.accept(
+        FrameParseResult.complete(Byte(2), Byte(0), UInt32(0), 5), Span(payload)
+    )
+    assert_true(zero_result.is_error())
+    assert_equal(zero_result.value, UInt32(1))
+    var short = Http2FrameDispatcher(Http2PeerSettings().snapshot())
+    var short_result = short.accept(
+        FrameParseResult.complete(Byte(2), Byte(0), UInt32(1), 4),
+        Span(payload)[:4],
+    )
+    assert_true(short_result.is_error())
+    assert_equal(short_result.value, UInt32(6))
+    for frame_type in [Byte(1), Byte(2)]:
+        var dispatcher = Http2FrameDispatcher(Http2PeerSettings().snapshot())
+        var result = dispatcher.accept(
+            FrameParseResult.complete(frame_type, Byte(0x24), UInt32(1), 5),
+            Span(payload),
+        )
+        assert_true(result.is_error())
+        assert_equal(result.value, UInt32(1))
+
+    var padded = Http2FrameDispatcher(Http2PeerSettings().snapshot())
+    var padded_payload: List[Byte] = [0, 0x80, 0, 0, 1, 0]
+    var padded_result = padded.accept(
+        FrameParseResult.complete(Byte(1), Byte(0x2C), UInt32(1), 6),
+        Span(padded_payload),
+    )
+    assert_true(padded_result.is_error())
+    assert_equal(padded_result.value, UInt32(1))
+
+
+def test_http2_priority_allows_other_dependencies_and_idle_streams() raises:
+    var dispatcher = Http2FrameDispatcher(Http2PeerSettings().snapshot())
+    var payload: List[Byte] = [0x80, 0, 0, 1, 0]
+    var priority = dispatcher.accept(
+        FrameParseResult.complete(Byte(2), Byte(0), UInt32(3), 5),
+        Span(payload),
+    )
+    assert_true(priority.is_ignored())
+    var padded_payload: List[Byte] = [0, 0x80, 0, 0, 1, 0]
+    var headers = dispatcher.accept(
+        FrameParseResult.complete(Byte(1), Byte(0x2C), UInt32(3), 6),
+        Span(padded_payload),
+    )
+    assert_true(headers.is_ignored())
+
+
+struct _Http2ControlHandler(Handler):
+    def __init__(out self):
+        pass
+
+    def handle(mut self, req: Request, mut writer: ResponseWriter) raises:
+        _ = req
+        writer.set_status(204)
+
+
+def test_http2_server_control_output_arms_and_preserves_write_deadline() raises:
+    from net import dial_tcp, listen_tcp, Timeout
+    from net.http import Handler, Request, ResponseWriter, Server, ServerConfig
+    from net.http._deadline import NO_DEADLINE
+
+    var server = Server(ServerConfig.default())
+    server.add_listener(listen_tcp("127.0.0.1:0"))
+    var client = dial_tcp(
+        String("127.0.0.1:") + String(server.local_address().port),
+        Timeout.seconds(2),
+    )
+    var handler = _Http2ControlHandler()
+    _ = server.tick(handler, Timeout.milliseconds(10))
+    assert_equal(server.active_connections(), 1)
+    assert_equal(server._conns[0].write_at, NO_DEADLINE)
+    assert_true(server._flush_http2_control_output(0, List[Byte]()))
+    assert_equal(server._conns[0].write_at, NO_DEADLINE)
+    var output: List[Byte] = [Byte(0)]
+    assert_true(server._flush_http2_control_output(0, output^))
+    var deadline = server._conns[0].write_at
+    assert_true(deadline != NO_DEADLINE)
+    output = [Byte(1)]
+    assert_true(server._flush_http2_control_output(0, output^))
+    assert_equal(server._conns[0].write_at, deadline)
+    client.close()
+
+
 def main() raises:
     TestSuite.discover_tests[__functions_in_module()]().run()
+
+
+def test_http2_streaming_head_and_consumption_credit() raises:
+    from net.http._buffer import SharedBufferBudget
+
+    var budget = SharedBufferBudget(1024)
+    var session = Http2RequestSession(
+        "build/http2/libnet_hpack",
+        4,
+        4,
+        request_body_budget=Optional(budget.copy()),
+    )
+    _stream_rate_bootstrap(session)
+    var block: List[Byte] = [
+        Byte(0x83),
+        Byte(0x87),
+        Byte(0x84),
+        Byte(0x01),
+        Byte(11),
+    ]
+    block.extend(String("example.com").as_bytes())
+    var head = _frame(1, 4, 1, block)
+    var result = session.consume(Span(head))
+    assert_true(result.is_head())
+    assert_false(result.is_request())
+    var request = result^.take_request()
+    var reader = request.body_reader()
+    assert_true(reader.is_streaming())
+    assert_equal(budget.used(), 4)
+    var bytes: List[Byte] = [Byte(97), Byte(98), Byte(99), Byte(100)]
+    var wire = _frame(0, 0, 1, bytes)
+    var received = session.consume(Span(wire))
+    assert_true(received.is_pending())
+    assert_equal(len(received.output), 0)
+    var buffer = Array[Byte, 4](fill=0)
+    assert_equal(reader.read(Span(buffer)), 4)
+    var credit = session.flush_body_credit()
+    assert_equal(len(credit), 26)
+    assert_equal(credit[12], Byte(4))
+    assert_equal(credit[25], Byte(4))
+    wire = _frame(0, 1, 1, bytes)
+    assert_true(session.consume(Span(wire)).is_pending())
+    assert_equal(reader.read(Span(buffer)), 4)
+    assert_equal(reader.read(Span(buffer)), 0)
+    credit = session.flush_body_credit()
+    assert_equal(len(credit), 13)
+    session.finish_response(UInt32(1))
+    assert_false(session.has_active_streams())
+    assert_equal(budget.used(), 0)
+
+
+def _streaming_head_wire(
+    stream_id: Int, end_stream: Bool = False
+) -> List[Byte]:
+    var block: List[Byte] = [
+        Byte(0x83),
+        Byte(0x87),
+        Byte(0x84),
+        Byte(0x01),
+        Byte(11),
+    ]
+    block.extend(String("example.com").as_bytes())
+    return _frame(1, 5 if end_stream else 4, stream_id, block)
+
+
+def _wire_credit(wire: List[Byte], stream_id: UInt32) raises -> Int:
+    var total = 0
+    var offset = 0
+    while offset < len(wire):
+        var frame = parse_frame(Span(wire)[offset:])
+        assert_true(frame.is_complete())
+        if frame.frame_type == Byte(8) and frame.stream_id == stream_id:
+            var update = parse_window_update_frame(
+                frame, Span(wire)[offset + 9 : offset + 13]
+            )
+            assert_true(update.is_valid())
+            total += Int(update.increment)
+        offset += 9 + frame.payload_length
+    return total
+
+
+def test_http2_streaming_small_window_admission_and_padding() raises:
+    from net.http._buffer import SharedBufferBudget
+
+    var budget = SharedBufferBudget(4)
+    var session = Http2RequestSession(
+        "build/http2/libnet_hpack",
+        4,
+        4,
+        request_body_budget=Optional(budget.copy()),
+    )
+    var wire = List[Byte]()
+    wire.extend("PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n".as_bytes())
+    var empty = List[Byte]()
+    var settings = _frame(4, 0, 0, empty)
+    wire.extend(Span(settings))
+    var boot = session.consume(Span(wire))
+    var frame = parse_frame(Span(boot.output))
+    var advertised = parse_settings_payload(
+        Span(boot.output)[9 : 9 + frame.payload_length]
+    )
+    var found = False
+    for i in range(len(advertised.settings)):
+        if advertised.settings[i].identifier == UInt16(4):
+            assert_equal(advertised.settings[i].value, UInt32(4))
+            found = True
+    assert_true(found)
+    wire = _frame(4, 1, 0, empty)
+    assert_true(session.consume(Span(wire)).is_pending())
+    wire = _streaming_head_wire(1)
+    var head = session.consume(Span(wire))
+    assert_true(head.is_head())
+    var request = head^.take_request()
+    var reader = request.body_reader()
+    wire = _streaming_head_wire(3)
+    var refused = session.consume(Span(wire))
+    assert_true(refused.is_pending())
+    assert_equal(budget.used(), 4)
+    assert_false(session.is_failed())
+    var padded: List[Byte] = [Byte(1), Byte(97), Byte(98), Byte(0)]
+    wire = _frame(0, 8, 1, padded)
+    var received = session.consume(Span(wire))
+    assert_equal(_wire_credit(received.output, UInt32(0)), 2)
+    assert_equal(_wire_credit(received.output, UInt32(1)), 2)
+    var buffer = Array[Byte, 2](fill=0)
+    assert_equal(reader.read(Span(buffer)), 2)
+    var credit = session.flush_body_credit()
+    assert_equal(_wire_credit(credit, UInt32(0)), 2)
+    assert_equal(_wire_credit(credit, UInt32(1)), 2)
+
+
+def test_http2_streaming_reset_refunds_only_affected_input() raises:
+    from net.http._buffer import SharedBufferBudget
+
+    var budget = SharedBufferBudget(8)
+    var session = Http2RequestSession(
+        "build/http2/libnet_hpack",
+        4,
+        4,
+        request_body_budget=Optional(budget.copy()),
+    )
+    _stream_rate_bootstrap(session)
+    var wire = _streaming_head_wire(1)
+    var first = session.consume(Span(wire))
+    var request1 = first^.take_request()
+    var reader1 = request1.body_reader()
+    wire = _streaming_head_wire(3)
+    var second = session.consume(Span(wire))
+    var request3 = second^.take_request()
+    var reader3 = request3.body_reader()
+    var bytes: List[Byte] = [Byte(97), Byte(98), Byte(99), Byte(100)]
+    wire = _frame(0, 0, 1, bytes)
+    assert_true(session.consume(Span(wire)).is_pending())
+    wire = _frame(0, 1, 3, bytes)
+    assert_true(session.consume(Span(wire)).is_pending())
+    var buffer = Array[Byte, 2](fill=0)
+    assert_equal(reader1.read(Span(buffer)), 2)
+    var reset: List[Byte] = [Byte(0), Byte(0), Byte(0), Byte(8)]
+    wire = _frame(3, 0, 1, reset)
+    var cancelled = session.consume(Span(wire))
+    assert_equal(_wire_credit(cancelled.output, UInt32(0)), 4)
+    assert_equal(_wire_credit(cancelled.output, UInt32(1)), 0)
+    assert_equal(budget.used(), 4)
+    assert_equal(reader3.read(Span(buffer)), 2)
+    var credit = session.flush_body_credit()
+    assert_equal(_wire_credit(credit, UInt32(0)), 2)
+    assert_equal(reader3.read(Span(buffer)), 2)
+    credit = session.flush_body_credit()
+    assert_equal(_wire_credit(credit, UInt32(0)), 2)
+    assert_equal(reader3.read(Span(buffer)), 0)
+    session.finish_response(UInt32(3))
+    assert_false(session.has_active_streams())
+    assert_equal(budget.used(), 0)
+    _ = reader1.detach()
+
+
+def test_http2_streaming_completed_retained_input_rejects_late_data() raises:
+    from net.http._buffer import SharedBufferBudget
+
+    var budget = SharedBufferBudget(8)
+    var session = Http2RequestSession(
+        "build/http2/libnet_hpack",
+        4,
+        4,
+        request_body_budget=Optional(budget.copy()),
+    )
+    _stream_rate_bootstrap(session)
+    var wire = _streaming_head_wire(1)
+    var head = session.consume(Span(wire))
+    var request = head^.take_request()
+    var reader = request.body_reader()
+    var bytes: List[Byte] = [Byte(97), Byte(98)]
+    wire = _frame(0, 1, 1, bytes)
+    assert_true(session.consume(Span(wire)).is_pending())
+    session.finish_response(UInt32(1))
+    assert_true(session.has_active_streams())
+    wire = _frame(0, 0, 1, bytes)
+    var late = session.consume(Span(wire))
+    assert_true(late.is_pending())
+    assert_equal(late.reset_stream_id, UInt32(1))
+    assert_false(session.is_failed())
+    assert_equal(_wire_credit(late.output, UInt32(0)), 4)
+    var frame = parse_frame(Span(late.output)[13:])
+    assert_equal(frame.frame_type, Byte(3))
+    assert_equal(late.output[25], Byte(5))
+    assert_equal(budget.used(), 0)
+    assert_false(session.has_active_streams())
+    _ = reader.detach()
+
+
+def test_http2_streaming_overrun_is_stream_error_and_shutdown_preserves_eof() raises:
+    from net.http._buffer import SharedBufferBudget
+
+    var budget = SharedBufferBudget(8)
+    var session = Http2RequestSession(
+        "build/http2/libnet_hpack",
+        4,
+        4,
+        request_body_budget=Optional(budget.copy()),
+    )
+    _stream_rate_bootstrap(session)
+    var wire = _streaming_head_wire(1)
+    var head = session.consume(Span(wire))
+    var request = head^.take_request()
+    var reader = request.body_reader()
+    var bytes: List[Byte] = [Byte(97), Byte(98), Byte(99), Byte(100), Byte(101)]
+    wire = _frame(0, 0, 1, bytes)
+    var overrun = session.consume(Span(wire))
+    assert_true(overrun.is_pending())
+    assert_equal(overrun.reset_stream_id, UInt32(1))
+    assert_false(session.is_failed())
+    assert_equal(_wire_credit(overrun.output, UInt32(0)), 5)
+    assert_equal(overrun.output[25], Byte(3))
+    wire = _streaming_head_wire(3)
+    head = session.consume(Span(wire))
+    request = head^.take_request()
+    var other = request.body_reader()
+    bytes.resize(4, fill=0)
+    wire = _frame(0, 1, 3, bytes)
+    assert_true(session.consume(Span(wire)).is_pending())
+    var peer_goaway: List[Byte] = [
+        Byte(0),
+        Byte(0),
+        Byte(0),
+        Byte(3),
+        Byte(0),
+        Byte(0),
+        Byte(0),
+        Byte(0),
+    ]
+    wire = _frame(7, 0, 0, peer_goaway)
+    assert_true(session.consume(Span(wire)).is_pending())
+    assert_true(session.is_draining())
+    var shutdown = session.begin_shutdown()
+    assert_equal(_wire_credit(shutdown, UInt32(0)), 0)
+    assert_equal(budget.used(), 4)
+    assert_false(request._body_pipe.value().is_cancelled())
+    var buffer = List[Byte](length=4, fill=0)
+    assert_equal(other.read(Span(buffer)), 4)
+    assert_true(other.is_eof())
+    var credit = session.flush_body_credit()
+    assert_equal(_wire_credit(credit, UInt32(0)), 4)
+    assert_equal(budget.used(), 0)
+    _ = reader.detach()
+    _ = other.detach()
+
+
+def test_http2_streaming_body_deadline_tracks_progress_and_refunds_expiry() raises:
+    from net import Timeout
+    from net.http._buffer import SharedBufferBudget
+    from net.http._deadline import NO_DEADLINE
+
+    var budget = SharedBufferBudget(4)
+    var session = Http2RequestSession(
+        "build/http2/libnet_hpack",
+        4,
+        4,
+        body_deadline=Timeout.seconds(1),
+        request_body_budget=Optional(budget.copy()),
+    )
+    _stream_rate_bootstrap(session)
+    var wire = _streaming_head_wire(1)
+    var head = session.consume(Span(wire))
+    var request = head^.take_request()
+    var reader = request.body_reader()
+    var initial = session.next_deadline()
+    var bytes: List[Byte] = [Byte(97), Byte(98)]
+    wire = _frame(0, 0, 1, bytes)
+    assert_true(session.consume(Span(wire)).is_pending())
+    var renewed = session.next_deadline()
+    assert_true(renewed > initial)
+    var empty = List[Byte]()
+    wire = _frame(0, 0, 1, empty)
+    assert_true(session.consume(Span(wire)).is_pending())
+    assert_equal(session.next_deadline(), renewed)
+    var expired_stream_ids = List[UInt32]()
+    assert_equal(len(session.expire(renewed - 1, expired_stream_ids)), 0)
+    assert_equal(len(expired_stream_ids), 0)
+    var expired = session.expire(renewed, expired_stream_ids)
+    assert_equal(len(expired_stream_ids), 1)
+    assert_equal(expired_stream_ids[0], UInt32(1))
+    assert_equal(_wire_credit(expired, UInt32(0)), 2)
+    assert_equal(session.next_deadline(), NO_DEADLINE)
+    assert_false(session.is_failed())
+    assert_equal(budget.used(), 0)
+    _ = reader.detach()
+
+
+def test_http2_streaming_retained_input_counts_after_response_completion() raises:
+    from net.http._buffer import SharedBufferBudget
+
+    var budget = SharedBufferBudget(8)
+    var session = Http2RequestSession(
+        "build/http2/libnet_hpack",
+        1,
+        4,
+        request_body_budget=Optional(budget.copy()),
+    )
+    _stream_rate_bootstrap(session)
+    var wire = _streaming_head_wire(1)
+    var head = session.consume(Span(wire))
+    var request = head^.take_request()
+    var reader = request.body_reader()
+    session.finish_response(UInt32(1))
+    wire = _streaming_head_wire(3)
+    var rejected = session.consume(Span(wire))
+    assert_true(rejected.is_pending())
+    assert_equal(rejected.output[12], Byte(7))
+    var bytes: List[Byte] = [Byte(97)]
+    wire = _frame(0, 1, 1, bytes)
+    assert_true(session.consume(Span(wire)).is_pending())
+    assert_true(session.has_active_streams())
+    var buffer = Array[Byte, 1](fill=0)
+    assert_equal(reader.read(Span(buffer)), 1)
+    assert_equal(reader.read(Span(buffer)), 0)
+    _ = session.flush_body_credit()
+    assert_false(session.has_active_streams())
+    wire = _streaming_head_wire(5, True)
+    head = session.consume(Span(wire))
+    assert_true(head.is_head())
+
+
+def test_http2_streaming_connection_window_is_independent_and_failure_cancels() raises:
+    from net.http._buffer import SharedBufferBudget
+    from net.http.request import Request
+
+    var budget = SharedBufferBudget(80000)
+    var session = Http2RequestSession(
+        "build/http2/libnet_hpack",
+        4,
+        20000,
+        request_body_budget=Optional(budget.copy()),
+    )
+    _stream_rate_bootstrap(session)
+    var requests = List[Request]()
+    var bytes = List[Byte](length=16384, fill=97)
+    for i in range(4):
+        var wire = _streaming_head_wire(i * 2 + 1)
+        var head = session.consume(Span(wire))
+        assert_true(head.is_head())
+        requests.append(head^.take_request())
+        wire = _frame(0, 0, i * 2 + 1, bytes)
+        var received = session.consume(Span(wire))
+        if i < 3:
+            assert_true(received.is_pending())
+        else:
+            assert_true(received.is_error())
+    assert_true(session.is_failed())
+    assert_equal(budget.used(), 0)
+    for i in range(len(requests)):
+        assert_true(requests[i]._body_pipe.value().is_cancelled())
+
+
+def test_http2_streaming_malformed_body_reports_local_reset() raises:
+    from net.http._buffer import SharedBufferBudget
+
+    var budget = SharedBufferBudget(4)
+    var session = Http2RequestSession(
+        "build/http2/libnet_hpack",
+        4,
+        4,
+        request_body_budget=Optional(budget.copy()),
+    )
+    _stream_rate_bootstrap(session)
+    var block: List[Byte] = [
+        Byte(0x83),
+        Byte(0x87),
+        Byte(0x84),
+        Byte(0x01),
+        Byte(11),
+    ]
+    block.extend(String("example.com").as_bytes())
+    block.append(Byte(0x0F))
+    block.append(Byte(13))
+    block.append(Byte(1))
+    block.append(Byte(49))
+    var wire = _frame(1, 4, 1, block)
+    var head = session.consume(Span(wire))
+    assert_true(head.is_head())
+    var request = head^.take_request()
+    var reader = request.body_reader()
+    var bytes: List[Byte] = [Byte(97), Byte(98)]
+    wire = _frame(0, 1, 1, bytes)
+    var malformed = session.consume(Span(wire))
+    assert_true(malformed.is_pending())
+    assert_equal(malformed.reset_stream_id, UInt32(1))
+    assert_equal(_wire_credit(malformed.output, UInt32(0)), 2)
+    assert_false(session.is_failed())
+    assert_equal(budget.used(), 0)
+    _ = reader.detach()
+
+
+def test_http2_streaming_pre_settings_data_retains_default_credit_until_ack() raises:
+    from net.http._buffer import SharedBufferBudget
+
+    var budget = SharedBufferBudget(65535)
+    var session = Http2RequestSession(
+        "build/http2/libnet_hpack",
+        4,
+        4,
+        request_body_budget=Optional(budget.copy()),
+    )
+    _stream_rate_bootstrap(session, False)
+    var wire = _streaming_head_wire(1)
+    var head = session.consume(Span(wire))
+    assert_true(head.is_head())
+    var request = head^.take_request()
+    var reader = request.body_reader()
+    assert_equal(budget.used(), 65535)
+    var bytes = List[Byte](length=8, fill=97)
+    wire = _frame(0, 0, 1, bytes)
+    var received = session.consume(Span(wire))
+    assert_true(received.is_pending())
+    assert_equal(received.reset_stream_id, UInt32(0))
+    assert_equal(len(received.output), 0)
+    var empty = List[Byte]()
+    wire = _frame(4, 0x81, 0, empty)
+    assert_true(session.consume(Span(wire)).is_pending())
+    assert_equal(budget.used(), 65535)
+    wire = _frame(0, 0, 1, empty)
+    var no_credit_data = session.consume(Span(wire))
+    assert_true(no_credit_data.is_pending())
+    assert_equal(no_credit_data.reset_stream_id, UInt32(0))
+    var buffer = Array[Byte, 4](fill=0)
+    assert_equal(reader.read(Span(buffer)), 4)
+    assert_equal(budget.used(), 65535)
+    var credit = session.flush_body_credit()
+    assert_equal(_wire_credit(credit, UInt32(1)), 4)
+    assert_equal(reader.read(Span(buffer)), 4)
+    assert_equal(budget.used(), 4)
+    credit = session.flush_body_credit()
+    assert_equal(_wire_credit(credit, UInt32(1)), 4)
+    bytes.resize(4, fill=97)
+    wire = _frame(0, 0, 1, bytes)
+    assert_true(session.consume(Span(wire)).is_pending())
+    assert_equal(reader.read(Span(buffer)), 4)
+    _ = session.flush_body_credit()
+    wire = _streaming_head_wire(3)
+    head = session.consume(Span(wire))
+    assert_true(head.is_head())
+    var request3 = head^.take_request()
+    var reader3 = request3.body_reader()
+    assert_equal(budget.used(), 8)
+    bytes.resize(5, fill=97)
+    wire = _frame(0, 0, 3, bytes)
+    var overrun = session.consume(Span(wire))
+    assert_equal(overrun.reset_stream_id, UInt32(3))
+    assert_false(session.is_failed())
+    assert_equal(budget.used(), 4)
+    _ = session.begin_shutdown()
+    _ = reader3.detach()
+    _ = reader.detach()
+
+
+def test_http2_buffered_shutdown_preserves_admitted_input() raises:
+    var session = Http2RequestSession("build/http2/libnet_hpack", 4, 4)
+    _stream_rate_bootstrap(session)
+    var wire = _streaming_head_wire(1)
+    assert_true(session.consume(Span(wire)).is_pending())
+    _ = session.begin_shutdown()
+    var bytes: List[Byte] = [Byte(97)]
+    wire = _frame(0, 1, 1, bytes)
+    var completed = session.consume(Span(wire))
+    assert_true(completed.is_request())
+    assert_false(session.is_failed())
+
+
+def test_http2_streaming_expiry_reports_only_matching_stream_ids() raises:
+    from net.http._buffer import SharedBufferBudget
+
+    var budget = SharedBufferBudget(8)
+    var session = Http2RequestSession(
+        "build/http2/libnet_hpack",
+        4,
+        4,
+        request_body_budget=Optional(budget.copy()),
+    )
+    _stream_rate_bootstrap(session)
+    var wire = _streaming_head_wire(1)
+    assert_true(session.consume(Span(wire)).is_head())
+    wire = _streaming_head_wire(3)
+    assert_true(session.consume(Span(wire)).is_head())
+    assert_true(session.has_request_inputs())
+    session._streams[0].body_at = 100
+    session._streams[1].body_at = 200
+    var reset_ids = List[UInt32]()
+    var output = session.expire(150, reset_ids)
+    assert_equal(len(reset_ids), 1)
+    assert_equal(reset_ids[0], UInt32(1))
+    assert_equal(output[12], Byte(8))
+    assert_true(session.has_request_inputs())
+    assert_equal(budget.used(), 4)
+    assert_equal(session.next_deadline(), 200)
+    _ = session.begin_shutdown()

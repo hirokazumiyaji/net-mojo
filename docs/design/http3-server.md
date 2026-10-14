@@ -6,9 +6,10 @@
 send, and provider timers from its event loop. `QuicServer` is a Rust provider
 behind the optional C ABI artifact. It owns QUIC connections and delegates HTTP/3
 framing, QPACK, stream flow control, and transport recovery to quiche 0.29.3.
-The provider returns a completed request record to Mojo; the HTTP server maps it
+The provider returns a request record to Mojo; the HTTP server maps it
 to the shared `Request`, invokes the same synchronous `Handler` used by HTTP/1.1
-and HTTP/2, then queues the buffered response on the originating stream.
+and HTTP/2. Buffered responses and detached producer messages remain bound to
+the originating request ID.
 
 The provider receives datagrams with their local and remote addresses and sends
 one pending datagram at a time with its destination. Mojo keeps UDP socket
@@ -20,8 +21,8 @@ timeouts are exposed as microseconds and advanced by the server loop.
 The adapter requires `:method`, `:scheme`, `:authority`, and `:path`, validates
 pseudo-header ordering and uniqueness, and maps them to `Request` fields. Regular
 headers and trailers remain separate. CONNECT, extended CONNECT, connection-
-specific fields, and invalid `TE` values are rejected. A request body is fully
-buffered before the shared handler runs.
+specific fields, and invalid `TE` values are rejected. By default a request body
+is fully buffered before the shared handler runs.
 
 Current limits are 100 request header fields and 32 KiB for the combined
 request header sections, 1 MiB for each decoded body, and 64 MiB for request
@@ -44,6 +45,70 @@ admit at most 64 MiB / 65,536 request entries, 4 MiB / 131,072 control entries,
 and 16 MiB / 131,072 CRYPTO entries. Initial peer stream counts remain 100
 bidirectional and 3 unidirectional. These bounds do not cover all native send,
 recovery, TLS or allocator memory.
+
+## Provider request input streaming
+
+The provider keeps full-body buffering as its default. Direct provider users
+can call `QuicUDPEndpoint.set_request_streaming(True)` before the first
+connection, then use `try_next_request_head()` to receive a validated head
+without waiting for DATA or FIN. Head records use the same request ID and field
+encoding as buffered requests, with empty body and trailer fields.
+
+`read_body(id, output)` copies at most the caller's output capacity and returns
+`QuicBodyReadResult`. Its state is `data`, `would_block`, `eof`, or `cancelled`;
+only `data` has a positive count. A zero-length span with valid backing storage
+probes EOF or cancellation without consuming DATA. Reads are
+bounded by the per-request limit on bytes copied but not yet consumed, allowing
+the total upload to exceed that limit as the application makes progress. The
+provider leaves additional DATA in quiche's bounded receive pool.
+
+DATA credit is held after the copy. The application calls
+`consume_body(id, count)` after consuming or discarding those bytes. This returns
+both QUIC stream and connection receive credit. HTTP framing and QPACK control
+bytes retain immediate credit. A count greater than the outstanding DATA debt
+is rejected without changing credit.
+
+`body_trailers(id)` becomes available after a read reports EOF. Initial headers,
+trailers, and input progress remain owned independently of the response route;
+sending response FIN does not retire input. Keep the input ID until queued body
+bytes have been consumed, then call `release_body(id)`. Releasing unfinished
+input discards its remaining receive side through STOP_SENDING while leaving
+response output available. `release_body(id, cancel=True)` cancels both sides.
+Reset, STOP_SENDING on active output, invalid trailers, body timeout, and
+connection teardown cancel input and refund retained metadata and DATA debt.
+The body timeout advances on DATA readiness, positive reads, and consumption.
+
+At the C boundary, `net_quic_read_body` returns positive byte counts, zero for
+EOF, -1 for would-block, -2 for cancellation, and -3 for invalid arguments.
+Head and trailer record functions return a negative required capacity when the
+output is too small and preserve the record for retry. Configuration,
+consumption, and release return 1 on success and -1 on rejection. The Mojo
+wrapper converts read statuses into the typed result above.
+
+## Server request input streaming
+
+Set `ServerConfig.enable_request_body_streaming = True` before constructing the
+server. The handler runs after validated initial headers, with empty `req.body`
+and a bounded body reader. Use `var reader = req.body_reader()` followed by
+`reader.detach()` to transfer the receiver to a worker independently of response
+output. Response FIN does not end an accepted upload;
+a detached receiver can continue reading DATA and trailers afterward.
+`Expect: 100-continue` queues informational headers before the handler runs when
+input is incomplete. Completed input needs no informational response. Unsupported
+expectations return 417 without invoking the handler.
+
+The server reserves body queue capacity from `total_buffer_budget`, copies at
+most 4 KiB per input per turn, and returns native receive credit only after the
+reader consumes or discards those bytes. A full queue pauses DATA copying while
+still observing EOF, resets, and body deadlines. Unclaimed input is discarded
+when the handler returns. Invalid trailers or an exhausted trailer budget cancel
+that stream while sibling requests continue. Temporary trailer budget pressure
+retries admission until `body_deadline`; consumption renews that deadline. If
+admission still cannot finish, the receiver is cancelled even after response FIN.
+
+Shutdown refuses new requests and lets accepted input finish during the grace
+period. Expiry cancels unfinished receivers. Run the independent client cases
+with `pixi run -e tls-http3 http3-request-stream-test`.
 
 ## Same-origin operation
 
@@ -111,6 +176,44 @@ same way response header names do, and trailer wire bytes are reserved
 against the shared `buffered_response_bytes` budget on enqueue so a
 rejected or completed stream releases both sections together. HEAD and
 non-body statuses drop trailers before the request reaches the provider.
+
+## Detached responses
+
+`ResponseWriter.detach()` gives the producer a `ResponseSender` bound to one
+HTTP/3 request ID. The server loop owns the native stream. Producers may queue
+one buffered `respond`, or `start`, ordered `send` chunks and `finish` with
+optional trailers. No HTTP/3 DATA frame ends the stream before `finish`; HEAD
+and bodyless statuses discard payload and trailers while still awaiting the
+producer's explicit finish.
+
+The shared server budget charges detached state, actor and message arrays,
+header storage, serialized field sections and retained chunk capacities. A
+chunk stays owned by its actor until quiche accepts every byte. Partial writes
+advance an offset; accepted bytes restore `stream_queue_limit` credit, and the
+capacity ticket is released when the entire chunk is dropped. A full queue
+makes `send` return false, letting producers retry without changing byte order.
+Native response watches, field sections and transport send storage retain their
+separate provider budgets.
+
+Trailers share the configured response header count and byte limits with the
+initial fields, reject forbidden names, and are queued only after all body
+chunks are accepted. Invalid initial responses become a minimal 500 when the
+native response has not started. Later encoding or budget failures cancel only
+the originating stream with `H3_INTERNAL_ERROR`; explicit abort, peer
+cancellation and producer timeout use `H3_REQUEST_CANCELLED`.
+
+The actor's `detached_response_timeout` refreshes on producer messages and
+accepted body bytes. Native write deadlines cover pending headers and the
+queued final FIN or trailer section; an open producer with no native write
+pending does not inherit that deadline. The reactor wait includes producer
+deadlines. Peer RESET_STREAM, STOP_SENDING, connection loss and shutdown expiry
+cancel the sender and release its mailbox and owned chunks. A successful final
+write releases the actor without marking its sender cancelled.
+
+`pixi run -e tls-http3 http3-detach-test` checks concurrent deferred and sibling
+responses, ordered chunks, trailers, HEAD completion, withheld stream credit,
+backpressure recovery, sustained progress, cancellation before response start,
+STOP_SENDING, timeout, header fallback and complete Mojo budget refund.
 
 ## Current verification
 

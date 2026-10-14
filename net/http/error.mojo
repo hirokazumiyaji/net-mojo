@@ -68,6 +68,8 @@ struct HttpError(Copyable, Movable, Writable):
 
 
 def _status_reason(status: Int) -> String:
+    if status == 101:
+        return "Switching Protocols"
     if status == 100:
         return "Continue"
     if status == 200:

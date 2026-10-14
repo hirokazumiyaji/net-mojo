@@ -1,7 +1,14 @@
 from std.ffi import c_int, c_ulong, external_call
 from std.testing import assert_equal, assert_false, assert_true, TestSuite
 
-from net._actor import Mailbox, PthreadMutex, WakeupChannel
+from net._actor import (
+    Mailbox,
+    PthreadMutex,
+    PthreadCond,
+    WakeupChannel,
+    _COND_TIMED_OUT,
+)
+from net.timeout import Timeout, _Deadline
 from tests.support import _join_thread
 
 
@@ -22,6 +29,48 @@ def test_pthread_mutex_lifecycle() raises:
     var mutex = PthreadMutex()
     mutex.lock()
     mutex.unlock()
+    mutex.destroy()
+
+
+def test_pthread_condition_monotonic_timeout_reacquires_mutex() raises:
+    var mutex = PthreadMutex()
+    var condition = PthreadCond()
+    condition.initialize()
+    mutex.lock()
+    assert_equal(
+        condition.wait(mutex, _Deadline.from_timeout(Timeout.milliseconds(1))),
+        _COND_TIMED_OUT,
+    )
+    assert_true(
+        external_call["pthread_mutex_trylock", c_int](
+            Pointer(to=mutex._storage).unsafe_bitcast[Byte]()
+        )
+        != 0
+    )
+    condition.broadcast()
+    mutex.unlock()
+    condition.destroy()
+    mutex.destroy()
+
+
+def test_pthread_condition_expired_deadline_does_not_release_mutex() raises:
+    var mutex = PthreadMutex()
+    var condition = PthreadCond()
+    condition.initialize()
+    mutex.lock()
+    assert_equal(
+        condition.wait(mutex, _Deadline.from_timeout(Timeout.nanoseconds(0))),
+        _COND_TIMED_OUT,
+    )
+    assert_true(
+        external_call["pthread_mutex_trylock", c_int](
+            Pointer(to=mutex._storage).unsafe_bitcast[Byte]()
+        )
+        != 0
+    )
+    condition.broadcast()
+    mutex.unlock()
+    condition.destroy()
     mutex.destroy()
 
 

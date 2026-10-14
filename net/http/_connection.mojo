@@ -7,6 +7,7 @@ values; nothing borrows across
 connections, so the table never shares ownership between threads.
 """
 
+from .switch import HijackedConn
 from net import TCPConn
 from net._reactor import ReactorToken
 from net.error import NetError, NetErrorKind
@@ -15,6 +16,8 @@ from net.http._http2.hpack import Http2HpackDeflater
 from net.http._http2.request_session import Http2RequestSession
 from net.http._http2.response_scheduler import Http2ResponseScheduler
 from net.http._parser import HeadOutcome, _RequestScan
+from net.http._body_decoder import _BodyDecoder
+from net.http._body_pipe import _BodyPipe
 from net.http._buffer import (
     _CapacityBudget,
     _CapacityTicket,
@@ -30,6 +33,8 @@ comptime STATE_STREAMING: UInt8 = 4
 comptime STATE_HANDSHAKING: UInt8 = 5
 comptime STATE_TLS_SHUTDOWN: UInt8 = 6
 comptime STATE_SENDING_HTTP2_CONTROL: UInt8 = 7
+comptime STATE_HIJACKING_FLUSH: UInt8 = 8
+comptime STATE_HIJACKED: UInt8 = 9
 comptime PROTOCOL_HTTP11: UInt8 = 1
 comptime PROTOCOL_HTTP2: UInt8 = 2
 comptime READ_BUFFER_SIZE: Int = 8192
@@ -53,15 +58,22 @@ struct HttpConnection(Movable):
     var should_close: Bool
     var sent_100: Bool
     var read_eof: Bool
+    var peer_hangup: Bool
     var stream_finished: Bool
     var stream_has_body: Bool
+    var stream_known_length: Int
+    var stream_pending_body: Int
+    var stream_header_count: Int
+    var stream_header_bytes: Int
     var header_at: Int
     var body_at: Int
     var write_at: Int
     var idle_at: Int
     var detach_at: Int
     var detach_state_addr: Int
+    var hijack_state_addr: Int
     var is_head: Bool
+    var is_connect: Bool
     var req_close: Bool
     var requests_served: Int
     var bytes_this_tick: Int
@@ -70,6 +82,10 @@ struct HttpConnection(Movable):
     var http1_body_reserved: Int
     var request_head: Optional[HeadOutcome]
     var request_scan: _RequestScan
+    var body_pipe: Optional[_BodyPipe]
+    var body_decoder: Optional[_BodyDecoder]
+    var body_blocked_budget: Int
+    var body_receiver_after_response: Bool
     var more_work: Bool
     var active: Bool
     var _no_deadline: Int
@@ -114,8 +130,13 @@ struct HttpConnection(Movable):
         self.should_close = False
         self.sent_100 = False
         self.read_eof = False
+        self.peer_hangup = False
         self.stream_finished = False
         self.stream_has_body = False
+        self.stream_known_length = -1
+        self.stream_pending_body = 0
+        self.stream_header_count = 0
+        self.stream_header_bytes = 0
         self._no_deadline = no_deadline
         self.header_at = no_deadline
         self.body_at = no_deadline
@@ -123,7 +144,9 @@ struct HttpConnection(Movable):
         self.idle_at = idle_at
         self.detach_at = no_deadline
         self.detach_state_addr = 0
+        self.hijack_state_addr = 0
         self.is_head = False
+        self.is_connect = False
         self.req_close = False
         self.requests_served = 0
         self.bytes_this_tick = 0
@@ -132,6 +155,10 @@ struct HttpConnection(Movable):
         self.http1_body_reserved = 0
         self.request_head = None
         self.request_scan = _RequestScan.start()
+        self.body_pipe = None
+        self.body_decoder = None
+        self.body_blocked_budget = -1
+        self.body_receiver_after_response = False
         self.more_work = False
         self.active = True
         self.tls_handshake_at = handshake_at
@@ -183,12 +210,23 @@ struct HttpConnection(Movable):
             return self.tls_handshake_wants_read
         if self.state == STATE_TLS_SHUTDOWN:
             return not self.tls_shutdown_wants_write
+        if self.state == STATE_HIJACKING_FLUSH:
+            return self.tls_write_would_block and self.tls_write_wants_read
         if self.tls_write_would_block or self.tls_read_would_block:
             return (
                 self.tls_write_would_block and self.tls_write_wants_read
-            ) or (self.tls_read_would_block and not self.tls_read_wants_write)
+            ) or (
+                self.tls_read_would_block
+                and not self.tls_read_wants_write
+                and self.body_blocked_budget < 0
+            )
         if self.state == STATE_SENDING_HTTP2_CONTROL:
             return True
+        if self.body_decoder:
+            return (
+                self.body_blocked_budget < 0
+                and self.body_decoder.value().wants_input()
+            )
         if self.state == STATE_READING:
             return True
         if self.state == STATE_DETACHED or self.state == STATE_STREAMING:
@@ -207,7 +245,15 @@ struct HttpConnection(Movable):
             return self.tls_handshake_wants_write
         if self.state == STATE_TLS_SHUTDOWN:
             return self.tls_shutdown_wants_write
-        if self.tls_read_would_block and self.tls_read_wants_write:
+        if self.state == STATE_HIJACKING_FLUSH:
+            return not (
+                self.tls_write_would_block and self.tls_write_wants_read
+            )
+        if (
+            self.tls_read_would_block
+            and self.tls_read_wants_write
+            and self.body_blocked_budget < 0
+        ):
             return True
         if self.tls_write_would_block:
             return not self.tls_write_wants_read
@@ -435,6 +481,21 @@ struct HttpConnection(Movable):
             return self.tls.value().raw_fd()
         return self.conn.value().raw_fd()
 
+    def _take_hijacked_connection(mut self) -> HijackedConn:
+        var connection: HijackedConn
+        if self.tls:
+            connection = HijackedConn(
+                self.tls.take(),
+                self.buf^,
+                self.tls_read_buffer^,
+                self.tls_read_retry_length,
+            )
+        else:
+            connection = HijackedConn(self.conn.take(), self.buf^)
+        self.buf = List[Byte]()
+        self.tls_read_buffer = List[Byte]()
+        return connection^
+
     def close(mut self) raises NetError:
         """Closes the underlying connection and releases socket allocations.
 
@@ -443,6 +504,11 @@ struct HttpConnection(Movable):
         shared state reference prior to calling `close()`.
         """
         self.active = False
+        if self.body_pipe:
+            self.body_pipe.value().cancel()
+        self.body_pipe = None
+        self.body_decoder = None
+        self.body_blocked_budget = -1
         # Drop the allocations instead of clearing: clear() would retain
         # capacity on a free-listed slot, hoarding memory the budget no
         # longer accounts for. Both lists are replaced, not cleared.
@@ -455,8 +521,13 @@ struct HttpConnection(Movable):
         self.detach_state_addr = 0
         self.detach_at = self._no_deadline
         self.is_head = False
+        self.is_connect = False
         self.stream_finished = False
         self.stream_has_body = False
+        self.stream_known_length = -1
+        self.stream_pending_body = 0
+        self.stream_header_count = 0
+        self.stream_header_bytes = 0
         self.tls = None
         self.http2_session = None
         self.http2_deflater = None

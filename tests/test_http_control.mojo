@@ -14,7 +14,7 @@ from net.http import (
     ServerControl,
     listen_and_serve_with_control,
 )
-from tests.support import _join_thread, _socket_pair
+from tests.support import _join_thread, _socket_pair, _count_open_fds
 
 
 struct _Handler(Handler):
@@ -249,6 +249,134 @@ def test_bind_error_marks_external_control_exited() raises:
         failed = True
     assert_true(failed)
     assert_true(control.is_shutdown_requested())
+    control.request_shutdown()
+
+
+def test_control_forks_broadcast_without_consuming_other_notifications() raises:
+    var control = ServerControl()
+    var first = control._fork()
+    var second = control._fork()
+    var first_reactor = Reactor()
+    var second_reactor = Reactor()
+    var first_token = first_reactor.register(first._read_fd())
+    var second_token = second_reactor.register(second._read_fd())
+    control.request_shutdown()
+    assert_equal(len(first_reactor.wait(Timeout.nanoseconds(0))), 1)
+    first._drain()
+    assert_equal(len(first_reactor.wait(Timeout.nanoseconds(0))), 0)
+    assert_equal(len(second_reactor.wait(Timeout.nanoseconds(0))), 1)
+    _ = first_reactor.remove(first_token)
+    first.mark_exited()
+    second._drain()
+    assert_equal(len(second_reactor.wait(Timeout.nanoseconds(0))), 0)
+    _ = second_reactor.remove(second_token)
+    second.mark_exited()
+    control.request_shutdown()
+
+
+def test_control_fork_after_shutdown_is_immediately_notified() raises:
+    var control = ServerControl()
+    control.request_shutdown()
+    var worker = control._fork()
+    var reactor = Reactor()
+    var token = reactor.register(worker._read_fd())
+    assert_true(worker.is_shutdown_requested())
+    assert_equal(len(reactor.wait(Timeout.nanoseconds(0))), 1)
+    _ = reactor.remove(token)
+    worker.mark_exited()
+
+
+def test_worker_exit_requests_shutdown_without_closing_sibling_channel() raises:
+    var control = ServerControl()
+    var first = control._fork()
+    var second = control._fork()
+    first.mark_exited()
+    assert_true(second.is_shutdown_requested())
+    var reactor = Reactor()
+    var token = reactor.register(second._read_fd())
+    assert_equal(len(reactor.wait(Timeout.nanoseconds(0))), 1)
+    second._drain()
+    _ = reactor.remove(token)
+    second.mark_exited()
+    first.mark_exited()
+
+
+def _await_serve_address(mut context: _ServeContext) -> String:
+    var address = String("")
+    for _ in range(1000):
+        context.ready_mutex.lock()
+        address = context.address.copy()
+        context.ready_mutex.unlock()
+        if address.byte_length() > 0:
+            return address^
+        sleep(0.001)
+    return address^
+
+
+def _request_ok(address: String) raises -> Bool:
+    var client = dial_tcp(address, Timeout.seconds(2))
+    var request = String(
+        "GET / HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n"
+    )
+    client.write_all(request.as_bytes(), Timeout.seconds(2))
+    var response = List[Byte](length=256, fill=0)
+    var count = client.read(Span[mut=True](response), Timeout.seconds(2))
+    client.close()
+    return count >= 12 and response[9] == Byte(ord("2"))
+
+
+def test_one_control_stops_two_running_servers() raises:
+    var control = ServerControl()
+    var first = _ServeContext(
+        Server(ServerConfig.default()),
+        control.copy(),
+        False,
+        PthreadMutex(),
+        String(""),
+    )
+    var second = _ServeContext(
+        Server(ServerConfig.default()),
+        control.copy(),
+        False,
+        PthreadMutex(),
+        String(""),
+    )
+    var first_thread = _spawn_serve(first)
+    var second_thread = _spawn_serve(second)
+    var first_served = False
+    var second_served = False
+    try:
+        first_served = _request_ok(_await_serve_address(first))
+        second_served = _request_ok(_await_serve_address(second))
+    except:
+        pass
+    control.request_shutdown()
+    _join_thread(first_thread)
+    _join_thread(second_thread)
+    first.ready_mutex.destroy()
+    second.ready_mutex.destroy()
+    assert_true(first_served)
+    assert_true(second_served)
+    assert_false(first.failed)
+    assert_false(second.failed)
+    assert_equal(first.server.active_connections(), 0)
+    assert_equal(second.server.active_connections(), 0)
+
+
+def _retained_external_control_after_server_exit() raises -> ServerControl:
+    var control = ServerControl()
+    var server = Server(ServerConfig.default())
+    var handler = _Handler()
+    control.request_shutdown()
+    server.serve_with_control(listen_tcp("127.0.0.1:0"), handler, control)
+    return control.copy()
+
+
+def test_retained_external_control_releases_all_notification_descriptors() raises:
+    var before = _count_open_fds()
+    var control = _retained_external_control_after_server_exit()
+    assert_true(control.is_shutdown_requested())
+    assert_equal(_count_open_fds(), before)
     control.request_shutdown()
 
 

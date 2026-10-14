@@ -21,7 +21,7 @@ struct _InvalidAltSvcHandler(Handler):
     def handle(mut self, req: Request, mut writer: ResponseWriter) raises:
         if req.path == "/arm":
             self.arms += 1
-            self.arm_slot = writer._slot
+            self.arm_slot = writer._target.slot
         elif req.path == "/error":
             self.targets += 1
             raise Error("configured Alt-Svc error fixture")

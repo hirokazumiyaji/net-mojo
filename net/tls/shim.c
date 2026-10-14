@@ -1,3 +1,4 @@
+#include <arpa/inet.h>
 #include <limits.h>
 #include <stddef.h>
 #include <stdint.h>
@@ -11,6 +12,7 @@
 
 #include <openssl/err.h>
 #include <openssl/ssl.h>
+#include <openssl/x509v3.h>
 
 #include "shim.h"
 
@@ -120,8 +122,7 @@ static int net_tls_select_alpn(SSL *ssl, const unsigned char **out,
     return SSL_TLSEXT_ERR_OK;
 }
 
-void *net_tls_context_server(const char *certificate, const char *private_key,
-                             const char *protocols) {
+static struct net_tls_context *net_tls_context_create(const SSL_METHOD *method) {
     ERR_clear_error();
     if (OpenSSL_version_num() < 0x30200000L) {
         return NULL;
@@ -130,44 +131,16 @@ void *net_tls_context_server(const char *certificate, const char *private_key,
     if (context == NULL) {
         return NULL;
     }
-    context->ssl = SSL_CTX_new(TLS_server_method());
-    if (context->ssl == NULL ||
-        SSL_CTX_set_min_proto_version(context->ssl, TLS1_2_VERSION) != 1 ||
-        SSL_CTX_use_certificate_chain_file(context->ssl, certificate) != 1 ||
-        SSL_CTX_use_PrivateKey_file(context->ssl, private_key, SSL_FILETYPE_PEM) != 1 ||
-        SSL_CTX_check_private_key(context->ssl) != 1) {
-        if (context->ssl != NULL) {
-            SSL_CTX_free(context->ssl);
-        }
+    context->ssl = SSL_CTX_new(method);
+    if (context->ssl == NULL) {
         OPENSSL_free(context);
         return NULL;
     }
-
-    const char *part = protocols;
-    while (*part != '\0') {
-        const char *end = strchr(part, ',');
-        size_t length = end == NULL ? strlen(part) : (size_t)(end - part);
-        if (length == 0 || length > UCHAR_MAX ||
-            context->alpn_length + length + 1 > sizeof(context->alpn) ||
-            (end != NULL && end[1] == '\0')) {
-            SSL_CTX_free(context->ssl);
-            OPENSSL_free(context);
-            return NULL;
-        }
-        context->alpn[context->alpn_length++] = (unsigned char)length;
-        memcpy(context->alpn + context->alpn_length, part, length);
-        context->alpn_length += (unsigned int)length;
-        if (end == NULL) {
-            break;
-        }
-        part = end + 1;
-    }
-    if (context->alpn_length == 0) {
+    if (SSL_CTX_set_min_proto_version(context->ssl, TLS1_2_VERSION) != 1) {
         SSL_CTX_free(context->ssl);
         OPENSSL_free(context);
         return NULL;
     }
-
 #ifdef __linux__
     context->write_filter = BIO_meth_new(BIO_TYPE_NONE | BIO_TYPE_FILTER,
                                         "net TLS socket write");
@@ -185,9 +158,77 @@ void *net_tls_context_server(const char *certificate, const char *private_key,
         return NULL;
     }
 #endif
-
     atomic_init(&context->references, 1);
+    return context;
+}
+
+void *net_tls_context_server(const char *certificate, const char *private_key,
+                             const char *protocols) {
+    struct net_tls_context *context = net_tls_context_create(TLS_server_method());
+    if (context == NULL) {
+        return NULL;
+    }
+    if (SSL_CTX_use_certificate_chain_file(context->ssl, certificate) != 1 ||
+        SSL_CTX_use_PrivateKey_file(context->ssl, private_key, SSL_FILETYPE_PEM) != 1 ||
+        SSL_CTX_check_private_key(context->ssl) != 1) {
+        net_tls_context_release(context);
+        return NULL;
+    }
+    const char *part = protocols;
+    while (*part != '\0') {
+        const char *end = strchr(part, ',');
+        size_t length = end == NULL ? strlen(part) : (size_t)(end - part);
+        if (length == 0 || length > UCHAR_MAX ||
+            context->alpn_length + length + 1 > sizeof(context->alpn) ||
+            (end != NULL && end[1] == '\0')) {
+            net_tls_context_release(context);
+            return NULL;
+        }
+        context->alpn[context->alpn_length++] = (unsigned char)length;
+        memcpy(context->alpn + context->alpn_length, part, length);
+        context->alpn_length += (unsigned int)length;
+        if (end == NULL) {
+            break;
+        }
+        part = end + 1;
+    }
+    if (context->alpn_length == 0) {
+        net_tls_context_release(context);
+        return NULL;
+    }
+
     SSL_CTX_set_alpn_select_cb(context->ssl, net_tls_select_alpn, context);
+    return context;
+}
+
+void net_tls_context_retain(void *opaque) {
+    struct net_tls_context *context = opaque;
+    atomic_fetch_add_explicit(&context->references, 1, memory_order_relaxed);
+}
+
+void *net_tls_context_client(const char *ca_bundle, const char *alpn,
+                            unsigned int flags) {
+    if (strcmp(alpn, "http/1.1") != 0 || (flags & ~1u) != 0) {
+        return NULL;
+    }
+    struct net_tls_context *context = net_tls_context_create(TLS_client_method());
+    if (context == NULL) {
+        return NULL;
+    }
+    int trust_loaded;
+    if (ca_bundle != NULL && ca_bundle[0] != '\0') {
+        trust_loaded = SSL_CTX_load_verify_locations(context->ssl, ca_bundle, NULL);
+    } else {
+        trust_loaded = SSL_CTX_set_default_verify_paths(context->ssl);
+    }
+    const unsigned char protocols[] = {8, 'h', 't', 't', 'p', '/', '1', '.', '1'};
+    if (trust_loaded != 1 ||
+        SSL_CTX_set_alpn_protos(context->ssl, protocols, sizeof(protocols)) != 0) {
+        net_tls_context_release(context);
+        return NULL;
+    }
+    SSL_CTX_set_verify(context->ssl,
+                       (flags & 1u) ? SSL_VERIFY_NONE : SSL_VERIFY_PEER, NULL);
     return context;
 }
 
@@ -197,7 +238,7 @@ void net_tls_context_free(void *opaque) {
     }
 }
 
-void *net_tls_connection_new(void *opaque, int fd) {
+static struct net_tls_connection *net_tls_connection_create(void *opaque, int fd) {
     struct net_tls_context *context = opaque;
     ERR_clear_error();
     struct net_tls_connection *connection = OPENSSL_zalloc(sizeof(*connection));
@@ -225,7 +266,14 @@ void *net_tls_connection_new(void *opaque, int fd) {
     connection->context = context;
     SSL_set_mode(connection->ssl,
                  SSL_MODE_ENABLE_PARTIAL_WRITE | SSL_MODE_ACCEPT_MOVING_WRITE_BUFFER);
-    SSL_set_accept_state(connection->ssl);
+    return connection;
+}
+
+void *net_tls_connection_new(void *opaque, int fd) {
+    struct net_tls_connection *connection = net_tls_connection_create(opaque, fd);
+    if (connection != NULL) {
+        SSL_set_accept_state(connection->ssl);
+    }
     return connection;
 }
 
@@ -251,6 +299,56 @@ static int net_tls_result(struct net_tls_connection *connection, int result) {
         return NET_TLS_CLOSED;
     }
     return NET_TLS_ERROR;
+}
+
+static int net_tls_is_ip(const char *host) {
+    unsigned char address[16];
+    return inet_pton(AF_INET, host, address) == 1 ||
+           inet_pton(AF_INET6, host, address) == 1;
+}
+
+void *net_tls_connection_new_client(void *opaque, int fd, const char *sni,
+                                   const char *verify_hostname) {
+    struct net_tls_connection *connection = net_tls_connection_create(opaque, fd);
+    if (connection == NULL) {
+        return NULL;
+    }
+    SSL_set_connect_state(connection->ssl);
+    if (!net_tls_is_ip(sni)) {
+        size_t length = strlen(sni);
+        if (length > 0 && sni[length - 1] == '.') {
+            length--;
+        }
+        char *name = OPENSSL_strndup(sni, length);
+        if (name == NULL) {
+            net_tls_connection_free(connection);
+            return NULL;
+        }
+        int sni_set = length > 0 && SSL_set_tlsext_host_name(connection->ssl, name) == 1;
+        OPENSSL_free(name);
+        if (!sni_set) {
+            net_tls_connection_free(connection);
+            return NULL;
+        }
+    }
+    SSL_set_hostflags(connection->ssl, X509_CHECK_FLAG_NO_PARTIAL_WILDCARDS);
+    int identity_set;
+    if (net_tls_is_ip(verify_hostname)) {
+        identity_set = X509_VERIFY_PARAM_set1_ip_asc(SSL_get0_param(connection->ssl),
+                                                  verify_hostname);
+    } else {
+        size_t length = strlen(verify_hostname);
+        if (length > 0 && verify_hostname[length - 1] == '.') {
+            length--;
+        }
+        identity_set = length > 0 && X509_VERIFY_PARAM_set1_host(
+            SSL_get0_param(connection->ssl), verify_hostname, length);
+    }
+    if (identity_set != 1) {
+        net_tls_connection_free(connection);
+        return NULL;
+    }
+    return connection;
 }
 
 int net_tls_handshake(void *opaque) {

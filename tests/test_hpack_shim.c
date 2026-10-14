@@ -1,5 +1,6 @@
 #include <assert.h>
 #include <stdint.h>
+#include <stdio.h>
 #include <string.h>
 
 #include "net/http/_http2/hpack_shim.h"
@@ -47,6 +48,40 @@ static size_t append_field(uint8_t *fields, size_t offset, const char *name,
     memcpy(fields + offset + 8, name, name_length);
     memcpy(fields + offset + 8 + name_length, value, value_length);
     return offset + 8 + name_length + value_length;
+}
+
+static void test_serialized_xy_regression(void) {
+    uint8_t fields[10];
+    FILE *fixture = fopen("tests/fuzz-regressions/hpack/serialized-xy.bin", "rb");
+    assert(fixture != NULL);
+    assert(fread(fields, 1, sizeof(fields), fixture) == sizeof(fields));
+    assert(fgetc(fixture) == EOF);
+    assert(fclose(fixture) == 0);
+
+    net_hpack_deflater *deflater = net_hpack_deflater_new(4096);
+    assert(deflater != NULL);
+    uint8_t block[128];
+    size_t bound = 0, block_length = 0;
+    assert(net_hpack_deflate_bound(deflater, fields, sizeof(fields), &bound) == 0);
+    assert(bound > 0);
+    assert(net_hpack_encode(deflater, fields, sizeof(fields), 34, 1, block,
+                            sizeof(block), &block_length) == NET_HPACK_ENCODE_OK);
+    assert(block_length > 0 && block_length <= bound);
+
+    net_hpack_inflater *inflater = net_hpack_inflater_new(4096);
+    assert(inflater != NULL);
+    uint8_t decoded[10];
+    size_t decoded_length = 0, field_count = 0, decoded_size = 0;
+    assert(decode(inflater, block, block_length, 34, 1, decoded,
+                  sizeof(decoded), &decoded_length, &field_count,
+                  &decoded_size) == NET_HPACK_DECODE_OK);
+    assert(field_count == 1);
+    assert(decoded_size == 34);
+    assert(decoded_length == sizeof(fields));
+    assert(expect_field(decoded, decoded_length, "x", "y") == decoded_length);
+    assert(memcmp(decoded, fields, sizeof(fields)) == 0);
+    net_hpack_inflater_free(inflater);
+    net_hpack_deflater_free(deflater);
 }
 
 static void test_deflater_round_trip_and_limits(void) {
@@ -219,6 +254,7 @@ static void test_decode_limits_and_compression_errors(void) {
 }
 
 int main(void) {
+    test_serialized_xy_regression();
     test_rfc_literal_and_huffman_blocks();
     test_dynamic_table_state_survives_output_limit();
     test_decode_limits_and_compression_errors();

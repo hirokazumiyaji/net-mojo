@@ -13,7 +13,16 @@ from net.error import NetError, NetErrorKind
 
 from ._buffer import _CapacityBudget
 from .error import _status_reason
-from .headers import _trailer_forbidden
+from .headers import (
+    Headers,
+    _parse_decimal,
+    _trailer_forbidden,
+    _declared_content_length,
+)
+from .client_error import ClientError
+from ._parser import _is_token, _trim_ows
+from ._authority import _host_is_valid
+from ._url import parse_url
 from .response import ResponseWriter, has_body_for_status
 
 
@@ -274,10 +283,26 @@ def _render_response[
     max_bytes: Int,
     mut out: List[Byte],
     mut byte_count: Int,
+    switching: Bool = False,
 ) raises NetError:
     # Final responses are 2xx–5xx (and uncommon 6xx–9xx). 1xx is
     # intermediate only; Expect: 100-continue uses encode_100_continue().
-    if writer.status < 200 or writer.status > 999:
+    if switching:
+        if (
+            (writer.status != 101 and not (200 <= writer.status < 300))
+            or len(writer.body) != 0
+            or len(writer.trailers) != 0
+            or writer.should_close
+            or writer.headers._first_lower_index("content-length") >= 0
+            or writer.headers._first_lower_index("transfer-encoding") >= 0
+        ):
+            raise NetError(
+                NetErrorKind.invalid_argument(),
+                "encode switch response",
+                None,
+                "switch requires 101 or 2xx headers without content framing",
+            )
+    elif writer.status < 200 or writer.status > 999:
         raise NetError(
             NetErrorKind.invalid_argument(),
             "encode response",
@@ -303,7 +328,9 @@ def _render_response[
             None,
             "response headers too large",
         )
-    var send_body = has_body_for_status(writer.status, is_head)
+    var send_body = not switching and has_body_for_status(
+        writer.status, is_head
+    )
     # Trailers only reach the wire for responses that frame a body on
     # this request (RFC 9112 §7.1.2); HEAD / 1xx / 204 / 205 / 304
     # silently drop trailers. 205 still uses Content-Length: 0.
@@ -345,9 +372,9 @@ def _render_response[
     # 205 omits content bytes but frames Content-Length: 0 so keep-alive
     # clients can delimit the empty message body (RFC 9112 §6.3).
     var wire_length = -1
-    if has_body_for_status(writer.status, False):
-        wire_length = len(writer.body)
-    elif writer.status == 205:
+    if not switching and has_body_for_status(writer.status, False):
+        wire_length = writer._representation_length(is_head)
+    elif not switching and writer.status == 205:
         wire_length = 0
     # Validate a caller-supplied Content-Length against the framed length.
     # For HEAD the framed length is the GET-equivalent body length.
@@ -529,11 +556,19 @@ def _measure_response(
     date: StringSlice,
     max_headers: Int,
     max_bytes: Int,
+    switching: Bool = False,
 ) raises NetError -> Int:
     var out = List[Byte]()
     var byte_count = 0
     _render_response[True](
-        writer, is_head, date, max_headers, max_bytes, out, byte_count
+        writer,
+        is_head,
+        date,
+        max_headers,
+        max_bytes,
+        out,
+        byte_count,
+        switching,
     )
     return byte_count
 
@@ -547,9 +582,10 @@ def _encode_response_budgeted[
     max_headers: Int,
     max_bytes: Int,
     mut budget: B,
+    switching: Bool = False,
 ) raises NetError -> List[Byte]:
     var capacity = _measure_response(
-        writer, is_head, date, max_headers, max_bytes
+        writer, is_head, date, max_headers, max_bytes, switching
     )
     if not budget.try_reserve(capacity):
         raise NetError(
@@ -562,7 +598,14 @@ def _encode_response_budgeted[
     var byte_count = 0
     try:
         _render_response[False](
-            writer, is_head, date, max_headers, max_bytes, out, byte_count
+            writer,
+            is_head,
+            date,
+            max_headers,
+            max_bytes,
+            out,
+            byte_count,
+            switching,
         )
     except e:
         _ = out^
@@ -727,12 +770,17 @@ def _render_chunked_start[
             None,
             "response headers too large",
         )
-    if writer.headers._first_lower_index("content-length") >= 0:
+    var declared = _declared_content_length(writer.headers)
+    if (
+        declared == -2
+        or (declared >= 0 and (writer.status == 204 or writer.status == 304))
+        or (writer.status == 205 and declared > 0)
+    ):
         raise NetError(
             NetErrorKind.invalid_argument(),
-            "encode chunked start",
+            "encode stream start",
             None,
-            "Content-Length is not permitted with chunked Transfer-Encoding",
+            "invalid streaming Content-Length",
         )
     if writer.headers._first_lower_index("transfer-encoding") >= 0:
         raise NetError(
@@ -744,7 +792,7 @@ def _render_chunked_start[
 
     # 1xx / 204 / 304 omit Transfer-Encoding. 205 also omits chunked
     # framing but emits Content-Length: 0 so the empty body is delimited.
-    var emit_transfer_encoding = True
+    var emit_transfer_encoding = declared < 0
     var emit_zero_content_length = False
     if (
         (writer.status >= 100 and writer.status <= 199)
@@ -766,6 +814,11 @@ def _render_chunked_start[
         byte_count,
     )
     for i in range(len(writer.headers)):
+        if (
+            writer.status == 205
+            and writer.headers._lower_names[i] == "content-length"
+        ):
+            continue
         var value_bytes = writer.headers._value_bytes_span(i)
         var name_bytes = writer.headers._names[i].as_bytes()
         for k in range(len(name_bytes)):
@@ -845,15 +898,15 @@ def encode_chunked_start(
     max_headers: Int,
     max_bytes: Int,
 ) raises NetError -> List[Byte]:
-    """Renders the status line and headers for a chunked response.
+    """Renders the status line and headers for a streaming response.
 
     Framing rules:
     - Status must be a 3-digit code (100-999).
-    - Content-Length is prohibited with chunked transfer coding (RFC 9112 §6.1).
+    - A validated Content-Length selects fixed-length framing; otherwise use chunked.
     - Transfer-Encoding header is managed by this encoder; caller-supplied is rejected.
     - Status 1xx, 204, 304 omit Transfer-Encoding: chunked.
     - Status 205 omits chunked coding and emits Content-Length: 0 instead.
-    - HEAD advertises Transfer-Encoding: chunked (if status allows body) but omits chunk bodies.
+    - HEAD advertises the selected framing but omits body bytes.
     """
     var capacity = _measure_chunked_start(
         writer, is_head, date, max_headers, max_bytes
@@ -952,12 +1005,192 @@ def _encode_chunk_budgeted[
 
 def _encode_chunk_end_budgeted[
     B: _CapacityBudget
-](mut budget: B) raises NetError -> List[Byte]:
-    if not budget.try_reserve(5):
+](
+    mut budget: B,
+    trailers: Headers = Headers(),
+    max_headers: Int = 64,
+    max_bytes: Int = 16384,
+) raises NetError -> List[Byte]:
+    var capacity = 5
+    for i in range(len(trailers)):
+        capacity += (
+            trailers._names[i].byte_length() + trailers.value_byte_length(i) + 4
+        )
+    if len(trailers) > max_headers or capacity - 5 > max_bytes:
+        raise NetError(
+            NetErrorKind.invalid_argument(),
+            "encode chunk end",
+            None,
+            "response trailers exceed header limits",
+        )
+    if not budget.try_reserve(capacity):
         raise NetError(
             NetErrorKind.invalid_argument(),
             "encode chunk end",
             None,
             "stream wire capacity exceeds budget",
         )
+    var out = List[Byte](capacity=capacity)
+    out.extend("0\r\n".as_bytes())
+    for i in range(len(trailers)):
+        out.extend(trailers._names[i].as_bytes())
+        out.extend(": ".as_bytes())
+        out.extend(trailers._value_bytes_span(i))
+        out.extend("\r\n".as_bytes())
+    out.extend("\r\n".as_bytes())
+    return out^
+
+
+def _render_request[
+    measure: Bool
+](
+    mut out: List[Byte],
+    method: StringSlice,
+    target: StringSlice,
+    authority: StringSlice,
+    headers: Headers,
+    body_length: Int,
+    chunked: Bool,
+    user_agent: StringSlice,
+    mut byte_count: Int,
+):
+    _append_response_string[measure](out, method, byte_count)
+    _append_response_string[measure](out, " ", byte_count)
+    _append_response_string[measure](out, target, byte_count)
+    _append_response_string[measure](out, " HTTP/1.1\r\n", byte_count)
+    for i in range(len(headers)):
+        _append_response_string[measure](out, headers.name_at(i), byte_count)
+        _append_response_string[measure](out, ": ", byte_count)
+        _append_response_bytes[measure](
+            out, headers._value_bytes_span(i), byte_count
+        )
+        _append_response_string[measure](out, "\r\n", byte_count)
+    if headers.count("host") == 0:
+        _append_response_string[measure](out, "Host: ", byte_count)
+        _append_response_string[measure](out, authority, byte_count)
+        _append_response_string[measure](out, "\r\n", byte_count)
+    if chunked and headers.count("transfer-encoding") == 0:
+        _append_response_string[measure](
+            out, "Transfer-Encoding: chunked\r\n", byte_count
+        )
+    elif not chunked and headers.count("content-length") == 0:
+        _append_response_string[measure](out, "Content-Length: ", byte_count)
+        _append_response_string[measure](out, String(body_length), byte_count)
+        _append_response_string[measure](out, "\r\n", byte_count)
+    if len(user_agent.as_bytes()) > 0 and headers.count("user-agent") == 0:
+        _append_response_string[measure](out, "User-Agent: ", byte_count)
+        _append_response_string[measure](out, user_agent, byte_count)
+        _append_response_string[measure](out, "\r\n", byte_count)
+    _append_response_string[measure](out, "\r\n", byte_count)
+
+
+def encode_request_head(
+    method: StringSlice,
+    target: StringSlice,
+    authority: StringSlice,
+    headers: Headers,
+    body_length: Int,
+    chunked: Bool = False,
+    user_agent: StringSlice = "",
+    max_header_bytes: Int = 32768,
+    max_header_count: Int = 100,
+) raises ClientError -> List[Byte]:
+    if not _is_token(method) or method == "CONNECT":
+        raise ClientError.parse("invalid or unsupported request method")
+    if not _host_is_valid(authority):
+        raise ClientError.parse("invalid request authority")
+    if not String(target).startswith("/"):
+        raise ClientError.parse("expected an origin-form request target")
+    var url = parse_url(String("http://") + String(authority) + String(target))
+    if url.target != target:
+        raise ClientError.parse("invalid request target")
+    if headers.count("host") > 1 or headers.count("upgrade") > 0:
+        raise ClientError.parse("invalid Host or unsupported Upgrade")
+    if headers.count("host") == 1:
+        if not _host_is_valid(headers.get_first("host").value()):
+            raise ClientError.parse("invalid Host")
+    if (
+        headers.count("content-length") > 1
+        or headers.count("transfer-encoding") > 1
+    ):
+        raise ClientError.parse("duplicate request framing header")
+    if chunked:
+        if headers.count("content-length") > 0:
+            raise ClientError.parse("Content-Length with chunked request")
+        if headers.count("transfer-encoding") == 1:
+            if (
+                _trim_ows(
+                    headers.get_first("transfer-encoding").value()
+                ).lower()
+                != "chunked"
+            ):
+                raise ClientError.parse("unsupported request Transfer-Encoding")
+    else:
+        if body_length < 0 or headers.count("transfer-encoding") > 0:
+            raise ClientError.parse("invalid request body framing")
+        if headers.count("content-length") == 1:
+            if (
+                _parse_decimal(
+                    _trim_ows(headers.get_first("content-length").value()),
+                    Int.MAX,
+                )
+                != body_length
+            ):
+                raise ClientError.parse(
+                    "request Content-Length differs from body length"
+                )
+    var header_count = len(headers)
+    if headers.count("host") == 0:
+        header_count += 1
+    if (
+        headers.count("content-length") == 0
+        and headers.count("transfer-encoding") == 0
+    ):
+        header_count += 1
+    if len(user_agent.as_bytes()) > 0 and headers.count("user-agent") == 0:
+        var checked = Headers()
+        try:
+            checked.add("User-Agent", String(user_agent))
+        except:
+            raise ClientError.parse("invalid User-Agent")
+        header_count += 1
+    if header_count > max_header_count:
+        raise ClientError.parse("request headers exceed count limit")
+    var out = List[Byte]()
+    var count = 0
+    _render_request[True](
+        out,
+        method,
+        target,
+        authority,
+        headers,
+        body_length,
+        chunked,
+        user_agent,
+        count,
+    )
+    if count > max_header_bytes:
+        raise ClientError.parse("request headers exceed byte limit")
+    out.reserve(count)
+    _render_request[False](
+        out,
+        method,
+        target,
+        authority,
+        headers,
+        body_length,
+        chunked,
+        user_agent,
+        count,
+    )
+    return out^
+
+
+def encode_request_chunk[
+    origin: ImmOrigin
+](data: Span[Byte, origin]) -> List[Byte]:
+    return encode_chunk(data)
+
+
+def encode_request_chunk_end() -> List[Byte]:
     return encode_chunk_end()

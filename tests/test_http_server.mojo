@@ -18,9 +18,12 @@ from net.http import (
     Handler,
     Request,
     ResponseWriter,
+    RecoverHandler,
     Server,
     ServerConfig,
     ServerControl,
+    ServeMux,
+    TimeoutHandler,
 )
 from tests.support import (
     _content_length_of,
@@ -1742,7 +1745,10 @@ def test_writer_workspace_returns_on_success_handler_and_encoder_errors() raises
     var handler = _WorkspaceHandler()
     var waiting = dial_tcp(address, Timeout.seconds(1))
     waiting.write_all("GET /".as_bytes(), Timeout.seconds(1))
-    _tick_n(server, handler, 2)
+    for _ in range(100):
+        _ = server.tick(handler, Timeout.milliseconds(1))
+        if server._budget.used() == 5 + H1_ERROR_CAPACITY:
+            break
     assert_equal(server._budget.used(), 5 + H1_ERROR_CAPACITY)
     for action in range(4):
         handler.action = action
@@ -1867,6 +1873,125 @@ def test_hello_keep_alive_two_requests() raises:
     client.close()
     _tick_n(server, handler, 50)
     assert_equal(server.active_connections(), 0)
+
+
+def _router_greeting(req: Request, mut writer: ResponseWriter) raises:
+    writer.write_string(String("hello, ") + ServeMux.param(req, "name").value())
+
+
+def _router_rest(req: Request, mut writer: ResponseWriter) raises:
+    writer.write_string(ServeMux.param(req, "path").value())
+
+
+def test_serve_mux_keep_alive_wildcards_404_and_405() raises:
+    var server = Server(ServerConfig.default())
+    server.add_listener(listen_tcp("127.0.0.1:0"))
+    var mux = ServeMux()
+    mux.handle("GET /hello/{name}", _router_greeting)
+    mux.handle("GET /static/{path...}", _router_rest)
+    var client = dial_tcp(
+        String("127.0.0.1:") + String(server.local_address().port),
+        Timeout.seconds(2),
+    )
+    var first = _exchange(
+        server, mux, client, "GET /hello/a%2Fb?x=1 HTTP/1.1\r\nHost: x\r\n\r\n"
+    )
+    assert_equal(_status_of(first), 200)
+    _assert_body(first, "hello, a%2Fb")
+    var forbidden = _exchange(
+        server, mux, client, "POST /hello/world HTTP/1.1\r\nHost: x\r\n\r\n"
+    )
+    assert_equal(_status_of(forbidden), 405)
+    assert_true(
+        String(from_utf8_lossy=Span(forbidden)).find("\r\nAllow: GET, HEAD\r\n")
+        >= 0
+    )
+    _assert_body(forbidden, "method not allowed")
+    var missing = _exchange(
+        server, mux, client, "GET /missing HTTP/1.1\r\nHost: x\r\n\r\n"
+    )
+    assert_equal(_status_of(missing), 404)
+    _assert_body(missing, "not found")
+    var rest = _exchange(
+        server, mux, client, "GET /static/a/b%2Fc HTTP/1.1\r\nHost: x\r\n\r\n"
+    )
+    assert_equal(_status_of(rest), 200)
+    _assert_body(rest, "a/b%2Fc")
+    assert_equal(server.active_connections(), 1)
+    client.close()
+    _tick_n(server, mux, 50)
+    assert_equal(server.active_connections(), 0)
+    assert_equal(server._budget.used(), 0)
+
+
+def test_serve_mux_head_falls_back_and_omits_wire_body() raises:
+    var server = Server(ServerConfig.default())
+    server.add_listener(listen_tcp("127.0.0.1:0"))
+    var mux = ServeMux()
+    mux.handle("GET /hello/{name}", _router_greeting)
+    var client = dial_tcp(
+        String("127.0.0.1:") + String(server.local_address().port),
+        Timeout.seconds(2),
+    )
+    var wire = _exchange(
+        server,
+        mux,
+        client,
+        "HEAD /hello/world HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n",
+    )
+    assert_equal(_status_of(wire), 200)
+    assert_equal(_content_length_of(wire), 12)
+    assert_equal(len(wire), _header_end(wire))
+    assert_equal(server.active_connections(), 0)
+    assert_equal(server._budget.used(), 0)
+    client.close()
+
+
+def test_recover_mux_keeps_connection_after_buffered_error() raises:
+    var server = Server(ServerConfig.default())
+    server.add_listener(listen_tcp("127.0.0.1:0"))
+    var mux = ServeMux()
+    mux.handle_handler("GET /raise", _HeadErrorHandler())
+    mux.handle_handler("GET /alive", _HeadErrorHandler())
+    var handler = RecoverHandler[ServeMux](mux^)
+    var client = dial_tcp(
+        String("127.0.0.1:") + String(server.local_address().port),
+        Timeout.seconds(2),
+    )
+    var failed = _exchange(
+        server, handler, client, "GET /raise HTTP/1.1\r\nHost: x\r\n\r\n"
+    )
+    assert_equal(_status_of(failed), 500)
+    _assert_body(failed, "500 Internal Server Error")
+    assert_equal(server.active_connections(), 1)
+    var alive = _exchange(
+        server, handler, client, "GET /alive HTTP/1.1\r\nHost: x\r\n\r\n"
+    )
+    assert_equal(_status_of(alive), 200)
+    _assert_body(alive, "alive")
+    assert_equal(server.active_connections(), 0)
+    assert_equal(server._budget.used(), 0)
+    client.close()
+
+
+def test_timeout_mux_rejects_detach_and_server_releases_state() raises:
+    var server = Server(ServerConfig.default())
+    server.add_listener(listen_tcp("127.0.0.1:0"))
+    var mux = ServeMux()
+    mux.handle_handler("GET /abort", _HeadErrorHandler())
+    var handler = TimeoutHandler[ServeMux](mux^, Timeout.seconds(1))
+    var client = dial_tcp(
+        String("127.0.0.1:") + String(server.local_address().port),
+        Timeout.seconds(2),
+    )
+    var wire = _exchange(
+        server, handler, client, "GET /abort HTTP/1.1\r\nHost: x\r\n\r\n"
+    )
+    assert_equal(_status_of(wire), 500)
+    _assert_body(wire, "500 Internal Server Error")
+    assert_equal(server.active_connections(), 0)
+    assert_equal(server._budget.used(), 0)
+    client.close()
 
 
 def test_http1_205_frames_zero_length_on_keep_alive_and_pipeline() raises:
@@ -2013,11 +2138,6 @@ def _drain_until_eof_driven[
 
 
 def test_pipelined_chain_completes_without_extra_waits() raises:
-    # Six pipelined requests must all complete well before six ticks:
-    # chaining parses each buffered request in the same drive instead
-    # of stalling one poll wait per request. The bound is deliberately
-    # loose (chaining needs two ticks: accept, then everything) so no
-    # wall-clock timing is asserted, only tick counts.
     var server = Server(ServerConfig.default())
     server.add_listener(listen_tcp("127.0.0.1:0"))
     var port = server.local_address().port
@@ -2025,19 +2145,21 @@ def test_pipelined_chain_completes_without_extra_waits() raises:
     var client = dial_tcp(
         String("127.0.0.1:") + String(port), Timeout.seconds(2)
     )
+    for _ in range(100):
+        _ = server.tick(handler, Timeout.milliseconds(1))
+        if server.active_connections() == 1:
+            break
+    assert_equal(server.active_connections(), 1)
     var batch = String("")
     for _ in range(5):
         batch += String("GET /one HTTP/1.1\r\nHost: x\r\n\r\n")
     batch += String("GET /two HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n")
     client.write_all(batch.as_bytes(), Timeout.seconds(2))
-    # Ticks alone must quiesce the server: client reads play no role in
-    # server progress (kernel buffers hold the small batch), so delivery
-    # timing cannot flake this bound. Without chaining, six requests
-    # need at least seven ticks (accept plus one each).
-    for _ in range(4):
-        _ = server.tick(handler, Timeout.nanoseconds(0))
+    _ = server.tick(handler, Timeout.seconds(2))
+    for _ in range(3):
         if server.active_connections() == 0:
             break
+        _ = server.tick(handler, Timeout.nanoseconds(0))
     assert_equal(server.active_connections(), 0)
     var out = _drain_until_eof(client)
     var text = String(from_utf8_lossy=Span(out))
@@ -2914,7 +3036,11 @@ def test_deadline_close_and_slot_reuse_removes_old_entries() raises:
     var base = now_ns()
     for _ in range(20):
         var client = dial_tcp(address, Timeout.seconds(2))
-        _tick_n(server, handler, 2)
+        for _ in range(100):
+            _ = server.tick(handler, Timeout.milliseconds(1))
+            if server.active_connections() == 1:
+                break
+        assert_equal(server.active_connections(), 1)
         assert_equal(len(server._conns), 1)
         server._conns[0].idle_at = base + 10_000_000
         server._arm_deadline(0)

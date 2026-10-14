@@ -37,6 +37,9 @@ underscore (see README "Versioning and compatibility"). Anything under
 
 ### Added
 
+- Bounded HTTP method/path `Pattern` matching with named and rest wildcards,
+  trailing-slash subtrees, explicit `{$}` endpoints, GET-to-HEAD matching,
+  and registration conflict/specificity checks. Wire paths stay encoded.
 - Publish conda packages for linux-64, linux-aarch64 and osx-arm64 to
   prefix.dev and create a GitHub Release when a `v*.*.*` tag is pushed
   (`.github/workflows/publish.yml`, `conda.recipe/recipe.yaml`).

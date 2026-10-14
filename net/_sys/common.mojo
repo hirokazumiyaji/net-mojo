@@ -400,18 +400,18 @@ def _copy_c_string[origin: MutOrigin](address: Pointer[Byte, origin]) -> String:
 
 
 def _strerror_text(error_number: Int32) -> String:
-    # NOTE: declared with a bare pointer return to match the stdlib's own
-    # strerror declaration (reached via std.tempfile); an
-    # Optional-wrapped return type conflicts at compile time. strerror
-    # never returns NULL on the supported targets (unknown codes yield
-    # "Unknown error N"). strerror may use a static buffer and is not
-    # guaranteed thread-safe; that is acceptable while net-mojo is
-    # single-threaded by design, and must be revisited (strerror_r) if
-    # threading support is ever added.
-    var message = external_call["strerror", Pointer[Byte, MutUntrackedOrigin]](
-        c_int(error_number)
-    )
-    return _copy_c_string(message)
+    var buffer = Array[Byte, 256](fill=0)
+    var destination = Pointer(to=buffer).unsafe_bitcast[Byte]()
+    comptime if _DARWIN:
+        _ = external_call["strerror_r", c_int](
+            c_int(error_number), destination, c_size_t(256)
+        )
+        return _copy_c_string(destination)
+    else:
+        var message = external_call[
+            "strerror_r", Pointer[Byte, MutUntrackedOrigin]
+        ](c_int(error_number), destination, c_size_t(256))
+        return _copy_c_string(message)
 
 
 def _system_error(operation: String, error_number: Int32) -> NetError:
@@ -586,6 +586,36 @@ def _no_sigpipe_status(fd: Int32) -> _SyscallStatus:
         if result == -1:
             return _SyscallStatus(value=-1, error_number=_last_errno())
     return _SyscallStatus(value=0, error_number=0)
+
+
+def _duplicate_fd(fd: Int32) raises NetError -> _OwnedFD:
+    comptime command: Int32 = 67 if _DARWIN else 1030
+    var raw = _fcntl(fd, command, 0)
+    if raw == -1:
+        raise _system_error("fcntl(F_DUPFD_CLOEXEC)", _last_errno())
+    return _OwnedFD(raw)
+
+
+def _online_cpu_count() -> Int:
+    comptime if _DARWIN:
+        var name = String("hw.activecpu")
+        var c_name = name.as_c_string_span()
+        var value: Int32 = 0
+        var length = c_size_t(size_of[Int32]())
+        var result = external_call["sysctlbyname", c_int](
+            c_name.ptr(),
+            Pointer(to=value),
+            Pointer(to=length),
+            Optional[Pointer[Byte, MutUntrackedOrigin]](None),
+            c_size_t(0),
+        )
+        if result == 0 and length == c_size_t(size_of[Int32]()) and value > 0:
+            return Int(value)
+    else:
+        var value = external_call["sysconf", c_ssize_t](c_int(84))
+        if value > 0:
+            return Int(value)
+    return 1
 
 
 def _set_nonblocking_cloexec(fd: Int32) raises NetError:

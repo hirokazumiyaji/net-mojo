@@ -1,6 +1,6 @@
 """Handler contract shared by HTTP/1.1, HTTP/2, and HTTP/3.
 
-The handler runs synchronously on the single event-loop thread. It
+The handler runs synchronously on its owning event-loop thread. It
 borrows the request and mutates the response writer, both valid only
 for the call. Blocking I/O or long CPU work stalls every connection
 on the loop; offload is future work.
@@ -18,3 +18,27 @@ from .response import ResponseWriter
 trait Handler(Movable):
     def handle(mut self, req: Request, mut writer: ResponseWriter) raises:
         ...
+
+
+trait HandlerFactory(Movable):
+    """Builds an independent handler for each worker before threads start."""
+
+    comptime HandlerType: Handler & Deinitable
+
+    def build(mut self, worker_id: Int) raises -> Self.HandlerType:
+        ...
+
+
+struct DefaultHandlerFactory[H: Handler & Copyable & Deinitable](
+    HandlerFactory
+):
+    """Copies the supplied handler for each worker."""
+
+    comptime HandlerType = Self.H
+    var _handler: Self.H
+
+    def __init__(out self, var handler: Self.H):
+        self._handler = handler^
+
+    def build(mut self, worker_id: Int) raises -> Self.H:
+        return self._handler.copy()

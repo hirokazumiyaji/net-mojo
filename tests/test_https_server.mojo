@@ -5,10 +5,13 @@ from net import TCPConn, Timeout, dial_tcp, listen_tcp
 from net.error import NetErrorKind
 from net._reactor import ReactorToken
 from net.http._deadline import now_ns
+from net.http._body_pipe import _BodyPipe
+from net.http._body_decoder import _BodyDecoder
 from net.http._connection import (
     HttpConnection,
     READ_BUFFER_SIZE,
     H1_ERROR_CAPACITY,
+    STATE_READING,
 )
 from net.http import Handler, Request, ResponseWriter, Server, ServerConfig
 from net.tls import TLSConnection, TLSContext
@@ -176,6 +179,45 @@ def test_https_emergency_admission_accounts_tls_store_and_alt_svc() raises:
         assert_equal(observer.used(), 5)
         observer.release(5)
         assert_equal(observer.used(), 0)
+
+
+def test_https_streaming_budget_pauses_required_read_retry() raises:
+    var config = ServerConfig.default()
+    config.enable_request_body_streaming = True
+    config.max_body_bytes = 512
+    var server = Server(config^)
+    server.add_tls_listener(listen_tcp("127.0.0.1:0"), _tls_context())
+    var client = dial_tcp(
+        String("127.0.0.1:") + String(server.local_address().port),
+        Timeout.seconds(1),
+    )
+    var expires = now_ns() + 1_000_000_000
+    while server.active_connections() == 0 and now_ns() < expires:
+        server._accept_pending(now_ns())
+        sleep(0.001)
+    assert_equal(server.active_connections(), 1)
+    server._conns[0].state = STATE_READING
+    var pipe = _BodyPipe(512, server._budget.copy())
+    server._conns[0].body_pipe = Optional(pipe.copy())
+    server._conns[0].body_decoder = Optional(
+        _BodyDecoder(pipe.copy(), False, 512)
+    )
+    server._request_body_conns.append(0)
+    server._pump_read(0, True, now_ns())
+    assert_true(server._conns[0].tls_read_would_block)
+    assert_equal(server._conns[0].tls_read_retry_length, 512)
+    var held = server._budget.remaining() - 256
+    assert_true(server._budget.try_reserve(held))
+    server._conns[0].more_work = False
+    server._pump_read(0, True, now_ns())
+    assert_true(not server._conns[0].more_work)
+    assert_true(not server._conns[0].wants_read())
+    assert_true(not server._conns[0].wants_write())
+    server._budget.release(held)
+    server._retry_request_body_budget()
+    assert_true(server._conns[0].wants_read())
+    server._close_conn(0)
+    client.close()
 
 
 def main() raises:

@@ -14,6 +14,164 @@ permissions:
   contents: read
 
 jobs:
+  compression:
+    name: Compression (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+          - macos-14
+          - ubuntu-24.04
+          - ubuntu-24.04-arm
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      - name: Install pixi
+        uses: prefix-dev/setup-pixi@f00437f565399d418b0acc85936d12c1fb668347
+        with:
+          frozen: true
+      - name: Test optional gzip provider and HTTP compression
+        run: pixi run -e compression compression-suite
+      - name: Run public gzip JSON example
+        run: pixi run -e compression example-http-gzip
+
+  websocket:
+    name: WebSocket (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+          - macos-14
+          - ubuntu-24.04
+          - ubuntu-24.04-arm
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      - name: Install pixi
+        uses: prefix-dev/setup-pixi@f00437f565399d418b0acc85936d12c1fb668347
+        with:
+          frozen: true
+      - name: Test public WebSocket ownership example
+        run: pixi run example-websocket-echo
+      - name: Test packaged public WebSocket ownership API
+        run: pixi run websocket-package-smoke
+      - name: Test independent WebSocket client
+        run: pixi run -e tls-websocket websocket-interop
+      - name: Check WebSocket measurement harness
+        run: pixi run -e websocket benchmark-websocket-echo --iterations 3
+      - name: Replay bounded WebSocket frames
+        run: pixi run -e websocket fuzz-websocket-frames --iterations 1000
+      - name: Replay bounded streaming UTF-8
+        run: pixi run -e websocket fuzz-websocket-utf8 --iterations 1000
+      - name: Verify deterministic WebSocket replay metadata
+        run: pixi run -e websocket fuzz-websocket-driver-test
+      - name: Test verified secure WebSocket client
+        run: pixi run -e tls-websocket websocket-tls-interop
+      - name: Test sanitized WS and WSS interoperability
+        run: pixi run -e tls-websocket websocket-interop-sanitize
+
+  websocket-conformance:
+    name: WebSocket conformance (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+          - ubuntu-24.04
+          - ubuntu-24.04-arm
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      - name: Install pixi
+        uses: prefix-dev/setup-pixi@f00437f565399d418b0acc85936d12c1fb668347
+        with:
+          frozen: true
+      - name: Enable pinned upstream image on ARM
+        if: matrix.os == 'ubuntu-24.04-arm'
+        uses: docker/setup-qemu-action@c7c53464625b32c7a7e944ae62b3e17d2b600130
+        with:
+          platforms: amd64
+      - name: Test upstream noncompression conformance
+        run: pixi run -e websocket autobahn-ws
+      - name: Retain standard conformance reports
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: websocket-autobahn-${{ matrix.os }}
+          path: build/websocket-autobahn
+          if-no-files-found: ignore
+
+  proptest:
+    name: Property tests (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-14, ubuntu-24.04]
+    env:
+      PROPTEST_SEED: "1"
+      PROPTEST_MAX_EXAMPLES: "100"
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      - name: Install pixi
+        uses: prefix-dev/setup-pixi@f00437f565399d418b0acc85936d12c1fb668347
+        with:
+          frozen: true
+          environments: proptest proptest-http2
+      - name: Test semantic properties
+        run: pixi run -e proptest test-prop
+      - name: Test HPACK properties
+        run: pixi run -e proptest-http2 test-prop-hpack
+
+  fuzz:
+    name: Fuzz smoke (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, ubuntu-24.04-arm, macos-14]
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      - name: Install pixi
+        uses: prefix-dev/setup-pixi@f00437f565399d418b0acc85936d12c1fb668347
+        with:
+          frozen: true
+      - name: Verify fuzz task coverage
+        run: |
+          python3 - <<'PYTHON'
+          import tomllib
+          from pathlib import Path
+          tasks = tomllib.loads(Path("pixi.toml").read_text())["feature"]["fuzz"]["tasks"]
+          expected = {"fuzz-build", "fuzz-native-build", "fuzz-http1", "fuzz-authority", "fuzz-http2-frames", "fuzz-ip", "fuzz-address", "fuzz-hpack-mojo", "fuzz-hpack", "fuzz-smoke", "fuzz-driver-test", "fuzz-nightly", "fuzz-nightly-test", "fuzz-minimize", "fuzz-minimize-test"}
+          assert set(tasks) == expected, set(tasks) ^ expected
+          assert tasks["fuzz-smoke"]["depends-on"] == ["fuzz-build"]
+          assert {"task": "fuzz-parser-build", "environment": "sanitize"} in tasks["fuzz-build"]["depends-on"]
+          PYTHON
+      - name: Test mutation and replay driver
+        run: pixi run -e fuzz fuzz-driver-test
+      - name: Test bounded nightly replay metadata
+        run: pixi run -e fuzz fuzz-nightly-test
+      - name: Test structured minimization with fixed markers
+        run: pixi run -e fuzz fuzz-minimize-test
+      - name: Fuzz protocol parsers and native HPACK
+        run: pixi run -e fuzz fuzz-smoke
+      - name: Preserve replay inputs and crash artifacts
+        if: failure()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: fuzz-failure-${{ matrix.os }}
+          path: build/fuzz/
+          if-no-files-found: ignore
+
   http2:
     name: HTTP/2 (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
@@ -44,8 +202,16 @@ jobs:
         run: pixi run -e tls-http2 http2-example-build
       - name: Test shared HTTP/1.1 and HTTP/2 application contract
         run: pixi run -e tls-http2 http-app-contract-test
+      - name: Test HTTP/1.1 and HTTP/2 router contract
+        run: pixi run -e tls-http2 http-router-h2-test
+      - name: Test static files over HTTP/1.1 and HTTP/2
+        run: pixi run -e tls-http2 http-fileserver-h2-test
       - name: Test HTTP/2 integration gaps
         run: pixi run -e tls-http2 http2-integration-test
+      - name: Test shared-listener HTTP worker pool
+        run: pixi run -e tls-http2 http-pool-integration-test
+      - name: Test HTTP/2 streaming request uploads
+        run: pixi run -e tls-http2 http2-request-stream-integration-test
       - name: Run HTTP/2 example with independent client
         run: pixi run -e tls-http2 http2-example-run
 
@@ -69,8 +235,22 @@ jobs:
           frozen: true
       - name: Test HTTP/3 provider and integration
         run: pixi run -e tls-http3 quic-suite
+      - name: Test streaming HTTP/3 request input
+        run: pixi run -e tls-http3 http3-request-stream-test
+      - name: Test detached HTTP/3 responses
+        run: pixi run -e tls-http3 http3-detach-test
       - name: Test independent HTTP/3 client
         run: pixi run -e tls-http3 http3-client-test
+      - name: Test shared TCP and worker-zero QUIC pool
+        run: pixi run -e tls-http3 http-pool-quic-integration-test
+      - name: Test HTTP/3 router contract
+        run: pixi run -e tls-http3 http-router-h3-test
+      - name: Test static files over HTTP/3
+        run: pixi run -e tls-http3 http-fileserver-h3-test
+      - name: Test gzip responses across HTTP protocols
+        run: pixi run -e http-stream-sse gzip-wire-test
+      - name: Test static files with optional gzip across HTTP protocols
+        run: pixi run -e http-stream-sse http-fileserver-compression-test
       - name: Test HTTP same-origin fallback
         run: pixi run -e tls-http3 http-same-origin-test
       - name: Test packaged HTTP/3 provider
@@ -79,6 +259,8 @@ jobs:
         run: pixi run -e tls-http3 http3-example-build
       - name: Run HTTP/3 example with independent client
         run: pixi run -e tls-http3 http3-example-run
+      - name: Run HTTP/3 worker pool example with independent client
+        run: pixi run -e tls-http3 http3-pool-example-run
 
   test:
     name: Test (${{ matrix.os }})
@@ -103,14 +285,7 @@ jobs:
       - name: Verify formatting
         run: git diff --exit-code
       - name: Verify test tasks mirror pixi
-        run: |
-          diff -u \
-            <(grep -oE '^test-[a-z0-9-]+' pixi.toml | sort -u) \
-            <(awk '$1 == "run:" && $2 == "pixi" && $3 == "run" && $4 ~ /^test-/ {print $4}' .github/workflows/ci.yml | sort -u)
-          for t in $(grep -oE '^test-[a-z0-9-]+' pixi.toml | sort -u); do
-            [ "$t" = "test-package" ] && continue
-            grep -q "\"$t\"," pixi.toml || { echo "$t missing from 'test' aggregate"; exit 1; }
-          done
+        run: python3 scripts/check_ci_tasks.py test
       # Individual test steps match `pixi run test` in pixi.toml for step-level triage.
       - name: Test core
         run: pixi run test-core
@@ -134,22 +309,92 @@ jobs:
         run: pixi run test-http-api
       - name: Test HTTP control
         run: pixi run test-http-control
+      - name: Test HTTP worker pool
+        run: pixi run test-http-pool
+      - name: Test request body pipe
+        run: pixi run test-http-body-pipe
+      - name: Test incremental HTTP body decoding
+        run: pixi run test-http-body-decoder
+      - name: Test HTTP/1 streaming request lifecycle
+        run: pixi run test-http-request-stream
+      - name: Test HTTP/2 streaming request models
+        run: pixi run test-http2-request-stream
+      - name: Test HTTP client
+        run: pixi run test-http-client
+      - name: Test HTTP URL parser
+        run: pixi run test-http-url
+      - name: Test HTTP client redirects
+        run: pixi run test-http-client-redirect
+      - name: Test HTTP client resiliency
+        run: pixi run test-http-client-resiliency
       - name: Test HTTP parser
         run: pixi run test-http-parser
       - name: Test HTTP response
         run: pixi run test-http-response
+      - name: Test confined HTTP filesystem
+        run: pixi run test-http-filesystem
+      - name: Test HTTP route patterns
+        run: pixi run test-http-router
+      - name: Test HTTP middleware
+        run: pixi run test-http-middleware
       - name: Test HTTP server
         run: pixi run test-http-server
+      - name: Test hijacked HTTP transport
+        run: pixi run test-http-hijacked-conn
+      - name: Test HTTP hijack actor
+        run: pixi run test-http-hijack-actor
+      - name: Run HTTP router example
+        run: pixi run example-http-router
       - name: Build HPACK shim for HTTP/2 session tests
         run: pixi run -e http2 hpack-test
       - name: Test HTTP/2 frame parser
         run: pixi run test-http2
       - name: Test TLS and HTTPS
         run: pixi run -e tls tls-suite
+      - name: Test owned WebSocket connection
+        run: pixi run test-http-websocket
+      - name: Test WebSocket handshake digest
+        run: pixi run test-http-handshake
+      - name: Test incremental WebSocket frames
+        run: pixi run test-http-websocket-fragments
+      - name: Test HTTP/1 connection switching
+        run: pixi run test-http-hijack
+      - name: Test CONNECT tunnels
+        run: pixi run test-http-connect
+      - name: Test independent raw switching interoperability
+        run: pixi run http-hijack-interop
+      - name: Run Upgrade echo example
+        run: pixi run example-http-upgrade-echo
+      - name: Run CONNECT tunnel example
+        run: pixi run example-http-connect
+
+      - name: Test static file HTTP metadata
+        run: pixi run test-http-file-metadata
+      - name: Test HTTP static files
+        run: pixi run test-http-fileserver
+      - name: Test static-file compression measurement driver
+        run: pixi run test-http-fileserver-compression-driver
+      - name: Test static-file client EOF handling
+        run: pixi run test-http-fileserver-driver
+      - name: Test static-file transfer and memory bound
+        run: pixi run test-http-fileserver-wire
+      - name: Test HTTP compression negotiation
+        run: pixi run test-http-compression-config
+      - name: Test known-length HTTP streaming
+        run: pixi run test-http-known-length
+      - name: Test HTTP worker offload
+        run: pixi run test-http-offload
+      - name: Test compression without a provider
+        run: pixi run test-http-compression-pass-through
       - name: Test HTTP detach
         run: pixi run test-http-detach
       - name: Test actor primitives
         run: pixi run test-actor
+      - name: Run HTTP client example
+        run: pixi run example-http-client
+      - name: Measure bounded HTTP client loopback workload
+        timeout-minutes: 5
+        run: pixi run benchmark-http-client
       - name: Package precompiled artifact
         run: pixi run package
       - name: Verify packaged artifact
@@ -161,6 +406,18 @@ jobs:
         with:
           go-version: "1.26.x"
           cache-dependency-path: benchmarks/http_go/go.sum
+      - name: Measure HTTP worker counts (descriptive)
+        timeout-minutes: 5
+        run: |
+          set -o pipefail
+          pixi run benchmark-http-server | tee http-worker-benchmark.txt
+      - name: Retain HTTP worker benchmark
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: http-worker-benchmark-${{ matrix.os }}
+          path: http-worker-benchmark.txt
+          if-no-files-found: ignore
       - name: Test HTTP benchmark harness regression
         run: pixi run benchmark-harness-test
       - name: Test Go HTTP loader
@@ -185,13 +442,7 @@ jobs:
         with:
           frozen: true
       - name: Verify sanitize tasks mirror pixi
-        run: |
-          diff -u \
-            <(grep -oE '^sanitize-[a-z0-9-]+' pixi.toml | sort -u) \
-            <(awk '$1 == "run:" && $2 == "pixi" && $3 == "run" && $4 ~ /^sanitize-/ {print $4}' .github/workflows/ci.yml | sort -u)
-          for t in $(grep -oE '^sanitize-[a-z0-9-]+' pixi.toml | sort -u); do
-            grep -q "\"$t\"," pixi.toml || { echo "$t missing from 'sanitize' aggregate"; exit 1; }
-          done
+        run: python3 scripts/check_ci_tasks.py sanitize
       # Individual sanitize steps match `pixi run sanitize` in pixi.toml for step-level triage.
       - name: Sanitize system bindings
         run: pixi run sanitize-sys
@@ -209,13 +460,60 @@ jobs:
         run: pixi run sanitize-http-api
       - name: Sanitize HTTP control
         run: pixi run sanitize-http-control
+      - name: Sanitize HTTP worker pool
+        run: pixi run sanitize-http-pool
+      - name: Sanitize HTTP client
+        run: pixi run sanitize-http-client
+      - name: Sanitize HTTP URL parser
+        run: pixi run sanitize-http-url
+      - name: Sanitize HTTP client redirects
+        run: pixi run sanitize-http-client-redirect
+      - name: Sanitize HTTP client resiliency
+        run: pixi run sanitize-http-client-resiliency
       - name: Sanitize HTTP parser
         run: pixi run sanitize-http-parser
+      - name: Sanitize request body pipe
+        run: pixi run sanitize-http-body-pipe
+      - name: Sanitize incremental HTTP body decoding
+        run: pixi run sanitize-http-body-decoder
+      - name: Sanitize HTTP/1 streaming request lifecycle
+        run: pixi run sanitize-http-request-stream
+      - name: Sanitize HTTP/2 streaming request models
+        run: pixi run sanitize-http2-request-stream
       - name: Sanitize HTTP response
         run: pixi run sanitize-http-response
+      - name: Sanitize confined HTTP filesystem
+        run: pixi run sanitize-http-filesystem
+      - name: Sanitize HTTP router
+        run: pixi run sanitize-http-router
+      - name: Sanitize HTTP middleware
+        run: pixi run sanitize-http-middleware
       - name: Sanitize HTTP server
         run: pixi run sanitize-http-server
+      - name: Sanitize hijacked HTTP transport
+        run: pixi run sanitize-http-hijacked-conn
+      - name: Sanitize HTTP hijack actor
+        run: pixi run sanitize-http-hijack-actor
       - name: Sanitize HTTP/2 frame parser
         run: pixi run sanitize-http2
+      - name: Sanitize owned WebSocket connection
+        run: pixi run sanitize-http-websocket
+      - name: Sanitize WebSocket handshake digest
+        run: pixi run sanitize-http-handshake
+      - name: Sanitize incremental WebSocket frames
+        run: pixi run sanitize-http-websocket-fragments
+      - name: Sanitize HTTP/1 connection switching
+        run: pixi run sanitize-http-hijack
+
+      - name: Sanitize static file HTTP metadata
+        run: pixi run sanitize-http-file-metadata
+      - name: Sanitize HTTP static files
+        run: pixi run sanitize-http-fileserver
+      - name: Sanitize static-file transfer and memory bound
+        run: pixi run sanitize-http-fileserver-wire
+      - name: Sanitize known-length HTTP streaming
+        run: pixi run sanitize-http-known-length
+      - name: Sanitize HTTP worker offload
+        run: pixi run sanitize-http-offload
       - name: Sanitize HTTP detach
         run: pixi run sanitize-http-detach

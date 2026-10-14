@@ -1,0 +1,47 @@
+name: HTTP/2 conformance
+
+on:
+  pull_request:
+  schedule:
+    - cron: '42 17 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  conformance:
+    name: h2spec (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, ubuntu-24.04-arm, macos-14]
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      - name: Install pixi
+        uses: prefix-dev/setup-pixi@f00437f565399d418b0acc85936d12c1fb668347
+        with:
+          frozen: true
+      - name: Build pinned h2spec and check local ASan TLS fixture
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: pixi run -e conformance http2-conformance
+      - name: Retain conformance results
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: http2-conformance-${{ matrix.os }}
+          path: |
+            build/conformance/h2spec.log
+            build/conformance/h2spec.xml
+            build/conformance/h2spec.json
+            build/conformance/http2-server.log
+          if-no-files-found: ignore
+          retention-days: 14

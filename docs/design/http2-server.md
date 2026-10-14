@@ -53,8 +53,8 @@ connection-owned deflater. Because the scheduler is the only producer that
 advances the deflater, encode order equals wire order on the connection and the
 peer's single inflater stays in sync without storing pre-compressed blocks. The
 optional HPACK shim is loaded when the first request headers arrive. The
-session returns connection and stream receive credit after request DATA is
-copied into the bounded body buffer. Responses stay within current connection
+buffered session returns connection and stream receive credit after request
+DATA is copied into the bounded body buffer. Responses stay within current connection
 send credit and the peer's initial stream window; a response body that does not
 fit the shared budget at enqueue time is refused on that stream with
 RST_STREAM(REFUSED_STREAM) and sibling streams keep running.
@@ -75,9 +75,8 @@ fail validation at enqueue time (e.g. an invalid status, over the peer's
 body), the server rebuilds a minimal 500 field list on the same stream and
 enqueues that; a stream whose compressed block exceeds the configured capacity
 at drain time retries with the same minimal 500 before the deflater runs on
-it, and only if that retry also fails is the stream reset with INTERNAL_ERROR. A handler that detaches/streams on
-HTTP/2 (SSE) also falls back to a stream-level 500 instead of closing the
-connection. A client-sent GOAWAY marks the session draining: new peer HEADERS
+it, and only if that retry also fails is the stream reset with INTERNAL_ERROR.
+A client-sent GOAWAY marks the session draining: new peer HEADERS
 are answered with RST_STREAM(REFUSED_STREAM), in-flight streams finish, the
 server emits its own acknowledging GOAWAY, and the connection closes once the
 scheduler and send-stream list drain. The one place where the connection still
@@ -85,6 +84,53 @@ closes under budget pressure is the aggregate request-body reservation across
 all concurrent streams: that budget is shared and the server cannot know which
 single stream to refuse, so the connection drops once the sum exceeds the
 remaining capacity budget.
+
+## Streaming request-session contract
+
+`Http2RequestSession` enables request streaming when `request_body_budget` is
+present. A successful request head produces `is_head()` with an owned `Request`
+whose body reader consumes a shared pipe. Buffered sessions keep `is_request()`
+completion and their fixed body deadline. Streaming sessions renew the body
+deadline only when a nonempty DATA payload is accepted; empty DATA does not
+extend it.
+
+Streaming sessions advertise `SETTINGS_INITIAL_WINDOW_SIZE` as
+`min(max_body_size, 65535)`. Before the peer acknowledges those SETTINGS, each
+admitted stream reserves the default 65535-byte receive window from the shared
+budget and accepts valid first-flight DATA within that credit. Insufficient
+reservation refuses the new stream without cancelling siblings. The ACK applies
+the signed window reduction to existing streams, preserving already queued
+bytes even when the resulting receive window is negative. Later streams reserve
+the configured window. Shrinking queue storage accounts for both allocations;
+when peak capacity is unavailable, consumption continues using the existing
+charged allocation until it can shrink or retire empty storage.
+
+DATA payload remains charged against connection and stream flow control until
+`flush_body_credit()` collects bytes consumed or discarded by the body reader.
+Padding credit returns immediately. Consumed WINDOW_UPDATE increments repay
+negative stream windows before enabling additional peer DATA. Remote completion
+keeps input state until consumed EOF; response completion removes send state
+independently. Terminal input refunds any remaining connection credit and
+removes the pipe's loop wakeup capability while preserving EOF and trailers.
+Admission counts the union of retained input and response streams.
+
+RST_STREAM, body expiry, connection failure and shutdown grace expiry cancel streaming
+input and wake detached readers. Cancellation refunds outstanding connection
+credit without issuing stream credit for a closed stream. Local stream resets
+also set `reset_stream_id` so the owner can cancel response work. Local shutdown
+preserves admitted streaming input during the configured grace period, including
+when an earlier peer GOAWAY already marked the session draining.
+
+With `ServerConfig.enable_request_body_streaming`, the Server dispatches the
+handler at completed request headers and supplies the pipe to paired detach.
+Consumer wakeups flush flow credit; per-stream body expiry cancels the matching
+response work. Unsupported Expect values produce 417, while `100-continue`
+produces informational HEADERS only when the request body remains open.
+Synchronous responses discard input unless a detached receiver owns it. A
+standalone `RequestBody.detach()` receiver survives synchronous response FIN.
+Consumer-generated control output starts the configured write deadline without
+extending an existing pending write deadline.
+The default configuration retains buffered request dispatch.
 
 ## Outbound frame encoding
 
@@ -193,6 +239,31 @@ The shared response encoder composes header adaptation, connection-owned HPACK
 compression, and frame generation; output failure after compression makes that
 deflater terminal because the peer did not receive its updated table state.
 
+## Detached responses
+
+`ResponseWriter.detach()` binds a `ResponseSender` to the connection slot,
+generation and HTTP/2 stream ID. The server owns the protocol scheduler and
+HPACK encoder. Producers queue `respond`, or `start`, ordered body chunks and
+`finish` with optional trailers. Streaming headers omit Content-Length. HEAD
+and bodyless statuses discard chunks and trailers, but await explicit producer
+finish before emitting END_STREAM.
+
+The shared budget charges mailbox state and arrays, headers, retained chunk
+capacities, scheduler metadata and pending frame storage. Accepted DATA bytes
+restore producer queue credit; the body capacity ticket stays owned until its
+whole chunk is consumed. Per-stream and connection flow control bound each
+scheduler turn, while a blocked stream lets writable siblings progress.
+Trailers use the peer's current header limit and share the local count and byte
+limits with initial fields. FIN is emitted only after queued body data drains.
+
+Peer reset, connection loss, producer timeout, abort and shutdown cancel only
+the affected sender or connection's senders and release their storage. Detached
+streams retain admission occupancy until completion or cancellation. Producer
+messages and output progress refresh their respective idle deadlines; an open
+producer with no queued wire does not expire under the write deadline. Invalid
+initial fields fall back to a minimal stream-level 500; failures after a stream
+starts reset it without affecting siblings.
+
 ## Response trailers
 
 When `ResponseWriter.trailers` carries at least one entry on a body-capable
@@ -241,7 +312,8 @@ whose initial send window is zero before later granting credit. Unit tests cover
 round-robin DATA scheduling, bounded payloads, header-once behavior, completion,
 credit exhaustion, resumption, and reset cancellation.
 
-Stream admission counts request streams until their response finishes. When the
+Buffered stream admission counts requests until their response finishes.
+Streaming admission also counts input retained until consumed EOF. When the
 local cap is reached, the server advances the client stream ID and sends
 `RST_STREAM(REFUSED_STREAM)` for that stream while keeping admitted streams and
 the connection usable. DATA that races with the refusal is ignored for that
@@ -250,8 +322,8 @@ closed stream.
 When shutdown begins, the server sends GOAWAY with the highest admitted peer
 stream ID and refuses later streams with `REFUSED_STREAM`. GOAWAY is queued
 behind existing connection output, and admitted requests keep the configured
-shutdown grace period to finish. At the grace deadline, remaining TCP
-connections are closed.
+shutdown grace period to finish their upload and response. At the grace deadline,
+remaining TCP connections close and cancel both request and response endpoints.
 
 ## Verification sequence
 
@@ -261,3 +333,11 @@ frame types, and multiple concatenated frames. The client preface parser tests
 every incomplete prefix, mismatch rejection, and the consumed byte count.
 Independent TLS client tests verify response completion and the GOAWAY boundary
 during graceful HTTP/2 shutdown.
+
+The Server request-streaming fixture runs with
+`pixi run -e tls-http2 http2-request-stream-integration-test`. Its independent
+hyper-h2 client covers first-flight DATA before SETTINGS acknowledgement, a
+1 MiB bounded upload, withheld consumer credit and sibling progress, padding,
+trailers, Expect, EOF wakeups, resets, progress deadlines, early response FIN,
+and accepted uploads completing during shutdown grace. `--fixture PATH` runs
+the same client against a precompiled sanitizer fixture.

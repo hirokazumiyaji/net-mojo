@@ -11,6 +11,7 @@ struct Http2FrameReadResult(Movable):
     var flags: UInt8
     var stream_id: UInt32
     var payload: List[Byte]
+    var error_code: UInt32
 
     @staticmethod
     def need_more(consumed: Int) -> Self:
@@ -21,6 +22,7 @@ struct Http2FrameReadResult(Movable):
             flags=Byte(0),
             stream_id=UInt32(0),
             payload=List[Byte](),
+            error_code=UInt32(0),
         )
 
     @staticmethod
@@ -38,10 +40,11 @@ struct Http2FrameReadResult(Movable):
             flags=flags,
             stream_id=stream_id,
             payload=payload^,
+            error_code=UInt32(0),
         )
 
     @staticmethod
-    def error(consumed: Int) -> Self:
+    def error(consumed: Int, error_code: UInt32 = UInt32(1)) -> Self:
         return Self(
             kind=3,
             consumed=consumed,
@@ -49,6 +52,7 @@ struct Http2FrameReadResult(Movable):
             flags=Byte(0),
             stream_id=UInt32(0),
             payload=List[Byte](),
+            error_code=error_code,
         )
 
     def is_need_more(self) -> Bool:
@@ -108,7 +112,7 @@ struct Http2FrameReader(Movable):
         var frame = parse_frame(Span(self._frame), self._max_frame_size)
         if frame.is_error():
             self._failed = True
-            return Http2FrameReadResult.error(consumed)
+            return Http2FrameReadResult.error(consumed, frame.error_code)
         if frame.is_need_more():
             var frame_length = 9 + (
                 (Int(self._frame[0]) << 16)

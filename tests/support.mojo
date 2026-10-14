@@ -364,8 +364,8 @@ def _malformed_corpus() -> List[_MalformedCase]:
     )
     cases.append(
         _MalformedCase(
-            "connect_rejected",
-            String("CONNECT h:443 HTTP/1.1\r\nHost: h\r\n\r\n"),
+            "connect_without_port",
+            String("CONNECT h HTTP/1.1\r\nHost: h\r\n\r\n"),
             400,
         )
     )

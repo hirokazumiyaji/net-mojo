@@ -56,3 +56,7 @@ cargo test --locked --release \
 bash scripts/test_quic_flow_credit.sh
 
 python3 tests/test_http3_receive_limits.py
+
+cargo test --locked --release \
+    --manifest-path "$task_quiche_source/Cargo.toml" \
+    --target-dir build/quic/cargo deferred_receive_credit

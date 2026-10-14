@@ -8,6 +8,8 @@ from net._actor import PthreadMutex
 from net.error import NetErrorKind
 from net.http import (
     Handler,
+    HandlerFactory,
+    DefaultHandlerFactory,
     Headers,
     HttpError,
     HttpVersion,
@@ -1356,6 +1358,52 @@ def test_alt_svc_empty_handler_value_still_suppresses_configured_injection() rai
             " 0\r\n\r\n"
         ),
     )
+
+
+@fieldwise_init
+struct _FactoryHandler(Copyable, Handler):
+    var worker_id: Int
+    var handled: Int
+
+    def handle(mut self, request: Request, mut writer: ResponseWriter) raises:
+        self.handled += 1
+        writer.write_string(String(self.worker_id))
+
+
+struct _PerWorkerFactory(HandlerFactory):
+    comptime HandlerType = _FactoryHandler
+
+    def __init__(out self):
+        pass
+
+    def build(mut self, worker_id: Int) raises -> _FactoryHandler:
+        return _FactoryHandler(worker_id, 0)
+
+
+def _build_worker[
+    F: HandlerFactory
+](mut factory: F, worker_id: Int) raises -> F.HandlerType:
+    return factory.build(worker_id)
+
+
+def test_handler_factory_builds_worker_specific_instances() raises:
+    var factory = _PerWorkerFactory()
+    var first = _build_worker(factory, 0)
+    var second = _build_worker(factory, 1)
+    assert_equal(first.worker_id, 0)
+    assert_equal(second.worker_id, 1)
+    first.handled += 1
+    assert_equal(second.handled, 0)
+
+
+def test_default_handler_factory_copies_independent_handler_state() raises:
+    var factory = DefaultHandlerFactory[_FactoryHandler](_FactoryHandler(9, 7))
+    var first = _build_worker(factory, 0)
+    var second = _build_worker(factory, 1)
+    first.handled += 1
+    assert_equal(first.worker_id, 9)
+    assert_equal(second.worker_id, 9)
+    assert_equal(second.handled, 7)
 
 
 def main() raises:

@@ -1,0 +1,223 @@
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -5730,9 +5730,28 @@
+     pub fn stream_recv_buf<B: bytes::BufMut>(
+         &mut self, stream_id: u64, out: B,
+     ) -> Result<(usize, bool)> {
+-        self.do_stream_recv(stream_id, RecvAction::Emit { out })
++        self.do_stream_recv(stream_id, RecvAction::Emit { out }, true)
+     }
+ 
++    /// Reads application-owned bytes without returning receive credit.
++    pub fn stream_recv_buf_deferred<B: bytes::BufMut>(
++        &mut self, stream_id: u64, out: B,
++    ) -> Result<(usize, bool)> {
++        self.do_stream_recv(stream_id, RecvAction::Emit { out }, false)
++    }
++
++    /// Returns credit for bytes read with deferred consumption.
++    /// The caller must return every byte exactly once, including after FIN.
++    pub fn stream_consume(&mut self, stream_id: u64, bytes: usize) {
++        self.flow_control.add_consumed(bytes as u64);
++        if let Some(stream) = self.streams.get_mut(stream_id) {
++            stream.recv.consume(bytes as u64);
++            if stream.recv.almost_full() {
++                self.streams.insert_almost_full(stream_id);
++            }
++        }
++    }
++
+     /// Discard contiguous data from a stream without copying.
+     ///
+     /// On success the amount of bytes discarded and a flag indicating the fin
+@@ -5766,7 +5785,7 @@
+         // `do_stream_recv()` is generic on the kind of `BufMut` in RecvAction.
+         // Since we are discarding, it doesn't matter, but the compiler still
+         // wants to know, so we say `&mut [u8]`.
+-        self.do_stream_recv::<&mut [u8]>(stream_id, RecvAction::Discard { len })
++        self.do_stream_recv::<&mut [u8]>(stream_id, RecvAction::Discard { len }, true)
+     }
+ 
+     // Reads or discards contiguous data from a stream.
+@@ -5788,7 +5807,7 @@
+     // [`Done`]: enum.Error.html#variant.Done
+     // [`send()`]: struct.Connection.html#method.send
+     fn do_stream_recv<B: bytes::BufMut>(
+-        &mut self, stream_id: u64, action: RecvAction<B>,
++        &mut self, stream_id: u64, action: RecvAction<B>, credit: bool,
+     ) -> Result<(usize, bool)> {
+         // We can't read on our own unidirectional streams.
+         if !stream::is_bidi(stream_id) &&
+@@ -5819,7 +5838,7 @@
+             RecvAction::Discard { .. } => Some(DataRecipient::Dropped),
+         };
+ 
+-        let (read, fin) = match stream.recv.emit_or_discard(action) {
++        let (read, fin) = match stream.recv.emit_or_discard_with_credit(action, credit) {
+             Ok(v) => v,
+ 
+             Err(e) => {
+@@ -5836,7 +5855,9 @@
+             },
+         };
+ 
+-        self.flow_control.add_consumed(read as u64);
++        if credit {
++            self.flow_control.add_consumed(read as u64);
++        }
+ 
+         let readable = stream.is_readable();
+ 
+--- a/src/h3/mod.rs
++++ b/src/h3/mod.rs
+@@ -1925,7 +1925,22 @@
+     /// }
+     /// ```
+     pub fn recv_body_buf<F: BufFactory, OUT: bytes::BufMut>(
+-        &mut self, conn: &mut super::Connection<F>, stream_id: u64, mut out: OUT,
++        &mut self, conn: &mut super::Connection<F>, stream_id: u64, out: OUT,
++    ) -> Result<usize> {
++        self.recv_body_buf_with_credit(conn, stream_id, out, true)
++    }
++
++    /// Reads DATA while the application retains its receive credit.
++    pub fn recv_body_deferred<F: BufFactory>(
++        &mut self, conn: &mut super::Connection<F>, stream_id: u64,
++        out: &mut [u8],
++    ) -> Result<usize> {
++        self.recv_body_buf_with_credit(conn, stream_id, out, false)
++    }
++
++    fn recv_body_buf_with_credit<F: BufFactory, OUT: bytes::BufMut>(
++        &mut self, conn: &mut super::Connection<F>, stream_id: u64,
++        mut out: OUT, credit: bool,
+     ) -> Result<usize> {
+         let mut total = 0;
+ 
+@@ -1941,7 +1956,7 @@
+                 break;
+             }
+ 
+-            let (read, fin) = match stream.try_consume_data(conn, &mut out) {
++            let (read, fin) = match stream.try_consume_data(conn, &mut out, credit) {
+                 Ok(v) => v,
+ 
+                 Err(Error::Done) => break,
+@@ -1950,9 +1965,12 @@
+             };
+ 
+             total += read;
++            if !credit && read > 0 {
++                break;
++            }
+ 
+             // No more data to read, we are done.
+-            if read == 0 || fin {
++            if (credit && read == 0) || fin {
+                 break;
+             }
+ 
+--- a/src/h3/stream.rs
++++ b/src/h3/stream.rs
+@@ -844,12 +844,17 @@
+ 
+     /// Tries to read DATA payload from the transport stream.
+     pub fn try_consume_data<F: BufFactory, OUT: bytes::BufMut>(
+-        &mut self, conn: &mut crate::Connection<F>, out: OUT,
++        &mut self, conn: &mut crate::Connection<F>, out: OUT, credit: bool,
+     ) -> Result<(usize, bool)> {
+         debug_assert_eq!(self.state, State::Data);
+         let out = out.limit(self.state_len - self.state_off);
+ 
+-        let (len, fin) = match conn.stream_recv_buf(self.id, out) {
++        let received = if credit {
++            conn.stream_recv_buf(self.id, out)
++        } else {
++            conn.stream_recv_buf_deferred(self.id, out)
++        };
++        let (len, fin) = match received {
+             Ok(v) => v,
+ 
+             Err(e) => {
+--- a/src/stream/recv_buf.rs
++++ b/src/stream/recv_buf.rs
+@@ -265,8 +265,14 @@
+     /// On success the amount of data read or discarded, and a flag indicating
+     /// if there is no more data in the buffer, are returned as a tuple.
+     pub fn emit_or_discard<B: bytes::BufMut>(
+-        &mut self, mut action: RecvAction<B>,
++        &mut self, action: RecvAction<B>,
+     ) -> Result<(usize, bool)> {
++        self.emit_or_discard_with_credit(action, true)
++    }
++
++    pub fn emit_or_discard_with_credit<B: bytes::BufMut>(
++        &mut self, mut action: RecvAction<B>, credit: bool,
++    ) -> Result<(usize, bool)> {
+         let mut len = 0;
+         let mut cap = match &action {
+             RecvAction::Emit { out } => out.remaining_mut(),
+@@ -329,9 +335,15 @@
+         }
+ 
+         // Update consumed bytes for flow control.
+-        self.flow_control.add_consumed(len as u64);
++        if credit {
++            self.consume(len as u64);
++        }
+ 
+         Ok((len, self.is_fin()))
++    }
++
++    pub fn consume(&mut self, bytes: u64) {
++        self.flow_control.add_consumed(bytes);
+     }
+ 
+     /// Resets the stream at the given offset.
+--- a/src/tests.rs
++++ b/src/tests.rs
+@@ -13083,4 +13083,44 @@
+         assert_eq!(&body[..5], b"hello");
+     }
+     assert!(pipe.server.streams.is_collected(2));
++}
++
++#[test]
++fn deferred_receive_credit_partial_consume_and_collected_fin() {
++    let mut pipe = test_utils::Pipe::new("reno").unwrap();
++    pipe.handshake().unwrap();
++    assert_eq!(pipe.client.stream_send(0, b"abcdefgh", true), Ok(8));
++    pipe.advance().unwrap();
++    let initial = pipe.server.flow_control.consumed();
++    assert_eq!(pipe.server.stream_recv_buf_deferred(0, &mut [0; 8][..]), Ok((8, true)));
++    assert_eq!(pipe.server.flow_control.consumed(), initial);
++    pipe.server.stream_consume(0, 3);
++    assert_eq!(pipe.server.flow_control.consumed(), initial + 3);
++    assert_eq!(pipe.server.stream_send(0, b"done", true), Ok(4));
++    pipe.advance().unwrap();
++    assert_eq!(pipe.client.stream_recv(0, &mut [0; 4]), Ok((4, true)));
++    assert!(pipe.server.streams.get(0).is_none());
++    pipe.server.stream_consume(0, 5);
++    assert_eq!(pipe.server.flow_control.consumed(), initial + 8);
++}
++
++#[test]
++fn deferred_receive_credit_shutdown_and_reset_leave_payload_debt_to_owner() {
++    for reset in [false, true] {
++        let mut pipe = test_utils::Pipe::new("reno").unwrap();
++        pipe.handshake().unwrap();
++        assert_eq!(pipe.client.stream_send(0, b"abcdefgh", false), Ok(8));
++        pipe.advance().unwrap();
++        let initial = pipe.server.flow_control.consumed();
++        assert_eq!(pipe.server.stream_recv_buf_deferred(0, &mut [0; 3][..]), Ok((3, false)));
++        if reset {
++            pipe.client.stream_shutdown(0, Shutdown::Write, 123).unwrap();
++            pipe.advance().unwrap();
++        } else {
++            pipe.server.stream_shutdown(0, Shutdown::Read, 123).unwrap();
++        }
++        assert_eq!(pipe.server.flow_control.consumed(), initial + 5);
++        pipe.server.stream_consume(0, 3);
++        assert_eq!(pipe.server.flow_control.consumed(), initial + 8);
++    }
+ }

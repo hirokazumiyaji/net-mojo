@@ -769,5 +769,37 @@ def test_shutdown_from_main_releases_blocked_reader() raises:
     listener.close()
 
 
+def test_duplicate_listener_owns_descriptor_and_shared_accept_queue() raises:
+    var listener = listen_tcp("127.0.0.1:0")
+    var duplicate = listener._duplicate()
+    var address = String(listener.local_address())
+    assert_true(listener.raw_fd() != duplicate.raw_fd())
+    assert_true((_fcntl(duplicate.raw_fd(), F_GETFD, 0) & FD_CLOEXEC) != 0)
+    assert_true((_fcntl(duplicate.raw_fd(), F_GETFL, 0) & O_NONBLOCK) != 0)
+    var first_poller = Poller()
+    var second_poller = Poller()
+    first_poller.add(listener.raw_fd())
+    second_poller.add(duplicate.raw_fd())
+    var first_client = dial_tcp(address, Timeout.seconds(1))
+    assert_equal(len(first_poller.wait(Timeout.seconds(1))), 1)
+    var first_server = listener.try_accept()
+    var second_client = dial_tcp(address, Timeout.seconds(1))
+    assert_equal(len(second_poller.wait(Timeout.seconds(1))), 1)
+    var second_server = duplicate.try_accept()
+    first_poller.remove(0)
+    listener.close()
+    var third_client = dial_tcp(address, Timeout.seconds(1))
+    assert_equal(len(second_poller.wait(Timeout.seconds(1))), 1)
+    var third_server = duplicate.try_accept()
+    second_poller.remove(0)
+    duplicate.close()
+    first_client.close()
+    second_client.close()
+    third_client.close()
+    first_server.close()
+    second_server.close()
+    third_server.close()
+
+
 def main() raises:
     TestSuite.discover_tests[__functions_in_module()]().run()

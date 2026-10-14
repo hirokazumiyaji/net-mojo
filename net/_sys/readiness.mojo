@@ -74,8 +74,10 @@ def _verify_readiness_abi():
             ), "invalid epoll_event align"
 
 
-def _epoll_mask(readable: Bool, writable: Bool) -> UInt32:
-    var mask: UInt32 = 0
+def _epoll_mask(
+    readable: Bool, writable: Bool, watch_hangup: Bool = False
+) -> UInt32:
+    var mask: UInt32 = linux.EPOLLRDHUP if watch_hangup else UInt32(0)
     # Fully disinterested slots still watch IN so a peer shutdown surfaces
     # instead of hiding behind silence (mirrors the poll baseline).
     if readable or not writable:
@@ -93,10 +95,6 @@ def _epoll_ctl_words(mask: UInt32, token: UInt64) -> Array[UInt32, 4]:
     words[linux._EPOLL_DATA_U32] = UInt32(token & UInt64(0xFFFFFFFF))
     words[linux._EPOLL_DATA_U32 + 1] = UInt32(token >> 32)
     return words^
-
-
-def _kqueue_wants_read(readable: Bool, writable: Bool) -> Bool:
-    return readable or not writable
 
 
 struct _EventQueue(Movable):
@@ -126,15 +124,29 @@ struct _EventQueue(Movable):
         return self._fd.raw()
 
     def register(
-        mut self, fd: Int32, readable: Bool, writable: Bool, token: UInt64
+        mut self,
+        fd: Int32,
+        readable: Bool,
+        writable: Bool,
+        token: UInt64,
+        exclusive: Bool = False,
+        watch_hangup: Bool = False,
     ) raises NetError:
         comptime if _IS_DARWIN:
-            if _kqueue_wants_read(readable, writable):
-                self._kevent_add(fd, darwin.EVFILT_READ, token)
+            if readable or not writable or watch_hangup:
+                self._kevent_add(
+                    fd,
+                    darwin.EVFILT_READ,
+                    token,
+                    paused_read=not readable and writable,
+                )
             if writable:
                 self._kevent_add(fd, darwin.EVFILT_WRITE, token)
         else:
-            var words = _epoll_ctl_words(_epoll_mask(readable, writable), token)
+            var mask = _epoll_mask(readable, writable, watch_hangup)
+            if exclusive:
+                mask |= linux.EPOLLEXCLUSIVE
+            var words = _epoll_ctl_words(mask, token)
             var rc = external_call["epoll_ctl", c_int](
                 c_int(self._fd.raw()),
                 c_int(linux.EPOLL_CTL_ADD),
@@ -146,19 +158,31 @@ struct _EventQueue(Movable):
                 raise _system_error("epoll_ctl add", errno)
 
     def modify(
-        mut self, fd: Int32, readable: Bool, writable: Bool, token: UInt64
+        mut self,
+        fd: Int32,
+        readable: Bool,
+        writable: Bool,
+        token: UInt64,
+        watch_hangup: Bool = False,
     ) raises NetError:
         comptime if _IS_DARWIN:
             # Drop both filters, re-add what is wanted. Modify is off the
             # hot path (interest flips only on queued sends).
             self._kevent_delete(fd, darwin.EVFILT_READ)
             self._kevent_delete(fd, darwin.EVFILT_WRITE)
-            if _kqueue_wants_read(readable, writable):
-                self._kevent_add(fd, darwin.EVFILT_READ, token)
+            if readable or not writable or watch_hangup:
+                self._kevent_add(
+                    fd,
+                    darwin.EVFILT_READ,
+                    token,
+                    paused_read=not readable and writable,
+                )
             if writable:
                 self._kevent_add(fd, darwin.EVFILT_WRITE, token)
         else:
-            var words = _epoll_ctl_words(_epoll_mask(readable, writable), token)
+            var words = _epoll_ctl_words(
+                _epoll_mask(readable, writable, watch_hangup), token
+            )
             var rc = external_call["epoll_ctl", c_int](
                 c_int(self._fd.raw()),
                 c_int(linux.EPOLL_CTL_MOD),
@@ -167,7 +191,7 @@ struct _EventQueue(Movable):
             )
             if rc == -1:
                 var words2 = _epoll_ctl_words(
-                    _epoll_mask(readable, writable), token
+                    _epoll_mask(readable, writable, watch_hangup), token
                 )
                 var rc2 = external_call["epoll_ctl", c_int](
                     c_int(self._fd.raw()),
@@ -325,14 +349,21 @@ struct _EventQueue(Movable):
             return out^
 
     def _kevent_add(
-        mut self, fd: Int32, filter: Int16, token: UInt64
+        mut self,
+        fd: Int32,
+        filter: Int16,
+        token: UInt64,
+        paused_read: Bool = False,
     ) raises NetError:
+        # A paused full receive buffer must not become a repeated readiness wake.
         var change = darwin._Kevent(
             ident=UInt64(Int(fd)),
             filter=filter,
-            flags=darwin.EV_ADD | darwin.EV_ENABLE,
-            fflags=0,
-            data=0,
+            flags=darwin.EV_ADD
+            | darwin.EV_ENABLE
+            | (darwin.EV_CLEAR if paused_read else UInt16(0)),
+            fflags=darwin.NOTE_LOWAT if paused_read else UInt32(0),
+            data=Int64(Int32.MAX) if paused_read else Int64(0),
             udata=token,
         )
         var dummy_ev = darwin._Kevent(

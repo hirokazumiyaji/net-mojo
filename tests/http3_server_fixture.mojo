@@ -1,3 +1,5 @@
+from tests.http_router_contract import router_contract
+from net.http import ServeMux
 from std.testing import assert_true
 
 from net import Timeout
@@ -16,14 +18,20 @@ from std.os import getenv
 
 struct _Http3Handler(Handler):
     var requests: Int
+    var router: ServeMux
 
-    def __init__(out self):
+    def __init__(out self) raises:
+        self.router = router_contract()
         self.requests = 0
 
     def handle(mut self, req: Request, mut writer: ResponseWriter) raises:
         assert_true(req.version == HttpVersion.http3())
         assert_true(req.authority == "localhost")
         assert_true(req.scheme == "https")
+        if req.path.startswith("/router/"):
+            self.router.handle(req, writer)
+            self.requests += 1
+            return
         if req.path == "/cancel-response":
             assert_true(req.method == "GET")
             assert_true(len(req.body) == 0)

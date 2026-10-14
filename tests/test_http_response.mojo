@@ -58,7 +58,7 @@ def test_stream_wire_denial_and_validation_leave_foreign_reservation() raises:
     for invalid in range(4):
         var writer = ResponseWriter(32)
         if invalid == 0:
-            writer.headers.add(String("Content-Length"), String("0"))
+            writer.headers.add(String("Content-Length"), String("bad"))
         elif invalid == 1:
             writer.headers.add(String("Transfer-Encoding"), String("chunked"))
         elif invalid == 2:
@@ -841,10 +841,7 @@ def test_empty_presence_and_content_length_errors_preserve_validation_order() ra
                 writer.headers.clear()
                 writer.headers.add(String("Content-Length"), String(""))
                 writer.headers.add(String("Transfer-Encoding"), String(""))
-                expected = String(
-                    "Content-Length is not permitted with chunked"
-                    " Transfer-Encoding"
-                )
+                expected = String("invalid streaming Content-Length")
         var budget = BufferBudget(4096)
         assert_true(budget.try_reserve(5))
         var rejected = False
@@ -1067,6 +1064,138 @@ def test_trailers_wire_capacity_exact_matches_measure() raises:
     assert_equal(len(wire), capacity)
     for i in range(len(expected)):
         assert_equal(wire[i], expected[i])
+
+
+def test_switch_wire_omits_http_body_framing() raises:
+    for status in [101, 200, 204, 205, 299]:
+        var writer = ResponseWriter(32)
+        writer.status = status
+        writer.headers.add(String("Connection"), String("Upgrade"))
+        writer.headers.add(String("Upgrade"), String("echo"))
+        var budget = BufferBudget(1024)
+        var wire = _encode_response_budgeted(
+            writer, False, "date", 100, 32768, budget, switching=True
+        )
+        var text = _bytes_to_string(Span(wire))
+        assert_true(text.startswith(String("HTTP/1.1 ") + String(status)))
+        if status == 101:
+            assert_true(text.startswith("HTTP/1.1 101 Switching Protocols\r\n"))
+        assert_true(text.endswith("\r\n\r\n"))
+        assert_true(text.find("Content-Length") < 0)
+        assert_true(text.find("Transfer-Encoding") < 0)
+        assert_true(text.find("Upgrade: echo\r\n") >= 0)
+        assert_equal(budget.used, wire.capacity())
+        var capacity = wire.capacity()
+        _ = wire^
+        budget.release(capacity)
+        assert_equal(budget.used, 0)
+
+
+def test_switch_wire_rejects_content_and_invalid_status_without_reserving() raises:
+    for scenario in range(7):
+        var writer = ResponseWriter(32)
+        writer.status = 101
+        if scenario == 0:
+            writer.write_string("body")
+        elif scenario == 1:
+            writer.add_trailer(String("X-Finish"), String("done"))
+        elif scenario == 2:
+            writer.headers.add(String("Content-Length"), String("0"))
+        elif scenario == 3:
+            writer.headers.add(String("Transfer-Encoding"), String("chunked"))
+        elif scenario == 4:
+            writer.status = 100
+        elif scenario == 5:
+            writer.status = 300
+        else:
+            writer.should_close = True
+        var budget = BufferBudget(1024)
+        assert_true(budget.try_reserve(7))
+        var rejected = False
+        try:
+            _ = _encode_response_budgeted(
+                writer, False, "date", 100, 32768, budget, switching=True
+            )
+        except e:
+            assert_equal(e.kind, NetErrorKind.invalid_argument())
+            rejected = True
+        assert_true(rejected)
+        assert_equal(budget.used, 7)
+
+
+def test_request_encoder_defaults_and_bytes() raises:
+    from net.http import Headers
+    from net.http._encoder import encode_request_head
+
+    var headers = Headers()
+    headers.add("X-Test", "yes")
+    var encoded = encode_request_head(
+        "POST", "/a?q=1", "example.com:8080", headers, 3, False, "net-mojo"
+    )
+    var text = String(from_utf8_lossy=encoded)
+    assert_true(text.startswith("POST /a?q=1 HTTP/1.1\r\n"))
+    assert_true(text.find("Host: example.com:8080\r\n") >= 0)
+    assert_true(text.find("Content-Length: 3\r\n") >= 0)
+    assert_true(text.find("User-Agent: net-mojo\r\n") >= 0)
+    assert_true(text.endswith("\r\n\r\n"))
+    var chunked = encode_request_head(
+        "POST", "/", "example.com", Headers(), -1, True
+    )
+    assert_true(
+        String(from_utf8_lossy=chunked).find("Transfer-Encoding: chunked\r\n")
+        >= 0
+    )
+
+
+def test_request_encoder_rejects_invalid_framing() raises:
+    from net.http import Headers, ClientError
+    from net.http._encoder import encode_request_head
+
+    var mismatch = Headers()
+    mismatch.add("Content-Length", "9")
+    var caught = False
+    try:
+        var _ = encode_request_head("POST", "/", "example.com", mismatch, 3)
+    except error:
+        assert_equal(error.kind, ClientError.PARSE)
+        caught = True
+    assert_true(caught)
+    caught = False
+    try:
+        var _ = encode_request_head(
+            "GET\r\nX:y", "/", "example.com", Headers(), 0
+        )
+    except error:
+        assert_equal(error.kind, ClientError.PARSE)
+        caught = True
+    assert_true(caught)
+
+
+def test_request_encoder_rejects_authority_injection() raises:
+    from net.http import Headers, ClientError
+    from net.http._encoder import encode_request_head
+
+    var caught = False
+    try:
+        var _ = encode_request_head(
+            "GET", "/", "example.com#\r\nX-Injected: yes", Headers(), 0
+        )
+    except error:
+        assert_equal(error.kind, ClientError.PARSE)
+        caught = True
+    assert_true(caught)
+
+
+def test_request_encoder_accepts_content_length_ows() raises:
+    from net.http import Headers
+    from net.http._encoder import encode_request_head
+
+    var headers = Headers()
+    headers.add("Content-Length", " 3 ")
+    var encoded = encode_request_head("POST", "/", "example.com", headers, 3)
+    assert_true(
+        String(from_utf8_lossy=encoded).find("Content-Length:  3 \r\n") >= 0
+    )
 
 
 def main() raises:

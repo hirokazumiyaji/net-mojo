@@ -1,10 +1,22 @@
 [workspace]
 channels = ["https://conda.modular.com/max", "conda-forge"]
 name = "net-mojo"
-platforms = ["osx-arm64", "linux-64", "linux-aarch64"]
+platforms = [
+  "osx-arm64",
+  { name = "linux-64-glibc-2-34", platform = "linux-64", glibc = "2.34" },
+  { name = "linux-aarch64-glibc-2-34", platform = "linux-aarch64", glibc = "2.34" },
+]
 version = "0.1.0"
 
+[target.linux-64.dependencies]
+sysroot_linux-64 = "==2.34"
+
+[target.linux-aarch64.dependencies]
+sysroot_linux-aarch64 = "==2.34"
+
 [tasks]
+fuzz-parser-build = { cmd = "bash scripts/build_fuzz_parser.sh", default-environment = "sanitize" }
+http2-conformance-fixture-build = { cmd = "bash scripts/build_http2_conformance_fixture.sh", default-environment = "sanitize" }
 format = "mojo format net tests examples benchmarks"
 test-core = "mojo run --Werror -I . tests/test_core.mojo"
 test-ip = "mojo run --Werror -I . tests/test_ip.mojo"
@@ -15,13 +27,45 @@ test-udp = "mojo run --Werror -I . tests/test_udp.mojo"
 test-unix = "mojo run --Werror -I . tests/test_unix.mojo"
 test-poll = "mojo run --Werror -I . tests/test_poll.mojo"
 test-reactor = "mojo run --Werror -I . tests/test_reactor.mojo"
+test-http-pool = "mojo run --Werror -I . tests/test_http_pool.mojo"
 test-http-control = "mojo run --Werror -I . tests/test_http_control.mojo"
 test-http-api = "mojo run --Werror -I . tests/test_http_api.mojo"
+test-http-request-stream = "mojo run --Werror -I . tests/test_http_request_stream.mojo"
+test-http-body-decoder = "mojo run --Werror -I . tests/test_http_body_decoder.mojo"
+test-http2-request-stream = "mojo run --Werror -I . tests/test_http2_request_stream.mojo"
+test-http-body-pipe = "mojo run --Werror -I . tests/test_http_body_pipe.mojo"
+test-http-client-redirect = "mojo run --Werror -I . tests/test_http_client_redirect.mojo"
+test-http-client-resiliency = "mojo run --Werror -I . tests/test_http_client_resiliency.mojo"
+test-http-client = "mojo run --Werror -I . tests/test_http_client.mojo"
+test-http-url = "mojo run --Werror -I . tests/test_http_url.mojo"
 test-http-parser = "mojo run --Werror -I . tests/test_http_parser.mojo"
 test-http-response = "mojo run --Werror -I . tests/test_http_response.mojo"
+test-http-fileserver-driver = "python3 tests/test_http_fileserver_driver.py"
+test-http-fileserver-compression-driver = "python3 tests/test_http_fileserver_compression_driver.py"
+test-http-fileserver-wire = "python3 scripts/test_http_fileserver.py"
+test-http-fileserver = "mojo run --Werror -I . tests/test_http_fileserver.mojo"
+test-http-filesystem = "mojo run --Werror -I . tests/test_http_filesystem.mojo"
+test-http-router = "mojo run --Werror -I . tests/test_http_router.mojo"
+test-http-middleware = "mojo run --Werror -I . tests/test_http_middleware.mojo"
 test-http-server = "mojo run --Werror -I . tests/test_http_server.mojo"
 test-http2 = "mojo run --Werror -I . tests/test_http2.mojo"
+http-hijack-fixture-build = "mkdir -p build && mojo build --Werror -I . -Xlinker -ldl tests/http_hijack_fixture.mojo -o build/http_hijack_fixture"
+http-hijack-interop = { cmd = "python3 tests/test_hijack_interop.py", depends-on = ["http-hijack-fixture-build"] }
+test-http-connect = "mojo run --Werror -I . tests/test_http_connect.mojo"
+test-http-hijack = "mojo run --Werror -I . tests/test_http_hijack.mojo"
+test-http-hijack-actor = "mojo run --Werror -I . tests/test_http_hijack_actor.mojo"
+test-http-hijacked-conn = "mojo run --Werror -I . tests/test_http_hijacked_conn.mojo"
+websocket-fixture-sanitize-build = { cmd = "bash scripts/build_websocket_sanitized.sh", default-environment = "sanitize" }
+test-http-websocket = "mojo run --Werror -I . tests/test_http_websocket.mojo"
+test-http-handshake = "mojo run --Werror -I . tests/test_http_handshake.mojo"
+test-http-websocket-fragments = "mojo run --Werror -I . tests/test_http_websocket_fragments.mojo"
+
+test-http-file-metadata = "mojo run --Werror -I . tests/test_http_file_metadata.mojo"
+test-http-known-length = "mojo run --Werror -I . tests/test_http_known_length.mojo"
 test-http-detach = "mojo run --Werror -I . tests/test_http_detach.mojo"
+test-http-offload = "mojo run --Werror -I . tests/test_http_offload.mojo"
+test-http-compression-config = "mojo run --Werror -I . tests/test_http_compression_config.mojo"
+test-http-compression-pass-through = "mojo run --Werror -I . tests/test_http_compression_pass_through.mojo"
 test-actor = "mojo run --Werror -I . tests/test_actor.mojo"
 sanitize-sys = { cmd = "bash scripts/run_sanitized.sh tests/test_sys.mojo", default-environment = "sanitize" }
 sanitize-tcp = { cmd = "bash scripts/run_sanitized.sh tests/test_tcp.mojo", default-environment = "sanitize" }
@@ -30,14 +74,38 @@ sanitize-unix = { cmd = "bash scripts/run_sanitized.sh tests/test_unix.mojo", de
 sanitize-reactor = { cmd = "bash scripts/run_sanitized.sh tests/test_reactor.mojo", default-environment = "sanitize" }
 sanitize-actor = { cmd = "bash scripts/run_sanitized.sh tests/test_actor.mojo", default-environment = "sanitize" }
 sanitize-http-api = { cmd = "bash scripts/run_sanitized.sh tests/test_http_api.mojo", default-environment = "sanitize" }
+sanitize-http-pool = { cmd = "bash scripts/run_sanitized.sh tests/test_http_pool.mojo", default-environment = "sanitize" }
 sanitize-http-control = { cmd = "bash scripts/run_sanitized.sh tests/test_http_control.mojo", default-environment = "sanitize" }
+sanitize-http-request-stream = { cmd = "bash scripts/run_sanitized.sh tests/test_http_request_stream.mojo", default-environment = "sanitize" }
+sanitize-http-body-decoder = { cmd = "bash scripts/run_sanitized.sh tests/test_http_body_decoder.mojo", default-environment = "sanitize" }
+sanitize-http2-request-stream = { cmd = "bash scripts/run_sanitized.sh tests/test_http2_request_stream.mojo", default-environment = "sanitize" }
+sanitize-http-body-pipe = { cmd = "bash scripts/run_sanitized.sh tests/test_http_body_pipe.mojo", default-environment = "sanitize" }
+sanitize-http-client-redirect = { cmd = "bash scripts/run_sanitized.sh tests/test_http_client_redirect.mojo", default-environment = "sanitize" }
+sanitize-http-client-resiliency = { cmd = "bash scripts/run_sanitized.sh tests/test_http_client_resiliency.mojo", default-environment = "sanitize" }
+sanitize-http-client = { cmd = "bash scripts/run_sanitized.sh tests/test_http_client.mojo", default-environment = "sanitize" }
+sanitize-http-url = { cmd = "bash scripts/run_sanitized.sh tests/test_http_url.mojo", default-environment = "sanitize" }
 sanitize-http-parser = { cmd = "bash scripts/run_sanitized.sh tests/test_http_parser.mojo", default-environment = "sanitize" }
 sanitize-http-response = { cmd = "bash scripts/run_sanitized.sh tests/test_http_response.mojo", default-environment = "sanitize" }
+sanitize-http-fileserver-wire = { cmd = "python3 scripts/test_http_fileserver.py --sanitize", default-environment = "sanitize" }
+sanitize-http-fileserver = { cmd = "bash scripts/run_sanitized.sh tests/test_http_fileserver.mojo", default-environment = "sanitize" }
+sanitize-http-filesystem = { cmd = "bash scripts/run_sanitized.sh tests/test_http_filesystem.mojo", default-environment = "sanitize" }
+sanitize-http-router = { cmd = "bash scripts/run_sanitized.sh tests/test_http_router.mojo", default-environment = "sanitize" }
+sanitize-http-middleware = { cmd = "bash scripts/run_sanitized.sh tests/test_http_middleware.mojo", default-environment = "sanitize" }
 sanitize-http-server = { cmd = "bash scripts/run_sanitized.sh tests/test_http_server.mojo", default-environment = "sanitize" }
 sanitize-http2 = { cmd = "bash scripts/run_sanitized.sh tests/test_http2.mojo", default-environment = "sanitize", depends-on = [
   { task = "hpack-test", environment = "http2" },
 ] }
+sanitize-http-hijack = { cmd = "bash scripts/run_sanitized.sh tests/test_http_hijack.mojo", default-environment = "sanitize" }
+sanitize-http-hijack-actor = { cmd = "bash scripts/run_sanitized.sh tests/test_http_hijack_actor.mojo", default-environment = "sanitize" }
+sanitize-http-hijacked-conn = { cmd = "bash scripts/run_sanitized.sh tests/test_http_hijacked_conn.mojo", default-environment = "sanitize" }
+sanitize-http-websocket = { cmd = "bash scripts/run_sanitized.sh tests/test_http_websocket.mojo", default-environment = "sanitize" }
+sanitize-http-handshake = { cmd = "bash scripts/run_sanitized.sh tests/test_http_handshake.mojo", default-environment = "sanitize" }
+sanitize-http-websocket-fragments = { cmd = "bash scripts/run_sanitized.sh tests/test_http_websocket_fragments.mojo", default-environment = "sanitize" }
+
+sanitize-http-file-metadata = { cmd = "bash scripts/run_sanitized.sh tests/test_http_file_metadata.mojo", default-environment = "sanitize" }
+sanitize-http-known-length = { cmd = "bash scripts/run_sanitized.sh tests/test_http_known_length.mojo", default-environment = "sanitize" }
 sanitize-http-detach = { cmd = "bash scripts/run_sanitized.sh tests/test_http_detach.mojo", default-environment = "sanitize" }
+sanitize-http-offload = { cmd = "bash scripts/run_sanitized.sh tests/test_http_offload.mojo", default-environment = "sanitize" }
 # Note: pixi runs depends-on tasks concurrently. To avoid high memory from parallel ASan runs, invoke individual tasks sequentially.
 sanitize = { depends-on = [
   { task = "sanitize-sys", environment = "sanitize" },
@@ -48,11 +116,34 @@ sanitize = { depends-on = [
   { task = "sanitize-actor", environment = "sanitize" },
   { task = "sanitize-http-api", environment = "sanitize" },
   { task = "sanitize-http-control", environment = "sanitize" },
+  { task = "sanitize-http-pool", environment = "sanitize" },
+  { task = "sanitize-http-client-redirect", environment = "sanitize" },
+  { task = "sanitize-http-client-resiliency", environment = "sanitize" },
+  { task = "sanitize-http-client", environment = "sanitize" },
+  { task = "sanitize-http-url", environment = "sanitize" },
   { task = "sanitize-http-parser", environment = "sanitize" },
+  { task = "sanitize-http-request-stream", environment = "sanitize" },
+  { task = "sanitize-http-body-decoder", environment = "sanitize" },
+  { task = "sanitize-http2-request-stream", environment = "sanitize" },
+  { task = "sanitize-http-body-pipe", environment = "sanitize" },
   { task = "sanitize-http-response", environment = "sanitize" },
+  { task = "sanitize-http-filesystem", environment = "sanitize" },
+  { task = "sanitize-http-router", environment = "sanitize" },
+  { task = "sanitize-http-middleware", environment = "sanitize" },
   { task = "sanitize-http-server", environment = "sanitize" },
   { task = "sanitize-http2", environment = "sanitize" },
+  { task = "sanitize-http-hijack", environment = "sanitize" },
+  { task = "sanitize-http-hijack-actor", environment = "sanitize" },
+  { task = "sanitize-http-hijacked-conn", environment = "sanitize" },
+  { task = "sanitize-http-websocket", environment = "sanitize" },
+  { task = "sanitize-http-handshake", environment = "sanitize" },
+  { task = "sanitize-http-websocket-fragments", environment = "sanitize" },
   { task = "sanitize-http-detach", environment = "sanitize" },
+  { task = "sanitize-http-known-length", environment = "sanitize" },
+  { task = "sanitize-http-file-metadata", environment = "sanitize" },
+  { task = "sanitize-http-fileserver", environment = "sanitize" },
+  { task = "sanitize-http-fileserver-wire", environment = "sanitize" },
+  { task = "sanitize-http-offload", environment = "sanitize" },
 ] }
 test = { depends-on = [
   "test-core",
@@ -66,31 +157,94 @@ test = { depends-on = [
   "test-reactor",
   "test-http-api",
   "test-http-control",
+  "test-http-pool",
+  "test-http-client-redirect",
+  "test-http-client-resiliency",
+  "test-http-client",
+  "test-http-url",
   "test-http-parser",
+  "test-http-request-stream",
+  "test-http-body-decoder",
+  "test-http2-request-stream",
+  "test-http-body-pipe",
   "test-http-response",
+  "test-http-filesystem",
+  "test-http-router",
+  "test-http-middleware",
   "test-http-server",
   "test-http2",
+  "http-hijack-interop",
+  "example-http-upgrade-echo",
+  "example-websocket-echo",
+  "example-http-connect",
+  "test-http-connect",
+  "test-http-hijack",
+  "test-http-hijack-actor",
+  "test-http-hijacked-conn",
+  "test-http-websocket",
+  "test-http-handshake",
+  "test-http-websocket-fragments",
   "test-http-detach",
+  "test-http-known-length",
+  "test-http-file-metadata",
+  "test-http-fileserver",
+  "test-http-fileserver-driver",
+  "test-http-fileserver-compression-driver",
+  "test-http-fileserver-wire",
+  "test-http-offload",
+  "test-http-compression-config",
+  "test-http-compression-pass-through",
   "test-actor",
 ] }
 example-tcp = "mojo run --Werror -I . examples/tcp_echo.mojo"
 example-udp = "mojo run --Werror -I . examples/udp_echo.mojo"
 example-unix = "mojo run --Werror -I . examples/unix_echo.mojo"
+example-http-client = "mojo run --Werror -I . examples/http_client.mojo"
 example-http-hello = "mojo run --Werror -I . examples/http_hello.mojo"
+example-http-fileserver = "mojo run --Werror -I . examples/http_fileserver.mojo"
+example-http-router = "mojo run --Werror -I . examples/http_router.mojo"
 example-http-json = "mojo run --Werror -I . examples/http_json.mojo"
 dogfood-build = "mkdir -p build && mojo build --Werror -I . examples/http_dogfood.mojo -o build/http-dogfood"
 dogfood-smoke = { cmd = "python3 scripts/test_dogfood.py", depends-on = ["dogfood-build"] }
+example-http-upgrade-echo = "mojo run --Werror -I . examples/http_upgrade_echo.mojo"
+example-websocket-echo = "mojo run --Werror -I . examples/websocket_echo.mojo"
+example-http-connect = "mojo run --Werror -I . examples/http_connect.mojo"
 example-http-sse = "mojo run --Werror -I . examples/http_sse.mojo"
+example-http-offload = "mojo run --Werror -I . examples/http_offload.mojo"
+example-http-offload-body = "mojo run --Werror -I . examples/http_offload_body.mojo"
 package = "mkdir -p build && mojo precompile net -o build/net.mojoc"
+websocket-package-smoke = { cmd = "mojo run --Werror -I build examples/websocket_echo.mojo", depends-on = ["package"] }
 test-package = "mojo run --Werror -I build tests/package_smoke.mojo"
+benchmark-http-client = "mojo run --Werror -I . benchmarks/http_client.mojo"
 benchmark-ip = "mojo run --Werror -I . benchmarks/ip_parse.mojo"
 benchmark-loopback = "mojo run --Werror -I . benchmarks/loopback_io.mojo"
 benchmark-http-parse = "mojo run --Werror -I . benchmarks/http_parse.mojo"
 benchmark-http-server = "mojo run --Werror -I . benchmarks/http_server.mojo"
 benchmark-http-stream = "mojo run --Werror -I . benchmarks/http_stream.mojo"
+benchmark-http-stream-sse = { cmd = "python3 benchmarks/http_stream_sse.py", default-environment = "http-stream-sse", depends-on = [{ task = "tls-build", environment = "http-stream-sse" }, { task = "hpack-test", environment = "http-stream-sse" }, { task = "quic-build", environment = "http-stream-sse" }] }
+benchmark-http-body-stream = { cmd = "python3 benchmarks/http_body_stream.py", default-environment = "http-stream-sse", depends-on = [{ task = "tls-build", environment = "http-stream-sse" }, { task = "hpack-test", environment = "http-stream-sse" }, { task = "quic-build", environment = "http-stream-sse" }] }
+benchmark-http-offload = "mojo run --Werror -I . benchmarks/http_offload.mojo"
 # Harness/loader regression only — no long performance runs or thresholds.
 benchmark-harness-test = "python3 tests/test_http_benchmark_harness.py"
 benchmark-go-test = "GOTOOLCHAIN=local go -C benchmarks/http_go test ./..."
+
+[feature.websocket.dependencies]
+python = ">=3.11,<3.14"
+
+[feature.websocket.pypi-dependencies]
+websockets = "==15.0.1"
+
+[feature.websocket.tasks]
+websocket-fixture-build = "mkdir -p build && mojo build --Werror -I . tests/websocket_fixture.mojo -Xlinker -ldl -o build/websocket_fixture"
+websocket-interop = { cmd = "python3 tests/test_http_websocket_interop.py", depends-on = ["websocket-fixture-build"] }
+websocket-tls-interop = { cmd = "python3 tests/test_http_websocket_interop.py --tls", depends-on = ["websocket-fixture-build", "tls-build"] }
+benchmark-websocket-echo = { cmd = "python3 benchmarks/websocket_echo/run.py", depends-on = ["websocket-fixture-build"] }
+fuzz-websocket-frames = { cmd = "python3 scripts/run_fuzz.py websocket-frames", depends-on = [{ task = "fuzz-parser-build", environment = "sanitize" }] }
+fuzz-websocket-utf8 = { cmd = "python3 scripts/run_fuzz.py websocket-utf8", depends-on = [{ task = "fuzz-parser-build", environment = "sanitize" }] }
+fuzz-websocket-driver-test = "python3 tests/fuzz/test_driver.py"
+websocket-report-test = "python3 tests/test_websocket_autobahn.py"
+autobahn-ws = { cmd = "python3 tests/websocket_autobahn.py", depends-on = ["websocket-fixture-build", "websocket-report-test"] }
+websocket-interop-sanitize = { cmd = "python3 tests/test_http_websocket_interop.py --binary build/sanitize/websocket_fixture && python3 tests/test_http_websocket_interop.py --tls --binary build/sanitize/websocket_fixture", depends-on = ["tls-build", { task = "websocket-fixture-sanitize-build", environment = "sanitize" }], default-environment = "tls-websocket" }
 
 [feature.tls.dependencies]
 c-compiler = "*"
@@ -112,6 +266,8 @@ python = ">=3.10,<3.15"
 h2 = "==4.4.1"
 
 [feature.http2.tasks]
+http-fileserver-h2-test = { cmd = "python3 scripts/test_http_fileserver.py --protocols h1 h2 --tls", depends-on = ["tls-build", "hpack-test"] }
+http-router-h2-test = { cmd = "python3 scripts/test_http_router_h2.py", depends-on = ["tls-build", "hpack-test"] }
 hpack-test = "bash scripts/build_hpack_shim.sh"
 hpack-mojo-test = { cmd = "mojo run --Werror -I . tests/test_hpack.mojo", depends-on = [
   "hpack-test",
@@ -129,7 +285,15 @@ http-app-contract-test = { cmd = "python3 scripts/test_http_app_contract.py", de
   "tls-build",
   "hpack-test",
 ] }
+http-pool-integration-test = { cmd = "python3 scripts/test_http_pool_integration.py", depends-on = [
+  "tls-build",
+  "hpack-test",
+] }
 http2-integration-test = { cmd = "python3 scripts/test_http2_integration.py", depends-on = [
+  "tls-build",
+  "hpack-test",
+] }
+http2-request-stream-integration-test = { cmd = "python3 scripts/test_http2_request_stream.py", depends-on = [
   "tls-build",
   "hpack-test",
 ] }
@@ -157,6 +321,10 @@ rust = ">=1.88,<2"
 aioquic = "==1.3.0"
 
 [feature.http3.tasks]
+fuzz-quic-build = { cmd = "bash scripts/build_fuzz_quic.sh", depends-on = ["tls-build"] }
+fuzz-quic-recv = { cmd = "python3 scripts/run_fuzz_quic.py", depends-on = ["fuzz-quic-build"] }
+http-fileserver-h3-test = { cmd = "python3 scripts/test_http_fileserver.py --protocols h3", depends-on = ["tls-build", "quic-build"] }
+http-router-h3-test = { cmd = "python3 scripts/test_http_router_h3.py", depends-on = ["tls-build", "quic-build"] }
 quic-build = "bash scripts/build_quic_provider.sh"
 quic-test = { cmd = "build/quic/test_quic_provider build/tls/test-cert.pem build/tls/test-key.pem", depends-on = [
   "tls-build",
@@ -170,7 +338,21 @@ quic-rust-test = { cmd = "bash scripts/test_quic_provider.sh", depends-on = [
   "tls-build",
   "quic-build",
 ] }
-quic-suite = { depends-on = ["quic-test", "quic-mojo-test", "quic-rust-test"] }
+http-pool-quic-test = { cmd = "mojo run --Werror -I . tests/test_http_pool_quic.mojo", depends-on = [
+  "tls-build", "quic-build",
+] }
+http-pool-quic-integration-test = { cmd = "python3 scripts/test_http_pool_quic_integration.py", depends-on = [
+  "tls-build", "quic-build",
+] }
+quic-suite = { depends-on = ["quic-test", "quic-mojo-test", "quic-rust-test", "http-pool-quic-test"] }
+http3-detach-test = { cmd = "python3 scripts/test_http3_detach.py", depends-on = [
+  "tls-build",
+  "quic-build",
+] }
+http3-request-stream-test = { cmd = "python3 scripts/test_http3_request_stream.py", depends-on = [
+  "tls-build",
+  "quic-build",
+] }
 http3-client-test = { cmd = "python3 scripts/test_http3_server.py", depends-on = [
   "tls-build",
   "quic-build",
@@ -188,20 +370,30 @@ http3-example-build = { cmd = "bash scripts/check_http3_example.sh", depends-on 
   "tls-build",
   "quic-build",
 ] }
+http3-pool-example-run = { cmd = "python3 scripts/run_http3_pool_example.py", depends-on = [
+  "tls-build", "quic-build",
+] }
 http3-example-run = { cmd = "python3 scripts/run_http3_example.py", depends-on = [
   "tls-build",
   "quic-build",
 ] }
 
 [feature.tls.tasks]
+http-hijack-tls-interop = { cmd = "python3 tests/test_hijack_interop.py --tls", depends-on = ["tls-build", "http-hijack-fixture-build"] }
+http-hijacked-tls-test = { cmd = "python3 scripts/test_http_hijacked_tls.py", depends-on = ["tls-build"] }
 tls-build = "bash scripts/build_tls_shim.sh"
 tls-test = { cmd = "mojo run --Werror -I . tests/test_tls.mojo", depends-on = [
   "tls-build",
 ] }
+test-https-client = { cmd = "mojo run --Werror -I . tests/test_https_client.mojo", depends-on = ["tls-build"] }
+https-client-interop-test = { cmd = "python3 scripts/test_https_client.py", depends-on = ["tls-build"] }
 https-state-test = { cmd = "mojo run --Werror -I . tests/test_https_server.mojo", depends-on = [
   "tls-build",
 ] }
 https-client-test = { cmd = "python3 scripts/test_https_server.py", depends-on = [
+  "tls-build",
+] }
+https-body-stream-test = { cmd = "python3 scripts/test_https_body_stream.py", depends-on = [
   "tls-build",
 ] }
 https-alt-svc-invalid-test = { cmd = "python3 scripts/test_https_alt_svc_invalid.py", depends-on = [
@@ -210,20 +402,107 @@ https-alt-svc-invalid-test = { cmd = "python3 scripts/test_https_alt_svc_invalid
 https-example-build = { cmd = "bash scripts/check_https_example.sh", depends-on = [
   "tls-build",
 ] }
+https-client-example-run = { cmd = "mojo run --Werror -I . examples/https_client.mojo", depends-on = ["tls-build"] }
 https-example-run = { cmd = "python3 scripts/run_https_example.py", depends-on = [
   "tls-build",
 ] }
 tls-suite = { depends-on = [
+  "http-hijack-tls-interop",
+  "http-hijacked-tls-test",
   "tls-test",
+  "test-https-client",
+  "https-client-interop-test",
   "https-state-test",
   "https-client-test",
+  "https-body-stream-test",
   "https-alt-svc-invalid-test",
   "https-example-build",
   "https-example-run",
+  "https-client-example-run",
 ] }
 example-https-hello = { cmd = "mojo run --Werror -I . examples/https_hello.mojo", depends-on = [
   "tls-build",
 ] }
+
+[feature.conformance.dependencies]
+go = "==1.27.2"
+
+[feature.conformance.tasks]
+h2spec-build = "bash scripts/install_h2spec.sh"
+http2-conformance = { cmd = "python3 scripts/run_http2_conformance.py", depends-on = [
+  "tls-build",
+  "hpack-test",
+  "h2spec-build",
+  { task = "http2-conformance-fixture-build", environment = "sanitize" },
+] }
+
+[feature.fuzz.dependencies]
+clang = "==23.1.2"
+compiler-rt = "==23.1.2"
+libnghttp2 = ">=1.64,<2"
+pkg-config = "*"
+python = ">=3.11,<3.15"
+
+[feature.fuzz.tasks]
+fuzz-native-build = "bash scripts/build_fuzz.sh"
+fuzz-build = { depends-on = ["fuzz-native-build", { task = "fuzz-parser-build", environment = "sanitize" }] }
+fuzz-http1 = { cmd = "python3 scripts/run_fuzz.py http1", depends-on = ["fuzz-build"] }
+fuzz-authority = { cmd = "python3 scripts/run_fuzz.py authority", depends-on = ["fuzz-build"] }
+fuzz-http2-frames = { cmd = "python3 scripts/run_fuzz.py http2-frames", depends-on = ["fuzz-build"] }
+fuzz-ip = { cmd = "python3 scripts/run_fuzz.py ip", depends-on = ["fuzz-build"] }
+fuzz-address = { cmd = "python3 scripts/run_fuzz.py address", depends-on = ["fuzz-build"] }
+fuzz-hpack-mojo = { cmd = "python3 scripts/run_fuzz.py hpack-mojo", depends-on = ["fuzz-build"] }
+fuzz-hpack = { cmd = "python3 scripts/run_fuzz.py hpack", depends-on = ["fuzz-build"] }
+fuzz-smoke = { cmd = "python3 scripts/run_fuzz.py smoke", depends-on = ["fuzz-build"] }
+fuzz-nightly = { cmd = "python3 scripts/run_fuzz_nightly.py", depends-on = ["fuzz-build"] }
+fuzz-nightly-test = { cmd = "python3 tests/fuzz/test_nightly.py", depends-on = ["fuzz-build"] }
+fuzz-driver-test = { cmd = "python3 tests/fuzz/test_driver.py", depends-on = ["fuzz-build"] }
+fuzz-minimize = { cmd = "python3 scripts/minimize_fuzz.py", depends-on = ["fuzz-build"] }
+fuzz-minimize-test = "python3 tests/fuzz/test_minimize.py"
+
+[feature.proptest]
+channels = ["https://prefix.dev/hirokazumiyaji/mojo"]
+platforms = ["osx-arm64", "linux-64-glibc-2-34"]
+
+[feature.proptest.dependencies]
+proptest = "==0.1.0"
+
+[feature.proptest.tasks]
+test-prop-ip = "mojo run --Werror -I . tests/prop/test_prop_ip.mojo"
+test-prop-address = "mojo run --Werror -I . tests/prop/test_prop_address.mojo"
+test-prop-timeout = "mojo run --Werror -I . tests/prop/test_prop_timeout.mojo"
+test-prop-mailbox = "mojo run --Werror -I . tests/prop/test_prop_mailbox.mojo"
+test-prop-http1-parser = "mojo run --Werror -I . tests/prop/test_prop_http1_parser.mojo"
+test-prop-http1-chunked = "mojo run --Werror -I . tests/prop/test_prop_http1_chunked.mojo"
+test-prop-http2-flow = "mojo run --Werror -I . tests/prop/test_prop_http2_flow.mojo"
+test-prop-http2-stream = "mojo run --Werror -I . tests/prop/test_prop_http2_stream.mojo"
+test-prop = { depends-on = ["test-prop-http2-flow", "test-prop-http2-stream", "test-prop-http1-parser", "test-prop-http1-chunked", "test-prop-ip", "test-prop-address", "test-prop-timeout", "test-prop-mailbox"] }
+
+[feature.proptest-http2.tasks]
+test-prop-hpack = { cmd = "mojo run --Werror -I . tests/prop/test_prop_hpack.mojo", depends-on = ["hpack-test"] }
+[feature.compression.dependencies]
+zlib = ">=1.3.1,<2"
+c-compiler = "*"
+pkg-config = "*"
+python = ">=3.10,<3.15"
+
+[feature.compression.tasks]
+compression-build = "bash scripts/build_zlib_shim.sh"
+example-http-gzip = { cmd = "mojo run --Werror -I . examples/http_gzip.mojo", depends-on = ["compression-build"] }
+test-gzip-provider = { cmd = "mojo run --Werror -I . tests/test_gzip_provider.mojo", depends-on = ["compression-build"] }
+test-http-compression = { cmd = "mojo run --Werror -I . tests/test_http_compression.mojo", depends-on = ["compression-build"] }
+test-http-compression-stream = { cmd = "mojo run --Werror -I . tests/test_http_compression_stream.mojo", depends-on = ["compression-build"] }
+compression-suite = { depends-on = ["test-gzip-provider", "test-http-compression-config", "test-http-compression", "test-http-compression-stream"] }
+
+[feature.http3.tasks.gzip-wire-test]
+cmd = "python3 scripts/test_http_compression.py"
+default-environment = "http-stream-sse"
+depends-on = [{ task = "tls-build", environment = "http-stream-sse" }, { task = "hpack-test", environment = "http-stream-sse" }, { task = "quic-build", environment = "http-stream-sse" }, { task = "compression-build", environment = "compression" }]
+
+[feature.http3.tasks.http-fileserver-compression-test]
+cmd = "python3 scripts/test_http_fileserver_compression.py"
+default-environment = "http-stream-sse"
+depends-on = [{ task = "tls-build", environment = "http-stream-sse" }, { task = "hpack-test", environment = "http-stream-sse" }, { task = "quic-build", environment = "http-stream-sse" }, { task = "compression-build", environment = "compression" }]
 
 [feature.mojo-1-1.dependencies]
 mojo = ">=1.1.0,<1.2"
@@ -234,9 +513,18 @@ compiler-rt = "==23.1.2"
 
 [environments]
 default = ["mojo-1-1"]
+proptest = ["proptest", "mojo-1-1"]
+proptest-http2 = ["proptest", "proptest-http2", "http2", "mojo-1-1"]
 sanitize = ["sanitize", "mojo-1-1"]
+fuzz = ["fuzz", "sanitize", "mojo-1-1"]
+conformance = ["conformance", "tls", "http2", "mojo-1-1"]
 tls = ["tls", "mojo-1-1"]
 http2 = ["http2", "mojo-1-1"]
 http3 = ["http3", "mojo-1-1"]
 tls-http2 = ["tls", "http2", "mojo-1-1"]
 tls-http3 = ["tls", "http3", "mojo-1-1"]
+http-stream-sse = ["tls", "http2", "http3", "mojo-1-1"]
+
+websocket = ["websocket", "mojo-1-1"]
+tls-websocket = ["websocket", "tls", "mojo-1-1"]
+compression = ["compression", "mojo-1-1"]

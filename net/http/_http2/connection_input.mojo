@@ -95,14 +95,14 @@ struct Http2ConnectionInputResult(Movable):
         )
 
     @staticmethod
-    def error(consumed: Int) -> Self:
+    def error(consumed: Int, error_code: UInt32 = UInt32(1)) -> Self:
         return Self(
             kind=7,
             consumed=consumed,
             frame_type=Byte(0),
             flags=Byte(0),
             stream_id=UInt32(0),
-            value=UInt32(0),
+            value=error_code,
             output=List[Byte](),
             payload=List[Byte](),
         )
@@ -156,6 +156,7 @@ struct Http2ServerConnectionInput(Movable):
     var _max_control_frames_per_second: Int
     var _max_resets_per_second: Int
     var _max_new_streams_per_second: Int
+    var _settings_acknowledged: Bool
 
     def __init__(
         out self,
@@ -165,9 +166,13 @@ struct Http2ServerConnectionInput(Movable):
         max_resets_per_second: Int = 100,
         max_new_streams_per_second: Int = 10000,
         max_header_list_size: Int = 32768,
+        initial_receive_window: Int = 65535,
     ):
         self._bootstrap = Http2ConnectionBootstrap(
-            max_frame_size, max_concurrent_streams, max_header_list_size
+            max_frame_size,
+            max_concurrent_streams,
+            max_header_list_size,
+            initial_receive_window,
         )
         self._reader = Http2FrameReader(max_frame_size)
         self._max_control_frames_per_second = max_control_frames_per_second
@@ -180,6 +185,10 @@ struct Http2ServerConnectionInput(Movable):
             max_new_streams_per_second,
         )
         self._failed = False
+        self._settings_acknowledged = False
+
+    def settings_acknowledged(self) -> Bool:
+        return self._settings_acknowledged
 
     def consume[
         origin: Origin
@@ -191,7 +200,12 @@ struct Http2ServerConnectionInput(Movable):
             var bootstrap = self._bootstrap.consume(data)
             if bootstrap.is_error():
                 self._failed = True
-                return Http2ConnectionInputResult.error(bootstrap.consumed)
+                var result = Http2ConnectionInputResult.error(
+                    bootstrap.consumed, bootstrap.error_code
+                )
+                result.output = bootstrap.output^
+                bootstrap.output = List[Byte]()
+                return result^
             if bootstrap.is_ready():
                 self._dispatcher = Http2FrameDispatcher(
                     self._bootstrap.peer_settings(),
@@ -210,7 +224,9 @@ struct Http2ServerConnectionInput(Movable):
         var read = self._reader.consume(data)
         if read.is_error():
             self._failed = True
-            return Http2ConnectionInputResult.error(read.consumed)
+            return Http2ConnectionInputResult.error(
+                read.consumed, read.error_code
+            )
         if read.is_need_more():
             return Http2ConnectionInputResult.need_more(read.consumed)
 
@@ -227,7 +243,9 @@ struct Http2ServerConnectionInput(Movable):
         )
         if dispatched.is_error():
             self._failed = True
-            return Http2ConnectionInputResult.error(read.consumed)
+            return Http2ConnectionInputResult.error(
+                read.consumed, dispatched.value
+            )
         if dispatched.is_flood():
             self._failed = True
             return Http2ConnectionInputResult.flood(consumed)
@@ -247,6 +265,8 @@ struct Http2ServerConnectionInput(Movable):
                 8, consumed, dispatched.stream_id, dispatched.value
             )
         if dispatched.is_ignored():
+            if read.frame_type == Byte(4) and (read.flags & Byte(1)) != Byte(0):
+                self._settings_acknowledged = True
             if read.frame_type == Byte(4) or read.frame_type == Byte(6):
                 return Http2ConnectionInputResult.ignored(consumed)
             if (

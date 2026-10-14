@@ -32,7 +32,7 @@ def require_http3_alpn(alpn):
 class Http3ClientProtocol(QuicConnectionProtocol):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        self.http = _Http3Connection(self._quic)
+        self.http = self.create_http_connection()
         self.responses = {}
         self.resets = {}
         self.terminated = self._loop.create_future()
@@ -41,6 +41,9 @@ class Http3ClientProtocol(QuicConnectionProtocol):
         self.reordered_datagram_batches = 0
         self._held_datagrams = []
         self._ping_id = 1
+
+    def create_http_connection(self):
+        return _Http3Connection(self._quic)
 
     def transmit(self, drop_next_datagram=False, reorder_datagrams=False):
         """Flush queued datagrams; returns the number actually sent."""
@@ -482,43 +485,48 @@ async def run_client(address):
             raise RuntimeError(f"expected H3_NO_ERROR close, got {close_code}")
 
 
-fixture_env = dict(os.environ)
-# Count the cancelled response's completed request, its sibling and reuse,
-# plus the existing five completions; partial request cancellations do not count.
-fixture_env["HTTP3_FIXTURE_EXPECT"] = "8"
-process = subprocess.Popen(
-    ["mojo", "run", "--Werror", "-I", ".", "tests/http3_server_fixture.mojo"],
-    stdout=subprocess.PIPE,
-    stderr=subprocess.PIPE,
-    text=True,
-    env=fixture_env,
-)
-
-try:
-    ready = process.stdout.readline().strip()
-    if not ready.startswith("READY "):
-        details = process.stderr.read()
-        raise RuntimeError(f"HTTP/3 fixture did not start: {ready}\n{details}")
-    async def _drive(address):
-        await run_qpack_dynamic_reference_rejected(address)
-        await run_client(address)
-
-    asyncio.run(_drive(ready.removeprefix("READY ")))
-    process.wait(timeout=5)
-    if process.returncode != 0:
-        raise RuntimeError(f"HTTP/3 fixture exited with {process.returncode}")
-    print(
-        "Independent aioquic HTTP/3 client roundtrips succeeded "
-        "(QPACK dynamic-ref rejected + STOP_SENDING + reorder + reset-storm siblings + ALPN h3)"
+def main():
+    fixture_env = dict(os.environ)
+    # Count the cancelled response's completed request, its sibling and reuse,
+    # plus the existing five completions; partial request cancellations do not count.
+    fixture_env["HTTP3_FIXTURE_EXPECT"] = "8"
+    process = subprocess.Popen(
+        ["mojo", "run", "--Werror", "-I", ".", "tests/http3_server_fixture.mojo"],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        env=fixture_env,
     )
-finally:
-    if process.poll() is None:
-        process.terminate()
-        try:
-            process.wait(timeout=5)
-        except subprocess.TimeoutExpired:
-            process.kill()
-            process.wait()
-    details = process.stderr.read()
-    if process.returncode != 0 and details:
-        print(details, file=sys.stderr, end="")
+
+    try:
+        ready = process.stdout.readline().strip()
+        if not ready.startswith("READY "):
+            details = process.stderr.read()
+            raise RuntimeError(f"HTTP/3 fixture did not start: {ready}\n{details}")
+        async def _drive(address):
+            await run_qpack_dynamic_reference_rejected(address)
+            await run_client(address)
+
+        asyncio.run(_drive(ready.removeprefix("READY ")))
+        process.wait(timeout=5)
+        if process.returncode != 0:
+            raise RuntimeError(f"HTTP/3 fixture exited with {process.returncode}")
+        print(
+            "Independent aioquic HTTP/3 client roundtrips succeeded "
+            "(QPACK dynamic-ref rejected + STOP_SENDING + reorder + reset-storm siblings + ALPN h3)"
+        )
+    finally:
+        if process.poll() is None:
+            process.terminate()
+            try:
+                process.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.wait()
+        details = process.stderr.read()
+        if process.returncode != 0 and details:
+            print(details, file=sys.stderr, end="")
+
+
+if __name__ == "__main__":
+    main()

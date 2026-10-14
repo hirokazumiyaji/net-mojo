@@ -1,6 +1,6 @@
-"""Optional OpenSSL-backed nonblocking TLS server transport.
+"""Optional OpenSSL-backed nonblocking TLS transport.
 
-`TLSContext` owns the server configuration. A `TLSConnection` owns its TLS
+`TLSContext` owns server credentials or client trust configuration. A `TLSConnection` owns its TLS
 session and accepted socket; drive `handshake`, `try_read`, and `try_write`
 from the socket's readiness events. The TLS feature is built separately from
 the core `net` package.
@@ -8,6 +8,7 @@ the core `net` package.
 
 from std.ffi import (
     c_int,
+    c_uint,
     c_size_t,
     OwnedDLHandle,
     Pointer,
@@ -88,6 +89,57 @@ struct TLSContext(Movable):
             protocols^,
         )
 
+    @staticmethod
+    def client(
+        var library_path: String,
+        ca_bundle_path: Optional[String] = None,
+        var alpn: String = "http/1.1",
+        insecure_skip_verify: Bool = False,
+    ) raises NetError -> Self:
+        if alpn != "http/1.1":
+            raise NetError(
+                NetErrorKind.invalid_argument(),
+                "create TLS client context",
+                None,
+                "only HTTP/1.1 ALPN is supported",
+            )
+        var ca = String("")
+        if ca_bundle_path:
+            ca = ca_bundle_path.value().copy()
+            if ca.byte_length() == 0:
+                raise NetError(
+                    NetErrorKind.invalid_argument(),
+                    "create TLS client context",
+                    None,
+                    "CA bundle path must not be empty",
+                )
+        var library: OwnedDLHandle
+        try:
+            library = OwnedDLHandle(library_path)
+        except error:
+            raise NetError(
+                NetErrorKind.system_error(),
+                "create TLS client context",
+                None,
+                String(error),
+            )
+        var flags = UInt32(0)
+        if insecure_skip_verify:
+            flags = 1
+        var ca_bytes = ca.as_c_string_span()
+        var alpn_bytes = alpn.as_c_string_span()
+        var context = _require_handle(
+            library.call[
+                "net_tls_context_client",
+                Optional[Pointer[Byte, MutUntrackedOrigin]],
+            ](ca_bytes.ptr(), alpn_bytes.ptr(), c_uint(flags)),
+            "create TLS client context",
+            "OpenSSL could not load the trust store or ALPN configuration",
+        )
+        return Self(
+            library_path=library_path^, library=library^, context=context
+        )
+
     def __init__(
         out self,
         var library_path: String,
@@ -115,6 +167,26 @@ struct TLSContext(Movable):
         self._library = library^
         self._context = context
 
+    def __init__(
+        out self,
+        *,
+        var library_path: String,
+        var library: OwnedDLHandle,
+        context: Pointer[Byte, MutUntrackedOrigin],
+    ):
+        self._library_path = library_path^
+        self._library = library^
+        self._context = context
+
+    def _duplicate(self) raises -> Self:
+        var library = OwnedDLHandle(self._library_path)
+        self._library.call["net_tls_context_retain"](self._context)
+        return Self(
+            library_path=self._library_path.copy(),
+            library=library^,
+            context=self._context,
+        )
+
     def __deinit__(deinit self):
         self._library.call["net_tls_context_free"](self._context)
 
@@ -134,6 +206,61 @@ struct TLSContext(Movable):
             session=session,
             socket=socket^,
         )
+
+    def connect(
+        mut self,
+        var socket: TCPConn,
+        var hostname: String,
+        sni_override: Optional[String] = None,
+    ) raises NetError -> TLSConnection:
+        var sni = hostname.copy()
+        if sni_override:
+            sni = sni_override.value().copy()
+        if hostname.byte_length() == 0 or sni.byte_length() == 0:
+            raise NetError(
+                NetErrorKind.invalid_argument(),
+                "create TLS client connection",
+                None,
+                "TLS peer names must not be empty",
+            )
+        for byte in hostname.as_bytes():
+            if byte == 0:
+                raise NetError(
+                    NetErrorKind.invalid_argument(),
+                    "create TLS client connection",
+                    None,
+                    "TLS hostname contains NUL",
+                )
+        for byte in sni.as_bytes():
+            if byte == 0:
+                raise NetError(
+                    NetErrorKind.invalid_argument(),
+                    "create TLS client connection",
+                    None,
+                    "TLS SNI contains NUL",
+                )
+        var fd = socket.raw_fd()
+        var session_library: OwnedDLHandle
+        try:
+            session_library = OwnedDLHandle(self._library_path)
+        except error:
+            raise NetError(
+                NetErrorKind.system_error(),
+                "create TLS client connection",
+                None,
+                String(error),
+            )
+        var host_bytes = hostname.as_c_string_span()
+        var sni_bytes = sni.as_c_string_span()
+        var session = _require_handle(
+            self._library.call[
+                "net_tls_connection_new_client",
+                Optional[Pointer[Byte, MutUntrackedOrigin]],
+            ](self._context, c_int(fd), sni_bytes.ptr(), host_bytes.ptr()),
+            "create TLS client connection",
+            "OpenSSL could not configure SNI or peer identity verification",
+        )
+        return TLSConnection(session_library^, session, socket^)
 
 
 struct TLSConnection(Movable):

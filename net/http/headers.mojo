@@ -372,3 +372,15 @@ struct Headers(Movable, Sized):
 
     def value_byte_length(self, index: Int) -> Int:
         return len(self._values[index])
+
+
+def _declared_content_length(headers: Headers) -> Int:
+    var count = headers.count("content-length")
+    if count == 0:
+        return -1
+    if count != 1:
+        return -2
+    var length = _parse_decimal(
+        headers.get_first("content-length").value(), Int.MAX
+    )
+    return length if length >= 0 else -2

@@ -968,3 +968,49 @@ one, because `dnctl pipe N config` targets an existing pipe instead of
 allocating a private one; the chosen id is recorded in the scenario detail
 and only that pipe is deleted afterwards, so a run never reconfigures or
 removes shaping that already existed on the host.
+
+## ServerPool worker comparison (issue #229)
+
+Local macOS arm64 loopback, Mojo 1.1.0, 2026-10-14;
+`pixi run benchmark-http-server` excludes compilation and startup. The pool
+case sends batches over 32 persistent connections, warms up five batches,
+and measures 50 batches (1,600 requests). Each handler performs 200,000
+UInt64 recurrence steps and returns its result. No timing threshold applies.
+
+| Workers | Requests/s | Relative to one worker |
+| --- | ---: | ---: |
+| 1 | 4,827.64 | 1.00 |
+| 2 | 4,996.75 | 1.04 |
+| 4 | 5,330.67 | 1.10 |
+
+This single run uses a synchronous load generator on the same machine, no CPU
+pinning, and fixed batches that wait for their slowest connection. It records
+the requested comparison; it does not establish linear multicore scaling or
+a Linux performance result. The original sequential/idle benchmark remains
+in the same task: 17,657.86 round-trips/s and 12.06 µs/tick with 1,000 idle
+connections in this run.
+
+The CI core matrix runs the same bounded worker comparison on macOS, Linux
+x86_64, and Linux arm64 and retains `http-worker-benchmark-<runner>` artifacts.
+Linux acceptance counts and benchmark output remain pending that CI run.
+
+
+## HTTP/1.1 Client loopback entrypoint
+
+Run `pixi run benchmark-http-client` for a bounded plaintext measurement of the public Client against the production Server in the same process.
+The server runs on one thread and returns 64 bytes.
+A pooled Client performs 10 warmup requests, then 1000 measured sequential requests.
+The second mode starts 32 driving threads, each with its own Client and 100 requests, for 3200 requests total.
+All response lengths, statuses and final server request counts are checked; timing has no pass/fail threshold.
+
+One local sample on 2026-10-14, Darwin arm64, Mojo 1.1.0 (`8189361e`), source based on `991291a` plus the client benchmark/example slice:
+
+| Mode | Requests | Elapsed ms | Requests/s |
+| --- | ---: | ---: | ---: |
+| Single pooled Client | 1000 | 48.924 | 20439.87 |
+| 32 independent Clients | 3200 | 50.061 | 63922.02 |
+
+Timers are inside the program, so compilation and process startup are excluded.
+The concurrent timer includes worker creation, Client creation, initial connections and worker joins.
+These short loopback samples include Client and Server work together, have no CPU affinity or independent repetitions, and are not a comparison against the Go server baseline or a Linux performance result.
+CI runs the bounded entrypoint on macOS and Linux and records its measurements in the job log.

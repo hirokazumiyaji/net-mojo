@@ -340,3 +340,21 @@ performance acceptance remains separate from this transport policy.
 - [quiche C API](https://github.com/cloudflare/quiche/blob/master/quiche/include/quiche.h): C transport and HTTP/3 interfaces.
 - [ngtcp2 README](https://github.com/ngtcp2/ngtcp2/blob/main/README.rst): QUIC library, TLS backends, and nghttp3 integration.
 - [MsQuic README](https://github.com/microsoft/msquic/blob/main/README.md) and [platform support](https://github.com/microsoft/msquic/blob/main/docs/Platforms.md): transport scope and supported TLS platforms.
+
+## HTTP/3 informational responses
+
+`QuicServer.send_continue(request_id)` and
+`QuicUDPEndpoint.send_continue(request_id)` queue a single 100 Continue response.
+A true result means it was accepted for delivery; it does not imply that the
+peer has received it. Unknown, cancelled, duplicate, and final-response-started
+requests return false.
+
+The informational placeholder reserves its native response state against the
+aggregate response byte budget and uses the existing write deadline until
+100 is sent. It remains associated with the response route after input EOF or
+`release_body(cancel=False)`. A later buffered or streaming final response
+retains that state and sends non-trailer additional HEADERS after 100, with the
+existing urgency and incremental priority. Stream blocking preserves header
+state for retry; final FIN, cancellation and deadline cleanup refund it. The
+Server adapter decides whether an Expect request needs an informational
+response before it dispatches the handler.

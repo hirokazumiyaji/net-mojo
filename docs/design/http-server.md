@@ -34,7 +34,8 @@ HTTP parser はソケットに依存させず、HTTP 固有の意味づけは `_
 初版は一つの event loop を持つサーバーとし、handler はその loop 上で同期実行する。
 Go の API の役割分担を参考にするが、goroutine と同じ実行特性は約束しない。
 blocking I/O や長時間 CPU 処理を handler に入れると同じ loop の接続を止めるため、用途と制約を API ドキュメントに明記する。
-マルチコア利用と重い handler の offload は後続段階とし、thread 間で接続所有者を共有する設計は持ち込まない。
+マルチコア利用は `ServerPool` が独立した `Server` を組み合わせて提供する。
+重い handler の offload は後続段階とし、thread 間で接続所有者を共有する設計は持ち込まない。
 参照: [Go net/http](https://pkg.go.dev/net/http)。
 
 ## 初版の公開 API と所有権
@@ -47,6 +48,7 @@ blocking I/O や長時間 CPU 処理を handler に入れると同じ loop の�
 | `Headers` | 大文字小文字を区別しない検索と重複値の列挙。すべてを一律にカンマ結合しない |
 | `ResponseWriter` | status と headers を設定し、上限付きの response buffer に body を書く。socket を直接待たず、handler 終了後に server が送信する |
 | `Handler` | request を借用し、response writer を変更する。コンパイル時に handler 型を選べる構成を優先する |
+| `ServeMux` | method/path の登録表から handler を選び、パス変数、404、405 を共通層で処理する |
 | `ServerConfig` | 接続数、byte 上限、各 deadline、公平性の処理量上限を保持する |
 | `Server.serve` | listener の所有権を受け取り、handler を使用して loop を実行する |
 | `listen_and_serve` | bind と serve の便利関数 |
@@ -56,8 +58,8 @@ request の views と response writer は handler 呼び出し中だけ有効と
 受信 buffer は呼び出し中に移動、拡張、再利用しない。保持したい値は明示的にコピーする。
 response は送信完了まで接続が所有する。短命な handler の値を送信待ち queue に借用しない。
 初版では request body 全体を上限付きで受信してから handler を呼ぶ。
-request streaming、response streaming、`Flush`、汎用 router、middleware framework は初版に含めない。
-handler は method/path で分岐できる。未処理 path の例は 404 を返す。
+request streaming、response streaming、`Flush` は初版に含めない。
+`ServeMux` は method/path パターンを登録し、未登録 path に 404 を返す。
 
 ## 最終形から逆算する共通境界
 
@@ -74,11 +76,11 @@ HTTP/1.1 の close に相当する処理を一律に connection close へ変換�
 
 HTTP/1.1 の平文 origin server を対象にする。TLS は前段で終端できる構成とする。
 HTTP/2 と HTTP/3、および server 自身の TLS 終端は後続の必須 Phase で実装する。
-HTTP/1.0、HTTP client、WebSocket、CONNECT tunnel、Upgrade、multipart の高水準 API、body 圧縮、静的ファイル配信は本 Issue の対象外とする。
+HTTP/1.0、HTTP client、WebSocket フレーミング、multipart の高水準 API、body 圧縮、静的ファイル配信はこの初期 Phase の対象外とする。HTTP/1.1 の CONNECT／Upgrade と raw transport の移譲は Issue #235 で追加する。
 
 - incremental parser を実装し、任意の byte 境界で分割された入力、複数 request の同時到着、binary body を扱う。
 - request line と header は CRLF を厳密に扱い、不正 token、改行注入、obs-fold、Host の欠落／重複／不正値を拒否する。
-- origin-form と absolute-form を扱い、absolute-form の authority を Host に優先する。`OPTIONS *` を扱う。CONNECT と Upgrade は切替を行わず、明示的なエラーにする。
+- origin-form と absolute-form を扱い、absolute-form の authority を Host に優先する。`OPTIONS *` を扱う。CONNECT は明示的な port を持つ authority-form のみ受理し、body framing は拒否する。Upgrade は `Connection: Upgrade` を要求し、h2c は拒否する。
 - `Content-Length` と chunked request を扱う。Transfer-Encoding と Content-Length の併存、矛盾する長さ、不正 chunk、overflow を拒否して close する。重複 Content-Length は同値でも拒否する保守的方針を仕様化する。
 - chunk extension と trailer は別の byte／件数上限で検証する。trailer を header に混ぜず別に保持し、framing や routing を変更させない。
 - `Expect: 100-continue` は header 検証と既知の body 上限判定後に 100 を送信して受信を継続する。他の expectation は 417 と close。
@@ -426,6 +428,61 @@ struct ResponseSender(Movable):
 trait Handler(Movable):
     def handle(mut self, req: Request, mut writer: ResponseWriter) raises: ...
 
+# net/http/router.mojo
+struct RouteHandler(Handler, Movable):
+    def __init__[F: def(Request, mut ResponseWriter) raises -> None](
+        out self, var callback: F
+    )
+    @staticmethod
+    def from_handler[H: Handler & Deinitable](var handler: H) -> Self
+    def handle(mut self, req: Request, mut writer: ResponseWriter) raises
+
+struct ServeMux(Handler, Movable):
+    def __init__(out self, max_routes: Int = 1024) raises NetError
+    def handle[F: def(Request, mut ResponseWriter) raises -> None](
+        mut self, pattern: StringSlice, var callback: F
+    ) raises NetError
+    def handle_handler[H: Handler & Deinitable](
+        mut self, pattern: StringSlice, var handler: H
+    ) raises NetError
+    def register(
+        mut self, pattern: StringSlice, var handler: RouteHandler
+    ) raises NetError
+    def handle(mut self, req: Request, mut writer: ResponseWriter) raises
+    @staticmethod
+    def param(req: Request, name: StringSlice) -> Optional[String]
+
+# net/http/middleware.mojo
+struct MiddlewareFn(Movable):
+    def __init__[F: def(Request, mut ResponseWriter, mut RouteHandler) raises -> None](
+        out self, var callback: F
+    )
+    def handle(
+        mut self, req: Request, mut writer: ResponseWriter, mut next: RouteHandler
+    ) raises
+
+def apply_middleware(
+    var final: RouteHandler, var layers: List[MiddlewareFn]
+) -> RouteHandler
+
+trait LogSink(Movable):
+    def record(
+        mut self, method: StringSlice, path: StringSlice, status: Int, elapsed_ns: Int
+    )
+
+struct LoggingHandler[
+    Inner: Handler & Deinitable, Sink: LogSink & Deinitable = StdoutLogSink
+](Handler):
+    var inner: Self.Inner
+    var sink: Self.Sink
+
+struct RecoverHandler[Inner: Handler & Deinitable](Handler):
+    var inner: Self.Inner
+
+struct TimeoutHandler[Inner: Handler & Deinitable](Handler):
+    var inner: Self.Inner
+    var timeout: Timeout
+
 # net/http/error.mojo
 struct HttpError(Copyable, Movable, Writable):
     var status: Int
@@ -604,10 +661,52 @@ HTTP/3 の record buffer と handler の `Request.body` は同じ借用 storage 
 request の view や mutable writer の借用を handler 終了後まで保持する用途には使わない。
 HTTP/2 と HTTP/3 の共通 handler は bounded buffered response を返す。
 両 protocol での detach は未対応で、現在の HTTP/2 adapter は接続を閉じ、HTTP/3 adapter は sender を取り消して 500 応答にする。
-request streaming、`Flush`、router、middleware は含めない。
+request streaming、`Flush` は含めない。
 
 所有値へのコピーは `tests/test_http_api.mojo` の `test_response_writer_owns_copies_of_handler_locals` と `test_header_value_span_borrows_storage_and_owned_copy_survives_clear` で検証する。
 HTTP/2 の request 組立ては `tests/test_http2.mojo` の `test_http2_request_stream_combines_headers_body_and_trailers`、HTTP/3 の native record と Mojo decode は `tests/test_quic_provider.mojo` で検証する。
+
+### method/path のルーティング
+
+`ServeMux` は protocol adapter が組み立てた `Request` を共通のパターン表で処理する。
+登録パターンは `GET /items/{id}`、`/static/{path...}`、末尾スラッシュの subtree、`/x/{$}` の完全一致を表せる。
+GET は HEAD にも一致し、一致する要求集合が狭いパターンを優先する。
+同じ要求に一致しても一方を優先できないパターンと重複パターンは登録時に `invalid_argument` となる。
+パスだけが一致する場合は 405 と登録 method を整列した `Allow`、パスも一致しない場合は 404 を返す。
+
+ルート数の既定上限は 1024、パターンは 1024 byte、32 segment、16 個の名前付き変数までとする。
+登録は serve の開始前に終え、一つの mux とその handler を一つの event loop が所有する。
+`RouteHandler` は登録 callback の所有権を受け取り、異なる型の callback と concrete handler を同じ表に保持する。
+callback はコピー捕捉か移動捕捉で値を所有し、捕捉した view の参照元は mux より長く生存させる。
+
+`Request` の内部共有領域に選択したルートの変数を保持し、`ServeMux.param` は所有する `Optional[String]` を返す。
+percent decoding は行わず、`a%2Fb` をそのまま返す。
+パラメータは選択した handler の呼び出し中だけ参照でき、入れ子の mux から戻ると外側の変数を復元する。
+handler が例外を返した場合も同じ復元を行う。
+
+### 関数による middleware 合成
+
+`MiddlewareFn` は request と response writer、次の `RouteHandler` の借用を受け取る callback を所有する。
+callback は `next.handle(req, writer)` を呼んで後続へ進むか、呼ばずに応答を完成させる。
+`apply_middleware` は最終 handler と外側から並べた callback の List を消費し、一つの `RouteHandler` を返す。
+合成は serve 開始前に行い、保持する捕捉値の所有権は route callback と同じ契約に従う。
+
+後続が例外を返すと、その例外は呼び出し元の middleware に伝わる。
+`next.handle` の後の処理を例外時にも実行する場合は callback が `try`/`except` を使う。
+合成自体は応答 status と body を変更せず、前後処理と短絡処理を callback が決める。
+
+### Handler を包む middleware
+
+`LoggingHandler` は内側の handler と `LogSink` を所有し、同期呼び出しの完了時に method、raw path、status、経過 nanosecond を記録する。
+`StdoutLogSink` はこれらを標準出力へ出し、利用者は同じ trait を満たす出力先を注入できる。
+内側から例外が出た場合は 500 を記録して同じ例外を返す。
+detach した応答は同期 handler の復帰時に記録するため、後で sender が設定する status はこの記録に含まれない。
+
+`RecoverHandler` は buffered handler の例外を 500 応答へ変換し、途中まで作った body、headers、trailers の storage と予算予約を解放する。
+detach 後の例外は server に返し、応答 owner に sender の取消を任せる。
+`TimeoutHandler` は同期呼び出しの前後で monotonic deadline を調べ、正常に戻った時点で期限を過ぎていれば途中の応答を 503 に置き換える。
+実行中の blocking work を中断する機能は持たず、内側の例外はそのまま返し、detach を行った場合は `invalid_state` を返す。
+500 と 503 の置換応答も writer の body 上限と共有予算に従う。
 
 ### エラー契約
 
@@ -645,7 +744,7 @@ parser と encoder の単体 fixture は wire bytes を入力または出力し�
 | C2 | CRLF を要求し、不正 field name、colon 前の空白、obs-fold を 400 にする | 9112 §2.2、§5.1、§5.2。9110 §5.5、§5.6.2 | P `test_strict_crlf_token_obs_fold` の bare LF、`Bad Header`、`X-A :`、折返し行が 400。P `test_obs_text_header_value_preserved` は 0x80 を保持。R `test_response_injection_rejected` は CRLF を含む value の追加を拒否 |
 | C3 | HTTP/1.1 の Host 欠落、複数行、空値、不正 authority を 400 にする | 9112 §3.2。9110 §7.2 | P `test_host_missing_duplicate_invalid` の欠落、重複、空値、空白と、`test_host_authority_structure` の host／port／IPv6 の有効例と不正例を確認 |
 | C4 | origin-form、absolute-form、`OPTIONS *` を受理し、absolute-form の authority を優先する | 9112 §3.2.1、§3.2.2、§3.2.4 | P `test_path_query_split_without_decoding` は percent escape を保持。`test_absolute_form_and_options_star` は Host と異なる absolute authority と `*` を確認。`test_absolute_query_only_normalizes_to_root` は空 path を `/` にする。URI 全体の再構築への適合はこの例から判断しない |
-| C5 | CONNECT と Upgrade は未対応で、現在は 400 にする（実装方針） | CONNECT: 9112 §3.2.3、9110 §9.3.6。Upgrade: 9110 §7.8 | P `test_strict_crlf_token_obs_fold` は CONNECT と `Upgrade: h2c` に 400。505 は同じ fixture の `HTTP/2.0` に対する別の結果。切替成功の適合試験は含まない |
+| C5 | CONNECT authority-form と Upgrade を handler に渡す。CONNECT の body framing、h2c、Connection upgrade token の欠落は 400 | CONNECT: 9112 §3.2.3、9110 §9.3.6。Upgrade: 9110 §7.8 | P `test_connect_authority_form_preserves_following_raw_bytes`、`test_upgrade_requires_connection_and_keeps_h2c_rejected`。Server の raw 移譲は `test-http-hijack`／`test-http-connect` で確認する |
 | C6 | CL と chunked を処理し、CL/TE 併存、重複 CL、不正 framing、overflow を拒否する。同値 CL も拒否する方針 | 9112 §6.1、§6.2、§6.3、§7.1。9110 §8.6 | P `test_content_length_and_transfer_encoding` は同値の重複 CL、CL/TE、非数値 CL、`gzip` 単独を 400、`Chunked` を受理。P `test_overflow_and_limits` は decimal overflow と不正 hex を 400。S `test_chunked_echo_roundtrip` は decoded `hello` を返す。これらの parser の 400 assertion 自体は TCP close を検証しない |
 | C7 | chunk extension を検証し、trailer を通常 header と別に保持する。metadata と trailer に別上限を適用する | 9112 §7.1.1、§7.1.2。9110 §6.5、§6.5.1、§6.5.2 | P `test_chunked_with_extension_and_trailer` は `X-Trailer` の値と別 storage を確認。`test_chunk_extension_grammar` は token／quoted extension と不正例。`test_chunk_metadata_and_trailer_limits` は trailer 件数超過を 431、指定した framing、認証、content 等の field を 400 |
 | C8 | header 検証と宣言 body 上限判定後に 100 Continue を送り、未対応 Expect は 417 と close にする | 9110 §10.1.1、§15.2.1、§15.5.18 | S `test_100_continue_flow` は body 送信前に 100 を受信し、3-byte body 送信後に 200 と `abc` を確認。P `test_multiple_expect_fields_all_must_agree` は両 field 順序で 417。S `test_unknown_expectation_is_417` は 417 の status のみ確認 |
@@ -657,7 +756,7 @@ parser と encoder の単体 fixture は wire bytes を入力または出力し�
 malformed corpus は `tests/support._malformed_corpus()` を共有辞書とし、`P test_malformed_corpus_matches_parser_status` が parser の status を、`S test_malformed_corpus_wire_closes_connection` が wire 上の status 行と `Connection: close` と EOF をそれぞれ全件確認する。
 HTTP/1 の `scheme` は接続の TLS 状態を表し、平文では `http`、TLS では `https` になる。
 absolute-form の記載 scheme をそのまま公開する契約ではなく、target URI 全体の再構築（9112 §3.3）への適合は別に検証する。
-CONNECT／Upgrade の 400 と、未対応 transfer-coding の一律 400 は実装方針であり、RFC の要求する唯一の応答ではない（9112 §6.1 は未理解 coding に 501 を推奨する）。
+未対応 transfer-coding の一律 400 は実装方針であり、RFC の要求する唯一の応答ではない（9112 §6.1 は未理解 coding に 501 を推奨する）。
 この表だけで HTTP/2、HTTP/3、proxy、cache の適合を判定しない。
 
 ### HTTP/2 と HTTP/3 の request 変換
@@ -779,7 +878,7 @@ handler をイベントループ上でブロックさせると全接続が停止
   - `ResponseSender` の `start(status, headers)`、`send(data)`、`finish()`、`abort()` 実装。
   - HTTP/1.1 chunked encoding（`encode_chunked_start`, `encode_chunk`, `encode_chunk_end`）。ゼロアロケーション hex 長さエンコード（`_append_hex`）。
   - RFC 9112 / RFC 9110 フレーミング規則の厳格な準拠：
-    - `start()` での `Content-Length` 指定拒否（`invalid_argument`）。
+    - `start()` の有効な `Content-Length` は既知長の送信を選択する。受理した本文バイト数を照合し、過剰・不足時は応答を中止する。
     - 1xx, 204, 205, 304 での `Transfer-Encoding: chunked` およびボディチャンク除外。
     - HEAD 要求における `Transfer-Encoding: chunked` ヘッダー出力とボディチャンク・終端チャンク省略。
     - 長さ 0 の `send()` の no-op（終端と誤認される 0 チャンク送出の防止）。
@@ -788,7 +887,7 @@ handler をイベントループ上でブロックさせると全接続が停止
   - `ServerConfig.stream_idle_timeout`（デフォルト 300 秒）によるストリームアイドルタイムアウト管理。
   - `STATE_STREAMING` 中のタイムアウト・abort 時における即時接続クローズ（ヘッダー送出後の不正な 500/503 送出による HTTP フレーミング破壊の防止）。
   - `STATE_STREAMING` 中の早期切断（EOF）検知とワーカーへの `cancelled = True` 伝播。
-  - `tests/test_http_detach.mojo` に Phase C 契約テストを追加（start -> send x 3 -> finish の chunked 復元、keep-alive 継続、Content-Length 指定エラー、queue_limit 超過時の中断、HEAD/204 でのチャンク省略、早期切断時のキャンセル）。
+  - `tests/test_http_detach.mojo` に Phase C 契約テストを追加（start -> send x 3 -> finish の chunked 復元、keep-alive 継続、不正 Content-Length 指定エラー、queue_limit 超過時の中断、HEAD/204 でのチャンク省略、早期切断時のキャンセル）。
 - **Phase D**: キャンセルと停止（実装完了）。
   - `ResponseSender.send(...) -> Bool` のキャンセル時戻り値を仕様（`docs/design/http-server.md` 表記）通り `False` に統一し、例外送出を解消（生成ワーカーでの自然なループ脱出を実現）。
   - サーバーイベントループ（`_process_detached_messages`）での世代（generation）不一致時の安全な処理（再利用先のアクティブ接続を巻き添えクローズせず、古い状態のみを安全に破棄）。
@@ -814,7 +913,7 @@ handler をイベントループ上でブロックさせると全接続が停止
 | `ResponseWriter.detach()` | `mut self -> ResponseSender` raises NetError | ハンドラ内で 1 回だけ呼び出し可能。呼び出し後は `ResponseWriter` への書き込みはエラーとなり、ハンドラ復帰後も接続は閉じず「切り離し待ち」状態に移行する。二重呼び出しは `invalid_state` エラー。 |
 | `ResponseSender` | `Movable` | 単一所有権（コピー不可、移動可能）。Mojo ランタイム管理外のスレッド（FFI 経由で生成した pthread 等）へ安全に移動可能。デストラクタで未送信 drop を検知した場合は自動的に `abort` をキューイングする。 |
 | `ResponseSender.respond` | `mut self, status: Int, var headers: Headers, var body: List[Byte]) raises NetError` | 遅延応答。Content-Length 付きの通常応答を 1 回で送信する。すでに `start()` や `respond()` が呼ばれている場合、またはキャンセル済みの場合はエラー。 |
-| `ResponseSender.start` | `mut self, status: Int = 200, var headers: Headers = Headers()) raises NetError` | レスポンスストリーミングを開始する。HTTP/1.1 では `Transfer-Encoding: chunked` ヘッダーを自動付与してステータス行とヘッダーを送信する（`Content-Length` を明示指定した場合は `invalid_argument` エラー）。 |
+| `ResponseSender.start` | `mut self, status: Int = 200, var headers: Headers = Headers()) raises NetError` | レスポンスストリーミングを開始する。有効な `Content-Length` があれば既知長で送信する。指定がなければ HTTP/1.1 は chunked、HTTP/2・HTTP/3 は長さ未指定の DATA で送信する。既知長では本文の過不足を拒否し、trailer を禁止する。 |
 | `ResponseSender.send` | `mut self, bytes: Span[Byte, _]) -> Bool` | ストリームのチャンク（body 断片）を送信する。HTTP/1.1 では 1 回の呼び出しを 1 つの chunk としてエンコードする。クライアント切断、タイムアウト、シャットダウンによりキャンセルされている場合は例外を送出せず `False` を返す。送信成功時は `True`。長さ 0 のバイト列は no-op（終端 chunk との混同を防ぐ）。 |
 | `ResponseSender.finish` | `mut self) raises NetError` | ストリームを正常終了する（HTTP/1.1 では `0\r\n\r\n` を送出）。その後、keep-alive の規則に従って次要求の受信へ進むか接続をクローズする。 |
 | `ResponseSender.abort` | `mut self)` | ストリームまたは遅延応答を中断し、接続を直ちにクローズする。例外は送出しない。 |
@@ -922,3 +1021,171 @@ Latency p99: 2.0 - 48 ms
   - 受信タイムスタンプの毎クライアント計測およびミリ秒未満の微小クロックスキュー許容により、5,000 イベント全件の完全な追跡と低遅延（p50 約 0.11〜0.18 ms）を確認。
   - 100 スレッドの並行送信中もイベントループの CPU 使用率は約 12〜24% に収まり、十分なスケーラビリティ余力を実証。
   - ハンドラエラー処理仕様: `writer.detach()` 後に応答責務は `ResponseSender` へ移行する。スレッド生成失敗等の場合は `ResponseSender.abort()` を呼んでハンドラを正常終了（return）させることが推奨され、万一ハンドラが例外を送出した場合もサーバーが切り離し状態を安全にキャンセル・解放して 500 を返送する二重の安全機構を備える。
+
+
+## マルチワーカー構成（#229）
+
+`ServerPool` は一つの TCP listener を複製し、各 worker の `Server` に独立した descriptor の所有権を渡す。
+各 worker は OS thread 上で自分の reactor、接続テーブル、handler を動かす。
+受理した接続の所有 worker は終了まで変わらない。
+Linux は listener の epoll 登録に `EPOLLEXCLUSIVE` を付け、macOS は kqueue で競合した accept の would-block を正常系として扱う。
+
+`HandlerFactory.build(worker_id)` は worker ごとの handler を返す。
+factory の呼び出しと server の準備は、thread 起動前に呼び出し元で順に行う。
+`DefaultHandlerFactory[H]` は `Copyable` な handler をコピーする。
+handler 間で意図的に共有する可変状態には、利用側で同期を設ける。
+
+`workers=0` は online CPU 数を検出し、明示値を含めて 1〜1024 に制限する。
+CPU 数を検出できない場合は 1 worker とする。
+`ServerConfig` の接続数と buffer budget を含む全ての上限は worker ごとに適用する。
+既定の `max_connections=10000` と `total_buffer_budget=256 MiB` を 4 worker に渡すと、全体の上限は 40000 接続と 1 GiB になる。
+
+`pool.control()` のコピーから一度 `request_shutdown()` を呼ぶと、worker ごとの通知 channel を介して全 worker を起こす。
+各 worker の channel は、その worker の終了時に共有 mutex の下で閉じる。
+他の worker の通知は消費も破棄もしない。
+外部 handle は pool の終了後も保持でき、そのためだけに通知 descriptor を残すことはない。
+
+`serve(factory)` は全 thread を join してから戻る。
+準備中の失敗では thread を起動せず、作成済み server と listener の複製を破棄する。
+thread 起動途中または worker 実行中の失敗では停止を通知し、起動済み thread を join してから最初のエラーを返す。
+同期 handler が実行中の場合は、その handler が戻るまで停止処理は進まない。
+既存の `Server` と `listen_and_serve` は単一 loop の API として使える。
+
+`tests/test_http_pool.mojo` は共有 listener の受理件数、一括停止、起動前停止、factory と worker の失敗時の所有権を確認する。
+`http-pool-integration-test` は一つの TLS listener で HTTP/1.1 と HTTP/2 を並行に検証する。
+
+`add_quic_endpoint(endpoint^)` は endpoint を worker 0 だけに移動する。
+他の worker は TCP/TLS を処理する。
+TCP listener がない pool は、設定した worker 数によらず worker 0 だけを起動する。
+QUIC の Connection ID による複数 loop への振り分けは行わない。
+`http-pool-quic-test` は endpoint の唯一所有と失敗時の解放を確認する。
+`http-pool-quic-integration-test` は TCP の分散と HTTP/3 の worker 0 固定、一括停止を確認する。
+
+## HTTP/1 のストリーミング本文受信
+
+`ServerConfig.enable_request_body_streaming` の既定値は `False` である。
+既定の HTTP/1 と、この段階の HTTP/2・HTTP/3 は、本文全体を `max_body_bytes` まで受信してから handler を呼ぶ。
+HTTP/1 でフラグを有効にすると、検証済みヘッダーを受信した時点で handler を一度だけ呼ぶ。
+`Expect: 100-continue` の中間応答も、本文を待つ前に送信する。
+
+ストリーミング時の `Request.body` は空の `List[Byte]` である。
+`req.body_reader()` は唯一の reader を取得し、`read(buffer)` は到着済みのデコード済みバイトを消化する。
+EOF は `0`、未到着は `NetErrorKind.timeout()`、キャンセルは `NetErrorKind.cancelled()` で区別する。
+同期 handler を同じリクエストについて再呼び出すことはない。
+本文を待つ処理は、receiver を worker へ移して実行する。
+
+`writer.detach_with_body(req)` は、`receiver` と `sender` を所有する `RequestBodyEndpoints` を返す。
+この値を worker の context へ移すと、借用された `Request` の寿命を超えて受信と応答を進められる。
+`receiver.receive(buffer, timeout)` は condition variable で待ち、消化したバイトの通知はイベントループを起こす。
+receiver を破棄すると、残りの本文は discard として扱う。
+トレーラーはデコード済み本文をすべて消化した EOF の後に `receiver.trailers()` で取得する。
+
+`max_body_bytes` は、ストリーミング中の pipe が保持する未消化のデコード済みバイト数を制限する。
+受信キューの上限または共有 budget に達すると、ソケットの read interest を止める。
+固定長本文も、大きな一つの chunk も、消化によって空いた容量まで順次デコードする。
+消費済みの wire prefix は接続バッファーから取り除き、次のリクエストのバイトは残す。
+チャンクサイズ行、CRLF、拡張とトレーラーには、既存の構文規則と metadata 上限を適用する。
+一時的なトレーラー容量不足では EOF 通知を再試行し、総 budget を超える容量は 503 の失敗として扱う。
+
+本文受信と応答送信の完了は別々に管理する。
+未完の本文を持つ同期 handler が receiver を detach せず、本文も discard せずに返した場合は、応答に `Connection: close` を付けて接続を閉じる。
+明示的な discard は残りのフレーミングを検証しながら排出し、応答と入力が両方完了した後に接続を再利用する。
+本文完了前に detached response を終えた場合も、discard 済みでなければ接続を閉じる。
+`sender.start()` 時点で本文が未完かつ未 discard の場合は、応答ヘッダーに `Connection: close` を付ける。
+
+ストリーミングの `body_deadline` は、本文またはフレーミングを消費した最後の進捗から更新する。
+応答側の期限と本文側の期限のうち、早い方を接続に適用する。
+`RequestBody.detach()` で receiver だけを所有した同期 handler は、応答を終えた後も本文を受信できる。
+`Connection: close` を指定した場合も accepted body を完了してから接続を閉じ、完了済みの本文とトレーラーは receiver に残す。
+shutdown grace 中も受信を続けるが、猶予や本文期限の満了は receiver をキャンセルする。
+
+未完本文の EOF、ソケットの失敗、本文期限と shutdown grace の満了は、pipe と sender をキャンセルする。
+本文の wire EOF 後には pipe の wakeup descriptor 参照を外し、完了済み receiver が接続再利用後に残っても、新しい入力を起こさない。
+
+`tests/test_http_request_stream.mojo` は、ヘッダーだけでの dispatch、固定長と chunked、トレーラー、discard と pipeline、未読本文の切断を検証する。
+期限更新、100-continue、受信途中の EOF・shutdown と、32 バイトのキューを使う 16 KiB の pthread 受信も同じテストで確認する。
+
+## Heavy handler offload
+
+Handlers remain synchronous on the event loop. `ResponseWriter.offload(pool,
+job)` transfers a detached response and an owned `HandlerJob` to the reusable
+`WorkerPool`; it does not give the job socket or reactor ownership. Copy
+buffered request values into jobs before returning from the handler. The
+pool's queue count limit is separate from Server buffer budgets and does not
+bound memory retained by user jobs.
+
+A full or closed pool completes the detached sender with 503 and
+`Retry-After: 1`, returning `False`. Accepted jobs return `True`. A failed
+detach releases the unsubmitted job. The response sender's existing ownership
+rules handle errors after detach, so handlers need no private rollback call.
+
+Shut down Server before the pool. Pool shutdown stops admission, waits within
+its own grace, then cancels outstanding response capabilities. Unfinished
+workers detach and retain the shared state until their jobs and destructors
+return. This bounds shutdown while preserving lifetime safety; it cannot stop
+arbitrary user code. See [http-offload.md](http-offload.md) for the full
+contract and `examples/http_offload.mojo` / `examples/http_sse.mojo` for usage.
+
+### Raw transport ownership
+
+`net.http.HijackedConn` owns one TCP or TLS transport and unread bytes from
+before the protocol switch. `read` and `try_read` consume these bytes before
+reading the socket; `buffered` borrows the unread suffix and `take_buffered`
+transfers it. The bytes belong to the switched protocol and must not be parsed
+as another HTTP request. `write` and `try_write` may return a partial count.
+The descriptor returned by `raw_fd` is borrowed. `close` consumes the connection;
+its owner also closes it when the value is destroyed.
+
+A TLS handoff retains the server's scratch allocation and outstanding read
+length. This permits a receiver to request fewer bytes without changing the
+pending OpenSSL read call. Newly decrypted surplus bytes remain buffered.
+A nonblocking TLS write retry must use the same content and length; a different
+length raises `invalid_state`. A timeout may require either readability or
+writability, so a raw-descriptor poller watches both. `shutdown_write` sends TLS
+close-notify before the TCP write-side shutdown and preserves the read side.
+It rejects shutdown while a TLS write retry remains outstanding.
+
+`HijackSender.take_connection` consumes a worker endpoint and blocks on a
+condition until the HTTP loop publishes the connection after output flush,
+or cancels the switch. Calling it on the HTTP loop thread prevents completion.
+Cancellation returns `NetError(closed)`. Dropping or aborting an incomplete
+sender wakes the loop; dropping an unclaimed completed sender closes its raw
+transport. Each handoff has two references, held by the loop and worker;
+its response-wire and state-allocation budget tickets return on cleanup.
+
+
+`ResponseWriter.switch_protocols(headers, status=101)` accepts 101 for Upgrade
+or a successful 2xx status for CONNECT. Switching responses have no HTTP body,
+trailers, Content-Length or Transfer-Encoding. CONNECT responses in the buffered,
+deferred or HTTP streaming paths must use a non-2xx status; success requires raw
+takeover. `hijack()` sends no status or headers, so its receiving worker writes the
+CONNECT status line when needed. Both methods are exclusive with `detach()`;
+body and trailer writes after hijack raise `invalid_state`.
+
+Only an HTTP/1.1 server writer can switch protocols. HTTP/2, HTTP/3 and standalone
+writers return `unsupported`. An attached streaming request body must have reached
+and consumed EOF before takeover. An active standalone body receiver prohibits
+takeover, even after EOF; dropping it releases that ownership. Keep it released
+through the handler return. New takeover requests after shutdown has been
+requested return `closed`. Already started switching output drains within the
+shutdown grace and write deadline. Abort, peer hangup, send failure, handler error,
+server destruction or an expired flush deadline cancels the handoff. After transfer,
+server shutdown, deadlines and connection admission limits no longer own the raw
+transport; the receiver supplies its own I/O timeouts and close responsibility.
+
+
+### 既知長ストリーミングと HEAD の表現長
+
+`ResponseSender.start` に単一の有効な `Content-Length` を渡すと、HTTP/1.1 は chunked 符号化を使わず、宣言した長さで本文を区切る。
+HTTP/2・HTTP/3 も同じ長さをヘッダーに載せる。
+送信側は mailbox が受理した本文だけを数え、宣言長を超える `send` と不足した `finish` で応答を中止する。
+既知長の応答では trailer を使えない。
+HEAD は宣言した GET 相当の長さを保持し、本文の受理を必要としない。
+
+buffered HEAD では、本文が空なら caller の `Content-Length` を表現の長さとして使える。
+このため大きなファイルも本文を読み込まず HEAD に応答できる。
+GET と本文がある buffered 応答の長さ照合は従来と同じである。
+
+`try_send` は送信キューが満杯なら本文を受理せず `False` を返す。
+利用者は `is_cancelled()` を確認して再試行する。
+従来の `send` は HTTP/1 のキュー超過時に応答を中止する。

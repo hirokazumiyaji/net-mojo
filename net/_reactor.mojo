@@ -17,7 +17,7 @@ from net._sys.readiness import (
     _encode_token,
     _EventQueue,
 )
-from net.error import NetError
+from net.error import NetError, NetErrorKind
 from net.timeout import Timeout, _Deadline
 
 
@@ -42,6 +42,7 @@ struct ReactorEvent(Copyable, Movable):
     var readable: Bool
     var writable: Bool
     var has_error: Bool
+    var has_hangup: Bool
 
 
 struct _ReactorSlot(Copyable, Movable):
@@ -50,6 +51,7 @@ struct _ReactorSlot(Copyable, Movable):
     var writable: Bool
     var generation: UInt64
     var active: Bool
+    var exclusive: Bool
 
     def __init__(out self):
         self.fd = -1
@@ -57,6 +59,7 @@ struct _ReactorSlot(Copyable, Movable):
         self.writable = False
         self.generation = 0
         self.active = False
+        self.exclusive = False
 
 
 struct Reactor(Movable, Sized):
@@ -88,8 +91,41 @@ struct Reactor(Movable, Sized):
     def is_empty(self) -> Bool:
         return self._active_count == 0
 
+    @staticmethod
+    def _probe_hangup(fd: Int32) raises NetError -> Bool:
+        """Inspect terminal readiness without consuming pending reactor events.
+        """
+        var queue = _EventQueue()
+        queue.register(fd, False, True, UInt64(0), watch_hangup=True)
+        var ready = queue.wait(_Deadline.from_timeout(Timeout.nanoseconds(0)))
+        for event in ready:
+            if event.eof or event.has_error:
+                return True
+        return False
+
     def register(
-        mut self, fd: Int32, readable: Bool = True, writable: Bool = False
+        mut self,
+        fd: Int32,
+        readable: Bool = True,
+        writable: Bool = False,
+        watch_hangup: Bool = False,
+    ) raises NetError -> ReactorToken:
+        return self._register(
+            fd, readable, writable, exclusive=False, watch_hangup=watch_hangup
+        )
+
+    def _register_listener(mut self, fd: Int32) raises NetError -> ReactorToken:
+        return self._register(
+            fd, True, False, exclusive=True, watch_hangup=False
+        )
+
+    def _register(
+        mut self,
+        fd: Int32,
+        readable: Bool,
+        writable: Bool,
+        exclusive: Bool,
+        watch_hangup: Bool,
     ) raises NetError -> ReactorToken:
         var slot: Int
         if len(self._free) > 0:
@@ -108,6 +144,7 @@ struct Reactor(Movable, Sized):
             entry.generation = self._next_generation
             entry.active = True
             self._slots.append(entry^)
+        self._slots[slot].exclusive = exclusive
         var token = ReactorToken(slot=slot, generation=self._next_generation)
         self._next_generation += 1
         # Generation must never wrap to 0 (reserved).
@@ -116,7 +153,14 @@ struct Reactor(Movable, Sized):
         self._active_count += 1
         var wire = _encode_token(slot, token.generation)
         try:
-            self._queue.register(fd, readable, writable, wire)
+            self._queue.register(
+                fd,
+                readable,
+                writable,
+                wire,
+                exclusive=exclusive,
+                watch_hangup=watch_hangup,
+            )
         except e:
             # Roll back the slot so a failed registration never validates.
             self._slots[slot].active = False
@@ -133,14 +177,29 @@ struct Reactor(Movable, Sized):
         return self._slots[token.slot].generation == token.generation
 
     def modify(
-        mut self, token: ReactorToken, readable: Bool, writable: Bool
+        mut self,
+        token: ReactorToken,
+        readable: Bool,
+        writable: Bool,
+        watch_hangup: Bool = False,
     ) raises NetError -> Bool:
         if not self.contains(token):
             return False
+        if self._slots[token.slot].exclusive:
+            if readable and not writable and not watch_hangup:
+                return True
+            raise NetError(
+                NetErrorKind.invalid_state(),
+                "reactor modify",
+                None,
+                "listener registrations have fixed readable interest",
+            )
         self._slots[token.slot].readable = readable
         self._slots[token.slot].writable = writable
         var wire = _encode_token(token.slot, token.generation)
-        self._queue.modify(self._slots[token.slot].fd, readable, writable, wire)
+        self._queue.modify(
+            self._slots[token.slot].fd, readable, writable, wire, watch_hangup
+        )
         return True
 
     def remove(mut self, token: ReactorToken) -> Bool:
@@ -170,15 +229,18 @@ struct Reactor(Movable, Sized):
         empty watch would report nothing at all, hence the forced read watch
         for disinterested slots in the queue). A deliberately paused
         direction stays quiet — ordinary readability on a
-        `readable == False, writable == True` registration is neither
-        watched nor reported — so disabling reads reliably suppresses work
+        `readable == False, writable == True` registration is not
+        reported — so disabling reads reliably suppresses work
         (e.g. backpressure) instead of spinning on suppressed wakeups, while
         a fully disinterested slot can still learn that its peer went away.
         Any surfaced hangup obliges the owner to drain via `try_*` until
         would-block or EOF and to remove the registration on EOF, so no
         hangup can trap the loop eventlessly. `has_error` stays reserved for
         kernel errors; a pure hangup arrives as `readable` with
-        `has_error == False`.
+        `has_error == False`. `has_hangup` preserves the terminal indication
+        without requiring an application read. `watch_hangup` enables receive
+        shutdown observation for paused reads; disarm it after acknowledging
+        EOF when retaining the connection for backpressured output.
         """
         var out = List[ReactorEvent]()
         if self._active_count == 0:
@@ -226,6 +288,7 @@ struct Reactor(Movable, Sized):
                     readable=readable,
                     writable=writable,
                     has_error=batch[i].has_error,
+                    has_hangup=batch[i].eof,
                 )
             )
         return out^

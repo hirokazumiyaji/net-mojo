@@ -1,5 +1,7 @@
 from std.testing import assert_equal, assert_false, assert_true, TestSuite
 
+from net.error import NetErrorKind
+
 from net.http._http2.hpack import Http2HpackDeflater, Http2HpackInflater
 from net.http._http2.frame import FrameParseResult, parse_frame
 from net.http._http2.header_decoder import Http2HeaderDecoder
@@ -18,8 +20,10 @@ from net.http._http2.response_headers import (
 )
 from net.http._http2.request_headers import decode_http2_request_headers
 from net.http.response import ResponseWriter
+from net.http._buffer import SharedBufferBudget
 from net.http.request import HttpVersion
 from tests.support import _append_hpack_field
+from net.http._deadline import NO_DEADLINE
 
 
 def _enqueue_response(
@@ -124,6 +128,92 @@ def test_hpack_deflater_encodes_bounded_header_fields() raises:
     assert_true(decoded.is_success())
     assert_equal(decoded.field_count, 2)
     assert_equal(decoded.output_length, len(fields))
+
+
+def _assert_connection_goaway[
+    origin: Origin
+](output: Span[Byte, origin], expected: UInt32,) raises:
+    var offset = 0
+    var error_code = UInt32(0)
+    while offset < len(output):
+        var frame = parse_frame(output[offset:])
+        assert_true(frame.is_complete())
+        if frame.frame_type == Byte(7):
+            var goaway = parse_goaway_frame(
+                frame, output[offset + 9 : offset + frame.consumed]
+            )
+            assert_true(goaway.is_valid())
+            error_code = goaway.error_code
+        offset += frame.consumed
+    assert_equal(error_code, expected)
+
+
+def test_http2_connection_window_overflow_reports_flow_control_error() raises:
+    var session = Http2RequestSession("build/http2/libnet_hpack", 4, 1024)
+    var wire = List[Byte]("PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n".as_bytes())
+    var empty = List[Byte]()
+    _append_frame(wire, Byte(4), Byte(0), UInt32(0), Span(empty))
+    var first: List[Byte] = [Byte(0x7F), Byte(0xFF), Byte(0), Byte(0)]
+    var second: List[Byte] = [Byte(0), Byte(0), Byte(0), Byte(1)]
+    _append_frame(wire, Byte(8), Byte(0), UInt32(0), Span(first))
+    _append_frame(wire, Byte(8), Byte(0), UInt32(0), Span(second))
+    var result = session.consume(Span(wire))
+    assert_true(result.is_error())
+    _assert_connection_goaway(Span(result.output), UInt32(3))
+
+
+def test_http2_initial_settings_preserve_preface_and_flow_control_error() raises:
+    var session = Http2RequestSession("build/http2/libnet_hpack", 4, 1024)
+    var wire = List[Byte]("PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n".as_bytes())
+    var invalid_window: List[Byte] = [
+        Byte(0),
+        Byte(4),
+        Byte(0x80),
+        Byte(0),
+        Byte(0),
+        Byte(0),
+    ]
+    _append_frame(wire, Byte(4), Byte(0), UInt32(0), Span(invalid_window))
+    var result = session.consume(Span(wire))
+    assert_true(result.is_error())
+    var first = parse_frame(Span(result.output))
+    assert_true(first.is_complete())
+    assert_equal(first.frame_type, Byte(4))
+    _assert_connection_goaway(Span(result.output), UInt32(3))
+
+
+def test_http2_settings_ack_payload_reports_frame_size_error() raises:
+    var session = Http2RequestSession("build/http2/libnet_hpack", 4, 1024)
+    var wire = List[Byte]("PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n".as_bytes())
+    var empty = List[Byte]()
+    _append_frame(wire, Byte(4), Byte(0), UInt32(0), Span(empty))
+    var payload: List[Byte] = [Byte(0)]
+    _append_frame(wire, Byte(4), Byte(1), UInt32(0), Span(payload))
+    var result = session.consume(Span(wire))
+    assert_true(result.is_error())
+    _assert_connection_goaway(Span(result.output), UInt32(6))
+
+
+def test_http2_session_preserves_connection_frame_size_error() raises:
+    var session = Http2RequestSession("build/http2/libnet_hpack", 4, 1024)
+    var wire = List[Byte]("PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n".as_bytes())
+    var empty = List[Byte]()
+    _append_frame(wire, Byte(4), Byte(0), UInt32(0), Span(empty))
+    var oversized: List[Byte] = [
+        Byte(0),
+        Byte(0x40),
+        Byte(1),
+        Byte(0),
+        Byte(0),
+        Byte(0),
+        Byte(0),
+        Byte(0),
+        Byte(1),
+    ]
+    wire.extend(Span(oversized))
+    var result = session.consume(Span(wire))
+    assert_true(result.is_error())
+    _assert_connection_goaway(Span(result.output), UInt32(6))
 
 
 def test_shared_response_encodes_to_http2_header_frames() raises:
@@ -859,9 +949,12 @@ def test_http2_request_session_resets_only_stream_for_oversized_body() raises:
     _append_frame(wire, Byte(0), Byte(1), UInt32(3), Span(next_body))
 
     var result = session.consume(Span(wire))
-    assert_true(result.is_request())
-    assert_equal(result.stream_id, UInt32(3))
-    assert_equal(result.request.body[0], Byte(4))
+    assert_true(result.is_pending())
+    assert_equal(result.reset_stream_id, UInt32(1))
+    var sibling = session.consume(Span(wire)[result.consumed :])
+    assert_true(sibling.is_request())
+    assert_equal(sibling.stream_id, UInt32(3))
+    assert_equal(sibling.request.body[0], Byte(4))
     var output_offset = 0
     var reset_found = False
     var connection_credit_found = False
@@ -1385,6 +1478,371 @@ def _bootstrap_session(mut session: Http2RequestSession) raises:
     var empty = List[Byte]()
     _append_frame(wire, Byte(4), Byte(0), UInt32(0), Span(empty))
     assert_true(session.consume(Span(wire)).is_pending())
+
+
+def test_http2_failed_session_ignores_header_and_body_deadlines() raises:
+    for flags in [Byte(0), Byte(4)]:
+        var session = Http2RequestSession("build/http2/libnet_hpack", 4, 1024)
+        _bootstrap_session(session)
+        var compressed: List[Byte] = [0x82, 0x87, 0x84, 0x01, 0x01, 0x78]
+        var opening = List[Byte]()
+        _append_frame(opening, Byte(1), flags, UInt32(1), Span(compressed))
+        assert_true(session.consume(Span(opening)).is_pending())
+        var deadline = session.next_deadline()
+        assert_true(deadline != NO_DEADLINE)
+        var malformed = List[Byte]()
+        var payload: List[Byte] = [Byte(0)]
+        _append_frame(malformed, Byte(6), Byte(0), UInt32(0), Span(payload))
+        assert_true(session.consume(Span(malformed)).is_error())
+        assert_true(session.is_failed())
+        assert_equal(session.next_deadline(), NO_DEADLINE)
+        var expired_stream_ids = List[UInt32]()
+        assert_equal(len(session.expire(deadline, expired_stream_ids)), 0)
+        assert_equal(len(expired_stream_ids), 0)
+        assert_equal(session.next_deadline(), NO_DEADLINE)
+
+
+def test_http2_streaming_headers_omit_unknown_and_preserve_declared_length() raises:
+    var writer = ResponseWriter(64)
+    var fields = encode_http2_response_headers(
+        writer, False, "Thu, 01 Jan 1970 00:00:00 GMT", 4096, 32, streaming=True
+    )
+    assert_true(fields.is_valid())
+    var raw = String(from_utf8_lossy=Span(fields.fields))
+    assert_equal(raw.find("content-length"), -1)
+    writer.headers.add("Content-Length", "0")
+    var declared = encode_http2_response_headers(
+        writer, False, "Thu, 01 Jan 1970 00:00:00 GMT", 4096, 32, streaming=True
+    )
+    assert_true(declared.is_valid())
+    assert_equal(declared.field_count, fields.field_count + 1)
+    var known_raw = String(from_utf8_lossy=Span(declared.fields))
+    assert_true(known_raw.find("content-length") >= 0)
+    writer.headers.add("Content-Length", "1")
+    var conflicting = encode_http2_response_headers(
+        writer, False, "Thu, 01 Jan 1970 00:00:00 GMT", 4096, 32, streaming=True
+    )
+    assert_true(conflicting.is_error())
+
+
+def _enqueue_streaming(
+    mut scheduler: Http2ResponseScheduler,
+    stream_id: UInt32,
+    var budget: Optional[SharedBufferBudget] = None,
+) -> Bool:
+    var fields = List[Byte]()
+    _append_hpack_field(fields, ":status", "200")
+    return scheduler.enqueue_streaming(
+        stream_id, fields^, 1, 4096, 32, 4096, budget=budget^
+    )
+
+
+def _open_stream(mut session: Http2RequestSession, stream_id: UInt32) raises:
+    var compressed: List[Byte] = [0x82, 0x86, 0x84, 0x01, 0x01, Byte(ord("x"))]
+    var opening = List[Byte]()
+    _append_frame(opening, Byte(1), Byte(5), stream_id, Span(compressed))
+    assert_true(session.consume(Span(opening)).is_request())
+
+
+def test_http2_streaming_waits_for_chunks_and_explicit_finish() raises:
+    var session = Http2RequestSession("build/http2/libnet_hpack", 4, 1024)
+    _bootstrap_session(session)
+    _open_stream(session, UInt32(1))
+    var scheduler = Http2ResponseScheduler()
+    var deflater = _make_deflater()
+    assert_true(_enqueue_streaming(scheduler, UInt32(1)))
+    var headers = scheduler.drain(
+        session, deflater, "Thu, 01 Jan 1970 00:00:00 GMT", 16384, 65536
+    )
+    assert_equal(scheduler.queued_count(), 1)
+    assert_equal(len(headers.completed_streams), 0)
+    var header_frame = parse_frame(Span(headers.wire))
+    assert_equal(header_frame.frame_type, Byte(1))
+    assert_equal(header_frame.flags & Byte(1), Byte(0))
+    var idle = scheduler.drain(
+        session, deflater, "Thu, 01 Jan 1970 00:00:00 GMT", 16384, 65536
+    )
+    assert_equal(len(idle.wire), 0)
+    var chunk: List[Byte] = [Byte(ord("a")), Byte(ord("b"))]
+    assert_true(scheduler.push_body(UInt32(1), chunk^))
+    var data = scheduler.drain(
+        session, deflater, "Thu, 01 Jan 1970 00:00:00 GMT", 16384, 65536
+    )
+    var data_frame = parse_frame(Span(data.wire))
+    assert_equal(data_frame.frame_type, Byte(0))
+    assert_equal(data_frame.flags & Byte(1), Byte(0))
+    assert_equal(scheduler.queued_count(), 1)
+    assert_true(scheduler.finish(UInt32(1)))
+    var finish = scheduler.drain(
+        session, deflater, "Thu, 01 Jan 1970 00:00:00 GMT", 16384, 65536
+    )
+    var end = parse_frame(Span(finish.wire))
+    assert_equal(end.frame_type, Byte(0))
+    assert_equal(end.flags & Byte(1), Byte(1))
+    assert_equal(len(finish.completed_streams), 1)
+    assert_equal(scheduler.queued_count(), 0)
+
+
+def test_http2_idle_streaming_response_does_not_starve_buffered_sibling() raises:
+    var session = Http2RequestSession("build/http2/libnet_hpack", 4, 1024)
+    _bootstrap_session(session)
+    _open_stream(session, UInt32(1))
+    _open_stream(session, UInt32(3))
+    var scheduler = Http2ResponseScheduler()
+    var deflater = _make_deflater()
+    assert_true(_enqueue_streaming(scheduler, UInt32(1)))
+    var body: List[Byte] = [Byte(ord("x"))]
+    assert_true(_enqueue_response(scheduler, UInt32(3), 200, body^))
+    var batch = scheduler.drain(
+        session, deflater, "Thu, 01 Jan 1970 00:00:00 GMT", 16384, 65536
+    )
+    assert_equal(len(batch.completed_streams), 1)
+    assert_equal(batch.completed_streams[0], UInt32(3))
+    assert_equal(scheduler.queued_count(), 1)
+
+
+def test_http2_streaming_chunk_storage_refunds_on_consumption_and_reset() raises:
+    var session = Http2RequestSession("build/http2/libnet_hpack", 4, 1024)
+    _bootstrap_session(session)
+    _open_stream(session, UInt32(1))
+    var scheduler = Http2ResponseScheduler()
+    var deflater = _make_deflater()
+    var budget = SharedBufferBudget(65536)
+    assert_true(_enqueue_streaming(scheduler, UInt32(1), budget.copy()))
+    var chunk = List[Byte](length=4096, fill=Byte(ord("x")))
+    assert_true(scheduler.push_body(UInt32(1), chunk^))
+    var queued = budget.used()
+    assert_true(queued >= 4096)
+    var sent = scheduler.drain(
+        session, deflater, "Thu, 01 Jan 1970 00:00:00 GMT", 16384, 65536
+    )
+    assert_equal(len(sent.consumed_bytes), 1)
+    assert_equal(sent.consumed_bytes[0].amount, 4096)
+    assert_true(budget.used() <= queued - 4096)
+    var next = List[Byte](length=2048, fill=Byte(ord("y")))
+    assert_true(scheduler.push_body(UInt32(1), next^))
+    assert_true(budget.used() >= 2048)
+    _ = scheduler.on_peer_reset(UInt32(1))
+    assert_equal(budget.used(), 0)
+    var dropped = scheduler.drain(
+        session, deflater, "Thu, 01 Jan 1970 00:00:00 GMT", 16384, 65536
+    )
+    assert_equal(len(dropped.completed_streams), 1)
+    assert_equal(scheduler.queued_count(), 0)
+    assert_equal(budget.used(), 0)
+
+
+def test_http2_streaming_flow_credit_preserves_chunk_order_before_trailers() raises:
+    var session = Http2RequestSession("build/http2/libnet_hpack", 4, 1024)
+    _bootstrap_session(session)
+    var zero_window: List[Byte] = [0, 4, 0, 0, 0, 0]
+    var settings = List[Byte]()
+    _append_frame(settings, Byte(4), Byte(0), UInt32(0), Span(zero_window))
+    assert_true(session.consume(Span(settings)).is_pending())
+    _open_stream(session, UInt32(1))
+    var scheduler = Http2ResponseScheduler()
+    var deflater = _make_deflater()
+    assert_true(_enqueue_streaming(scheduler, UInt32(1)))
+    var first: List[Byte] = [Byte(ord("a")), Byte(ord("b"))]
+    var second: List[Byte] = [Byte(ord("c")), Byte(ord("d"))]
+    assert_true(scheduler.push_body(UInt32(1), first^))
+    assert_true(scheduler.push_body(UInt32(1), second^))
+    var trailers = List[Byte]()
+    _append_hpack_field(trailers, "x-digest", "done")
+    assert_true(scheduler.finish(UInt32(1), trailers^, 1, 4096, 32))
+    var blocked = scheduler.drain(
+        session, deflater, "Thu, 01 Jan 1970 00:00:00 GMT", 16384, 65536
+    )
+    assert_equal(len(blocked.completed_streams), 0)
+    assert_equal(len(blocked.consumed_bytes), 0)
+    var headers = parse_frame(Span(blocked.wire))
+    assert_equal(headers.frame_type, Byte(1))
+    assert_equal(headers.flags & Byte(1), Byte(0))
+    var credit: List[Byte] = [0, 0, 0, 1]
+    var update = List[Byte]()
+    _append_frame(update, Byte(8), Byte(0), UInt32(1), Span(credit))
+    assert_true(session.consume(Span(update)).is_pending())
+    var partial = scheduler.drain(
+        session, deflater, "Thu, 01 Jan 1970 00:00:00 GMT", 16384, 65536
+    )
+    assert_equal(partial.consumed_bytes[0].amount, 1)
+    assert_equal(len(partial.completed_streams), 0)
+    assert_equal(partial.wire[9], Byte(ord("a")))
+    credit[3] = 3
+    update = List[Byte]()
+    _append_frame(update, Byte(8), Byte(0), UInt32(1), Span(credit))
+    assert_true(session.consume(Span(update)).is_pending())
+    var resumed = scheduler.drain(
+        session, deflater, "Thu, 01 Jan 1970 00:00:00 GMT", 16384, 65536
+    )
+    assert_equal(resumed.consumed_bytes[0].amount, 3)
+    assert_equal(len(resumed.completed_streams), 1)
+    var body = List[Byte]()
+    var offset = 0
+    var saw_trailers = False
+    while offset < len(resumed.wire):
+        var frame = parse_frame(Span(resumed.wire)[offset:])
+        if frame.frame_type == Byte(0):
+            assert_false(saw_trailers)
+            assert_equal(frame.flags & Byte(1), Byte(0))
+            body.extend(
+                Span(resumed.wire)[offset + 9 : offset + frame.consumed]
+            )
+        elif frame.frame_type == Byte(1):
+            saw_trailers = True
+            assert_equal(frame.flags & Byte(1), Byte(1))
+        offset += frame.consumed
+    assert_equal(String(from_utf8_lossy=Span(body)), "bcd")
+    assert_true(saw_trailers)
+
+
+def test_http2_streaming_finish_uses_current_trailer_limits() raises:
+    var session = Http2RequestSession("build/http2/libnet_hpack", 4, 1024)
+    _bootstrap_session(session)
+    _open_stream(session, UInt32(1))
+    var scheduler = Http2ResponseScheduler()
+    var deflater = _make_deflater()
+    var fields = List[Byte]()
+    _append_hpack_field(fields, ":status", "200")
+    assert_true(
+        scheduler.enqueue_streaming(UInt32(1), fields^, 1, 128, 32, 128)
+    )
+    var initial = scheduler.drain(
+        session, deflater, "Thu, 01 Jan 1970 00:00:00 GMT", 16384, 65536
+    )
+    assert_equal(len(initial.completed_streams), 0)
+    var trailers = List[Byte]()
+    var value = String(
+        from_utf8_lossy=Span(List[Byte](length=256, fill=Byte(120)))
+    )
+    _append_hpack_field(trailers, "x-meta", value)
+    assert_true(scheduler.finish(UInt32(1), trailers^, 1, 8192, 32))
+    var finished = scheduler.drain(
+        session, deflater, "Thu, 01 Jan 1970 00:00:00 GMT", 16384, 65536
+    )
+    assert_false(finished.deflater_failed)
+    assert_equal(len(finished.failed_streams), 0)
+    assert_equal(len(finished.completed_streams), 1)
+    var frame = parse_frame(Span(finished.wire))
+    assert_equal(frame.frame_type, Byte(1))
+    assert_equal(frame.flags & Byte(1), Byte(1))
+
+
+def test_http2_streaming_header_fallback_reports_failure_and_refunds_chunks() raises:
+    var session = Http2RequestSession("build/http2/libnet_hpack", 4, 1024)
+    _bootstrap_session(session)
+    _open_stream(session, UInt32(1))
+    var scheduler = Http2ResponseScheduler()
+    var deflater = _make_deflater()
+    var budget = SharedBufferBudget(2 * 1024 * 1024)
+    var fields = List[Byte]()
+    _append_hpack_field(fields, ":status", "200")
+    var value = String(
+        from_utf8_lossy=Span(List[Byte](length=70000, fill=Byte(120)))
+    )
+    _append_hpack_field(fields, "x-pad", value)
+    assert_true(
+        scheduler.enqueue_streaming(
+            UInt32(1), fields^, 2, 131072, 32, 131072, budget=budget.copy()
+        )
+    )
+    var chunk: List[Byte] = [1, 2, 3, 4]
+    assert_true(scheduler.push_body(UInt32(1), chunk^))
+    assert_true(budget.used() > 0)
+    var batch = scheduler.drain(
+        session, deflater, "Thu, 01 Jan 1970 00:00:00 GMT", 16384, 65536
+    )
+    assert_false(batch.deflater_failed)
+    assert_equal(len(batch.failed_streams), 1)
+    assert_equal(batch.failed_streams[0], UInt32(1))
+    assert_equal(len(batch.completed_streams), 1)
+    assert_equal(batch.completed_streams[0], UInt32(1))
+    assert_equal(len(batch.consumed_bytes), 0)
+    assert_equal(scheduler.queued_count(), 0)
+    assert_equal(budget.used(), 0)
+
+
+def test_http2_streaming_chunk_metadata_budget_failure_refunds_body() raises:
+    var scheduler = Http2ResponseScheduler()
+    var budget = SharedBufferBudget(1024)
+    assert_true(_enqueue_streaming(scheduler, UInt32(1), budget.copy()))
+    var body = List[Byte](length=1024, fill=0)
+    assert_false(scheduler.push_body(UInt32(1), body^))
+    assert_equal(budget.used(), 0)
+    assert_true(scheduler.finish(UInt32(1)))
+    var late: List[Byte] = [1]
+    assert_false(scheduler.push_body(UInt32(1), late^))
+    assert_false(scheduler.finish(UInt32(1)))
+    _ = scheduler.cancel(UInt32(1))
+    assert_equal(budget.used(), 0)
+
+
+def test_http2_streaming_fifo_compaction_preserves_order_and_budget() raises:
+    var session = Http2RequestSession("build/http2/libnet_hpack", 4, 1024)
+    _bootstrap_session(session)
+    _open_stream(session, UInt32(1))
+    var scheduler = Http2ResponseScheduler()
+    var deflater = _make_deflater()
+    var budget = SharedBufferBudget(65536)
+    assert_true(_enqueue_streaming(scheduler, UInt32(1), budget.copy()))
+    _ = scheduler.drain(
+        session, deflater, "Thu, 01 Jan 1970 00:00:00 GMT", 16384, 65536
+    )
+    for byte in "abcdefgh".as_bytes():
+        var chunk: List[Byte] = [byte]
+        assert_true(scheduler.push_body(UInt32(1), chunk^))
+    var body = List[Byte]()
+    for _ in range(2):
+        var partial = scheduler.drain(
+            session, deflater, "Thu, 01 Jan 1970 00:00:00 GMT", 16384, 20
+        )
+        var offset = 0
+        while offset < len(partial.wire):
+            var frame = parse_frame(Span(partial.wire)[offset:])
+            body.extend(
+                Span(partial.wire)[offset + 9 : offset + frame.consumed]
+            )
+            offset += frame.consumed
+    for byte in "ij".as_bytes():
+        var chunk: List[Byte] = [byte]
+        assert_true(scheduler.push_body(UInt32(1), chunk^))
+    assert_true(scheduler.finish(UInt32(1)))
+    var remainder = scheduler.drain(
+        session, deflater, "Thu, 01 Jan 1970 00:00:00 GMT", 16384, 65536
+    )
+    var offset = 0
+    while offset < len(remainder.wire):
+        var frame = parse_frame(Span(remainder.wire)[offset:])
+        body.extend(Span(remainder.wire)[offset + 9 : offset + frame.consumed])
+        offset += frame.consumed
+    assert_equal(String(from_utf8_lossy=Span(body)), "abcdefghij")
+    assert_equal(budget.used(), 0)
+
+
+def test_http2_streaming_fifo_reuses_storage_across_long_lived_stream() raises:
+    var session = Http2RequestSession("build/http2/libnet_hpack", 4, 1024)
+    _bootstrap_session(session)
+    _open_stream(session, UInt32(1))
+    var scheduler = Http2ResponseScheduler()
+    var deflater = _make_deflater()
+    var budget = SharedBufferBudget(1024)
+    assert_true(_enqueue_streaming(scheduler, UInt32(1), budget.copy()))
+    _ = scheduler.drain(
+        session, deflater, "Thu, 01 Jan 1970 00:00:00 GMT", 16384, 65536
+    )
+    var retained = -1
+    for _ in range(256):
+        var chunk: List[Byte] = [1]
+        assert_true(scheduler.push_body(UInt32(1), chunk^))
+        var batch = scheduler.drain(
+            session, deflater, "Thu, 01 Jan 1970 00:00:00 GMT", 16384, 65536
+        )
+        assert_equal(batch.consumed_bytes[0].amount, 1)
+        if retained < 0:
+            retained = budget.used()
+        assert_equal(budget.used(), retained)
+    _ = scheduler.cancel(UInt32(1))
+    assert_equal(budget.used(), 0)
 
 
 def test_http2_scheduler_peer_reset_before_headers_sent_drops_entry() raises:
@@ -2187,5 +2645,341 @@ def test_http2_window_update_on_idle_stream_is_connection_error() raises:
     assert_true(session.is_failed())
 
 
+def test_http2_closed_data_reports_stream_or_connection_closed() raises:
+    for completed in [False, True]:
+        var session = Http2RequestSession("build/http2/libnet_hpack", 4, 1024)
+        _bootstrap_two_open_streams(session)
+        var close = List[Byte]()
+        var empty = List[Byte]()
+        if completed:
+            _append_frame(close, Byte(0), Byte(1), UInt32(1), Span(empty))
+            assert_true(session.consume(Span(close)).is_request())
+        else:
+            var reset_payload: List[Byte] = [0, 0, 0, 8]
+            _append_frame(
+                close, Byte(3), Byte(0), UInt32(1), Span(reset_payload)
+            )
+            assert_true(session.consume(Span(close)).is_pending())
+        var late = List[Byte]()
+        var body: List[Byte] = [Byte(ord("x"))]
+        _append_frame(late, Byte(0), Byte(0), UInt32(1), Span(body))
+        var result = session.consume(Span(late))
+        if not completed:
+            assert_true(result.is_error())
+            _assert_connection_goaway(Span(result.output), UInt32(5))
+            var offset = 0
+            while offset < len(result.output):
+                var frame = parse_frame(Span(result.output)[offset:])
+                assert_true(frame.is_complete())
+                assert_true(frame.frame_type != Byte(3))
+                offset += frame.consumed
+            continue
+        assert_true(result.is_pending())
+        assert_equal(result.reset_stream_id, UInt32(1))
+        var offset = 0
+        var found = False
+        while offset < len(result.output):
+            var frame = parse_frame(Span(result.output)[offset:])
+            assert_true(frame.is_complete())
+            if frame.frame_type == Byte(3):
+                var reset = parse_rst_stream_frame(
+                    frame, Span(result.output)[offset + 9 :]
+                )
+                assert_true(reset.is_valid())
+                assert_equal(reset.error_code, UInt32(5))
+                found = True
+            offset += frame.consumed
+        assert_true(found)
+        assert_false(session.is_failed())
+        var sibling = List[Byte]()
+        _append_frame(sibling, Byte(0), Byte(1), UInt32(3), Span(empty))
+        var request = session.consume(Span(sibling))
+        assert_true(request.is_request())
+        assert_equal(request.stream_id, UInt32(3))
+
+
+def test_http2_data_after_local_reset_returns_connection_credit_without_reset() raises:
+    var session = Http2RequestSession("build/http2/libnet_hpack", 4, 1024)
+    _bootstrap_two_open_streams(session)
+    _ = session.refuse_stream(UInt32(1), UInt32(7))
+    var retained = session.buffered_request_bytes()
+    var body: List[Byte] = [Byte(ord("x"))]
+    for _ in range(2):
+        var late = List[Byte]()
+        _append_frame(late, Byte(0), Byte(0), UInt32(1), Span(body))
+        var result = session.consume(Span(late))
+        assert_true(result.is_pending())
+        assert_equal(result.reset_stream_id, UInt32(0))
+        var frame = parse_frame(Span(result.output))
+        assert_true(frame.is_complete())
+        assert_equal(frame.frame_type, Byte(8))
+        assert_equal(frame.stream_id, UInt32(0))
+        assert_equal(len(result.output), frame.consumed)
+        assert_equal(session.buffered_request_bytes(), retained)
+    var empty = List[Byte]()
+    var sibling = List[Byte]()
+    _append_frame(sibling, Byte(0), Byte(1), UInt32(3), Span(empty))
+    assert_true(session.consume(Span(sibling)).is_request())
+    assert_equal(session.buffered_request_bytes(), 0)
+    assert_equal(len(session._locally_reset_streams), 1)
+
+
+def test_http2_scheduler_reset_ignores_late_data() raises:
+    var session = Http2RequestSession("build/http2/libnet_hpack", 4, 1024)
+    _bootstrap_two_open_streams(session)
+    var empty = List[Byte]()
+    var complete = List[Byte]()
+    _append_frame(complete, Byte(0), Byte(1), UInt32(1), Span(empty))
+    assert_true(session.consume(Span(complete)).is_request())
+    var scheduler = Http2ResponseScheduler()
+    var deflater = _make_deflater()
+    assert_true(_enqueue_response(scheduler, UInt32(1), 200, List[Byte]()))
+    var batch = scheduler.drain(
+        session, deflater, "Thu, 01 Jan 1970 00:00:00 GMT", 16384, 13
+    )
+    var reset = parse_frame(Span(batch.wire))
+    assert_true(reset.is_complete())
+    assert_equal(reset.frame_type, Byte(3))
+    assert_equal(reset.stream_id, UInt32(1))
+    var late = List[Byte]()
+    var body: List[Byte] = [Byte(ord("x"))]
+    _append_frame(late, Byte(0), Byte(0), UInt32(1), Span(body))
+    var result = session.consume(Span(late))
+    assert_true(result.is_pending())
+    assert_equal(result.reset_stream_id, UInt32(0))
+    var credit = parse_frame(Span(result.output))
+    assert_true(credit.is_complete())
+    assert_equal(credit.frame_type, Byte(8))
+    assert_equal(credit.stream_id, UInt32(0))
+    assert_equal(len(result.output), credit.consumed)
+
+
+def test_http2_local_reset_history_limit_drains_connection() raises:
+    var session = Http2RequestSession("build/http2/libnet_hpack", 4, 1024)
+    _bootstrap_session(session)
+    var compressed: List[Byte] = [0x82, 0x87, 0x84, 0x01, 0x01, 0x78]
+    for i in range(256):
+        var stream_id = UInt32(1 + 2 * i)
+        var opening = List[Byte]()
+        _append_frame(opening, Byte(1), Byte(5), stream_id, Span(compressed))
+        assert_true(session.consume(Span(opening)).is_request())
+        var output = session.refuse_stream(stream_id, UInt32(7))
+        assert_equal(session.is_failed(), i == 255)
+        if i == 255:
+            _assert_connection_goaway(Span(output), UInt32(11))
+    assert_true(session.is_draining())
+    assert_equal(len(session._locally_reset_streams), 256)
+    _ = session.refuse_stream(UInt32(513), UInt32(7))
+    assert_equal(len(session._locally_reset_streams), 256)
+
+
+def test_http2_peer_reset_history_limit_drains_connection() raises:
+    var session = Http2RequestSession(
+        "build/http2/libnet_hpack", 4, 1024, max_resets_per_second=1000
+    )
+    _bootstrap_session(session)
+    var compressed: List[Byte] = [0x82, 0x87, 0x84, 0x01, 0x01, 0x78]
+    var reset_payload: List[Byte] = [0, 0, 0, 8]
+    for i in range(256):
+        var stream_id = UInt32(1 + 2 * i)
+        var opening = List[Byte]()
+        _append_frame(opening, Byte(1), Byte(4), stream_id, Span(compressed))
+        assert_true(session.consume(Span(opening)).is_pending())
+        var reset = List[Byte]()
+        _append_frame(reset, Byte(3), Byte(0), stream_id, Span(reset_payload))
+        var result = session.consume(Span(reset))
+        assert_equal(result.is_error(), i == 255)
+        if i == 255:
+            _assert_connection_goaway(Span(result.output), UInt32(11))
+    assert_true(session.is_failed())
+    assert_true(session.is_draining())
+    assert_equal(len(session._peer_reset_streams), 256)
+
+
+def test_http2_scheduler_streaming_reset_preserves_credit_and_batch_limit() raises:
+    var budget = SharedBufferBudget(8)
+    var session = Http2RequestSession(
+        "build/http2/libnet_hpack",
+        4,
+        4,
+        request_body_budget=Optional(budget.copy()),
+    )
+    _bootstrap_session(session)
+    var empty = List[Byte]()
+    var ack = List[Byte]()
+    _append_frame(ack, Byte(4), Byte(1), UInt32(0), Span(empty))
+    assert_true(session.consume(Span(ack)).is_pending())
+    var compressed: List[Byte] = [0x83, 0x87, 0x84, 0x01, 0x01, 0x78]
+    var opening1 = List[Byte]()
+    _append_frame(opening1, Byte(1), Byte(4), UInt32(1), Span(compressed))
+    var head1 = session.consume(Span(opening1))
+    assert_true(head1.is_head())
+    var request1 = head1^.take_request()
+    var reader1 = request1.body_reader()
+    var opening3 = List[Byte]()
+    _append_frame(opening3, Byte(1), Byte(4), UInt32(3), Span(compressed))
+    var head3 = session.consume(Span(opening3))
+    assert_true(head3.is_head())
+    var request3 = head3^.take_request()
+    var reader3 = request3.body_reader()
+    var payload: List[Byte] = [Byte(97), Byte(98), Byte(99), Byte(100)]
+    var input1 = List[Byte]()
+    _append_frame(input1, Byte(0), Byte(0), UInt32(1), Span(payload))
+    var received1 = session.consume(Span(input1))
+    assert_true(received1.is_pending())
+    assert_equal(len(received1.output), 0)
+    var partial = Array[Byte, 2](fill=0)
+    assert_equal(reader1.read(Span(partial)), 2)
+    assert_equal(session._receive_window.receive_window(), 65531)
+    assert_equal(budget.used(), 8)
+    assert_equal(session.reset_response_credit_size(UInt32(1)), 13)
+
+    var scheduler = Http2ResponseScheduler()
+    var deflater = _make_deflater()
+    assert_true(_enqueue_response(scheduler, UInt32(1), 200, List[Byte]()))
+    var tight = scheduler.drain(
+        session, deflater, "Thu, 01 Jan 1970 00:00:00 GMT", 16384, 13
+    )
+    assert_equal(len(tight.wire), 0)
+    assert_equal(len(tight.failed_streams), 0)
+    assert_equal(len(tight.completed_streams), 0)
+    assert_equal(scheduler.queued_count(), 1)
+    assert_equal(len(session._locally_reset_streams), 0)
+    assert_equal(session._receive_window.receive_window(), 65531)
+    assert_equal(session.reset_response_credit_size(UInt32(1)), 13)
+    assert_equal(budget.used(), 8)
+
+    var batch = scheduler.drain(
+        session, deflater, "Thu, 01 Jan 1970 00:00:00 GMT", 16384, 26
+    )
+    assert_equal(len(batch.wire), 26)
+    var reset = parse_frame(Span(batch.wire))
+    assert_true(reset.is_complete())
+    assert_equal(reset.frame_type, Byte(3))
+    assert_equal(reset.stream_id, UInt32(1))
+    var reset_fields = parse_rst_stream_frame(reset, Span(batch.wire)[9:13])
+    assert_true(reset_fields.is_valid())
+    assert_equal(reset_fields.error_code, UInt32(2))
+    var update = parse_frame(Span(batch.wire)[13:])
+    assert_true(update.is_complete())
+    assert_equal(update.frame_type, Byte(8))
+    assert_equal(update.stream_id, UInt32(0))
+    var fields = parse_window_update_frame(update, Span(batch.wire)[22:26])
+    assert_true(fields.is_valid())
+    assert_equal(fields.increment, UInt32(4))
+    assert_equal(scheduler.queued_count(), 0)
+    assert_equal(session._receive_window.receive_window(), 65535)
+    assert_equal(session.reset_response_credit_size(UInt32(1)), 0)
+    assert_true(UInt32(1) in session._locally_reset_streams)
+    assert_equal(budget.used(), 4)
+    var cancelled = False
+    try:
+        _ = reader1.read(Span(partial))
+    except error:
+        cancelled = error.kind == NetErrorKind.cancelled()
+    assert_true(cancelled)
+    var no_duplicate_credit = session.flush_body_credit()
+    assert_equal(len(no_duplicate_credit), 0)
+
+    var sibling = List[Byte]()
+    _append_frame(sibling, Byte(0), Byte(0), UInt32(3), Span(payload))
+    assert_true(session.consume(Span(sibling)).is_pending())
+    assert_false(session.is_failed())
+    var buffer = Array[Byte, 4](fill=0)
+    assert_equal(reader3.read(Span(buffer)), 4)
+    var sibling_credit = session.flush_body_credit()
+    assert_equal(len(sibling_credit), 26)
+    assert_equal(session._receive_window.receive_window(), 65535)
+
+
 def main() raises:
     TestSuite.discover_tests[__functions_in_module()]().run()
+
+
+def _check_http2_body_expiry_response_work(started: Bool) raises:
+    from net import Timeout
+
+    var budget = SharedBufferBudget(4)
+    var session = Http2RequestSession(
+        "build/http2/libnet_hpack",
+        4,
+        4,
+        body_deadline=Timeout.seconds(1),
+        request_body_budget=Optional(budget.copy()),
+    )
+    _bootstrap_session(session)
+    var empty = List[Byte]()
+    var ack = List[Byte]()
+    _append_frame(ack, Byte(4), Byte(1), UInt32(0), Span(empty))
+    assert_true(session.consume(Span(ack)).is_pending())
+    var zero_window: List[Byte] = [0, 4, 0, 0, 0, 0]
+    var settings = List[Byte]()
+    _append_frame(settings, Byte(4), Byte(0), UInt32(0), Span(zero_window))
+    assert_true(session.consume(Span(settings)).is_pending())
+    var compressed: List[Byte] = [0x83, 0x87, 0x84, 0x01, 0x01, 0x78]
+    var opening = List[Byte]()
+    _append_frame(opening, Byte(1), Byte(4), UInt32(1), Span(compressed))
+    var head = session.consume(Span(opening))
+    assert_true(head.is_head())
+    var request = head^.take_request()
+    var reader = request.body_reader()
+    var bytes: List[Byte] = [Byte(97), Byte(98)]
+    var data = List[Byte]()
+    _append_frame(data, Byte(0), Byte(0), UInt32(1), Span(bytes))
+    assert_true(session.consume(Span(data)).is_pending())
+    assert_equal(session._receive_window.receive_window(), 65533)
+    var scheduler = Http2ResponseScheduler()
+    var deflater = _make_deflater()
+    var body: List[Byte] = [Byte(97), Byte(98), Byte(99), Byte(100)]
+    assert_true(_enqueue_response(scheduler, UInt32(1), 200, body^))
+    if started:
+        var first = scheduler.drain(
+            session, deflater, "Thu, 01 Jan 1970 00:00:00 GMT", 16384, 2048
+        )
+        var headers = parse_frame(Span(first.wire))
+        assert_true(headers.is_complete())
+        assert_equal(headers.frame_type, Byte(1))
+        assert_equal(headers.stream_id, UInt32(1))
+        assert_equal(len(first.wire), headers.consumed)
+        assert_equal(scheduler.queued_count(), 1)
+
+    var expired_stream_ids = List[UInt32]()
+    var expired = session.expire(session.next_deadline(), expired_stream_ids)
+    assert_equal(len(expired_stream_ids), 1)
+    assert_equal(expired_stream_ids[0], UInt32(1))
+    assert_equal(len(expired), 26)
+    var reset = parse_frame(Span(expired))
+    assert_true(reset.is_complete())
+    assert_equal(reset.frame_type, Byte(3))
+    assert_equal(reset.stream_id, UInt32(1))
+    var reset_fields = parse_rst_stream_frame(reset, Span(expired)[9:13])
+    assert_true(reset_fields.is_valid())
+    assert_equal(reset_fields.error_code, UInt32(8))
+    var update = parse_frame(Span(expired)[13:])
+    assert_true(update.is_complete())
+    assert_equal(update.frame_type, Byte(8))
+    assert_equal(update.stream_id, UInt32(0))
+    var credit = parse_window_update_frame(update, Span(expired)[22:26])
+    assert_true(credit.is_valid())
+    assert_equal(credit.increment, UInt32(2))
+    assert_equal(session._receive_window.receive_window(), 65535)
+    assert_equal(budget.used(), 0)
+    for stream_id in expired_stream_ids:
+        var cancellation = scheduler.on_peer_reset(stream_id)
+        assert_true(cancellation.released_bytes > 0)
+        assert_equal(cancellation.kept_headers, started)
+    var after = scheduler.drain(
+        session, deflater, "Thu, 01 Jan 1970 00:00:00 GMT", 16384, 2048
+    )
+    assert_equal(len(after.wire), 0)
+    assert_equal(scheduler.queued_count(), 0)
+    assert_equal(session.next_deadline(), NO_DEADLINE)
+    _ = reader.detach()
+
+
+def test_http2_body_expiry_cancels_queued_response() raises:
+    _check_http2_body_expiry_response_work(False)
+
+
+def test_http2_body_expiry_cancels_started_response() raises:
+    _check_http2_body_expiry_response_work(True)
