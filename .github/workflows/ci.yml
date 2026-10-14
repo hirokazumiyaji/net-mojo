@@ -337,6 +337,8 @@ jobs:
       - name: Run CONNECT tunnel example
         run: pixi run example-http-connect
 
+      - name: Test static file HTTP metadata
+        run: pixi run test-http-file-metadata
       - name: Test known-length HTTP streaming
         run: pixi run test-http-known-length
       - name: Test HTTP detach
@@ -460,6 +462,8 @@ jobs:
       - name: Sanitize HTTP/1 connection switching
         run: pixi run sanitize-http-hijack
 
+      - name: Sanitize static file HTTP metadata
+        run: pixi run sanitize-http-file-metadata
       - name: Sanitize known-length HTTP streaming
         run: pixi run sanitize-http-known-length
       - name: Sanitize HTTP detach

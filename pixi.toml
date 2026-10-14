@@ -56,6 +56,7 @@ test-http-websocket = "mojo run --Werror -I . tests/test_http_websocket.mojo"
 test-http-handshake = "mojo run --Werror -I . tests/test_http_handshake.mojo"
 test-http-websocket-fragments = "mojo run --Werror -I . tests/test_http_websocket_fragments.mojo"
 
+test-http-file-metadata = "mojo run --Werror -I . tests/test_http_file_metadata.mojo"
 test-http-known-length = "mojo run --Werror -I . tests/test_http_known_length.mojo"
 test-http-detach = "mojo run --Werror -I . tests/test_http_detach.mojo"
 test-http-offload = "mojo run --Werror -I . tests/test_http_offload.mojo"
@@ -93,6 +94,7 @@ sanitize-http-websocket = { cmd = "bash scripts/run_sanitized.sh tests/test_http
 sanitize-http-handshake = { cmd = "bash scripts/run_sanitized.sh tests/test_http_handshake.mojo", default-environment = "sanitize" }
 sanitize-http-websocket-fragments = { cmd = "bash scripts/run_sanitized.sh tests/test_http_websocket_fragments.mojo", default-environment = "sanitize" }
 
+sanitize-http-file-metadata = { cmd = "bash scripts/run_sanitized.sh tests/test_http_file_metadata.mojo", default-environment = "sanitize" }
 sanitize-http-known-length = { cmd = "bash scripts/run_sanitized.sh tests/test_http_known_length.mojo", default-environment = "sanitize" }
 sanitize-http-detach = { cmd = "bash scripts/run_sanitized.sh tests/test_http_detach.mojo", default-environment = "sanitize" }
 sanitize-http-offload = { cmd = "bash scripts/run_sanitized.sh tests/test_http_offload.mojo", default-environment = "sanitize" }
@@ -130,6 +132,7 @@ sanitize = { depends-on = [
   { task = "sanitize-http-websocket-fragments", environment = "sanitize" },
   { task = "sanitize-http-detach", environment = "sanitize" },
   { task = "sanitize-http-known-length", environment = "sanitize" },
+  { task = "sanitize-http-file-metadata", environment = "sanitize" },
   { task = "sanitize-http-offload", environment = "sanitize" },
 ] }
 test = { depends-on = [
@@ -173,6 +176,7 @@ test = { depends-on = [
   "test-http-websocket-fragments",
   "test-http-detach",
   "test-http-known-length",
+  "test-http-file-metadata",
   "test-http-offload",
   "test-actor",
 ] }
