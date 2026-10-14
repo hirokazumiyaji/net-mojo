@@ -235,7 +235,7 @@ Constraints (see `docs/design/http-server.md` for the full contract):
   `switch_protocols()`. The receiving worker uses `HijackSender.take_connection()`;
   unread bytes are retained by `HijackedConn`. HTTP/2 and HTTP/3 do not support
   connection takeover.
-- No HTTP/1.0, no multipart helpers, no body compression.
+- No HTTP/1.0, no multipart helpers.
 
 ### Method and path routing
 
@@ -334,11 +334,63 @@ and after a synchronous call, replacing an expired successful response with
 responses are unsupported. Replacement responses obey the writer's body
 limit and shared buffer budget.
 
-Optional provider pins live in `pixi.toml` (`openssl`, `libnghttp2`) and
+Optional provider pins live in `pixi.toml` (`openssl`, `libnghttp2`, `zlib`) and
 `net/quic/provider/Cargo.toml` (quiche). After bumping a pin, refresh
 `pixi.lock` / the provider `Cargo.lock`, rebuild the `tls-http2` /
-`tls-http3` environments, and re-run the matching suites. Measured H2/H3
+`tls-http3` / `compression` environments, and re-run the matching suites. Measured H2/H3
 numbers are recorded in `benchmarks/http/README.md`.
+
+### Optional gzip response compression
+
+Build the libz provider with `pixi run -e compression compression-build`, then
+wrap your handler explicitly:
+
+```mojo
+from net.http import CompressionConfig, CompressionHandler
+
+var app = CompressionHandler[App](
+    App(), CompressionConfig.default(),
+    Optional[String]("build/compression/libnet_zlib"),
+)
+```
+
+A `None` provider path preserves the response and its headers. Eligible buffered
+responses negotiate gzip, add `Vary: Accept-Encoding`, use the compressed wire
+length, and preserve trailers. HEAD, bodyless statuses, partial responses,
+existing encodings, small bodies, and configured compressed media types or
+extensions skip compression. Strong ETags become weak validators after gzip.
+The source and output allocation peak count against the shared buffer budget;
+compressed expansion beyond the buffered body limit is an error.
+
+For detached streams, use `writer.detach_compressed(req, cfg, provider_path)`.
+The movable `CompressingSender` owns bounded input/output buffers. `send` returns
+True when the source is owned, including when compressed output remains pending;
+False leaves the new source with the caller. `finish(trailers)` returns False
+until footer output drains into the actor queue; retry with `finish()` and supply
+trailers only on the first call. Known source lengths are checked separately
+from compressed wire bytes. Explicit unknown-length streams opt into gzip even
+when their eventual size is below `min_size`.
+
+Run `pixi run -e compression compression-suite` and
+`pixi run -e compression example-http-gzip`.
+The [compression design contract](docs/design/http-compression.md) describes
+selection, capacity, identity pass-through, and retry behavior.
+
+**BREACH:** Compressing responses that combine secrets with reflected user input
+can reveal those secrets through response size, even over TLS. Bypass compression
+for such routes, or exclude their content types; for example:
+
+```mojo
+var cfg = CompressionConfig.default()
+cfg.skip_content_type_prefixes.append("text/html")
+cfg.skip_content_type_prefixes.append("application/json")
+```
+
+Choose exclusions for your actual response types; MIME alone does not identify
+secret content. See the [BREACH research and mitigations](https://breachattack.com/).
+TLS record compression remains disabled by the provider's OpenSSL defaults;
+HTTP gzip is a separate feature. See
+[OpenSSL's compression option](https://docs.openssl.org/3.6/man3/SSL_CTX_set_options/).
 
 ### Response streaming and deferred responses
 

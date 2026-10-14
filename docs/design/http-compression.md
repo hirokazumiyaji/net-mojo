@@ -90,3 +90,22 @@ Invalid length, provider errors, or forbidden trailers abort the response.
 
 The encoder can retain source internally until it has enough data to emit a deflate block.
 `send` does not promise a per-chunk flush; `finish` completes the gzip member.
+
+## Secrets and response compression
+
+Gzip is disabled until an application opts in.
+[BREACH](https://breachattack.com/) exploits compressed response sizes when attacker-controlled reflected data and secrets appear in the same response.
+TLS does not remove this HTTP compression risk.
+Bypass the middleware or pass an absent provider for sensitive routes, or add their media types to exclusions:
+
+```mojo
+var cfg = CompressionConfig.default()
+cfg.skip_content_type_prefixes.append("text/html")
+cfg.skip_content_type_prefixes.append("application/json")
+```
+
+This example excludes common authenticated document formats; applications must choose exclusions from their actual response content.
+No `strict_default` preset is added because media type cannot determine whether a response contains reflected input and secrets.
+Static public responses and sensitive dynamic routes can use separate handler configurations.
+The TLS provider does not clear OpenSSL's default `SSL_OP_NO_COMPRESSION` option, so TLS record compression remains disabled independently of HTTP gzip.
+The pinned context default was checked at runtime; the [OpenSSL option contract](https://docs.openssl.org/3.6/man3/SSL_CTX_set_options/) documents it.
