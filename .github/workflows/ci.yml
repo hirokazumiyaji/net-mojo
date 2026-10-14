@@ -14,6 +14,63 @@ permissions:
   contents: read
 
 jobs:
+  websocket:
+    name: WebSocket (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+          - macos-14
+          - ubuntu-24.04
+          - ubuntu-24.04-arm
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      - name: Install pixi
+        uses: prefix-dev/setup-pixi@f00437f565399d418b0acc85936d12c1fb668347
+        with:
+          frozen: true
+      - name: Test independent WebSocket client
+        run: pixi run -e tls-websocket websocket-interop
+      - name: Test verified secure WebSocket client
+        run: pixi run -e tls-websocket websocket-tls-interop
+      - name: Test sanitized WS and WSS interoperability
+        run: pixi run -e tls-websocket websocket-interop-sanitize
+
+  websocket-conformance:
+    name: WebSocket conformance (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+          - ubuntu-24.04
+          - ubuntu-24.04-arm
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      - name: Install pixi
+        uses: prefix-dev/setup-pixi@f00437f565399d418b0acc85936d12c1fb668347
+        with:
+          frozen: true
+      - name: Enable pinned upstream image on ARM
+        if: matrix.os == 'ubuntu-24.04-arm'
+        uses: docker/setup-qemu-action@c7c53464625b32c7a7e944ae62b3e17d2b600130
+        with:
+          platforms: amd64
+      - name: Test upstream noncompression conformance
+        run: pixi run -e websocket autobahn-ws
+      - name: Retain standard conformance reports
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: websocket-autobahn-${{ matrix.os }}
+          path: build/websocket-autobahn
+          if-no-files-found: ignore
+
   proptest:
     name: Property tests (${{ matrix.os }})
     runs-on: ${{ matrix.os }}

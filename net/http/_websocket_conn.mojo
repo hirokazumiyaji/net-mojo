@@ -296,7 +296,10 @@ struct WebSocketConn[Stream: DuplexStream = _HijackedWebSocketStream](Movable):
         self._ping_deadline = _Deadline.from_timeout(self._config.ping_interval)
 
     def _read_frame(
-        mut self, deadline: _Deadline
+        mut self,
+        deadline: _Deadline,
+        mut validator: _UTF8Validator,
+        message_opcode: UInt8,
     ) raises NetError -> _WebSocketFrame:
         var scratch = Array[Byte, 4096](fill=0)
         while not self._decoder.complete():
@@ -339,10 +342,33 @@ struct WebSocketConn[Stream: DuplexStream = _HijackedWebSocketStream](Movable):
                     None,
                     "stream closed",
                 )
+            var payload_offset = len(self._decoder._payload)
             try:
                 _ = self._decoder.feed(Span(scratch)[0:count])
             except err:
                 self._fail(err.code, err.reason, deadline)
+            if self._decoder._parsed and not self._sent_close:
+                var frame_opcode = self._decoder._opcode
+                if frame_opcode == 0 and message_opcode == 0:
+                    self._fail(1002, "unexpected continuation frame", deadline)
+                if (
+                    frame_opcode == 1 or frame_opcode == 2
+                ) and message_opcode != 0:
+                    self._fail(
+                        1002,
+                        "new data frame during fragmented message",
+                        deadline,
+                    )
+                if self._config.validate_utf8 and (
+                    frame_opcode == 1
+                    or frame_opcode == 0
+                    and message_opcode == 1
+                ):
+                    var valid = validator.feed(
+                        Span(self._decoder._payload)[payload_offset:]
+                    )
+                    if not valid:
+                        self._fail(1007, "invalid message UTF-8", deadline)
         try:
             return self._decoder.take_frame()
         except err:
@@ -392,7 +418,7 @@ struct WebSocketConn[Stream: DuplexStream = _HijackedWebSocketStream](Movable):
         while True:
             var frame: _WebSocketFrame
             try:
-                frame = self._read_frame(deadline)
+                frame = self._read_frame(deadline, validator, opcode)
             except err:
                 self._abort()
                 raise err^
@@ -422,16 +448,7 @@ struct WebSocketConn[Stream: DuplexStream = _HijackedWebSocketStream](Movable):
                         self._config.ping_interval
                     )
                 continue
-            if frame.opcode == 0:
-                if opcode == 0:
-                    self._fail(1002, "unexpected continuation frame", deadline)
-            else:
-                if opcode != 0:
-                    self._fail(
-                        1002,
-                        "new data frame during fragmented message",
-                        deadline,
-                    )
+            if frame.opcode != 0:
                 opcode = frame.opcode
             fragments += 1
             if fragments > self._config.max_fragment_count:
@@ -441,9 +458,7 @@ struct WebSocketConn[Stream: DuplexStream = _HijackedWebSocketStream](Movable):
             ):
                 self._fail(1009, "message exceeds configured limit", deadline)
             if opcode == 1 and self._config.validate_utf8:
-                if not validator.feed(Span(frame.payload)) or (
-                    frame.fin and not validator.complete()
-                ):
+                if frame.fin and not validator.complete():
                     self._fail(1007, "invalid message UTF-8", deadline)
             payload.extend(Span(frame.payload))
             if frame.fin:
@@ -483,8 +498,9 @@ struct WebSocketConn[Stream: DuplexStream = _HijackedWebSocketStream](Movable):
                 var deadline = _Deadline.from_timeout(
                     self._config.read_deadline
                 )
+                var validator = _UTF8Validator()
                 while not self._closed:
-                    var frame = self._read_frame(deadline)
+                    var frame = self._read_frame(deadline, validator, 0)
                     if frame.opcode == 8:
                         self._peer_close(Span(frame.payload), deadline)
                     elif frame.opcode == 9:

@@ -169,6 +169,7 @@ def _expect_close(
         failed = True
     assert_true(failed)
     assert_true(ws.is_closed())
+    assert_true(len(state[].outgoing) >= 4)
     assert_equal(state[].outgoing[0], 136)
     assert_equal(state[].outgoing[1], 2)
     assert_equal(
@@ -613,6 +614,12 @@ def test_partial_write_timeout_aborts_and_preserves_original_error() raises:
     assert_equal(len(state[].outgoing), 2)
     assert_equal(state[].outgoing[0], 129)
     assert_equal(state[].outgoing[1], 5)
+
+
+def test_invalid_utf8_fails_before_frame_payload_is_complete() raises:
+    _expect_close([129, 132, 0, 0, 0, 0, 244, 144], 1007)
+    _expect_close([1, 128, 0, 0, 0, 0, 128, 132, 0, 0, 0, 0, 244, 144], 1007)
+    _expect_close([2, 128, 0, 0, 0, 0, 129, 132, 0, 0, 0, 0, 244, 144], 1002)
 
 
 def main() raises:

@@ -61,3 +61,38 @@ and TLS retry state. Closed connections consume the stream immediately while
 retaining Close metadata. The codec does not require TCP or TLS. In-memory streams
 exercise the same contract in tests. A future extended-CONNECT stream adapter
 can reuse framing and message handling without altering the HTTP/1 hijack API.
+
+
+## Reproducible conformance
+
+Install the frozen environment, then run:
+
+```sh
+pixi run test-http-websocket
+pixi run sanitize-http-websocket
+pixi run -e tls-websocket websocket-interop
+pixi run -e tls-websocket websocket-tls-interop
+pixi run -e tls-websocket websocket-interop-sanitize
+pixi run -e websocket autobahn-ws
+```
+
+The independent Python client is `websockets==15.0.1`, driven through its
+asyncio API so one TLS driver handles reads and writes. It verifies the generated
+fixture certificate and HTTP/1.1 ALPN. WS and WSS cover a coalesced Upgrade and
+first frame, 1 MiB text/binary messages, fragmented messages, Ping/Pong, sibling
+connections, Close metadata, and ignored extension offers.
+
+Autobahn uses the unmodified `wstest` CLI in
+`crossbario/autobahn-testsuite@sha256:519915fb568b04c9383f70a1c405ae3ff44ab9e35835b085239c258b6fac3074`,
+built from upstream revision `6ed6f439dc7ed0d7432fe2cf7481b110905ecc5c`.
+Groups 1–7 and 9 are selected; compression groups 12/13 are excluded.
+The fixture raises message/frame limits to 64 MiB for upstream large-payload
+cases. Each run gets a fresh report directory under `build/websocket-autobahn`.
+Every scheduled case must have a report; failures, missing cases, and non-strict
+verdicts fail the task. Upstream informational verdicts are retained.
+
+Docker is required. Linux uses host networking; Docker Desktop on macOS uses
+`host.docker.internal`, both targeting this repository's own loopback fixture.
+CI runs independent WS/WSS and ASan on all three supported platforms and Docker
+conformance on Linux x64/ARM64, using pinned amd64 image emulation on ARM64.
+Hosted macOS runners lack the Docker daemon needed by the upstream suite.
