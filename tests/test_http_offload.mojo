@@ -788,6 +788,7 @@ def test_http1_offload_preserves_pipeline_order_and_sibling_progress() raises:
             break
         sleep(0.001)
     pool.shutdown()
+    _wait_destroyed(gate, 1)
     var parts = _split_responses(response)
     assert_equal(before_release, 0)
     assert_equal(_status_of(sibling_response), 200)
