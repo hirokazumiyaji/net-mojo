@@ -389,6 +389,7 @@ func TestSlowReaderPartialSetupClosesOriginalSocketAndMetadata(t *testing.T) {
 
 func TestSlowReaderNoPacedReadAndOrdinaryOverloadCannotClaimValid(t *testing.T) {
 	var delay atomic.Bool
+	var firstEcho atomic.Bool
 	s := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path == "/echo" {
 			body, err := io.ReadAll(r.Body)
@@ -396,6 +397,11 @@ func TestSlowReaderNoPacedReadAndOrdinaryOverloadCannotClaimValid(t *testing.T) 
 				return
 			}
 			w.Header().Set("Content-Length", fmt.Sprint(len(body)))
+			w.WriteHeader(http.StatusOK)
+			w.(http.Flusher).Flush()
+			if !firstEcho.Swap(true) {
+				time.Sleep(1250 * time.Millisecond)
+			}
 			w.Write(body)
 			return
 		}
@@ -408,6 +414,8 @@ func TestSlowReaderNoPacedReadAndOrdinaryOverloadCannotClaimValid(t *testing.T) 
 	c := readerConfig(s.URL + "/fixed")
 	c.Warmup = 0
 	c.Duration = 20 * time.Millisecond
+	// This case must finish postflight drainage, rather than select the batch-timeout path.
+	c.SetupTimeout = 10 * time.Second
 	c.SlowInterval = 250 * time.Millisecond
 	r, err := run(c)
 	if err == nil || r.Valid || r.Success == 0 || r.Slow.Readers.MeasuredUsed != 0 || r.Slow.Readers.Final != 1 || r.Slow.ReaderReadTotal != 8<<20 || r.Slow.Measured.Readers.PacedReadBytes != 0 || r.Slow.Measured.Readers.IncompleteNS == 0 {
