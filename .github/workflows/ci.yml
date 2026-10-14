@@ -349,6 +349,8 @@ jobs:
         run: pixi run test-http-fileserver-driver
       - name: Test static-file transfer and memory bound
         run: pixi run test-http-fileserver-wire
+      - name: Test HTTP compression negotiation
+        run: pixi run test-http-compression-config
       - name: Test known-length HTTP streaming
         run: pixi run test-http-known-length
       - name: Test HTTP worker offload

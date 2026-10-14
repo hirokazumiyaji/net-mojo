@@ -28,6 +28,7 @@ from .fileserver import (
     file_server,
     serve_file,
 )
+from .compression import CompressionConfig, negotiate_encoding
 from .config import ServerConfig
 from .error import HttpError, _status_reason
 from .handler import Handler, HandlerFactory, DefaultHandlerFactory
