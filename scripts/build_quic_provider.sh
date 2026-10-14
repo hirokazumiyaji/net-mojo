@@ -30,7 +30,8 @@ if [ "$(uname -s)" = "Darwin" ]; then
         -o build/quic/libnet_quic_provider
 else
     quic_system_libs=(-lpthread -ldl -lm)
-    cc -shared -fPIC -O2 -Wall -Wextra -Werror \
+    # BoringSSL pthread TLS callbacks must survive the last provider handle.
+    cc -shared -Wl,-z,nodelete -fPIC -O2 -Wall -Wextra -Werror \
         -Inet/quic/provider \
         net/quic/provider/shim.c \
         build/quic/cargo/release/libnet_quic_provider.a \

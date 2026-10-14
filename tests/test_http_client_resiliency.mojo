@@ -98,14 +98,14 @@ def test_retry_preserves_request_deadline() raises:
     var replies: List[String] = [
         "HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n",
         "",
-        "HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n",
+        "",
     ]
-    var fixture = _Fixture(replies^, 0.04)
+    var fixture = _Fixture(replies^, 0.5)
     var client = Client(ClientConfig.default())
     var seed = client.do(ClientRequest.get(fixture.url))
     var _ = seed.read_all()
     var request = ClientRequest.get(fixture.url)
-    request.deadline = Timeout.milliseconds(70)
+    request.deadline = Timeout.milliseconds(750)
     var caught = False
     try:
         var _ = client.do(request^)

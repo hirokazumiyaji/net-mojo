@@ -1,8 +1,10 @@
 import sys
 from pathlib import Path
 import unittest
+from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
+import test_http_fileserver as fileserver
 from test_http_fileserver import H1Client
 
 
@@ -88,6 +90,45 @@ class DriverTests(unittest.TestCase):
         with self.assertRaisesRegex(AssertionError, "closed before headers"):
             client.slow_cancel()
         self.assertEqual(peer.reads, 1)
+
+
+class TransferWaitTests(unittest.TestCase):
+    def wait(self, duration, progressing, idle=1, total=4):
+        now = 0.0
+        with patch.object(fileserver.time, "monotonic", side_effect=lambda: now):
+            progress = fileserver.TransferProgress()
+
+            class Transfer:
+                def is_alive(self):
+                    return now < duration
+
+                def join(self, timeout):
+                    nonlocal now
+                    now += timeout
+                    if progressing:
+                        progress.set()
+
+            fileserver.wait_for_transfer(Transfer(), progress, idle, total)
+        return now
+
+    def test_progressing_transfer_can_outlive_idle_timeout(self):
+        self.assertGreaterEqual(self.wait(2, True), 2)
+
+    def test_idle_transfer_fails(self):
+        with self.assertRaisesRegex(AssertionError, "idle"):
+            self.wait(10, False)
+
+    def test_continuous_transfer_has_total_cap(self):
+        with self.assertRaisesRegex(AssertionError, "completion deadline"):
+            self.wait(10, True, total=2)
+
+    def test_body_bytes_refresh_progress(self):
+        with patch.object(fileserver.time, "monotonic", side_effect=[0, 5]):
+            progress = fileserver.TransferProgress()
+            response = fileserver.Response(progress=progress)
+            response.add(b"abc")
+        self.assertEqual(progress.last_activity, 5)
+        self.assertEqual(response.count, 3)
 
 
 if __name__ == "__main__":

@@ -38,7 +38,7 @@ jobs:
         with:
           frozen: true
       - name: Restore receive corpus
-        uses: actions/cache@0400d5f644dc74513175e3cd8d07132dd4860809
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
         with:
           path: build/fuzz/quic-recv-corpus
           key: fuzz-quic-${{ matrix.os }}-${{ github.run_id }}
@@ -52,7 +52,7 @@ jobs:
           pixi run -e tls-http3 fuzz-quic-recv --seconds "$REPLAY_SECONDS"
       - name: Retain reproduction inputs
         if: always()
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
         with:
           name: quic-receive-${{ matrix.os }}
           path: |
