@@ -41,6 +41,7 @@ test-http-middleware = "mojo run --Werror -I . tests/test_http_middleware.mojo"
 test-http-server = "mojo run --Werror -I . tests/test_http_server.mojo"
 test-http2 = "mojo run --Werror -I . tests/test_http2.mojo"
 test-http-detach = "mojo run --Werror -I . tests/test_http_detach.mojo"
+test-http-offload = "mojo run --Werror -I . tests/test_http_offload.mojo"
 test-actor = "mojo run --Werror -I . tests/test_actor.mojo"
 sanitize-sys = { cmd = "bash scripts/run_sanitized.sh tests/test_sys.mojo", default-environment = "sanitize" }
 sanitize-tcp = { cmd = "bash scripts/run_sanitized.sh tests/test_tcp.mojo", default-environment = "sanitize" }
@@ -64,6 +65,7 @@ sanitize-http2 = { cmd = "bash scripts/run_sanitized.sh tests/test_http2.mojo", 
   { task = "hpack-test", environment = "http2" },
 ] }
 sanitize-http-detach = { cmd = "bash scripts/run_sanitized.sh tests/test_http_detach.mojo", default-environment = "sanitize" }
+sanitize-http-offload = { cmd = "bash scripts/run_sanitized.sh tests/test_http_offload.mojo", default-environment = "sanitize" }
 # Note: pixi runs depends-on tasks concurrently. To avoid high memory from parallel ASan runs, invoke individual tasks sequentially.
 sanitize = { depends-on = [
   { task = "sanitize-sys", environment = "sanitize" },
@@ -86,6 +88,7 @@ sanitize = { depends-on = [
   { task = "sanitize-http-server", environment = "sanitize" },
   { task = "sanitize-http2", environment = "sanitize" },
   { task = "sanitize-http-detach", environment = "sanitize" },
+  { task = "sanitize-http-offload", environment = "sanitize" },
 ] }
 test = { depends-on = [
   "test-core",
@@ -111,6 +114,7 @@ test = { depends-on = [
   "test-http-server",
   "test-http2",
   "test-http-detach",
+  "test-http-offload",
   "test-actor",
 ] }
 example-tcp = "mojo run --Werror -I . examples/tcp_echo.mojo"

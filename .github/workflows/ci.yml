@@ -246,6 +246,8 @@ jobs:
         run: pixi run -e tls tls-suite
       - name: Test HTTP detach
         run: pixi run test-http-detach
+      - name: Test HTTP offload
+        run: pixi run test-http-offload
       - name: Test actor primitives
         run: pixi run test-actor
       - name: Package precompiled artifact
@@ -343,3 +345,5 @@ jobs:
         run: pixi run sanitize-http2
       - name: Sanitize HTTP detach
         run: pixi run sanitize-http-detach
+      - name: Sanitize HTTP offload
+        run: pixi run sanitize-http-offload
