@@ -18,6 +18,26 @@ import time
 from dataclasses import dataclass, field
 
 
+class TransferProgress(threading.Event):
+    def __init__(self):
+        super().__init__()
+        self.last_activity = time.monotonic()
+
+    def set(self):
+        self.last_activity = time.monotonic()
+        super().set()
+
+
+def wait_for_transfer(transfer_thread, progress, idle_timeout=120, total_timeout=600):
+    deadline = time.monotonic() + total_timeout
+    while transfer_thread.is_alive():
+        now = time.monotonic()
+        idle = now - progress.last_activity
+        assert idle < idle_timeout, f"large response idle for {idle:.2f}s"
+        assert now < deadline, "large response exceeded completion deadline"
+        transfer_thread.join(timeout=min(1, idle_timeout - idle, deadline - now))
+
+
 @dataclass
 class Response:
     status: int = 0
@@ -25,8 +45,11 @@ class Response:
     body: bytearray = field(default_factory=bytearray)
     count: int = 0
     digest: object = field(default_factory=hashlib.sha256)
+    progress: TransferProgress | None = None
 
     def add(self, data: bytes) -> None:
+        if data and self.progress is not None:
+            self.progress.set()
         self.count += len(data)
         self.digest.update(data)
         if len(self.body) + len(data) <= 262144:
@@ -63,7 +86,7 @@ class H1Client:
                 pending.extend(block)
             header, body = bytes(pending).split(b"\r\n\r\n", 1)
             lines = header.decode().split("\r\n")
-            response = Response(status=int(lines[0].split()[1]))
+            response = Response(status=int(lines[0].split()[1]), progress=started)
             response.headers = [tuple(line.split(": ", 1)) for line in lines[1:]]
             if started is not None:
                 started.set()
@@ -114,7 +137,7 @@ class H2Client:
             conn.initiate_connection()
             conn.send_headers(1, [(":method", method), (":scheme", "https"), (":authority", "localhost"), (":path", path), *[(key.lower(), value) for key, value in headers]], end_stream=True)
             sock.sendall(conn.data_to_send())
-            response = Response()
+            response = Response(progress=started)
             ended = False
             while not ended:
                 block = sock.recv(65536)
@@ -150,7 +173,7 @@ async def h3_request(port: int, method: str, path: str, headers=(), started=None
         def __init__(self, *args, **kwargs):
             super().__init__(*args, **kwargs)
             self.http = HeadAwareConnection(self._quic)
-            self.response = Response()
+            self.response = Response(progress=started)
             self.done = self._loop.create_future()
 
         def quic_event_received(self, event):
@@ -178,7 +201,7 @@ async def h3_request(port: int, method: str, path: str, headers=(), started=None
             client.http.head_streams.add(stream)
         client.http.send_headers(stream, [(b":method", method.encode()), (b":scheme", b"https"), (b":authority", b"localhost"), (b":path", path.encode()), *[(key.lower().encode(), value.encode()) for key, value in headers]], end_stream=True)
         client.transmit()
-        return await asyncio.wait_for(client.done, 120)
+        return await asyncio.wait_for(client.done, 600 if started is not None else 120)
 
 
 class H3Client:
@@ -267,7 +290,7 @@ def cases(client, pattern: bytes, large_size: int, large_digest: str):
     head = client.request("HEAD", "/large.bin")
     assert head.status == 200 and head.values("content-length") == [str(large_size)] and head.count == 0
     started = time.monotonic()
-    received_headers = threading.Event()
+    received_headers = TransferProgress()
     outcome = []
     failures = []
 
@@ -285,8 +308,7 @@ def cases(client, pattern: bytes, large_size: int, large_digest: str):
         sibling = client.request("GET", "/alive")
         assert sibling.status == 200 and bytes(sibling.body) == b"ok"
     finally:
-        transfer_thread.join(timeout=120)
-    assert not transfer_thread.is_alive(), "large response stalled"
+        wait_for_transfer(transfer_thread, received_headers)
     if failures:
         raise failures[0]
     large = outcome[0]

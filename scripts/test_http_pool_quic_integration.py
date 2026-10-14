@@ -70,7 +70,7 @@ def exercise(binary: Path, quic_only: bool) -> None:
         print(f"QUIC-only={quic_only}: all {len(responses)} HTTP/3 responses came from worker 0")
         assert asyncio.run(h3_request(port, "/shutdown")) == b"bye"
         stdout, stderr = proc.communicate(timeout=10)
-        assert proc.returncode == 0, stderr
+        assert proc.returncode == 0, f"QUIC pool fixture exited with {proc.returncode}: {stderr}"
         assert stdout.strip() == "EXIT", stdout
     finally:
         if proc.poll() is None:
