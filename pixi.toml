@@ -137,6 +137,7 @@ test = { depends-on = [
   "test-http2",
   "http-hijack-interop",
   "example-http-upgrade-echo",
+  "example-websocket-echo",
   "example-http-connect",
   "test-http-connect",
   "test-http-hijack",
@@ -158,11 +159,13 @@ example-http-json = "mojo run --Werror -I . examples/http_json.mojo"
 dogfood-build = "mkdir -p build && mojo build --Werror -I . examples/http_dogfood.mojo -o build/http-dogfood"
 dogfood-smoke = { cmd = "python3 scripts/test_dogfood.py", depends-on = ["dogfood-build"] }
 example-http-upgrade-echo = "mojo run --Werror -I . examples/http_upgrade_echo.mojo"
+example-websocket-echo = "mojo run --Werror -I . examples/websocket_echo.mojo"
 example-http-connect = "mojo run --Werror -I . examples/http_connect.mojo"
 example-http-sse = "mojo run --Werror -I . examples/http_sse.mojo"
 example-http-offload = "mojo run --Werror -I . examples/http_offload.mojo"
 example-http-offload-body = "mojo run --Werror -I . examples/http_offload_body.mojo"
 package = "mkdir -p build && mojo precompile net -o build/net.mojoc"
+websocket-package-smoke = { cmd = "mojo run --Werror -I build examples/websocket_echo.mojo", depends-on = ["package"] }
 test-package = "mojo run --Werror -I build tests/package_smoke.mojo"
 benchmark-ip = "mojo run --Werror -I . benchmarks/ip_parse.mojo"
 benchmark-loopback = "mojo run --Werror -I . benchmarks/loopback_io.mojo"
@@ -186,6 +189,7 @@ websockets = "==15.0.1"
 websocket-fixture-build = "mkdir -p build && mojo build --Werror -I . tests/websocket_fixture.mojo -Xlinker -ldl -o build/websocket_fixture"
 websocket-interop = { cmd = "python3 tests/test_http_websocket_interop.py", depends-on = ["websocket-fixture-build"] }
 websocket-tls-interop = { cmd = "python3 tests/test_http_websocket_interop.py --tls", depends-on = ["websocket-fixture-build", "tls-build"] }
+benchmark-websocket-echo = { cmd = "python3 benchmarks/websocket_echo/run.py", depends-on = ["websocket-fixture-build"] }
 websocket-report-test = "python3 tests/test_websocket_autobahn.py"
 autobahn-ws = { cmd = "python3 tests/websocket_autobahn.py", depends-on = ["websocket-fixture-build", "websocket-report-test"] }
 websocket-interop-sanitize = { cmd = "python3 tests/test_http_websocket_interop.py --binary build/sanitize/websocket_fixture && python3 tests/test_http_websocket_interop.py --tls --binary build/sanitize/websocket_fixture", depends-on = ["tls-build", { task = "websocket-fixture-sanitize-build", environment = "sanitize" }], default-environment = "tls-websocket" }

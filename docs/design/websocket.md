@@ -74,6 +74,7 @@ pixi run -e tls-websocket websocket-interop
 pixi run -e tls-websocket websocket-tls-interop
 pixi run -e tls-websocket websocket-interop-sanitize
 pixi run -e websocket autobahn-ws
+pixi run websocket-package-smoke
 ```
 
 The independent Python client is `websockets==15.0.1`, driven through its

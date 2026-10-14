@@ -32,8 +32,14 @@ jobs:
         uses: prefix-dev/setup-pixi@f00437f565399d418b0acc85936d12c1fb668347
         with:
           frozen: true
+      - name: Test public WebSocket ownership example
+        run: pixi run example-websocket-echo
+      - name: Test packaged public WebSocket ownership API
+        run: pixi run websocket-package-smoke
       - name: Test independent WebSocket client
         run: pixi run -e tls-websocket websocket-interop
+      - name: Check WebSocket measurement harness
+        run: pixi run -e websocket benchmark-websocket-echo --iterations 3
       - name: Test verified secure WebSocket client
         run: pixi run -e tls-websocket websocket-tls-interop
       - name: Test sanitized WS and WSS interoperability

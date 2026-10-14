@@ -21,6 +21,16 @@ from net.http import (
     apply_middleware,
     has_body_for_status,
 )
+from net.http.websocket import (
+    OPCODE_TEXT,
+    WebSocketConfig,
+    WebSocketMessage,
+    WebSocketCloseInfo,
+    WebSocketUpgrade,
+    WebSocketConn,
+    websocket_accept,
+    websocket_adopt,
+)
 from net.http._parser import parse_one
 
 
@@ -119,6 +129,18 @@ def _check_http_router() raises:
         raise Error("packaged net.http middleware mismatch")
 
 
+def _check_websocket_values() raises:
+    var config = WebSocketConfig.default()
+    var message = WebSocketMessage(OPCODE_TEXT, _to_bytes("packaged"))
+    var close = WebSocketCloseInfo(1000, String("done"))
+    if config.max_message_bytes != 1_048_576 or config.max_fragment_count != 64:
+        raise Error("packaged WebSocket config mismatch")
+    if message.opcode != OPCODE_TEXT or len(message.payload) != 8:
+        raise Error("packaged WebSocket message mismatch")
+    if close.code != 1000 or close.reason != "done":
+        raise Error("packaged WebSocket Close metadata mismatch")
+
+
 def main() raises:
     var listener = listen_tcp("127.0.0.1:0")
     var client = dial_tcp(String(listener.local_address()), Timeout.seconds(1))
@@ -150,3 +172,6 @@ def main() raises:
 
     _check_http_router()
     print("packaged net.http router succeeded")
+
+    _check_websocket_values()
+    print("packaged WebSocket values succeeded")

@@ -218,7 +218,7 @@ Constraints (see `docs/design/http-server.md` for the full contract):
   `switch_protocols()`. The receiving worker uses `HijackSender.take_connection()`;
   unread bytes are retained by `HijackedConn`. HTTP/2 and HTTP/3 do not support
   connection takeover.
-- No client, no HTTP/1.0, no WebSocket framing, no multipart helpers,
+- No client, no HTTP/1.0, no multipart helpers,
   no body compression, no static file serving.
 
 ### Method and path routing
@@ -496,6 +496,53 @@ Reproduce the performance comparison with
 `benchmarks/http/README.md` (Go baseline in `benchmarks/http_go`,
 parser benchmark `pixi run benchmark-http-parse`, server benchmark
 `pixi run benchmark-http-server`). CI does not gate on timing numbers.
+
+
+### WebSocket over HTTP/1.1
+
+`net.http.websocket` provides an RFC 6455 server over HTTP Upgrade, including
+verified WSS through the optional TLS provider. `websocket_accept(request,
+writer, config)` returns an owned `WebSocketUpgrade`; transfer it to a single
+worker and call `websocket_adopt(upgrade^)` there after the HTTP loop drains
+switching headers. The wrapper preserves the selected subprotocol and config.
+Adoption can wait, so an active HTTP loop must keep running independently.
+
+`WebSocketConn[]` exposes `read_message`, `write_text`, `write_binary`,
+`write_ping`, `write_pong`, `selected_subprotocol`, `close_info`, `is_closed`,
+and consuming `close`. Messages own an opcode and byte payload; `WebSocketCloseInfo`
+retains a validated code/reason. `WebSocketConfig.default()` limits frames and
+messages to 1 MiB and messages to 64 fragments, with a 30-second whole-message
+read deadline and 10-second whole-message write deadline. Ping is disabled by
+default; configured keepalive progresses during synchronous reads. The handler
+applies its own Origin allowlist.
+
+```mojo
+from net.error import NetError
+from net.http.websocket import OPCODE_TEXT, WebSocketUpgrade, websocket_adopt
+
+
+def echo_worker(var upgrade: WebSocketUpgrade) raises NetError:
+    var ws = websocket_adopt(upgrade^)
+    while not ws.is_closed():
+        try:
+            var message = ws.read_message()
+            if message.opcode == OPCODE_TEXT:
+                ws.write_text(String(from_utf8_lossy=Span(message.payload)))
+            else:
+                ws.write_binary(Span(message.payload))
+        except:
+            break
+    ws^.close()
+```
+
+Run `pixi run example-websocket-echo` for a self-contained owned handoff and
+echo. The [WebSocket design](docs/design/websocket.md) documents bounded Close,
+write-error transport abort, subprotocol preference, and reproducible WS/WSS
+and pinned Autobahn checks. Compression/extensions and a public WebSocket client
+are outside this phase. HTTP/2 RFC 8441 and HTTP/3 RFC 9220 can later use the
+`DuplexStream` adapter boundary. Measure small/medium/large binary echoes with
+`pixi run -e websocket benchmark-websocket-echo`; it records throughput and p99
+without performance thresholds.
 
 ## Examples, Benchmarks, and Tests
 
