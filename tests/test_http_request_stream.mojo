@@ -5,7 +5,7 @@ from std.time import perf_counter_ns, sleep
 
 from net import TCPConn, Timeout, dial_tcp, listen_tcp
 from net.error import NetErrorKind
-from net.http._deadline import now_ns
+from net.http._deadline import NO_DEADLINE, now_ns
 from net.http import (
     Handler,
     Headers,
@@ -758,7 +758,7 @@ def test_shutdown_grace_cancels_incomplete_input() raises:
 def test_discarded_input_uses_body_deadline_after_response_finishes() raises:
     var config = ServerConfig.default()
     config.enable_request_body_streaming = True
-    config.body_deadline = Timeout.milliseconds(100)
+    config.body_deadline = Timeout.seconds(30)
     config.idle_timeout = Timeout.milliseconds(1)
     var server = Server(config^)
     var client = _connect(server)
@@ -770,8 +770,11 @@ def test_discarded_input_uses_body_deadline_after_response_finishes() raises:
         Timeout.seconds(1),
     )
     assert_equal(_status_of(_tick_and_read(server, handler, client)), 200)
-    sleep(0.01)
-    _ = server.tick(handler, Timeout.nanoseconds(0))
+    # Discarded unread input must arm body_deadline and clear idle, not race a
+    # short sleep against a 100ms body clock that CI scheduling can overrun.
+    assert_equal(len(server._request_body_conns), 1)
+    assert_equal(server._conns[0].idle_at, NO_DEADLINE)
+    assert_true(server._conns[0].body_at > now_ns())
     assert_equal(server.active_connections(), 1)
     client.write_all(
         String("bodyGET /next HTTP/1.1\r\nHost: x\r\n\r\n").as_bytes(),
