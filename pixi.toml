@@ -1,6 +1,6 @@
 [workspace]
 channels = ["https://conda.modular.com/max", "conda-forge"]
-name = "net-mojo"
+name = "net"
 platforms = [
   "osx-arm64",
   { name = "linux-64-glibc-2-34", platform = "linux-64", glibc = "2.34" },

@@ -85,7 +85,7 @@ Issue226 のサービスと HTTP/metrics smoke は確認済みである。
 ### Prefix 配布と release 成果
 
 ローカル conda build と [publish workflow](../../.github/workflows/publish.yml) は確認済みである。
-Prefix channel の管理権限、`PREFIX_CHANNEL` と `PREFIX_API_KEY` の設定、3 platform の実際の upload、clean environmentでの `pixi add net-mojo -c <channel>` は未確認である。
+Prefix channel の管理権限、`PREFIX_CHANNEL` と `PREFIX_API_KEY` の設定、3 platform の実際の upload、clean environmentでの `pixi add net -c <channel>` は未確認である。
 secret の値は証拠に含めず、設定名と権限所有者、実行結果を記録する。
 
 要求された機能と品質の確認後に、version、3 platform artifact/checksum、GitHub Release 本文・添付と Prefix install の結果を記録する。
