@@ -49,17 +49,19 @@ them; rebuilding from source always works.
 
 Releases follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 with the version source of truth in `pixi.toml`. Changes are recorded in
-[CHANGELOG.md](CHANGELOG.md). Public API is every name reachable from
+the [GitHub Release](https://github.com/hirokazumiyaji/net-mojo/releases)
+description. Public API is every name reachable from
 `net` that does not start with an underscore; anything under `net/_sys/`
 or starting with `_` is internal and may change without a version bump.
 
 To release, set the same version in `pixi.toml` and
-`conda.recipe/recipe.yaml`, move the CHANGELOG entries under
-`## [X.Y.Z] - YYYY-MM-DD`, optionally add `docs/releases/vX.Y.Z.md`, and push
-the tag `vX.Y.Z`. The Publish workflow checks that these agree, builds and
-tests the conda package on every supported platform, uploads it to the
-prefix.dev channel named by the `PREFIX_CHANNEL` repository variable (using
-the `PREFIX_API_KEY` secret), and creates the GitHub Release.
+`conda.recipe/recipe.yaml`, then publish a GitHub Release for the tag `vX.Y.Z`
+with the changes in its description. The Publish workflow checks that the tag
+and both versions agree, builds and tests the conda package on every supported
+platform, uploads it to the prefix.dev channel named by the `PREFIX_CHANNEL`
+repository variable (using the `PREFIX_API_KEY` secret), and attaches the
+packages to the Release without changing its description. Pushing only the
+tag creates the Release with generated notes.
 
 Build and test the conda package locally with `bash scripts/build_conda.sh`.
 Pull requests and manual Publish runs build packages without uploading to
