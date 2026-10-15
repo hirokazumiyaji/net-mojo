@@ -53,6 +53,14 @@ with the version source of truth in `pixi.toml`. Changes are recorded in
 `net` that does not start with an underscore; anything under `net/_sys/`
 or starting with `_` is internal and may change without a version bump.
 
+Before removing or incompatibly changing a public API, announce its deprecation
+in the CHANGELOG and its docstring at least one minor release in advance.
+For stable releases, removal takes effect in the next major release. During
+the `0.y` series, a breaking change may take effect in the next minor release
+after that notice. Security fixes may require a shorter notice period when
+retaining the affected behavior would expose users to a vulnerability.
+See [SECURITY.md](SECURITY.md) for supported versions and private reporting.
+
 To release, set the same version in `pixi.toml` and
 `conda.recipe/recipe.yaml`, move the CHANGELOG entries under
 `## [X.Y.Z] - YYYY-MM-DD`, optionally add `docs/releases/vX.Y.Z.md`, and push
